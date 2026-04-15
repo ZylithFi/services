@@ -1,0 +1,16 @@
+/target
+/.scarb
+/.snfoundry_cache
+/client/node_modules
+/client/dist
+/client/*.tsbuildinfo
+/client/vite.config.js
+/client/vite.config.d.ts
+/client/starknet-9.4.2.tgz
+/contracts/target
+/contracts/.snfoundry_cache
+/stwo_statement/target
+/coordinator/batches.dev.json
+/.deploy
+/.external
+/.DS_Store
