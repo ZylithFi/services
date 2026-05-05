@@ -74,6 +74,18 @@ pub fn poseidon_chain_hex(seed: Felt, inputs: &[Felt]) -> String {
     felt_hex(&state)
 }
 
+pub fn ordered_felt_list_commitment(
+    domain_tag: &str,
+    values: &[String],
+) -> Result<String, ProtocolError> {
+    let mut state = domain_felt(domain_tag);
+    state = poseidon_hash(state, Felt::from(values.len() as u64));
+    for value in values {
+        state = poseidon_hash(state, felt_from_hex_str(&normalize_felt_hex(value)?)?);
+    }
+    Ok(felt_hex(&state))
+}
+
 pub fn felt_hex(value: &Felt) -> String {
     format!("{value:#x}")
 }

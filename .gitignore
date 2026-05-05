@@ -7,6 +7,11 @@
 /client/vite.config.js
 /client/vite.config.d.ts
 /client/starknet-9.4.2.tgz
+/client/public/deployment.json
+/frontend/node_modules
+/frontend/dist
+/frontend/*.tsbuildinfo
+/scripts/
 /contracts/target
 /contracts/.snfoundry_cache
 /stwo_statement/target

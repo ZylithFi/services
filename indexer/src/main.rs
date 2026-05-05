@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use starknet::core::utils::get_selector_from_name;
+use starknet_rust_core::utils::get_selector_from_name;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use zylith_core::{
@@ -75,7 +75,7 @@ struct PublishedBatchArtifactsStoreFile {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), String> {
     let artifact_archive_path = env::var("ZYLITH_INDEXER_ARTIFACT_PATH")
         .ok()
         .map(PathBuf::from)
@@ -102,7 +102,7 @@ async fn main() {
         internal_api_token: Some(Arc::new(load_required_control_plane_token(
             "zylith-indexer",
             CONTROL_PLANE_TOKEN_ENV,
-        ))),
+        )?)),
     };
 
     let app = build_app_with_state(state);
@@ -111,10 +111,12 @@ async fn main() {
         env::var("ZYLITH_INDEXER_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .expect("bind indexer");
+        .map_err(|error| format!("failed to bind indexer on {bind_addr}: {error}"))?;
 
     println!("Zylith indexer listening on http://{bind_addr}");
-    axum::serve(listener, app).await.expect("serve indexer");
+    axum::serve(listener, app)
+        .await
+        .map_err(|error| format!("indexer service failed: {error}"))
 }
 
 fn build_app_with_state(state: AppState) -> Router {
@@ -156,10 +158,21 @@ fn build_app_with_state(state: AppState) -> Router {
         )
 }
 
-fn load_required_control_plane_token(service_name: &str, env_name: &str) -> String {
-    env::var(env_name).unwrap_or_else(|_| {
-        panic!("{service_name} requires {env_name} to protect internal control-plane routes")
-    })
+fn load_required_control_plane_token(service_name: &str, env_name: &str) -> Result<String, String> {
+    env::var(env_name)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| {
+            format!("{service_name} requires {env_name} to protect internal control-plane routes")
+        })
+        .and_then(|value| {
+            if value.is_empty() {
+                Err(format!(
+                    "{service_name} requires non-empty {env_name} to protect internal control-plane routes"
+                ))
+            } else {
+                Ok(value)
+            }
+        })
 }
 
 fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
@@ -171,7 +184,7 @@ fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), St
         .and_then(|value| value.to_str().ok())
         .and_then(extract_bearer_token)
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if provided != expected_token.as_str() {
+    if !zylith_core::constant_time_eq(provided, expected_token.as_str()) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
@@ -202,7 +215,13 @@ fn load_deployment_manifest() -> Option<DeploymentManifest> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_DEPLOYMENT_MANIFEST_PATH));
     let manifest = fs::read_to_string(manifest_path).ok()?;
-    serde_json::from_str(&manifest).ok()
+    parse_deployment_manifest(&manifest).ok()
+}
+
+fn parse_deployment_manifest(contents: &str) -> Result<DeploymentManifest, serde_json::Error> {
+    let value = serde_json::from_str::<serde_json::Value>(contents)?;
+    let manifest = value.get("manifest").cloned().unwrap_or(value);
+    serde_json::from_value(manifest)
 }
 
 fn selector_hex(name: &str) -> String {
@@ -231,16 +250,29 @@ fn persist_published_batch_artifacts_store(
     path: &FsPath,
     artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
 ) -> Result<(), StatusCode> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-
     let encoded = serde_json::to_string_pretty(&PublishedBatchArtifactsStoreFile {
         artifacts_by_batch: artifacts.clone(),
     })
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    fs::write(path, encoded).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    atomic_write(path, &encoded)
+}
+
+fn atomic_write(path: &FsPath, contents: &str) -> Result<(), StatusCode> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    let file_name = path.file_name().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let temp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    fs::write(&temp_path, contents).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    fs::rename(&temp_path, path).map_err(|_| {
+        let _ = fs::remove_file(&temp_path);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn published_batch_artifact_summary(
@@ -536,7 +568,10 @@ fn normalize_hex(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, build_app_with_state, normalize_hex, parse_hex_u64, parse_hex_u128};
+    use super::{
+        AppState, build_app_with_state, normalize_hex, parse_deployment_manifest, parse_hex_u64,
+        parse_hex_u128,
+    };
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode},
@@ -557,6 +592,40 @@ mod tests {
     fn normalize_hex_adds_prefix_and_lowercases() {
         assert_eq!(normalize_hex("ABC"), "0xabc");
         assert_eq!(normalize_hex("0xDEF"), "0xdef");
+    }
+
+    #[test]
+    fn deployment_manifest_parser_accepts_public_and_live_wrapped_shapes() {
+        let public_manifest = r#"{
+            "network": "sepolia",
+            "rpc_url": "https://rpc.example",
+            "chain_id": "SN_SEPOLIA",
+            "contracts": {
+                "commitment_registry": "0x1",
+                "batch_registry": "0x2",
+                "fee_ledger": "0x3",
+                "shielded_asset_adapter": "0x4",
+                "privacy_deposit_bridge": "0x6",
+                "auction_verifier": "0x7"
+            },
+            "token_addresses": {
+                "STRK": "0x9"
+            }
+        }"#;
+
+        let live_manifest = format!(
+            r#"{{
+                "manifest": {public_manifest},
+                "deployment": {{
+                    "timestamp": "2026-04-29T00:00:00Z"
+                }}
+            }}"#
+        );
+
+        let public = parse_deployment_manifest(public_manifest).expect("public manifest");
+        let live = parse_deployment_manifest(&live_manifest).expect("live manifest");
+        assert_eq!(public, live);
+        assert_eq!(live.contracts.shielded_asset_adapter, "0x4");
     }
 
     #[tokio::test]

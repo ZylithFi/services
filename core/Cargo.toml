@@ -8,6 +8,8 @@ authors.workspace = true
 [dependencies]
 aes-gcm = "0.10"
 hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdh"] }
 rand = "0.9"
 rand_core = "0.6"

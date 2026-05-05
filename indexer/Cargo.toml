@@ -10,7 +10,7 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-starknet = "0.17.0"
+starknet-rust-core = "0.19"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
 tower-http = { version = "0.6", features = ["cors"] }
 zylith-core = { path = "../core" }

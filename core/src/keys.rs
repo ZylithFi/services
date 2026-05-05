@@ -14,6 +14,7 @@ pub struct UserKeys {
     pub recovery_key: [u8; 32],
     pub note_recognition_key: [u8; 32],
     pub order_cancellation_key: [u8; 32],
+    pub withdraw_auth_key: [u8; 32],
 }
 
 impl RecoverySeed {
@@ -44,6 +45,7 @@ pub fn derive_user_keys(seed: &RecoverySeed) -> UserKeys {
         recovery_key: derive_labeled_key(&seed.0, "zylith/recovery"),
         note_recognition_key: derive_labeled_key(&seed.0, "zylith/note-recognition"),
         order_cancellation_key: derive_labeled_key(&seed.0, "zylith/order-cancel"),
+        withdraw_auth_key: derive_labeled_key(&seed.0, "zylith/withdraw-auth"),
     }
 }
 

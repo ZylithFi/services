@@ -12,4 +12,14 @@ pub enum ProtocolError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("protocol cryptography error: {0}")]
     Crypto(String),
+    #[error("invalid product config: {0}")]
+    InvalidProductConfig(String),
+    #[error("invalid funding rail config: {0}")]
+    InvalidFundingRailConfig(String),
+    #[error("unsupported pair: {0}")]
+    UnsupportedPair(String),
+    #[error("invalid order: {0}")]
+    InvalidOrder(String),
+    #[error("invalid settlement proof: {0}")]
+    InvalidSettlementProof(String),
 }
