@@ -1,6 +1,9 @@
+#![recursion_limit = "256"]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    io::Cursor,
     path::{Path as FsPath, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -10,7 +13,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
@@ -37,24 +40,32 @@ use tokio::{
     task,
     time::{Duration, sleep},
 };
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use url::Url;
-use zylith_core::hash::{encode_starknet_felt, ordered_felt_list_commitment};
+use zylith_core::hash::{encode_starknet_felt, normalize_felt_hex, ordered_felt_list_commitment};
 use zylith_core::{
-    AssetId, AuctionOrderWitness, BatchId, BatchOrderSet, BatchSummary, CONTROL_PLANE_TOKEN_ENV,
-    ConsumedInput, DeploymentManifest, FeeEntry, MatchedOrder, MatchedOrderWitness, Note,
+    AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchOrderSet, BatchSummary,
+    CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord, DepositRecordList,
+    FeeEntry, MatchedOrder, MatchedOrderWitness, Note, NoteMembershipKind, NoteMembershipWitness,
     OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport, OrderIngressReceipt,
-    OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OutputCiphertextBundle,
-    OutputNoteRecord, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig,
-    PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig,
-    ProofArtifactRecord, ProofJobStatus, PublishedBatchArtifacts, SettlementSubmissionPlan,
-    SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
-    TrustedOrderIngressResponse, build_auction_serialized_input, build_output_note,
-    build_settlement_submission_plan, create_order_ingress_receipt, decrypt_order_bundle,
-    encrypt_note_for_owner, extract_bearer_token, format_bearer_token,
-    native_settlement_message_hash, private_execution_key_registry_fingerprint,
-    private_order_payload_commitment, proof_artifact_commitment,
-    sanitize_order_submission_for_coordinator, settlement_proof_message_hash,
+    OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle,
+    OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
+    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
+    ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublishedBatchArtifacts,
+    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTranscript,
+    SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
+    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
+    auction_result_proof_message_hash_for_program, build_admission_serialized_input,
+    build_auction_result_serialized_input, build_auction_serialized_input,
+    build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
+    create_order_ingress_receipt, decrypt_order_bundle,
+    deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
+    extract_bearer_token, format_bearer_token, native_settlement_message_hash,
+    nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
+    private_execution_key_registry_fingerprint, private_order_payload_commitment,
+    proof_artifact_commitment, renewal_sparse_witnesses_for_child_uses,
+    sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
+    settlement_proof_message_hash_for_program, settlement_state_transition_root,
     settlement_transcript_commitment, validate_order_ingress_receipt_for_manifest_with_secrets,
 };
 
@@ -69,6 +80,7 @@ const DEFAULT_PROVER_DATA_DIR: &str = "prover/data.dev";
 const DEFAULT_NATIVE_L1_GAS_FLOOR: u64 = 1_000;
 const DEFAULT_NATIVE_L1_DATA_GAS_FLOOR: u64 = 8_000;
 const DEFAULT_NATIVE_L2_GAS_FLOOR: u64 = 120_000_000;
+const DEFAULT_NATIVE_PROOF_ONLY_L2_GAS_FLOOR: u64 = 10_000_000_000;
 const DEFAULT_STWO_MANIFEST_PATH: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../stwo_statement/Scarb.toml");
 const DEFAULT_STWO_PACKAGE_NAME: &str = "zylith_settlement_statement";
@@ -78,6 +90,7 @@ const DEFAULT_RECEIPT_POLL_INTERVAL_MS: u64 = 1_500;
 const DEFAULT_NATIVE_PROVER_ATTEMPTS: usize = 8;
 const DEFAULT_NATIVE_PROVER_RETRY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_NATIVE_PROVER_REQUEST_TIMEOUT_SECONDS: u64 = 3_600;
+const DEFAULT_NATIVE_PROVER_BLOCKS_BACK: u64 = 0;
 const DEFAULT_NATIVE_PROOF_FACTS_SUBMIT_RETRY_ATTEMPTS: usize = 120;
 const DEFAULT_NATIVE_PROOF_FACTS_SUBMIT_RETRY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_AUCTION_PROVER_KEYS_PATH: &str = "prover/auction_keys.dev.json";
@@ -92,16 +105,26 @@ const NATIVE_PROVER_ATTEMPTS_ENV: &str = "ZYLITH_NATIVE_PROVER_ATTEMPTS";
 const NATIVE_PROVER_RETRY_INTERVAL_MS_ENV: &str = "ZYLITH_NATIVE_PROVER_RETRY_INTERVAL_MS";
 const NATIVE_PROVER_REQUEST_TIMEOUT_SECONDS_ENV: &str =
     "ZYLITH_NATIVE_PROVER_REQUEST_TIMEOUT_SECONDS";
+const NATIVE_PROVER_BLOCKS_BACK_ENV: &str = "ZYLITH_NATIVE_PROVER_BLOCKS_BACK";
 const NATIVE_PROOF_FACTS_SUBMIT_RETRY_ATTEMPTS_ENV: &str =
     "ZYLITH_NATIVE_PROOF_FACTS_SUBMIT_RETRY_ATTEMPTS";
 const NATIVE_PROOF_FACTS_SUBMIT_RETRY_INTERVAL_MS_ENV: &str =
     "ZYLITH_NATIVE_PROOF_FACTS_SUBMIT_RETRY_INTERVAL_MS";
+const NATIVE_SIGNATURE_BINDS_PROOF_FACTS_ENV: &str = "ZYLITH_NATIVE_SIGNATURE_BINDS_PROOF_FACTS";
 const NATIVE_PROOF_ACCOUNT_ADDRESS_ENV: &str = "ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS";
+const NATIVE_PROOF_PROGRAM_ADDRESS_ENV: &str = "ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS";
+const NATIVE_PROOF_ENTRYPOINT_ENV: &str = "ZYLITH_NATIVE_PROOF_ENTRYPOINT";
+const NATIVE_PROOF_AGGREGATE_ENTRYPOINT_ENV: &str = "ZYLITH_NATIVE_PROOF_AGGREGATE_ENTRYPOINT";
+const NATIVE_PROOF_AGGREGATOR_URL_ENV: &str = "ZYLITH_NATIVE_PROOF_AGGREGATOR_URL";
+const NATIVE_SPLIT_AUCTION_PROOF_REQUIRED_ENV: &str = "ZYLITH_NATIVE_SPLIT_AUCTION_PROOF_REQUIRED";
+const NATIVE_PROOF_SMOKE_ZERO_ROOTS_ENV: &str = "ZYLITH_NATIVE_PROOF_SMOKE_ZERO_ROOTS";
 const AUCTION_PROVER_KEYS_PATH_ENV: &str = "ZYLITH_AUCTION_PROVER_KEYS_PATH";
 const AUCTION_PROVER_ALLOW_KEYGEN_ENV: &str = "ZYLITH_AUCTION_PROVER_ALLOW_KEYGEN";
 const DEFAULT_PRODUCT_PAIR_IDS: &str = "STRK/ETH,STRK/USDC,STRK/strkBTC";
-const PROTOCOL_FEE_BPS: u128 = 30;
-const PROTOCOL_FEE_RECIPIENT: &str = "zylith-protocol-fees";
+const DEFAULT_PROTOCOL_FEE_BPS: u128 = 30;
+const DEFAULT_PROTOCOL_FEE_RECIPIENT: &str = "zylith-protocol-fees";
+const PROTOCOL_FEE_BPS_ENV: &str = "ZYLITH_PROTOCOL_FEE_BPS";
+const PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_FEE_RECIPIENT";
 const PROOF_JOBS_DIR: &str = "proof_jobs";
 const SETTLEMENT_PLANS_DIR: &str = "settlement_plans";
 const SETTLEMENT_WITNESSES_DIR: &str = "settlement_witnesses";
@@ -115,6 +138,8 @@ const ORDER_INGRESS_RECEIPT_SECRET_ENV: &str = "ZYLITH_TRUSTED_INGRESS_RECEIPT_S
 const ORDER_INGRESS_RECEIPT_PREVIOUS_SECRETS_ENV: &str =
     "ZYLITH_TRUSTED_INGRESS_RECEIPT_PREVIOUS_SECRETS";
 const ORDER_INGRESS_ID_ENV: &str = "ZYLITH_TRUSTED_PROVER_INGRESS_ID";
+const HEARTBEAT_COVER_SECRET_ENV: &str = "ZYLITH_HEARTBEAT_COVER_SECRET";
+const HEARTBEAT_COVER_PRICES_ENV: &str = "ZYLITH_HEARTBEAT_COVER_PRICES";
 const MIN_BATCH_BASE_LIQUIDITY_ENV: &str = "ZYLITH_MIN_BATCH_BASE_LIQUIDITY";
 const PROVER_MAX_BODY_BYTES_ENV: &str = "ZYLITH_PROVER_MAX_BODY_BYTES";
 const PROVER_PRIVATE_INGRESS_RATE_LIMIT_PER_MINUTE_ENV: &str =
@@ -122,22 +147,41 @@ const PROVER_PRIVATE_INGRESS_RATE_LIMIT_PER_MINUTE_ENV: &str =
 const PROVER_MAX_STORED_PRIVATE_PAYLOADS_ENV: &str = "ZYLITH_PROVER_MAX_STORED_PRIVATE_PAYLOADS";
 const PROVER_PRIVATE_PAYLOAD_RETENTION_MS_ENV: &str = "ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS";
 const PROVER_EMERGENCY_PAUSED_ENV: &str = "ZYLITH_PROVER_EMERGENCY_PAUSED";
+const PROVER_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_PROVER_ALLOWED_ORIGINS";
 const MIN_BATCH_PARTICIPANTS_ENV: &str = "ZYLITH_MIN_BATCH_PARTICIPANTS";
+const MIN_ELIGIBLE_ORDERS_ENV: &str = "ZYLITH_MIN_ELIGIBLE_ORDERS";
+const MIN_MAKER_PARTICIPANTS_ENV: &str = "ZYLITH_MIN_MAKER_PARTICIPANTS";
 const MAX_SINGLE_ORDER_FILL_BPS_ENV: &str = "ZYLITH_MAX_SINGLE_ORDER_FILL_BPS";
+const MAX_SINGLE_OWNER_FILL_BPS_ENV: &str = "ZYLITH_MAX_SINGLE_OWNER_FILL_BPS";
+const MAX_MAKER_FILL_BPS_ENV: &str = "ZYLITH_MAX_MAKER_FILL_BPS";
+const MAX_PROVABLE_BATCH_ORDERS_ENV: &str = "ZYLITH_MAX_PROVABLE_BATCH_ORDERS";
 const MAX_ORDER_AMOUNT_ENV: &str = "ZYLITH_MAX_ORDER_AMOUNT";
 const MAX_MAKER_CURVE_BASE_AMOUNT_ENV: &str = "ZYLITH_MAX_MAKER_CURVE_BASE_AMOUNT";
 const MAX_MAKER_CURVE_QUOTE_NOTIONAL_ENV: &str = "ZYLITH_MAX_MAKER_CURVE_QUOTE_NOTIONAL";
+const SETTLEMENT_SUBMISSION_JITTER_MS_ENV: &str = "ZYLITH_SETTLEMENT_SUBMISSION_JITTER_MS";
+const NATIVE_TX_PROVER_OHTTP_ENABLED_ENV: &str = "ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED";
+const NATIVE_TX_PROVER_OHTTP_RELAY_URL_ENV: &str = "ZYLITH_NATIVE_TX_PROVER_OHTTP_RELAY_URL";
+const NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX_ENV: &str =
+    "ZYLITH_NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX";
 const DEFAULT_PROVER_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_PROVER_PRIVATE_INGRESS_RATE_LIMIT_PER_MINUTE: u64 = 60;
 const DEFAULT_PROVER_MAX_STORED_PRIVATE_PAYLOADS: usize = 10_000;
 const DEFAULT_PROVER_PRIVATE_PAYLOAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS: u64 = 5_000;
+const DEFAULT_MAX_PROVABLE_BATCH_ORDERS: u64 = 32;
 
 #[derive(Clone)]
 struct AppState {
     coordinator_url: String,
     indexer_url: String,
     auction_verifier_address: String,
+    native_proof_program_address: String,
+    native_proof_entrypoint: String,
+    native_proof_aggregate_entrypoint: String,
+    native_split_auction_proof_required: bool,
     native_tx_prover_url: Option<String>,
+    native_tx_prover_ohttp: Option<NativeProverOhttpConfig>,
+    native_proof_aggregator_url: Option<String>,
     scarb_bin: String,
     stwo_manifest_path: Arc<PathBuf>,
     stwo_package_name: String,
@@ -158,12 +202,21 @@ struct AppState {
     order_ingress_id: String,
     order_ingress_receipt_secret: Option<Arc<String>>,
     order_ingress_receipt_secrets: Arc<Vec<String>>,
+    heartbeat_cover_secret: Arc<String>,
     min_batch_base_liquidity: u128,
     min_batch_participants: u64,
+    min_eligible_orders: u64,
+    min_maker_participants: u64,
     max_single_order_fill_bps: u64,
+    max_single_owner_fill_bps: u64,
+    max_maker_fill_bps: u64,
+    max_provable_batch_orders: u64,
     max_order_amount: u128,
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
+    protocol_fee_bps: u128,
+    protocol_fee_recipient: String,
+    settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
     max_stored_private_payloads: usize,
     private_ingress_rate_limit_per_minute: u64,
@@ -201,11 +254,36 @@ struct BatchRegistrarConfig {
     batch_registry_address: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SettlementRoots {
+    note_root: String,
+    nullifier_root: String,
+    renewal_root: String,
+    fee_root: String,
+}
+
+impl SettlementRoots {
+    fn zero() -> Self {
+        Self {
+            note_root: "0x0".into(),
+            nullifier_root: "0x0".into(),
+            renewal_root: "0x0".into(),
+            fee_root: "0x0".into(),
+        }
+    }
+}
+
 struct AppConfig {
     coordinator_url: String,
     indexer_url: String,
     auction_verifier_address: String,
+    native_proof_program_address: String,
+    native_proof_entrypoint: String,
+    native_proof_aggregate_entrypoint: String,
+    native_split_auction_proof_required: bool,
     native_tx_prover_url: Option<String>,
+    native_tx_prover_ohttp: Option<NativeProverOhttpConfig>,
+    native_proof_aggregator_url: Option<String>,
     scarb_bin: String,
     stwo_manifest_path: PathBuf,
     stwo_package_name: String,
@@ -218,12 +296,21 @@ struct AppConfig {
     order_ingress_id: String,
     order_ingress_receipt_secret: Option<String>,
     order_ingress_receipt_secrets: Vec<String>,
+    heartbeat_cover_secret: String,
     min_batch_base_liquidity: u128,
     min_batch_participants: u64,
+    min_eligible_orders: u64,
+    min_maker_participants: u64,
     max_single_order_fill_bps: u64,
+    max_single_owner_fill_bps: u64,
+    max_maker_fill_bps: u64,
+    max_provable_batch_orders: u64,
     max_order_amount: u128,
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
+    protocol_fee_bps: u128,
+    protocol_fee_recipient: String,
+    settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
     max_stored_private_payloads: usize,
     private_ingress_rate_limit_per_minute: u64,
@@ -341,6 +428,14 @@ struct NativeProverRpcResponse {
 struct NativeProverResult {
     proof: String,
     proof_facts: Vec<String>,
+    l2_to_l1_messages: Vec<NativeMessageToL1>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NativeMessageToL1 {
+    from_address: String,
+    to_address: String,
+    payload: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -349,6 +444,80 @@ struct NativeProverError {
     message: String,
     #[serde(default)]
     data: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeProverOhttpConfig {
+    relay_url: Option<String>,
+    pinned_key_config: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProofAggregationManifest {
+    manifest_id: String,
+    mode: String,
+    epoch_start: u64,
+    epoch_end: u64,
+    batch_count_bucket: String,
+    pair_count_bucket: String,
+    proof_artifact_count_bucket: String,
+    aggregate_commitment: String,
+    proof_artifact_commitment_root: String,
+    transcript_commitment_root: String,
+    native_aggregation_supported: bool,
+    verifier_mode: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NativeProofAggregationMember {
+    batch_id: BatchId,
+    pair_id: PairId,
+    batch_epoch: u64,
+    transcript_commitment: String,
+    proof_artifact_commitment: String,
+    proof_system: String,
+    prover_backend: String,
+    proof: String,
+    proof_facts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NativeProofAggregationProviderRequest {
+    manifest: ProofAggregationManifest,
+    members: Vec<NativeProofAggregationMember>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NativeProofAggregationProviderResponse {
+    proof: String,
+    proof_facts: Vec<String>,
+    #[serde(default)]
+    aggregate_proof_artifact_commitment: Option<String>,
+    #[serde(default)]
+    verifier_mode: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NativeProofAggregationRecord {
+    manifest: ProofAggregationManifest,
+    member_count_bucket: String,
+    provider: String,
+    verifier_mode: String,
+    aggregate_proof_artifact_commitment: String,
+    settlement_call: StarknetCall,
+    member_batches: Vec<BatchId>,
+    proof: String,
+    proof_facts: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeAggregationPreparedMember {
+    witness: SettlementWitness,
+    settlement_plan: SettlementSubmissionPlan,
+    auction_order_witnesses: Vec<AuctionOrderWitness>,
+    proof_message_hash: String,
 }
 
 fn redact_native_execution_request(
@@ -402,7 +571,6 @@ fn build_app() -> Result<Router, String> {
         env::var("ZYLITH_COORDINATOR_URL").unwrap_or_else(|_| DEFAULT_COORDINATOR_URL.into());
     let indexer_url = env::var("ZYLITH_INDEXER_URL").unwrap_or_else(|_| DEFAULT_INDEXER_URL.into());
     let auction_verifier_address = env::var("ZYLITH_AUCTION_VERIFIER_ADDRESS")
-        .or_else(|_| env::var("ZYLITH_SETTLEMENT_VERIFIER_ADDRESS"))
         .ok()
         .or_else(|| {
             deployment_manifest
@@ -410,7 +578,45 @@ fn build_app() -> Result<Router, String> {
                 .map(|manifest| manifest.contracts.auction_verifier.clone())
         })
         .unwrap_or_default();
+    let native_proof_program_address = env::var(NATIVE_PROOF_PROGRAM_ADDRESS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            deployment_manifest.as_ref().and_then(|manifest| {
+                let manifest_address = manifest.proof.proof_program_address.trim();
+                if manifest_address.is_empty() {
+                    None
+                } else {
+                    Some(manifest.proof.proof_program_address.clone())
+                }
+            })
+        })
+        .unwrap_or_else(|| auction_verifier_address.clone());
+    let native_proof_entrypoint = env::var(NATIVE_PROOF_ENTRYPOINT_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            deployment_manifest.as_ref().and_then(|manifest| {
+                let manifest_entrypoint = manifest.proof.proof_entrypoint.trim();
+                if manifest_entrypoint.is_empty() {
+                    None
+                } else {
+                    Some(manifest.proof.proof_entrypoint.clone())
+                }
+            })
+        })
+        .unwrap_or_else(|| "compile_settlement_proof".into());
+    let native_proof_aggregate_entrypoint = env::var(NATIVE_PROOF_AGGREGATE_ENTRYPOINT_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "compile_auction_aggregate_proof".into());
     let native_tx_prover_url = env::var("ZYLITH_NATIVE_TX_PROVER_URL").ok();
+    let native_tx_prover_ohttp = load_native_prover_ohttp_config()?;
+    let native_proof_aggregator_url = env::var(NATIVE_PROOF_AGGREGATOR_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     let scarb_bin = env::var("ZYLITH_SCARB_BIN").unwrap_or_else(|_| DEFAULT_SCARB_BIN.into());
     let stwo_manifest_path = env::var("ZYLITH_STWO_MANIFEST_PATH")
         .map(PathBuf::from)
@@ -428,6 +634,8 @@ fn build_app() -> Result<Router, String> {
         .filter(|value| !value.is_empty());
     let order_ingress_receipt_secrets =
         load_receipt_secret_keyring(order_ingress_receipt_secret.as_ref());
+    let heartbeat_cover_secret =
+        load_required_control_plane_token("zylith-prover", HEARTBEAT_COVER_SECRET_ENV)?;
     let product_config = load_product_config(deployment_manifest.as_ref())?;
     let auction_private_keys = load_auction_private_keys()?;
     let starknet_executor = load_starknet_executor_from_env(deployment_manifest.as_ref());
@@ -447,7 +655,16 @@ fn build_app() -> Result<Router, String> {
         coordinator_url,
         indexer_url,
         auction_verifier_address,
+        native_proof_program_address,
+        native_proof_entrypoint,
+        native_proof_aggregate_entrypoint,
+        native_split_auction_proof_required: env_bool_or_default(
+            NATIVE_SPLIT_AUCTION_PROOF_REQUIRED_ENV,
+            false,
+        ),
         native_tx_prover_url,
+        native_tx_prover_ohttp,
+        native_proof_aggregator_url,
         scarb_bin,
         stwo_manifest_path,
         stwo_package_name,
@@ -463,14 +680,32 @@ fn build_app() -> Result<Router, String> {
         order_ingress_id,
         order_ingress_receipt_secret,
         order_ingress_receipt_secrets,
+        heartbeat_cover_secret,
         min_batch_base_liquidity: env_parse_or_default(MIN_BATCH_BASE_LIQUIDITY_ENV, 0_u128),
         min_batch_participants: env_parse_or_default(MIN_BATCH_PARTICIPANTS_ENV, 0_u64),
+        min_eligible_orders: env_parse_or_default(MIN_ELIGIBLE_ORDERS_ENV, 0_u64),
+        min_maker_participants: env_parse_or_default(MIN_MAKER_PARTICIPANTS_ENV, 0_u64),
         max_single_order_fill_bps: env_parse_or_default(MAX_SINGLE_ORDER_FILL_BPS_ENV, 0_u64),
+        max_single_owner_fill_bps: env_parse_or_default(MAX_SINGLE_OWNER_FILL_BPS_ENV, 0_u64),
+        max_maker_fill_bps: env_parse_or_default(MAX_MAKER_FILL_BPS_ENV, 0_u64),
+        max_provable_batch_orders: env_parse_or_default(
+            MAX_PROVABLE_BATCH_ORDERS_ENV,
+            DEFAULT_MAX_PROVABLE_BATCH_ORDERS,
+        ),
         max_order_amount: env_parse_or_default(MAX_ORDER_AMOUNT_ENV, 0_u128),
         max_maker_curve_base_amount: env_parse_or_default(MAX_MAKER_CURVE_BASE_AMOUNT_ENV, 0_u128),
         max_maker_curve_quote_notional: env_parse_or_default(
             MAX_MAKER_CURVE_QUOTE_NOTIONAL_ENV,
             0_u128,
+        ),
+        protocol_fee_bps: env_parse_or_default(PROTOCOL_FEE_BPS_ENV, DEFAULT_PROTOCOL_FEE_BPS),
+        protocol_fee_recipient: env::var(PROTOCOL_FEE_RECIPIENT_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_PROTOCOL_FEE_RECIPIENT.into()),
+        settlement_submission_jitter_ms: env_parse_or_default(
+            SETTLEMENT_SUBMISSION_JITTER_MS_ENV,
+            DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS,
         ),
         private_payload_retention_ms: env_parse_or_default(
             PROVER_PRIVATE_PAYLOAD_RETENTION_MS_ENV,
@@ -508,15 +743,21 @@ fn load_deployment_manifest() -> Option<DeploymentManifest> {
 fn load_product_config(
     deployment_manifest: Option<&DeploymentManifest>,
 ) -> Result<ProductConfig, String> {
-    if let Ok(value) = env::var("ZYLITH_PRODUCT_PAIRS") {
-        return ProductConfig::from_enabled_pair_ids_csv(&value)
-            .map_err(|error| format!("invalid ZYLITH_PRODUCT_PAIRS: {error}"));
+    let mut product_config = if let Ok(value) = env::var("ZYLITH_PRODUCT_PAIRS") {
+        ProductConfig::from_enabled_pair_ids_csv(&value)
+            .map_err(|error| format!("invalid ZYLITH_PRODUCT_PAIRS: {error}"))?
+    } else if let Some(manifest) = deployment_manifest {
+        manifest.product.clone()
+    } else {
+        ProductConfig::from_enabled_pair_ids_csv(DEFAULT_PRODUCT_PAIR_IDS)
+            .map_err(|error| format!("default prover product pairs are invalid: {error}"))?
+    };
+    if let Ok(value) = env::var(HEARTBEAT_COVER_PRICES_ENV) {
+        product_config
+            .apply_heartbeat_cover_prices_csv(&value)
+            .map_err(|error| format!("invalid ZYLITH_HEARTBEAT_COVER_PRICES: {error}"))?;
     }
-    if let Some(manifest) = deployment_manifest {
-        return Ok(manifest.product.clone());
-    }
-    ProductConfig::from_enabled_pair_ids_csv(DEFAULT_PRODUCT_PAIR_IDS)
-        .map_err(|error| format!("default prover product pairs are invalid: {error}"))
+    Ok(product_config)
 }
 
 fn load_auction_private_keys() -> Result<Vec<PrivateExecutionKeyPrivateConfig>, String> {
@@ -564,6 +805,38 @@ fn load_required_control_plane_token(service_name: &str, env_name: &str) -> Resu
         })
 }
 
+fn service_cors_layer(env_name: &str) -> CorsLayer {
+    let base = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(Any);
+    match allowed_origins_from_env(env_name) {
+        Some(origins) => base.allow_origin(AllowOrigin::list(origins)),
+        None => base.allow_origin(Any),
+    }
+}
+
+fn allowed_origins_from_env(env_name: &str) -> Option<Vec<HeaderValue>> {
+    let value = env::var(env_name).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let origins = value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            HeaderValue::from_str(origin)
+                .unwrap_or_else(|_| panic!("{env_name} contains invalid origin '{origin}'"))
+        })
+        .collect::<Vec<_>>();
+    if origins.is_empty() {
+        None
+    } else {
+        Some(origins)
+    }
+}
+
 fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
     let Some(expected_token) = state.internal_api_token.as_deref() else {
         return Ok(());
@@ -595,7 +868,13 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         coordinator_url,
         indexer_url,
         auction_verifier_address,
+        native_proof_program_address,
+        native_proof_entrypoint,
+        native_proof_aggregate_entrypoint,
+        native_split_auction_proof_required,
         native_tx_prover_url,
+        native_tx_prover_ohttp,
+        native_proof_aggregator_url,
         scarb_bin,
         stwo_manifest_path,
         stwo_package_name,
@@ -608,12 +887,21 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         order_ingress_id,
         order_ingress_receipt_secret,
         order_ingress_receipt_secrets,
+        heartbeat_cover_secret,
         min_batch_base_liquidity,
         min_batch_participants,
+        min_eligible_orders,
+        min_maker_participants,
         max_single_order_fill_bps,
+        max_single_owner_fill_bps,
+        max_maker_fill_bps,
+        max_provable_batch_orders,
         max_order_amount,
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
+        protocol_fee_bps,
+        protocol_fee_recipient,
+        settlement_submission_jitter_ms,
         private_payload_retention_ms,
         max_stored_private_payloads,
         private_ingress_rate_limit_per_minute,
@@ -623,6 +911,13 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         native_prover_retry_interval_ms,
         native_prover_request_timeout_seconds,
     } = config;
+
+    if protocol_fee_bps > 10_000 {
+        return Err("protocol fee bps must be <= 10000".into());
+    }
+    if protocol_fee_recipient.trim().is_empty() {
+        return Err("protocol fee recipient must not be empty".into());
+    }
 
     ensure_prover_dirs(&data_dir)?;
     let auction_key_registry = PrivateExecutionKeyRegistry {
@@ -639,7 +934,13 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         coordinator_url,
         indexer_url,
         auction_verifier_address,
+        native_proof_program_address,
+        native_proof_entrypoint,
+        native_proof_aggregate_entrypoint,
+        native_split_auction_proof_required,
         native_tx_prover_url,
+        native_tx_prover_ohttp,
+        native_proof_aggregator_url,
         scarb_bin,
         stwo_manifest_path: Arc::new(stwo_manifest_path),
         stwo_package_name,
@@ -684,12 +985,21 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         order_ingress_id,
         order_ingress_receipt_secret: order_ingress_receipt_secret.map(Arc::new),
         order_ingress_receipt_secrets: Arc::new(order_ingress_receipt_secrets),
+        heartbeat_cover_secret: Arc::new(heartbeat_cover_secret),
         min_batch_base_liquidity,
         min_batch_participants,
+        min_eligible_orders,
+        min_maker_participants,
         max_single_order_fill_bps,
+        max_single_owner_fill_bps,
+        max_maker_fill_bps,
+        max_provable_batch_orders,
         max_order_amount,
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
+        protocol_fee_bps,
+        protocol_fee_recipient,
+        settlement_submission_jitter_ms,
         private_payload_retention_ms,
         max_stored_private_payloads,
         private_ingress_rate_limit_per_minute,
@@ -737,6 +1047,14 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
             get(get_proof_artifact),
         )
         .route(
+            "/api/internal/proof-aggregation-manifests/epochs/{start_epoch}/{end_epoch}",
+            get(get_proof_aggregation_manifest).post(run_native_proof_aggregation),
+        )
+        .route(
+            "/api/internal/proof-aggregation-manifests/epochs/{start_epoch}/{end_epoch}/submit",
+            post(submit_native_proof_aggregation),
+        )
+        .route(
             "/api/internal/onchain-submissions/{batch_id}",
             get(get_onchain_submission),
         )
@@ -746,12 +1064,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_body_bytes))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers(Any),
-        ))
+        .layer(service_cors_layer(PROVER_ALLOWED_ORIGINS_ENV)))
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -763,18 +1076,19 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let private_order_payloads = state.private_order_payloads.read().await;
     Json(serde_json::json!({
         "service": "zylith-prover",
-        "coordinator_url": state.coordinator_url,
-        "indexer_url": state.indexer_url,
-        "prepared_jobs": proof_jobs.len(),
+        "coordinator_configured": !state.coordinator_url.trim().is_empty(),
+        "indexer_configured": !state.indexer_url.trim().is_empty(),
+        "prepared_jobs_bucket": count_bucket(proof_jobs.len()),
         "auction_verifier_address": state.auction_verifier_address,
-        "native_tx_prover_url": state.native_tx_prover_url,
-        "prepared_settlement_plans": settlement_plans.len(),
-        "prepared_settlement_witnesses": settlement_witnesses.len(),
-        "stored_proof_artifacts": proof_artifacts.len(),
-        "stored_onchain_submissions": onchain_submissions.len(),
-        "stored_private_order_payloads": private_order_payloads.len(),
+        "prepared_settlement_plans_bucket": count_bucket(settlement_plans.len()),
+        "prepared_settlement_witnesses_bucket": count_bucket(settlement_witnesses.len()),
+        "stored_proof_artifacts_bucket": count_bucket(proof_artifacts.len()),
+        "stored_onchain_submissions_bucket": count_bucket(onchain_submissions.len()),
+        "stored_private_order_payloads_bucket": count_bucket(private_order_payloads.len()),
         "starknet_executor_enabled": state.starknet_executor.is_some(),
         "native_tx_prover_enabled": state.native_tx_prover_url.is_some(),
+        "native_tx_prover_ohttp_enabled": state.native_tx_prover_ohttp.is_some(),
+        "native_proof_aggregation_enabled": state.native_tx_prover_url.is_some() || state.native_proof_aggregator_url.is_some(),
         "trusted_order_ingress_enabled": state.order_ingress_receipt_secret.is_some(),
         "trusted_order_ingress_id": state.order_ingress_id,
         "trusted_order_ingress_receipt_key_count": state.order_ingress_receipt_secrets.len(),
@@ -786,10 +1100,18 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "private_ingress_rate_limit_per_minute": state.private_ingress_rate_limit_per_minute,
         "min_batch_base_liquidity": state.min_batch_base_liquidity.to_string(),
         "min_batch_participants": state.min_batch_participants,
+        "min_eligible_orders": state.min_eligible_orders,
+        "min_maker_participants": state.min_maker_participants,
         "max_single_order_fill_bps": state.max_single_order_fill_bps,
+        "max_single_owner_fill_bps": state.max_single_owner_fill_bps,
+        "max_maker_fill_bps": state.max_maker_fill_bps,
+        "max_provable_batch_orders": state.max_provable_batch_orders,
         "max_order_amount": state.max_order_amount.to_string(),
         "max_maker_curve_base_amount": state.max_maker_curve_base_amount.to_string(),
         "max_maker_curve_quote_notional": state.max_maker_curve_quote_notional.to_string(),
+        "protocol_fee_bps": state.protocol_fee_bps.to_string(),
+        "protocol_fee_recipient": &state.protocol_fee_recipient,
+        "settlement_submission_jitter_ms": state.settlement_submission_jitter_ms,
         "native_prover_attempts": state.native_prover_attempts,
         "native_prover_retry_interval_ms": state.native_prover_retry_interval_ms,
         "native_prover_request_timeout_seconds": state.native_prover_request_timeout_seconds,
@@ -803,6 +1125,30 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 async fn public_auction_keys(State(state): State<AppState>) -> Json<PrivateExecutionKeyRegistry> {
     Json((*state.auction_key_registry).clone())
+}
+
+fn count_bucket(count: usize) -> &'static str {
+    match count {
+        0..=7 => "0-7",
+        8..=31 => "8-31",
+        32..=127 => "32-127",
+        128..=511 => "128-511",
+        _ => "512+",
+    }
+}
+
+fn deterministic_settlement_submission_jitter_ms(batch_id: &str, max_jitter_ms: u64) -> u64 {
+    if max_jitter_ms == 0 {
+        return 0;
+    }
+    let mut accumulator = 0xd6e8_feb8_6659_fd93_u64;
+    for byte in batch_id.as_bytes() {
+        accumulator ^= u64::from(*byte);
+        accumulator = accumulator
+            .rotate_left(9)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    accumulator % max_jitter_ms.saturating_add(1)
 }
 
 async fn public_auction_keys_fingerprint(
@@ -859,6 +1205,7 @@ async fn ingest_private_order_payload(
             return Ok(Json(TrustedOrderIngressResponse {
                 receipt: existing.receipt.clone(),
                 coordinator_submission,
+                padding: Some(private_ingress_response_padding()),
             }));
         }
     }
@@ -927,7 +1274,12 @@ async fn ingest_private_order_payload(
     Ok(Json(TrustedOrderIngressResponse {
         receipt,
         coordinator_submission,
+        padding: Some(private_ingress_response_padding()),
     }))
+}
+
+fn private_ingress_response_padding() -> String {
+    "0".repeat(512)
 }
 
 async fn prune_private_order_payloads(state: &AppState) -> Result<(), StatusCode> {
@@ -959,9 +1311,15 @@ async fn prepare_private_auction_batch(
 ) -> Result<Json<PreparedBatchStatus>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
-    prepare_private_auction_batch_inner(&state, &batch_id)
+    let prepared = prepare_private_auction_batch_inner(&state, &batch_id)
         .await
-        .map(Json)
+        .inspect_err(|status| {
+            eprintln!(
+                "prepare_private_auction_batch batch_id={} failed status={}",
+                batch_id, status
+            );
+        })?;
+    Ok(Json(prepared))
 }
 
 fn env_parse_or_default<T>(env_name: &str, default: T) -> T
@@ -990,7 +1348,44 @@ fn env_bool_or_default(env_name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn load_native_prover_ohttp_config() -> Result<Option<NativeProverOhttpConfig>, String> {
+    if !env_bool_or_default(NATIVE_TX_PROVER_OHTTP_ENABLED_ENV, false) {
+        return Ok(None);
+    }
+    let relay_url = env::var(NATIVE_TX_PROVER_OHTTP_RELAY_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let pinned_key_config = env::var(NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX_ENV)
+        .ok()
+        .map(|value| parse_ohttp_key_config_hex(&value))
+        .transpose()?;
+    Ok(Some(NativeProverOhttpConfig {
+        relay_url,
+        pinned_key_config,
+    }))
+}
+
+fn parse_ohttp_key_config_hex(value: &str) -> Result<Vec<u8>, String> {
+    let trimmed = value.trim();
+    let stripped = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if stripped.is_empty() {
+        return Err(format!(
+            "{NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX_ENV} must not be empty"
+        ));
+    }
+    hex::decode(stripped).map_err(|error| {
+        format!("{NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX_ENV} is invalid hex: {error}")
+    })
+}
+
 fn validate_private_order_risk_limits(state: &AppState, order: &OrderIntent) -> Result<(), String> {
+    if matches!(order.order_type, zylith_core::OrderType::HeartbeatCover) {
+        return Err("heartbeat cover orders are protocol-generated".into());
+    }
     if state.max_order_amount > 0 && order.amount > state.max_order_amount {
         return Err("order amount exceeds configured maximum".into());
     }
@@ -1079,7 +1474,7 @@ fn enforce_rate_limit(
 }
 
 fn rate_limit_subject(headers: &HeaderMap) -> String {
-    for header in ["x-zylith-client-id", "x-forwarded-for", "x-real-ip"] {
+    for header in ["x-forwarded-for", "x-real-ip"] {
         if let Some(value) = headers
             .get(header)
             .and_then(|value| value.to_str().ok())
@@ -1146,6 +1541,558 @@ async fn get_proof_artifact(
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(artifact))
+}
+
+async fn get_proof_aggregation_manifest(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((start_epoch, end_epoch)): Path<(u64, u64)>,
+) -> Result<Json<ProofAggregationManifest>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    Ok(Json(
+        build_proof_aggregation_manifest(&state, start_epoch, end_epoch).await?,
+    ))
+}
+
+async fn run_native_proof_aggregation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((start_epoch, end_epoch)): Path<(u64, u64)>,
+) -> Result<Json<NativeProofAggregationRecord>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    if state.native_tx_prover_url.is_some() {
+        return Ok(Json(
+            run_true_native_proof_aggregation(&state, start_epoch, end_epoch).await?,
+        ));
+    }
+    let Some(aggregator_url) = state.native_proof_aggregator_url.clone() else {
+        return Err(StatusCode::NOT_IMPLEMENTED);
+    };
+    Ok(Json(
+        run_provider_proof_aggregation(&state, &aggregator_url, start_epoch, end_epoch).await?,
+    ))
+}
+
+async fn submit_native_proof_aggregation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((start_epoch, end_epoch)): Path<(u64, u64)>,
+) -> Result<Json<OnchainSubmissionRecord>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    require_prover_not_paused(&state)?;
+    let aggregate = run_true_native_proof_aggregation(&state, start_epoch, end_epoch).await?;
+    let tx_hash = submit_native_invoke_with_typed_sdk_retry(
+        &state,
+        state
+            .starknet_executor
+            .as_ref()
+            .ok_or(StatusCode::CONFLICT)?,
+        &aggregate.settlement_call,
+        aggregate.proof.clone(),
+        &aggregate.proof_facts,
+    )
+    .await
+    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let submission_id = format!(
+        "{}:{}:{}",
+        aggregate.manifest.manifest_id, aggregate.aggregate_proof_artifact_commitment, tx_hash
+    );
+    let mut submission = OnchainSubmissionRecord {
+        submission_id,
+        batch_id: BatchId(aggregate.manifest.manifest_id.clone()),
+        transaction_hash: tx_hash.clone(),
+        submitted_at_unix_ms: now_unix_ms(),
+        receipt_checked_at_unix_ms: None,
+        confirmed_at_unix_ms: None,
+        finality_status: None,
+        execution_status: None,
+        revert_reason: None,
+        block_number: None,
+        block_hash: None,
+        submission_mode: "native-aggregate-proof-facts".into(),
+        settlement_contract_address: aggregate.settlement_call.contract_address.clone(),
+    };
+    if let Some(executor) = &state.starknet_executor {
+        let provider = JsonRpcClient::new(HttpTransport::new(
+            Url::parse(&executor.rpc_url).map_err(|_| StatusCode::BAD_GATEWAY)?,
+        ));
+        populate_submission_receipt_status(
+            &mut submission,
+            wait_for_receipt(
+                &provider,
+                parse_felt(&tx_hash, "aggregate transaction hash")
+                    .map_err(|_| StatusCode::BAD_GATEWAY)?,
+            )
+            .await,
+        );
+    }
+    Ok(Json(submission))
+}
+
+async fn run_provider_proof_aggregation(
+    state: &AppState,
+    aggregator_url: &str,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Result<NativeProofAggregationRecord, StatusCode> {
+    let manifest = build_proof_aggregation_manifest(state, start_epoch, end_epoch).await?;
+    let members = build_native_proof_aggregation_members(state, start_epoch, end_epoch).await?;
+    if members.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let request = NativeProofAggregationProviderRequest {
+        manifest: manifest.clone(),
+        members,
+    };
+    let response = tokio::time::timeout(
+        Duration::from_secs(state.native_prover_request_timeout_seconds),
+        state.http_client.post(aggregator_url).json(&request).send(),
+    )
+    .await
+    .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !response.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let provider_response = response
+        .json::<NativeProofAggregationProviderResponse>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if provider_response.proof.trim().is_empty() || provider_response.proof_facts.is_empty() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let aggregate_proof_artifact_commitment = match provider_response
+        .aggregate_proof_artifact_commitment
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(value) => value,
+        None => zylith_core::hash::tagged_commitment_sha256(
+            "zylith/native-proof-aggregation-result-v1",
+            &serde_json::json!({
+                "manifest_id": manifest.manifest_id,
+                "aggregate_commitment": manifest.aggregate_commitment,
+                "proof": &provider_response.proof,
+                "proof_facts": &provider_response.proof_facts,
+            }),
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    };
+    let prepared_members =
+        prepare_native_aggregation_members(state, start_epoch, end_epoch).await?;
+    validate_aggregate_root_chain(&prepared_members).map_err(|_| StatusCode::CONFLICT)?;
+    let expected_messages = prepared_members
+        .iter()
+        .map(|member| member.proof_message_hash.clone())
+        .collect::<Vec<_>>();
+    validate_native_proof_facts_messages(&provider_response.proof_facts, &expected_messages)
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let settlement_call = build_aggregate_settlement_call(&prepared_members)?;
+    Ok(NativeProofAggregationRecord {
+        manifest,
+        member_count_bucket: count_bucket(request.members.len()).into(),
+        provider: provider_response
+            .provider
+            .unwrap_or_else(|| "configured-native-proof-aggregator".into()),
+        verifier_mode: provider_response
+            .verifier_mode
+            .unwrap_or_else(|| "aggregate_submit_settlement_with_proof_facts".into()),
+        aggregate_proof_artifact_commitment,
+        settlement_call,
+        member_batches: prepared_members
+            .iter()
+            .map(|member| member.witness.batch_id.clone())
+            .collect(),
+        proof: provider_response.proof,
+        proof_facts: provider_response.proof_facts,
+    })
+}
+
+async fn run_true_native_proof_aggregation(
+    state: &AppState,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Result<NativeProofAggregationRecord, StatusCode> {
+    let Some(tx_prover_url) = state.native_tx_prover_url.clone() else {
+        return Err(StatusCode::NOT_IMPLEMENTED);
+    };
+    let manifest = build_proof_aggregation_manifest(state, start_epoch, end_epoch).await?;
+    let members = prepare_native_aggregation_members(state, start_epoch, end_epoch).await?;
+    if members.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    validate_aggregate_root_chain(&members).map_err(|_| StatusCode::CONFLICT)?;
+    let expected_messages = members
+        .iter()
+        .map(|member| member.proof_message_hash.clone())
+        .collect::<Vec<_>>();
+    let aggregate_call = build_native_aggregate_proof_program_call(state, &members)?;
+    let executor = state
+        .starknet_executor
+        .clone()
+        .ok_or(StatusCode::CONFLICT)?;
+    let execution_request = build_native_execution_request(
+        &executor,
+        &aggregate_call,
+        NativeTransactionMode::ProofOnly,
+    )
+    .await
+    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let rpc_request = NativeProverRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "starknet_proveTransaction".into(),
+        params: NativeProverParams {
+            block_id: execution_request.block_id.clone(),
+            transaction: execution_request.transaction.clone(),
+        },
+    };
+    let (result, response_value) = request_native_proof(state, &tx_prover_url, &rpc_request)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    validate_native_proof_facts_messages(&result.proof_facts, &expected_messages)
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let settlement_call = build_aggregate_settlement_call(&members)?;
+    let aggregate_proof_artifact_commitment = zylith_core::hash::tagged_commitment_sha256(
+        "zylith/native-aggregate-proof-artifact-v1",
+        &serde_json::json!({
+            "manifest_id": manifest.manifest_id,
+            "aggregate_commitment": manifest.aggregate_commitment,
+            "proof": &result.proof,
+            "proof_facts": &result.proof_facts,
+            "native_execution_request": redact_native_prover_request(&rpc_request),
+            "native_prover_response": response_value,
+        }),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(NativeProofAggregationRecord {
+        manifest,
+        member_count_bucket: count_bucket(members.len()).into(),
+        provider: "native-transaction-prover".into(),
+        verifier_mode: "submit_aggregate_settlements_with_proof_facts".into(),
+        aggregate_proof_artifact_commitment,
+        settlement_call,
+        member_batches: members
+            .iter()
+            .map(|member| member.witness.batch_id.clone())
+            .collect(),
+        proof: result.proof,
+        proof_facts: result.proof_facts,
+    })
+}
+
+async fn prepare_native_aggregation_members(
+    state: &AppState,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Result<Vec<NativeAggregationPreparedMember>, StatusCode> {
+    let witnesses = proof_aggregation_witness_members(state, start_epoch, end_epoch).await?;
+    let mut members = Vec::with_capacity(witnesses.len());
+    for witness in witnesses {
+        let transcript = fetch_transcript(state, &witness.batch_id.0).await?;
+        let transcript_commitment =
+            settlement_transcript_commitment(&transcript).map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if transcript_commitment != witness.transcript_commitment {
+            return Err(StatusCode::CONFLICT);
+        }
+        let statement_message =
+            native_settlement_message_hash(&state.auction_verifier_address, &transcript_commitment)
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let proof_message = settlement_proof_message_hash_for_program(
+            &state.native_proof_program_address,
+            &state.auction_verifier_address,
+            &transcript_commitment,
+        )
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let settlement_plan = build_settlement_submission_plan(
+            &transcript,
+            &state.auction_verifier_address,
+            &statement_message,
+        )
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let auction_order_witnesses = fetch_auction_order_witnesses(state, &witness.batch_id.0)
+            .await
+            .map_err(|_| StatusCode::CONFLICT)?;
+        members.push(NativeAggregationPreparedMember {
+            witness,
+            settlement_plan,
+            auction_order_witnesses,
+            proof_message_hash: proof_message,
+        });
+    }
+    Ok(members)
+}
+
+async fn build_proof_aggregation_manifest(
+    state: &AppState,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Result<ProofAggregationManifest, StatusCode> {
+    let members = proof_aggregation_witness_members(state, start_epoch, end_epoch).await?;
+    let pair_count = members
+        .iter()
+        .map(|witness| witness.pair_id.0.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let proof_artifact_commitments = members
+        .iter()
+        .map(|witness| {
+            native_settlement_message_hash(
+                &state.auction_verifier_address,
+                &witness.transcript_commitment,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .collect::<Result<Vec<_>, StatusCode>>()?;
+    let transcript_commitments = members
+        .iter()
+        .map(|witness| witness.transcript_commitment.clone())
+        .collect::<Vec<_>>();
+    let proof_artifact_commitment_root = zylith_core::hash::tagged_commitment_sha256(
+        "zylith/proof-aggregation/artifact-root-v1",
+        &proof_artifact_commitments,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transcript_commitment_root = zylith_core::hash::tagged_commitment_sha256(
+        "zylith/proof-aggregation/transcript-root-v1",
+        &transcript_commitments,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let native_aggregation_supported =
+        state.native_tx_prover_url.is_some() || state.native_proof_aggregator_url.is_some();
+    let mode = if native_aggregation_supported {
+        if state.native_tx_prover_url.is_some() {
+            "native_virtual_tx_aggregate_proof_facts"
+        } else {
+            "native_provider_aggregate_proof_facts"
+        }
+    } else {
+        "manifest_only_per_batch_proof_facts"
+    };
+    let binding_members = members
+        .iter()
+        .zip(proof_artifact_commitments.iter())
+        .map(|(witness, proof_artifact_commitment)| {
+            serde_json::json!({
+                "batch_id": witness.batch_id,
+                "pair_id": witness.pair_id,
+                "batch_epoch": witness.batch_epoch,
+                "transcript_commitment": witness.transcript_commitment,
+                "proof_artifact_commitment": proof_artifact_commitment,
+                "proof_system": "starknet-snip36",
+                "prover_backend": prover_backend_label(state.native_tx_prover_url.is_some()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let aggregate_commitment = zylith_core::hash::tagged_commitment_sha256(
+        "zylith/proof-aggregation-manifest-v1",
+        &serde_json::json!({
+            "mode": mode,
+            "epoch_start": start_epoch,
+            "epoch_end": end_epoch,
+            "members": binding_members,
+            "proof_artifact_commitment_root": proof_artifact_commitment_root,
+            "transcript_commitment_root": transcript_commitment_root,
+        }),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let suffix = aggregate_commitment
+        .get(..16)
+        .unwrap_or(aggregate_commitment.as_str());
+
+    Ok(ProofAggregationManifest {
+        manifest_id: format!("proof-aggregation-{start_epoch}-{end_epoch}-{suffix}"),
+        mode: mode.into(),
+        epoch_start: start_epoch,
+        epoch_end: end_epoch,
+        batch_count_bucket: count_bucket(members.len()).into(),
+        pair_count_bucket: count_bucket(pair_count).into(),
+        proof_artifact_count_bucket: count_bucket(proof_artifact_commitments.len()).into(),
+        aggregate_commitment,
+        proof_artifact_commitment_root,
+        transcript_commitment_root,
+        native_aggregation_supported,
+        verifier_mode: if native_aggregation_supported {
+            "submit_aggregate_settlements_with_proof_facts".into()
+        } else {
+            "per_batch_submit_settlement_with_proof_facts".into()
+        },
+    })
+}
+
+async fn build_native_proof_aggregation_members(
+    state: &AppState,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Result<Vec<NativeProofAggregationMember>, StatusCode> {
+    proof_aggregation_members(state, start_epoch, end_epoch)
+        .await?
+        .into_iter()
+        .map(|(witness, artifact)| {
+            let proof_path = artifact
+                .native_proof_file_path
+                .as_deref()
+                .ok_or(StatusCode::CONFLICT)?;
+            let proof_facts_path = artifact
+                .native_proof_facts_file_path
+                .as_deref()
+                .ok_or(StatusCode::CONFLICT)?;
+            let proof = fs::read_to_string(proof_path).map_err(|_| StatusCode::CONFLICT)?;
+            let proof_facts = serde_json::from_str::<Vec<String>>(
+                &fs::read_to_string(proof_facts_path).map_err(|_| StatusCode::CONFLICT)?,
+            )
+            .map_err(|_| StatusCode::CONFLICT)?;
+            if proof.trim().is_empty() || proof_facts.is_empty() {
+                return Err(StatusCode::CONFLICT);
+            }
+            Ok(NativeProofAggregationMember {
+                batch_id: witness.batch_id,
+                pair_id: witness.pair_id,
+                batch_epoch: witness.batch_epoch,
+                transcript_commitment: witness.transcript_commitment,
+                proof_artifact_commitment: artifact.proof_artifact_commitment,
+                proof_system: artifact.proof_system,
+                prover_backend: artifact.prover_backend,
+                proof,
+                proof_facts,
+            })
+        })
+        .collect()
+}
+
+async fn proof_aggregation_members(
+    state: &AppState,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Result<Vec<(SettlementWitness, ProofArtifactRecord)>, StatusCode> {
+    if start_epoch > end_epoch {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let settlement_witnesses = state.settlement_witnesses.read().await;
+    let proof_artifacts = state.proof_artifacts.read().await;
+    let mut members = settlement_witnesses
+        .values()
+        .filter(|witness| witness.batch_epoch >= start_epoch && witness.batch_epoch <= end_epoch)
+        .filter_map(|witness| {
+            proof_artifacts
+                .get(&witness.batch_id.0)
+                .map(|artifact| (witness.clone(), artifact.clone()))
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|(left_witness, _), (right_witness, _)| {
+        left_witness
+            .batch_epoch
+            .cmp(&right_witness.batch_epoch)
+            .then_with(|| left_witness.pair_id.0.cmp(&right_witness.pair_id.0))
+            .then_with(|| left_witness.batch_id.0.cmp(&right_witness.batch_id.0))
+    });
+    Ok(members)
+}
+
+async fn proof_aggregation_witness_members(
+    state: &AppState,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Result<Vec<SettlementWitness>, StatusCode> {
+    if start_epoch > end_epoch {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let settlement_witnesses = state.settlement_witnesses.read().await;
+    let mut members = settlement_witnesses
+        .values()
+        .filter(|witness| witness.batch_epoch >= start_epoch && witness.batch_epoch <= end_epoch)
+        .cloned()
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| {
+        left.batch_epoch
+            .cmp(&right.batch_epoch)
+            .then_with(|| left.pair_id.0.cmp(&right.pair_id.0))
+            .then_with(|| left.batch_id.0.cmp(&right.batch_id.0))
+    });
+    Ok(members)
+}
+
+fn validate_aggregate_root_chain(
+    members: &[NativeAggregationPreparedMember],
+) -> Result<(), String> {
+    for window in members.windows(2) {
+        let current = &window[0].settlement_plan.encoded_args;
+        let next = &window[1].settlement_plan.encoded_args;
+        if current.new_note_root != next.prior_note_root {
+            return Err("aggregate member note roots are not chained".into());
+        }
+        if current.new_nullifier_root != next.prior_nullifier_root {
+            return Err("aggregate member nullifier roots are not chained".into());
+        }
+        if current.new_renewal_root != next.prior_renewal_root {
+            return Err("aggregate member renewal roots are not chained".into());
+        }
+        if current.new_fee_root != next.prior_fee_root {
+            return Err("aggregate member fee roots are not chained".into());
+        }
+    }
+    Ok(())
+}
+
+fn build_native_aggregate_proof_program_call(
+    state: &AppState,
+    members: &[NativeAggregationPreparedMember],
+) -> Result<StarknetCall, StatusCode> {
+    let verifier = normalize_nonzero_felt(&state.auction_verifier_address, "auction_verifier")
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let mut aggregate_payload = vec![encode_usize_hex(members.len())];
+    for member in members {
+        let serialized =
+            build_auction_serialized_input(&member.witness, &member.auction_order_witnesses)
+                .map_err(|_| StatusCode::CONFLICT)?;
+        aggregate_payload.extend(serialized);
+    }
+    let mut calldata = Vec::with_capacity(aggregate_payload.len() + 2);
+    calldata.push(verifier);
+    calldata.push(encode_usize_hex(aggregate_payload.len()));
+    calldata.extend(aggregate_payload);
+    Ok(StarknetCall {
+        contract_address: normalize_nonzero_felt(
+            &state.native_proof_program_address,
+            "native_proof_program_address",
+        )
+        .map_err(|_| StatusCode::BAD_GATEWAY)?,
+        entrypoint: state.native_proof_aggregate_entrypoint.clone(),
+        calldata,
+    })
+}
+
+fn build_aggregate_settlement_call(
+    members: &[NativeAggregationPreparedMember],
+) -> Result<StarknetCall, StatusCode> {
+    let first = members.first().ok_or(StatusCode::NOT_FOUND)?;
+    let mut payload = vec![encode_usize_hex(members.len())];
+    for member in members {
+        payload.extend(
+            member
+                .settlement_plan
+                .settlement_call
+                .calldata
+                .iter()
+                .cloned(),
+        );
+    }
+    let mut calldata = Vec::with_capacity(payload.len() + 1);
+    calldata.push(encode_usize_hex(payload.len()));
+    calldata.extend(payload);
+    Ok(StarknetCall {
+        contract_address: first
+            .settlement_plan
+            .settlement_call
+            .contract_address
+            .clone(),
+        entrypoint: "submit_aggregate_settlements_with_proof_facts".into(),
+        calldata,
+    })
+}
+
+fn encode_usize_hex(value: usize) -> String {
+    format!("0x{value:x}")
 }
 
 async fn get_onchain_submission(
@@ -1260,6 +2207,14 @@ async fn run_proof_job(
 
     match proof_result {
         Ok(artifact) => {
+            if state.native_split_auction_proof_required
+                && state.native_tx_prover_url.is_some()
+                && let Err(error) = prove_and_record_auction_result(&state, &batch_id, false).await
+            {
+                set_job_error(&state, &batch_id, error).await?;
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+
             let settlement_plan = match build_settlement_submission_plan_for_artifact(
                 &transcript,
                 &state.auction_verifier_address,
@@ -1345,6 +2300,21 @@ async fn submit_onchain(
         return Err(StatusCode::CONFLICT);
     }
 
+    if state.native_split_auction_proof_required
+        && let Err(error) = prove_and_record_auction_result(&state, &batch_id, true).await
+    {
+        set_onchain_submission_error(&state, &batch_id, error).await?;
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let jitter_ms = deterministic_settlement_submission_jitter_ms(
+        &settlement_plan.batch_id.0,
+        state.settlement_submission_jitter_ms,
+    );
+    if jitter_ms > 0 {
+        sleep(Duration::from_millis(jitter_ms)).await;
+    }
+
     let submission =
         match submit_native_plan_onchain(&state, &settlement_plan, &proof_artifact).await {
             Ok(submission) => submission,
@@ -1369,25 +2339,449 @@ async fn submit_onchain(
     Ok(Json(submission))
 }
 
+async fn prove_and_record_auction_result(
+    state: &AppState,
+    batch_id: &str,
+    record_onchain: bool,
+) -> Result<Option<String>, String> {
+    let tx_prover_url = state.native_tx_prover_url.clone().ok_or_else(|| {
+        "native split auction proof requires ZYLITH_NATIVE_TX_PROVER_URL".to_string()
+    })?;
+    let executor = state.starknet_executor.clone().ok_or_else(|| {
+        "native split auction proof requires Starknet executor config".to_string()
+    })?;
+    let transcript = fetch_transcript(state, batch_id)
+        .await
+        .map_err(|status| format!("failed to fetch transcript for auction proof: {status}"))?;
+    let settlement_witness = {
+        let settlement_witnesses = state.settlement_witnesses.read().await;
+        settlement_witnesses
+            .get(batch_id)
+            .cloned()
+            .ok_or_else(|| "settlement witness not prepared for auction proof".to_string())?
+    };
+    let auction_order_witnesses = fetch_auction_order_witnesses(state, batch_id)
+        .await
+        .map_err(|status| format!("failed to fetch auction order witnesses: {status}"))?;
+    let transcript_commitment =
+        settlement_transcript_commitment(&transcript).map_err(|error| error.to_string())?;
+    if settlement_witness.transcript_commitment != transcript_commitment {
+        return Err("auction proof transcript commitment does not match settlement witness".into());
+    }
+    let batch_id_felt = encode_starknet_felt("batch-id", &transcript.batch_id.0);
+    let order_commitment_root =
+        normalize_felt_hex(&transcript.order_commitment_root).map_err(|error| error.to_string())?;
+    let admission_root = auction_admission_root(&settlement_witness, &auction_order_witnesses)
+        .map_err(|error| format!("failed to compute admission root: {error}"))?;
+    let expected_admission_message_hash = admission_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &batch_id_felt,
+        &order_commitment_root,
+        &admission_root,
+    )
+    .map_err(|error| error.to_string())?;
+    let serialized_admission_witness =
+        build_admission_serialized_input(&settlement_witness, &auction_order_witnesses)
+            .map_err(|error| format!("failed to serialize admission witness: {error}"))?;
+    let admission_program_calldata = build_native_proof_program_calldata(
+        &state.auction_verifier_address,
+        &serialized_admission_witness,
+    )?;
+    let admission_compilation_call = StarknetCall {
+        contract_address: normalize_nonzero_felt(
+            &state.native_proof_program_address,
+            "native_proof_program_address",
+        )?,
+        entrypoint: "compile_admission_proof".into(),
+        calldata: admission_program_calldata,
+    };
+    let admission_execution_request = build_native_execution_request(
+        &executor,
+        &admission_compilation_call,
+        NativeTransactionMode::ProofOnly,
+    )
+    .await?;
+    let admission_rpc_request = NativeProverRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "starknet_proveTransaction".into(),
+        params: NativeProverParams {
+            block_id: admission_execution_request.block_id.clone(),
+            transaction: admission_execution_request.transaction.clone(),
+        },
+    };
+
+    let mut final_admission_response_value = None;
+    let mut final_admission_result = None;
+    let mut last_admission_error = None;
+    for attempt in 1..=state.native_prover_attempts {
+        match request_native_proof(state, &tx_prover_url, &admission_rpc_request).await {
+            Ok((result, response_value)) => {
+                final_admission_result = Some(result);
+                final_admission_response_value = Some(response_value);
+                break;
+            }
+            Err(error) if attempt < state.native_prover_attempts => {
+                eprintln!(
+                    "native admission prover attempt {attempt}/{attempts} failed for batch {batch_id}: {error}",
+                    attempts = state.native_prover_attempts
+                );
+                last_admission_error = Some(error);
+                sleep(Duration::from_millis(state.native_prover_retry_interval_ms)).await;
+            }
+            Err(error) => {
+                last_admission_error = Some(error);
+                break;
+            }
+        }
+    }
+    let admission_response_value = final_admission_response_value.ok_or_else(|| {
+        last_admission_error.unwrap_or_else(|| "native admission prover returned no result".into())
+    })?;
+    let admission_result = final_admission_result
+        .ok_or_else(|| "native admission prover returned no result".to_string())?;
+    validate_native_proof_facts(
+        &admission_result.proof_facts,
+        &expected_admission_message_hash,
+    )?;
+
+    let admission_stage_key = format!("{batch_id}-admission");
+    delete_execution_outputs_if_exist(state.data_dir.as_ref(), &admission_stage_key)
+        .map_err(|status| format!("failed to clear admission proof outputs: {status}"))?;
+    let admission_paths = proof_execution_paths(state.data_dir.as_ref(), &admission_stage_key);
+    persist_json_file(
+        &admission_paths.native_execution_request_path,
+        &redact_native_execution_request(&admission_execution_request),
+    )
+    .map_err(status_to_error)?;
+    fs::write(&admission_paths.proof_path, admission_result.proof.trim())
+        .map_err(|error| format!("failed to persist native admission proof: {error}"))?;
+    persist_json_file(
+        &admission_paths.public_inputs_path,
+        &admission_result.proof_facts,
+    )
+    .map_err(status_to_error)?;
+    persist_json_file(
+        &admission_paths.stdout_path,
+        &serde_json::json!({
+            "request": redact_native_prover_request(&admission_rpc_request),
+            "response": admission_response_value,
+        }),
+    )
+    .map_err(status_to_error)?;
+    fs::write(&admission_paths.stderr_path, "")
+        .map_err(|error| format!("failed to persist native admission stderr log: {error}"))?;
+
+    let provider = if record_onchain {
+        let admission_record_call = StarknetCall {
+            contract_address: normalize_nonzero_felt(
+                &state.auction_verifier_address,
+                "auction_verifier_address",
+            )?,
+            entrypoint: "record_admission_root_with_proof_facts".into(),
+            calldata: vec![
+                batch_id_felt.clone(),
+                order_commitment_root.clone(),
+                admission_root.clone(),
+            ],
+        };
+        let admission_tx_hash = submit_native_invoke_with_typed_sdk_retry(
+            state,
+            &executor,
+            &admission_record_call,
+            admission_result.proof.clone(),
+            &admission_result.proof_facts,
+        )
+        .await
+        .map_err(|error| format!("failed to record native admission proof: {error}"))?;
+        let provider = JsonRpcClient::new(HttpTransport::new(
+            Url::parse(&executor.rpc_url)
+                .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?,
+        ));
+        let admission_receipt = wait_for_accepted_receipt(
+            &provider,
+            parse_felt(&admission_tx_hash, "admission transaction hash")?,
+        )
+        .await
+        .ok_or_else(|| {
+            format!(
+                "admission proof transaction {admission_tx_hash} was not accepted before settlement"
+            )
+        })?;
+        if let ExecutionResult::Reverted { reason } = admission_receipt.receipt.execution_result() {
+            return Err(format!(
+                "admission proof transaction {admission_tx_hash} reverted onchain: {reason}"
+            ));
+        }
+        Some(provider)
+    } else {
+        None
+    };
+
+    let expected_proof_message_hash = auction_result_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &batch_id_felt,
+        &order_commitment_root,
+        &admission_root,
+        &transcript_commitment,
+    )
+    .map_err(|error| error.to_string())?;
+    let serialized_native_witness =
+        build_auction_result_serialized_input(&settlement_witness, &auction_order_witnesses)
+            .map_err(|error| format!("failed to serialize auction result witness: {error}"))?;
+    let proof_program_calldata = build_native_proof_program_calldata(
+        &state.auction_verifier_address,
+        &serialized_native_witness,
+    )?;
+    let proof_compilation_call = StarknetCall {
+        contract_address: normalize_nonzero_felt(
+            &state.native_proof_program_address,
+            "native_proof_program_address",
+        )?,
+        entrypoint: "compile_auction_result_proof".into(),
+        calldata: proof_program_calldata,
+    };
+    let execution_request = build_native_execution_request(
+        &executor,
+        &proof_compilation_call,
+        NativeTransactionMode::ProofOnly,
+    )
+    .await?;
+    let rpc_request = NativeProverRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "starknet_proveTransaction".into(),
+        params: NativeProverParams {
+            block_id: execution_request.block_id.clone(),
+            transaction: execution_request.transaction.clone(),
+        },
+    };
+
+    let mut final_response_value = None;
+    let mut final_result = None;
+    let mut last_error = None;
+    for attempt in 1..=state.native_prover_attempts {
+        match request_native_proof(state, &tx_prover_url, &rpc_request).await {
+            Ok((result, response_value)) => {
+                final_result = Some(result);
+                final_response_value = Some(response_value);
+                break;
+            }
+            Err(error) if attempt < state.native_prover_attempts => {
+                eprintln!(
+                    "native auction-result prover attempt {attempt}/{attempts} failed for batch {batch_id}: {error}",
+                    attempts = state.native_prover_attempts
+                );
+                last_error = Some(error);
+                sleep(Duration::from_millis(state.native_prover_retry_interval_ms)).await;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+    let response_value = final_response_value.ok_or_else(|| {
+        last_error.unwrap_or_else(|| "native auction-result prover returned no result".into())
+    })?;
+    let result = final_result
+        .ok_or_else(|| "native auction-result prover returned no result".to_string())?;
+    validate_native_proof_facts(&result.proof_facts, &expected_proof_message_hash)?;
+
+    let stage_key = format!("{batch_id}-auction-result");
+    delete_execution_outputs_if_exist(state.data_dir.as_ref(), &stage_key)
+        .map_err(|status| format!("failed to clear auction proof outputs: {status}"))?;
+    let paths = proof_execution_paths(state.data_dir.as_ref(), &stage_key);
+    persist_json_file(
+        &paths.native_execution_request_path,
+        &redact_native_execution_request(&execution_request),
+    )
+    .map_err(status_to_error)?;
+    fs::write(&paths.proof_path, result.proof.trim())
+        .map_err(|error| format!("failed to persist native auction-result proof: {error}"))?;
+    persist_json_file(&paths.public_inputs_path, &result.proof_facts).map_err(status_to_error)?;
+    persist_json_file(
+        &paths.stdout_path,
+        &serde_json::json!({
+            "request": redact_native_prover_request(&rpc_request),
+            "response": response_value,
+        }),
+    )
+    .map_err(status_to_error)?;
+    fs::write(&paths.stderr_path, "")
+        .map_err(|error| format!("failed to persist native auction-result stderr log: {error}"))?;
+
+    if record_onchain {
+        let provider = provider.expect("provider exists when record_onchain is true");
+        let record_call = StarknetCall {
+            contract_address: normalize_nonzero_felt(
+                &state.auction_verifier_address,
+                "auction_verifier_address",
+            )?,
+            entrypoint: "record_auction_result_with_proof_facts".into(),
+            calldata: vec![
+                batch_id_felt,
+                order_commitment_root,
+                admission_root,
+                transcript_commitment,
+            ],
+        };
+        let tx_hash = submit_native_invoke_with_typed_sdk_retry(
+            state,
+            &executor,
+            &record_call,
+            result.proof.clone(),
+            &result.proof_facts,
+        )
+        .await
+        .map_err(|error| format!("failed to record native auction-result proof: {error}"))?;
+        let receipt = wait_for_accepted_receipt(
+            &provider,
+            parse_felt(&tx_hash, "auction-result transaction hash")?,
+        )
+        .await
+        .ok_or_else(|| {
+            format!("auction-result proof transaction {tx_hash} was not accepted before settlement")
+        })?;
+        match receipt.receipt.execution_result() {
+            ExecutionResult::Succeeded => Ok(Some(tx_hash)),
+            ExecutionResult::Reverted { reason } => Err(format!(
+                "auction-result proof transaction {tx_hash} reverted onchain: {reason}"
+            )),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 async fn prepare_private_auction_batch_inner(
     state: &AppState,
     batch_id: &str,
 ) -> Result<PreparedBatchStatus, StatusCode> {
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=prune_payloads start");
     prune_private_order_payloads(state).await?;
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=fetch_batch start");
     let batch = fetch_batch_order_set(state, batch_id).await?;
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=fetch_batch ok status={:?} orders={}",
+        batch_id,
+        batch.batch.status,
+        batch.orders.len()
+    );
+    if state.max_provable_batch_orders > 0
+        && batch.orders.len() as u64 > state.max_provable_batch_orders
+    {
+        eprintln!(
+            "prepare_private_auction_batch batch_id={} failed=max_provable_batch_orders orders={} limit={}",
+            batch_id,
+            batch.orders.len(),
+            state.max_provable_batch_orders
+        );
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     let pair = state
         .product_config
         .enabled_pair(&batch.batch.pair_id)
         .cloned()
         .ok_or(StatusCode::CONFLICT)?;
-    let records = decrypt_private_auction_orders(state, &batch).await?;
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=decrypt_orders start");
+    let records = decrypt_private_auction_orders(state, &batch, &pair).await?;
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=decrypt_orders ok records={}",
+        batch_id,
+        records.len()
+    );
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=fetch_root_history start");
+    let indexed_history =
+        fetch_indexed_root_history_witnesses(state, batch.batch.epoch_id, batch_id).await?;
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=fetch_root_history ok witnesses={}",
+        batch_id,
+        indexed_history.len()
+    );
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=fetch_current_roots start");
+    let prior_roots = fetch_current_settlement_roots(state).await?;
+    let prior_note_root_nonzero =
+        normalize_felt_hex(&prior_roots.note_root).map_err(|_| StatusCode::BAD_GATEWAY)? != "0x0";
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=fetch_current_roots ok prior_note_root_nonzero={}",
+        batch_id, prior_note_root_nonzero
+    );
+    let historical_witnesses = {
+        let settlement_witnesses = state.settlement_witnesses.read().await;
+        let mut merged = indexed_history
+            .into_iter()
+            .map(|witness| (witness.batch_id.0.clone(), witness))
+            .collect::<BTreeMap<_, _>>();
+        merged.extend(
+            settlement_witnesses
+                .values()
+                .filter(|witness| witness.batch_id.0 != batch_id)
+                .cloned()
+                .map(|witness| (witness.batch_id.0.clone(), witness)),
+        );
+        let merged_witnesses = merged.into_values().collect::<Vec<_>>();
+        let confirmed_witnesses =
+            filter_root_history_witnesses_for_current_roots(state, merged_witnesses, &prior_roots)?;
+        validate_batch_nullifier_freshness(batch_id, &records, confirmed_witnesses.iter())
+            .map_err(|_| StatusCode::CONFLICT)?;
+        confirmed_witnesses
+    };
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=confirmed_root_history ok witnesses={}",
+        batch_id,
+        historical_witnesses.len()
+    );
+    let deposit_records = if !records.is_empty() && prior_note_root_nonzero {
+        eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=fetch_deposits start");
+        fetch_indexed_deposit_records(state).await?
+    } else {
+        Vec::new()
+    };
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=fetch_deposits ok records={}",
+        batch_id,
+        deposit_records.len()
+    );
+    let note_root_transitions = if !records.is_empty() && prior_note_root_nonzero {
+        eprintln!(
+            "prepare_private_auction_batch batch_id={batch_id} stage=fetch_note_root_transitions start"
+        );
+        fetch_note_root_transition_records(state).await?
+    } else {
+        Vec::new()
+    };
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=fetch_note_root_transitions ok records={}",
+        batch_id,
+        note_root_transitions.len()
+    );
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=build_artifacts start");
     let artifacts = build_settlement_artifacts(
         batch_id,
         &batch.batch,
         &pair,
         &records,
-        &state.product_config,
+        SettlementBuildContext {
+            product_config: &state.product_config,
+            prior_roots: &prior_roots,
+            deposit_records: &deposit_records,
+            note_root_transitions: &note_root_transitions,
+            prior_settlement_witnesses: &historical_witnesses,
+            privacy_gate: Default::default(),
+            protocol_fee_bps: state.protocol_fee_bps,
+            protocol_fee_recipient: &state.protocol_fee_recipient,
+        },
     )?;
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=build_artifacts ok matched_orders={} outputs={}",
+        batch_id,
+        artifacts.transcript.matched_orders.len(),
+        artifacts.transcript.output_notes.len()
+    );
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=privacy_metrics start");
     let matched_volume =
         artifacts
             .transcript
@@ -1417,51 +2811,127 @@ async fn prepare_private_auction_batch_inner(
     let below_minimum_participants = state.min_batch_participants > 0
         && matched_participant_count > 0
         && matched_participant_count < state.min_batch_participants;
+    let eligible_order_count = candidate_clearing_price
+        .map(|price| eligible_order_count(&records, price))
+        .unwrap_or(0);
+    let below_minimum_eligible_orders = state.min_eligible_orders > 0
+        && eligible_order_count > 0
+        && eligible_order_count < state.min_eligible_orders;
     let single_order_fill_bps =
         max_single_order_fill_share_bps(&artifacts.transcript.matched_orders, matched_volume)?;
     let single_order_dominance_blocked = state.max_single_order_fill_bps > 0
         && single_order_fill_bps > state.max_single_order_fill_bps;
-    let privacy_blocked =
-        below_minimum_liquidity || below_minimum_participants || single_order_dominance_blocked;
+    let single_owner_fill_bps = max_single_owner_fill_share_bps(
+        &records,
+        &artifacts.transcript.matched_orders,
+        matched_volume,
+    )?;
+    let single_owner_dominance_blocked = state.max_single_owner_fill_bps > 0
+        && single_owner_fill_bps > state.max_single_owner_fill_bps;
+    let maker_participant_count =
+        matched_maker_participant_count(&records, &artifacts.transcript.matched_orders);
+    let below_minimum_maker_participants = state.min_maker_participants > 0
+        && maker_participant_count > 0
+        && maker_participant_count < state.min_maker_participants;
+    let maker_fill_bps = max_maker_fill_share_bps(
+        &records,
+        &artifacts.transcript.matched_orders,
+        matched_volume,
+    )?;
+    let maker_dominance_blocked =
+        state.max_maker_fill_bps > 0 && maker_fill_bps > state.max_maker_fill_bps;
+    let privacy_blocked = below_minimum_liquidity
+        || below_minimum_participants
+        || below_minimum_eligible_orders
+        || single_order_dominance_blocked
+        || single_owner_dominance_blocked
+        || below_minimum_maker_participants
+        || maker_dominance_blocked;
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=privacy_metrics ok blocked={} matched_volume={} participants={} eligible={}",
+        batch_id, privacy_blocked, matched_volume, matched_participant_count, eligible_order_count
+    );
+    let privacy_gate_witness = AuctionPrivacyGateWitness {
+        enforced: true,
+        min_batch_base_liquidity: state.min_batch_base_liquidity,
+        min_batch_participants: state.min_batch_participants,
+        min_eligible_orders: state.min_eligible_orders,
+        max_single_order_fill_bps: state.max_single_order_fill_bps,
+        max_single_owner_fill_bps: state.max_single_owner_fill_bps,
+        min_maker_participants: state.min_maker_participants,
+        max_maker_fill_bps: state.max_maker_fill_bps,
+    };
+    let prepared_artifacts = if privacy_blocked {
+        eprintln!(
+            "prepare_private_auction_batch batch_id={batch_id} stage=build_privacy_blocked_artifacts start"
+        );
+        build_settlement_artifacts(
+            batch_id,
+            &batch.batch,
+            &pair,
+            &records,
+            SettlementBuildContext {
+                product_config: &state.product_config,
+                prior_roots: &prior_roots,
+                deposit_records: &deposit_records,
+                note_root_transitions: &note_root_transitions,
+                prior_settlement_witnesses: &historical_witnesses,
+                privacy_gate: privacy_gate_witness.clone(),
+                protocol_fee_bps: state.protocol_fee_bps,
+                protocol_fee_recipient: &state.protocol_fee_recipient,
+            },
+        )?
+    } else if !artifacts.transcript.matched_orders.is_empty() {
+        let mut artifacts = artifacts;
+        artifacts.settlement_witness.privacy_gate = privacy_gate_witness;
+        artifacts
+    } else {
+        artifacts
+    };
     let status = PreparedBatchStatus {
-        batch_id: artifacts.transcript.batch_id.clone(),
+        batch_id: prepared_artifacts.transcript.batch_id.clone(),
         pair_id: batch.batch.pair_id.clone(),
         order_count: records.len() as u64,
         state: if below_minimum_liquidity {
             "proof-auction-below-minimum".into()
         } else if below_minimum_participants {
             "proof-auction-below-participants".into()
+        } else if below_minimum_eligible_orders {
+            "proof-auction-below-eligible-orders".into()
         } else if single_order_dominance_blocked {
             "proof-auction-dominance-risk".into()
-        } else if artifacts.transcript.matched_orders.is_empty() {
+        } else if single_owner_dominance_blocked {
+            "proof-auction-owner-dominance-risk".into()
+        } else if below_minimum_maker_participants {
+            "proof-auction-below-maker-diversity".into()
+        } else if maker_dominance_blocked {
+            "proof-auction-maker-dominance-risk".into()
+        } else if prepared_artifacts.transcript.matched_orders.is_empty() {
             "proof-auction-no-match".into()
         } else {
             "proof-auction-ready".into()
         },
         candidate_clearing_price,
         matched_volume,
-        transcript_available: !privacy_blocked,
+        transcript_available: true,
         liquidity,
-        order_execution_reports: if privacy_blocked {
-            Vec::new()
-        } else {
-            artifacts.order_execution_reports.clone()
-        },
+        order_execution_reports: prepared_artifacts.order_execution_reports.clone(),
     };
 
-    if privacy_blocked {
-        return Ok(status);
-    }
-
-    publish_batch_artifacts_to_coordinator(state, &artifacts).await?;
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=publish_artifacts start");
+    publish_batch_artifacts_to_coordinator(state, &prepared_artifacts).await?;
+    eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=publish_artifacts ok");
     {
         let mut settlement_witnesses = state.settlement_witnesses.write().await;
-        settlement_witnesses.insert(batch_id.into(), artifacts.settlement_witness.clone());
+        settlement_witnesses.insert(
+            batch_id.into(),
+            prepared_artifacts.settlement_witness.clone(),
+        );
         persist_record(
             state.data_dir.as_ref(),
             SETTLEMENT_WITNESSES_DIR,
             batch_id,
-            &artifacts.settlement_witness,
+            &prepared_artifacts.settlement_witness,
         )?;
     }
 
@@ -1471,6 +2941,7 @@ async fn prepare_private_auction_batch_inner(
 async fn decrypt_private_auction_orders(
     state: &AppState,
     batch: &BatchOrderSet,
+    pair: &ProductPairConfig,
 ) -> Result<Vec<DecryptedOrderRecord>, StatusCode> {
     let private_order_payloads = state.private_order_payloads.read().await;
     let mut records = Vec::with_capacity(batch.orders.len());
@@ -1489,6 +2960,21 @@ async fn decrypt_private_auction_orders(
             funding_authorization: payload.funding_authorization,
         });
     }
+    let cover_orders = build_heartbeat_cover_orders(
+        state.heartbeat_cover_secret.as_str(),
+        &batch.batch,
+        &pair.base_asset_id,
+        &pair.quote_asset_id,
+        pair.heartbeat_cover_price,
+        records.len(),
+    )
+    .map_err(|_| StatusCode::CONFLICT)?;
+    records.extend(cover_orders.into_iter().map(|cover| DecryptedOrderRecord {
+        order_commitment: cover.order_commitment,
+        order: cover.payload.order,
+        funding_note: cover.payload.funding_note,
+        funding_authorization: cover.payload.funding_authorization,
+    }));
 
     let root = ordered_felt_list_commitment(
         "zylith/batch-order-root",
@@ -1504,12 +2990,50 @@ async fn decrypt_private_auction_orders(
     Ok(records)
 }
 
+fn validate_batch_nullifier_freshness<'a>(
+    current_batch_id: &str,
+    records: &[DecryptedOrderRecord],
+    historical_witnesses: impl IntoIterator<Item = &'a SettlementWitness>,
+) -> Result<(), String> {
+    let mut current_nullifiers = BTreeSet::new();
+    for record in records {
+        let nullifier = normalize_felt_hex(&record.order.funding_nullifier.0)
+            .map_err(|error| format!("invalid funding nullifier: {error}"))?;
+        if !current_nullifiers.insert(nullifier) {
+            return Err("duplicate funding nullifier in current batch".into());
+        }
+    }
+
+    for witness in historical_witnesses {
+        if witness.batch_id.0 == current_batch_id {
+            continue;
+        }
+        for input in &witness.consumed_inputs {
+            let historical_nullifier = normalize_felt_hex(&input.nullifier.0)
+                .map_err(|error| format!("invalid historical nullifier: {error}"))?;
+            if current_nullifiers.contains(&historical_nullifier) {
+                return Err(format!(
+                    "funding nullifier was already reserved by batch {}",
+                    witness.batch_id.0
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn fetch_auction_order_witnesses(
     state: &AppState,
     batch_id: &str,
 ) -> Result<Vec<AuctionOrderWitness>, StatusCode> {
     let batch = fetch_batch_order_set(state, batch_id).await?;
-    let records = decrypt_private_auction_orders(state, &batch).await?;
+    let pair = state
+        .product_config
+        .enabled_pair(&batch.batch.pair_id)
+        .cloned()
+        .ok_or(StatusCode::CONFLICT)?;
+    let records = decrypt_private_auction_orders(state, &batch, &pair).await?;
     Ok(records
         .into_iter()
         .map(|record| AuctionOrderWitness {
@@ -1519,6 +3043,284 @@ async fn fetch_auction_order_witnesses(
             funding_authorization: record.funding_authorization,
         })
         .collect())
+}
+
+async fn fetch_current_settlement_roots(state: &AppState) -> Result<SettlementRoots, StatusCode> {
+    if env_bool_or_default(NATIVE_PROOF_SMOKE_ZERO_ROOTS_ENV, false) {
+        return Ok(SettlementRoots::zero());
+    }
+    let Some(executor) = &state.starknet_executor else {
+        return Ok(SettlementRoots::zero());
+    };
+    if state.auction_verifier_address.trim().is_empty() {
+        return Ok(SettlementRoots::zero());
+    }
+
+    let rpc_url = Url::parse(&executor.rpc_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let provider = JsonRpcClient::new(HttpTransport::new(rpc_url));
+    let call = FunctionCall {
+        contract_address: parse_felt(
+            &state.auction_verifier_address,
+            "ZYLITH_AUCTION_VERIFIER_ADDRESS",
+        )
+        .map_err(|_| StatusCode::BAD_GATEWAY)?,
+        entry_point_selector: get_selector_from_name("current_settlement_roots")
+            .map_err(|_| StatusCode::BAD_GATEWAY)?,
+        calldata: vec![],
+    };
+    let result = provider
+        .call(call, BlockId::Tag(BlockTag::Latest))
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if result.len() != 4 {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    Ok(SettlementRoots {
+        note_root: format!("{:#x}", result[0]),
+        nullifier_root: format!("{:#x}", result[1]),
+        renewal_root: format!("{:#x}", result[2]),
+        fee_root: format!("{:#x}", result[3]),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct NoteRootTransitionRecord {
+    kind: u64,
+    key: String,
+    batch_root: String,
+    new_root: String,
+}
+
+async fn fetch_note_root_transition_records(
+    state: &AppState,
+) -> Result<Vec<NoteRootTransitionRecord>, StatusCode> {
+    let Some(executor) = &state.starknet_executor else {
+        return Ok(Vec::new());
+    };
+    if state.auction_verifier_address.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rpc_url = Url::parse(&executor.rpc_url).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let provider = JsonRpcClient::new(HttpTransport::new(rpc_url));
+    let contract_address = parse_felt(
+        &state.auction_verifier_address,
+        "ZYLITH_AUCTION_VERIFIER_ADDRESS",
+    )
+    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let count_call = FunctionCall {
+        contract_address,
+        entry_point_selector: get_selector_from_name("note_root_transition_count")
+            .map_err(|_| StatusCode::BAD_GATEWAY)?,
+        calldata: vec![],
+    };
+    let count_result = provider
+        .call(count_call, BlockId::Tag(BlockTag::Latest))
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let count: usize = count_result
+        .first()
+        .ok_or(StatusCode::BAD_GATEWAY)?
+        .to_biguint()
+        .try_into()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let selector =
+        get_selector_from_name("note_root_transition").map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let mut records = Vec::with_capacity(count);
+    for transition_id in 0..count {
+        let call = FunctionCall {
+            contract_address,
+            entry_point_selector: selector,
+            calldata: vec![Felt::from(transition_id as u64)],
+        };
+        let result = provider
+            .call(call, BlockId::Tag(BlockTag::Latest))
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if result.len() != 4 {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        records.push(NoteRootTransitionRecord {
+            kind: result[0]
+                .to_biguint()
+                .try_into()
+                .map_err(|_| StatusCode::BAD_GATEWAY)?,
+            key: format!("{:#x}", result[1]),
+            batch_root: format!("{:#x}", result[2]),
+            new_root: format!("{:#x}", result[3]),
+        });
+    }
+    Ok(records)
+}
+
+async fn fetch_indexed_deposit_records(state: &AppState) -> Result<Vec<DepositRecord>, StatusCode> {
+    let sync_url = format!("{}/api/internal/sync/deposits", state.indexer_url);
+    apply_internal_auth(
+        state.http_client.post(sync_url),
+        state
+            .internal_api_token
+            .as_ref()
+            .map(|token| token.as_str()),
+    )
+    .send()
+    .await
+    .map_err(|_| StatusCode::BAD_GATEWAY)?
+    .error_for_status()
+    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let list_url = format!("{}/api/deposits/range/0/{}", state.indexer_url, u64::MAX);
+    let response = state
+        .http_client
+        .get(list_url)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .error_for_status()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let mut records = response
+        .json::<DepositRecordList>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .records;
+    records.sort_by_key(|record| record.deposit_id);
+    Ok(records)
+}
+
+async fn fetch_indexed_root_history_witnesses(
+    state: &AppState,
+    batch_epoch: u64,
+    current_batch_id: &str,
+) -> Result<Vec<SettlementWitness>, StatusCode> {
+    if batch_epoch == 0 {
+        return Ok(Vec::new());
+    }
+    let url = format!(
+        "{}/api/internal/batches/root-history/epochs/0/{}",
+        state.indexer_url,
+        batch_epoch.saturating_sub(1)
+    );
+    let response = apply_internal_auth(
+        state.http_client.get(url),
+        state
+            .internal_api_token
+            .as_ref()
+            .map(|token| token.as_str()),
+    )
+    .send()
+    .await
+    .map_err(|_| StatusCode::BAD_GATEWAY)?
+    .error_for_status()
+    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let archive = response
+        .json::<SettlementRootHistoryArchive>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    Ok(archive
+        .batches
+        .into_iter()
+        .filter(|batch| batch.batch_id.0 != current_batch_id)
+        .map(root_history_batch_to_witness)
+        .collect())
+}
+
+fn root_history_batch_to_witness(
+    batch: zylith_core::SettlementRootHistoryBatch,
+) -> SettlementWitness {
+    SettlementWitness {
+        batch_id: batch.batch_id,
+        pair_id: batch.pair_id,
+        batch_epoch: batch.batch_epoch,
+        order_commitment_root: "0x0".into(),
+        encrypted_order_set_commitment: "0x0".into(),
+        transcript_commitment: "0x0".into(),
+        auction_verifier_address: "0x0".into(),
+        prior_note_root: batch.prior_note_root,
+        prior_nullifier_root: batch.prior_nullifier_root,
+        prior_renewal_root: batch.prior_renewal_root,
+        prior_fee_root: batch.prior_fee_root,
+        new_nullifier_root: batch.new_nullifier_root,
+        new_renewal_root: batch.new_renewal_root,
+        clearing_price: 0,
+        base_asset_id: AssetId("ROOT_HISTORY".into()),
+        quote_asset_id: AssetId("ROOT_HISTORY".into()),
+        matched_orders: Vec::new(),
+        matched_order_witnesses: Vec::new(),
+        consumed_inputs: batch.consumed_inputs,
+        note_membership_witnesses: Vec::new(),
+        nullifier_history: Vec::new(),
+        nullifier_sparse_witnesses: Vec::new(),
+        renewal_history: Vec::new(),
+        renewal_child_sparse_witnesses: Vec::new(),
+        renewal_cancel_sparse_witnesses: Vec::new(),
+        privacy_gate: Default::default(),
+        renewal_child_uses: Vec::new(),
+        fees: Vec::new(),
+        output_notes: batch.output_notes,
+        output_note_preimages: Vec::new(),
+        output_recovery_records: Vec::new(),
+        output_recovery_dummy_commitments: Vec::new(),
+        output_ciphertext_bundle_ref: "root-history".into(),
+    }
+}
+
+fn filter_root_history_witnesses_for_current_roots(
+    state: &AppState,
+    witnesses: Vec<SettlementWitness>,
+    roots: &SettlementRoots,
+) -> Result<Vec<SettlementWitness>, StatusCode> {
+    if !should_filter_root_history_against_onchain(state) {
+        return Ok(witnesses);
+    }
+
+    let zero = normalize_felt_hex("0x0").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut cursor_nullifier =
+        normalize_felt_hex(&roots.nullifier_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let mut cursor_renewal =
+        normalize_felt_hex(&roots.renewal_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if cursor_nullifier == zero && cursor_renewal == zero {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates = witnesses;
+    candidates.sort_by(|left, right| {
+        left.batch_epoch
+            .cmp(&right.batch_epoch)
+            .then_with(|| left.batch_id.0.cmp(&right.batch_id.0))
+    });
+    let mut selected = Vec::new();
+    while cursor_nullifier != zero || cursor_renewal != zero {
+        let Some(position) = candidates.iter().rposition(|witness| {
+            normalize_felt_hex(&witness.new_nullifier_root)
+                .map(|root| root == cursor_nullifier)
+                .unwrap_or(false)
+                && normalize_felt_hex(&witness.new_renewal_root)
+                    .map(|root| root == cursor_renewal)
+                    .unwrap_or(false)
+        }) else {
+            eprintln!(
+                "filter_root_history_witnesses_for_current_roots failed missing cursor_nullifier={} cursor_renewal={}",
+                cursor_nullifier, cursor_renewal
+            );
+            return Err(StatusCode::CONFLICT);
+        };
+        let witness = candidates.remove(position);
+        cursor_nullifier =
+            normalize_felt_hex(&witness.prior_nullifier_root).map_err(|_| StatusCode::CONFLICT)?;
+        cursor_renewal =
+            normalize_felt_hex(&witness.prior_renewal_root).map_err(|_| StatusCode::CONFLICT)?;
+        selected.push(witness);
+    }
+    selected.reverse();
+    Ok(selected)
+}
+
+fn should_filter_root_history_against_onchain(state: &AppState) -> bool {
+    state.starknet_executor.is_some()
+        && !state.auction_verifier_address.trim().is_empty()
+        && state.auction_verifier_address.trim() != "0x123"
 }
 
 fn max_single_order_fill_share_bps(
@@ -1535,6 +3337,100 @@ fn max_single_order_fill_share_bps(
         .unwrap_or(0);
     let bps = max_fill.checked_mul(10_000).ok_or(StatusCode::CONFLICT)? / matched_volume;
     Ok(bps.min(u64::MAX as u128) as u64)
+}
+
+fn max_maker_fill_share_bps(
+    records: &[DecryptedOrderRecord],
+    matched_orders: &[MatchedOrder],
+    matched_volume: u128,
+) -> Result<u64, StatusCode> {
+    if matched_volume == 0 {
+        return Ok(0);
+    }
+    let order_types = records
+        .iter()
+        .map(|record| (record.order_commitment.0.as_str(), &record.order.order_type))
+        .collect::<BTreeMap<_, _>>();
+    let max_maker_fill = matched_orders
+        .iter()
+        .filter(|order| {
+            order_types
+                .get(order.order_commitment.0.as_str())
+                .is_some_and(|order_type| matches!(order_type, OrderType::MakerCurve))
+        })
+        .map(|order| order.filled_amount)
+        .max()
+        .unwrap_or(0);
+    let bps = max_maker_fill
+        .checked_mul(10_000)
+        .ok_or(StatusCode::CONFLICT)?
+        / matched_volume;
+    Ok(bps.min(u64::MAX as u128) as u64)
+}
+
+fn eligible_order_count(records: &[DecryptedOrderRecord], price: u128) -> u64 {
+    records
+        .iter()
+        .filter(|record| {
+            is_order_eligible(&record.order, price) && max_fill_at_price(record, price) > 0
+        })
+        .count() as u64
+}
+
+fn max_single_owner_fill_share_bps(
+    records: &[DecryptedOrderRecord],
+    matched_orders: &[MatchedOrder],
+    matched_volume: u128,
+) -> Result<u64, StatusCode> {
+    if matched_volume == 0 {
+        return Ok(0);
+    }
+    let owners = records
+        .iter()
+        .map(|record| {
+            (
+                record.order_commitment.0.as_str(),
+                record.funding_note.owner_public_key.as_str(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut fill_by_owner = BTreeMap::<&str, u128>::new();
+    for order in matched_orders
+        .iter()
+        .filter(|order| order.filled_amount > 0)
+    {
+        let Some(owner) = owners.get(order.order_commitment.0.as_str()) else {
+            continue;
+        };
+        let total = fill_by_owner.entry(owner).or_default();
+        *total = total
+            .checked_add(order.filled_amount)
+            .ok_or(StatusCode::CONFLICT)?;
+    }
+    let max_owner_fill = fill_by_owner.values().copied().max().unwrap_or(0);
+    let bps = max_owner_fill
+        .checked_mul(10_000)
+        .ok_or(StatusCode::CONFLICT)?
+        / matched_volume;
+    Ok(bps.min(u64::MAX as u128) as u64)
+}
+
+fn matched_maker_participant_count(
+    records: &[DecryptedOrderRecord],
+    matched_orders: &[MatchedOrder],
+) -> u64 {
+    let matched_commitments = matched_orders
+        .iter()
+        .filter(|order| order.filled_amount > 0)
+        .map(|order| order.order_commitment.0.as_str())
+        .collect::<BTreeSet<_>>();
+    records
+        .iter()
+        .filter(|record| matched_commitments.contains(record.order_commitment.0.as_str()))
+        .filter(|record| matches!(record.order.order_type, OrderType::MakerCurve))
+        .map(|record| record.funding_note.owner_public_key.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as u64
 }
 
 fn matched_participant_count(
@@ -1599,11 +3495,18 @@ async fn publish_batch_artifacts_to_coordinator(
     artifacts: &SettlementArtifacts,
 ) -> Result<(), StatusCode> {
     let batch_id = &artifacts.transcript.batch_id.0;
+    let transcript_shape = zylith_core::validate_transcript_shape_policy(
+        &artifacts.transcript,
+        &artifacts.output_bundle,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let payload = PublishedBatchArtifacts {
         transcript: artifacts.transcript.clone(),
         output_bundle: artifacts.output_bundle.clone(),
         settlement_witness: artifacts.settlement_witness.clone(),
+        published_at_unix_ms: now_unix_ms(),
         order_execution_reports: artifacts.order_execution_reports.clone(),
+        transcript_shape: Some(transcript_shape),
     };
     let coordinator_url = format!(
         "{}/api/internal/batches/{batch_id}/artifacts",
@@ -1622,9 +3525,21 @@ async fn publish_batch_artifacts_to_coordinator(
     )
     .send()
     .await
-    .map_err(|_| StatusCode::BAD_GATEWAY)?
+    .map_err(|error| {
+        eprintln!(
+            "publish_batch_artifacts batch_id={} target=coordinator send_failed={}",
+            batch_id, error
+        );
+        StatusCode::BAD_GATEWAY
+    })?
     .error_for_status()
-    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    .map_err(|error| {
+        eprintln!(
+            "publish_batch_artifacts batch_id={} target=coordinator status_failed={}",
+            batch_id, error
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
     apply_internal_auth(
         state.http_client.post(indexer_url).json(&payload),
         state
@@ -1634,9 +3549,21 @@ async fn publish_batch_artifacts_to_coordinator(
     )
     .send()
     .await
-    .map_err(|_| StatusCode::BAD_GATEWAY)?
+    .map_err(|error| {
+        eprintln!(
+            "publish_batch_artifacts batch_id={} target=indexer send_failed={}",
+            batch_id, error
+        );
+        StatusCode::BAD_GATEWAY
+    })?
     .error_for_status()
-    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    .map_err(|error| {
+        eprintln!(
+            "publish_batch_artifacts batch_id={} target=indexer status_failed={}",
+            batch_id, error
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
 
     Ok(())
 }
@@ -1680,6 +3607,10 @@ async fn prepare_or_rebuild_job(
     }
     settlement_witness.transcript_commitment = transcript_commitment.clone();
     settlement_witness.auction_verifier_address = state.auction_verifier_address.clone();
+    settlement_witness.prior_note_root = transcript.prior_note_root.clone();
+    settlement_witness.prior_nullifier_root = transcript.prior_nullifier_root.clone();
+    settlement_witness.prior_renewal_root = transcript.prior_renewal_root.clone();
+    settlement_witness.prior_fee_root = transcript.prior_fee_root.clone();
 
     let now = now_unix_ms();
     let settlement_entrypoint = "submit_settlement_with_proof_facts";
@@ -2020,9 +3951,12 @@ async fn execute_native_transaction_prover(
     let native_proof_reference =
         native_settlement_message_hash(&state.auction_verifier_address, &transcript_commitment)
             .map_err(|error| error.to_string())?;
-    let expected_proof_message_hash =
-        settlement_proof_message_hash(&state.auction_verifier_address, &transcript_commitment)
-            .map_err(|error| error.to_string())?;
+    let expected_proof_message_hash = settlement_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &transcript_commitment,
+    )
+    .map_err(|error| error.to_string())?;
     let paths = proof_execution_paths(state.data_dir.as_ref(), batch_id);
     delete_execution_outputs_if_exist(state.data_dir.as_ref(), batch_id)
         .map_err(status_to_error)?;
@@ -2036,17 +3970,26 @@ async fn execute_native_transaction_prover(
     if settlement_witness.transcript_commitment != transcript_commitment {
         return Err("settlement witness commitment does not match transcript".into());
     }
-    let serialized_auction_witness =
+    let serialized_native_witness = if state.native_proof_entrypoint == "compile_settlement_proof" {
+        zylith_core::build_stwo_serialized_input(settlement_witness).map_err(|error| {
+            format!("failed to serialize settlement witness for native proof: {error}")
+        })?
+    } else {
         build_auction_serialized_input(settlement_witness, auction_order_witnesses).map_err(
             |error| format!("failed to serialize auction witness for native proof: {error}"),
-        )?;
+        )?
+    };
+    let proof_program_calldata = build_native_proof_program_calldata(
+        &state.auction_verifier_address,
+        &serialized_native_witness,
+    )?;
     let proof_compilation_call = StarknetCall {
         contract_address: normalize_nonzero_felt(
-            &state.auction_verifier_address,
-            "auction_verifier_address",
+            &state.native_proof_program_address,
+            "native_proof_program_address",
         )?,
-        entrypoint: "compile_auction_proof".into(),
-        calldata: serialized_auction_witness,
+        entrypoint: state.native_proof_entrypoint.clone(),
+        calldata: proof_program_calldata,
     };
     let execution_request = build_native_execution_request(
         &executor,
@@ -2145,6 +4088,9 @@ async fn request_native_proof(
     tx_prover_url: &str,
     rpc_request: &NativeProverRpcRequest,
 ) -> Result<(NativeProverResult, serde_json::Value), String> {
+    if let Some(ohttp_config) = &state.native_tx_prover_ohttp {
+        return request_native_proof_ohttp(state, tx_prover_url, ohttp_config, rpc_request).await;
+    }
     let response_value = tokio::time::timeout(
         Duration::from_secs(state.native_prover_request_timeout_seconds),
         async {
@@ -2167,6 +4113,157 @@ async fn request_native_proof(
             state.native_prover_request_timeout_seconds
         )
     })??;
+    decode_native_prover_response(response_value)
+}
+
+async fn request_native_proof_ohttp(
+    state: &AppState,
+    tx_prover_url: &str,
+    ohttp_config: &NativeProverOhttpConfig,
+    rpc_request: &NativeProverRpcRequest,
+) -> Result<(NativeProverResult, serde_json::Value), String> {
+    let response_value = tokio::time::timeout(
+        Duration::from_secs(state.native_prover_request_timeout_seconds),
+        async {
+            let body = serde_json::to_vec(rpc_request).map_err(|error| {
+                format!("native transaction prover OHTTP request encode failed: {error}")
+            })?;
+            let key_config = load_ohttp_key_config(state, tx_prover_url, ohttp_config).await?;
+            let ohttp_client = ohttp::ClientRequest::from_encoded_config_list(&key_config)
+                .map_err(|error| {
+                    format!("native transaction prover OHTTP key config invalid: {error}")
+                })?;
+            let bhttp_request = encode_bhttp_json_post(&body).map_err(|error| {
+                format!("native transaction prover OHTTP BHTTP encode failed: {error}")
+            })?;
+            let (encrypted_request, response_context) =
+                ohttp_client.encapsulate(&bhttp_request).map_err(|error| {
+                    format!("native transaction prover OHTTP encapsulation failed: {error}")
+                })?;
+            let target_url = ohttp_config.relay_url.as_deref().unwrap_or(tx_prover_url);
+            let response = state
+                .http_client
+                .post(target_url)
+                .header("content-type", "message/ohttp-req")
+                .body(encrypted_request)
+                .send()
+                .await
+                .map_err(|error| {
+                    format!("native transaction prover OHTTP request failed: {error}")
+                })?;
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let response_bytes = response.bytes().await.map_err(|error| {
+                format!("native transaction prover OHTTP response read failed: {error}")
+            })?;
+            if !status.is_success() && !content_type.contains("message/ohttp-res") {
+                let body = String::from_utf8_lossy(&response_bytes);
+                return Err(format!(
+                    "native transaction prover OHTTP gateway returned HTTP {status}: {body}"
+                ));
+            }
+            let bhttp_response =
+                response_context
+                    .decapsulate(&response_bytes)
+                    .map_err(|error| {
+                        format!("native transaction prover OHTTP decapsulation failed: {error}")
+                    })?;
+            let (inner_status, inner_body) =
+                decode_bhttp_response(&bhttp_response).map_err(|error| {
+                    format!("native transaction prover OHTTP BHTTP decode failed: {error}")
+                })?;
+            if inner_status != 200 {
+                return Err(format!(
+                    "native transaction prover OHTTP inner response HTTP {inner_status}: {}",
+                    String::from_utf8_lossy(&inner_body)
+                ));
+            }
+            serde_json::from_slice::<serde_json::Value>(&inner_body).map_err(|error| {
+                format!("native transaction prover OHTTP JSON response decode failed: {error}")
+            })
+        },
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "native transaction prover OHTTP request timed out after {}s",
+            state.native_prover_request_timeout_seconds
+        )
+    })??;
+    decode_native_prover_response(response_value)
+}
+
+async fn load_ohttp_key_config(
+    state: &AppState,
+    tx_prover_url: &str,
+    ohttp_config: &NativeProverOhttpConfig,
+) -> Result<Vec<u8>, String> {
+    if let Some(pinned) = &ohttp_config.pinned_key_config {
+        return Ok(pinned.clone());
+    }
+    let parsed_url =
+        Url::parse(tx_prover_url).map_err(|error| format!("invalid native prover URL: {error}"))?;
+    if parsed_url.scheme() != "https" {
+        return Err(format!(
+            "{NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX_ENV} is required when {NATIVE_TX_PROVER_OHTTP_ENABLED_ENV}=true and ZYLITH_NATIVE_TX_PROVER_URL is not HTTPS"
+        ));
+    }
+    let key_url = format!("{}/ohttp-keys", tx_prover_url.trim_end_matches('/'));
+    let response = state
+        .http_client
+        .get(key_url)
+        .send()
+        .await
+        .map_err(|error| format!("native transaction prover OHTTP key fetch failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "native transaction prover OHTTP key fetch returned HTTP {status}: {body}"
+        ));
+    }
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| {
+            format!("native transaction prover OHTTP key response read failed: {error}")
+        })
+}
+
+fn encode_bhttp_json_post(body: &[u8]) -> Result<Vec<u8>, bhttp::Error> {
+    let mut message = bhttp::Message::request(
+        b"POST".to_vec(),
+        b"https".to_vec(),
+        b"ohttp-target.invalid".to_vec(),
+        b"/".to_vec(),
+    );
+    message.put_header(b"content-type".to_vec(), b"application/json".to_vec());
+    message.write_content(body);
+    let mut encoded = Vec::new();
+    message.write_bhttp(bhttp::Mode::KnownLength, &mut encoded)?;
+    Ok(encoded)
+}
+
+fn decode_bhttp_response(bytes: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let mut cursor = Cursor::new(bytes);
+    let message = bhttp::Message::read_bhttp(&mut cursor).map_err(|error| error.to_string())?;
+    let status = message
+        .control()
+        .status()
+        .ok_or_else(|| "OHTTP inner message was not a response".to_string())?
+        .code();
+    Ok((status, message.content().to_vec()))
+}
+
+fn decode_native_prover_response(
+    response_value: serde_json::Value,
+) -> Result<(NativeProverResult, serde_json::Value), String> {
     let response: NativeProverRpcResponse = serde_json::from_value(response_value.clone())
         .map_err(|error| format!("native transaction prover response shape error: {error}"))?;
     let result = match (response.result, response.error) {
@@ -2184,13 +4281,54 @@ async fn request_native_proof(
         }
         _ => return Err("native transaction prover returned no result".to_string()),
     };
+    validate_native_prover_l2_messages(&result)?;
 
     Ok((result, response_value))
+}
+
+fn validate_native_prover_l2_messages(result: &NativeProverResult) -> Result<(), String> {
+    if result.l2_to_l1_messages.is_empty() {
+        return Err("native transaction prover returned no L2-to-L1 messages".into());
+    }
+    for (index, message) in result.l2_to_l1_messages.iter().enumerate() {
+        normalize_nonzero_felt(
+            &message.from_address,
+            &format!("native l2_to_l1_messages[{index}].from_address"),
+        )?;
+        let to_address = message.to_address.trim();
+        if !to_address.starts_with("0x") {
+            return Err(format!(
+                "native l2_to_l1_messages[{index}].to_address is not hex encoded"
+            ));
+        }
+        if message.payload.is_empty() {
+            return Err(format!(
+                "native l2_to_l1_messages[{index}].payload must not be empty"
+            ));
+        }
+        for (payload_index, payload) in message.payload.iter().enumerate() {
+            parse_felt(
+                payload,
+                &format!("native l2_to_l1_messages[{index}].payload[{payload_index}]"),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_native_proof_facts(
     serialized_proof_facts: &[String],
     expected_message_hash: &str,
+) -> Result<(), String> {
+    validate_native_proof_facts_messages(
+        serialized_proof_facts,
+        &[expected_message_hash.to_owned()],
+    )
+}
+
+fn validate_native_proof_facts_messages(
+    serialized_proof_facts: &[String],
+    expected_message_hashes: &[String],
 ) -> Result<(), String> {
     if serialized_proof_facts.len() < 8 {
         return Err("native prover returned malformed proof_facts".into());
@@ -2207,19 +4345,35 @@ fn validate_native_proof_facts(
             serialized_proof_facts.len()
         ));
     }
-    if message_count != 1 {
+    if message_count != expected_message_hashes.len() {
         return Err(format!(
-            "native prover returned {message_count} proof messages, expected exactly 1"
+            "native prover returned {message_count} proof messages, expected {}",
+            expected_message_hashes.len()
         ));
     }
-    let actual_message_hash = normalize_nonzero_felt(&serialized_proof_facts[8], "proof_message")?;
-    let expected_message_hash = normalize_nonzero_felt(expected_message_hash, "expected_message")?;
-    if actual_message_hash != expected_message_hash {
-        return Err(format!(
-            "native proof_facts message mismatch: expected {expected_message_hash}, got {actual_message_hash}"
-        ));
+    for (index, expected_message_hash) in expected_message_hashes.iter().enumerate() {
+        let actual_message_hash =
+            normalize_nonzero_felt(&serialized_proof_facts[8 + index], "proof_message")?;
+        let expected_message_hash =
+            normalize_nonzero_felt(expected_message_hash, "expected_message")?;
+        if actual_message_hash != expected_message_hash {
+            return Err(format!(
+                "native proof_facts message {index} mismatch: expected {expected_message_hash}, got {actual_message_hash}"
+            ));
+        }
     }
     Ok(())
+}
+
+fn build_native_proof_program_calldata(
+    auction_verifier_address: &str,
+    serialized_auction_witness: &[String],
+) -> Result<Vec<String>, String> {
+    let verifier = normalize_nonzero_felt(auction_verifier_address, "auction_verifier_address")?;
+    let mut calldata = Vec::with_capacity(serialized_auction_witness.len() + 1);
+    calldata.push(verifier);
+    calldata.extend(serialized_auction_witness.iter().cloned());
+    Ok(calldata)
 }
 
 fn build_settlement_submission_plan_for_artifact(
@@ -2239,47 +4393,36 @@ async fn fetch_transcript(
     batch_id: &str,
 ) -> Result<SettlementTranscript, StatusCode> {
     let url = format!(
-        "{}/api/batches/{}/transcript",
+        "{}/api/internal/batches/{}/transcript",
         state.coordinator_url, batch_id
     );
-    state
-        .http_client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .error_for_status()
-        .map_err(|status| {
-            if status.status() == Some(reqwest::StatusCode::NOT_FOUND) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_GATEWAY
-            }
-        })?
-        .json()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)
+    apply_internal_auth(
+        state.http_client.get(url),
+        state
+            .internal_api_token
+            .as_ref()
+            .map(|token| token.as_str()),
+    )
+    .send()
+    .await
+    .map_err(|_| StatusCode::BAD_GATEWAY)?
+    .error_for_status()
+    .map_err(|status| {
+        if status.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::BAD_GATEWAY
+        }
+    })?
+    .json()
+    .await
+    .map_err(|_| StatusCode::BAD_GATEWAY)
 }
 
 async fn fetch_batch_summary(state: &AppState, batch_id: &str) -> Result<BatchSummary, StatusCode> {
-    let url = format!("{}/api/batches/{batch_id}", state.coordinator_url);
-    state
-        .http_client
-        .get(url)
-        .send()
+    fetch_batch_order_set(state, batch_id)
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .error_for_status()
-        .map_err(|status| {
-            if status.status() == Some(reqwest::StatusCode::NOT_FOUND) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::BAD_GATEWAY
-            }
-        })?
-        .json()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)
+        .map(|order_set| order_set.batch)
 }
 
 async fn fetch_batch_order_set(
@@ -2346,8 +4489,26 @@ fn compute_candidate_clearing_price(
 ) -> Result<Option<u128>, StatusCode> {
     let mut candidate_prices: Vec<u128> = records
         .iter()
+        .filter(|record| {
+            !matches!(
+                record.order.order_type,
+                zylith_core::OrderType::HeartbeatCover
+            )
+        })
         .flat_map(|record| candidate_prices_for_order(&record.order))
         .collect();
+    if candidate_prices.is_empty() {
+        candidate_prices = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.order.order_type,
+                    zylith_core::OrderType::HeartbeatCover
+                )
+            })
+            .flat_map(|record| candidate_prices_for_order(&record.order))
+            .collect();
+    }
     candidate_prices.sort_unstable();
     candidate_prices.dedup();
 
@@ -2600,30 +4761,456 @@ fn build_batch_liquidity_report(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OutputNettingKey {
+    asset_id: String,
+    owner_public_key: String,
+    spend_authority: String,
+    withdraw_authority: String,
+}
+
+struct OutputNettingGroup {
+    template: Note,
+    amount: u128,
+    old_commitments: Vec<String>,
+}
+
+struct OutputNettingResult {
+    bundle: OutputCiphertextBundle,
+    note_preimages: Vec<Note>,
+    recovery_records: Vec<OutputRecoveryRecord>,
+    recovery_dummy_commitments: Vec<String>,
+}
+
+fn add_output_to_netting_group(
+    groups: &mut BTreeMap<OutputNettingKey, OutputNettingGroup>,
+    note: &Note,
+) -> Result<(), StatusCode> {
+    let old_commitment = note
+        .commitment()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .0;
+    let key = OutputNettingKey {
+        asset_id: note.asset_id.0.clone(),
+        owner_public_key: note.owner_public_key.clone(),
+        spend_authority: normalize_felt_hex(&note.spend_authority)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        withdraw_authority: normalize_felt_hex(&note.withdraw_authority)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    };
+    let entry = groups.entry(key).or_insert_with(|| OutputNettingGroup {
+        template: note.clone(),
+        amount: 0,
+        old_commitments: Vec::new(),
+    });
+    entry.amount = entry
+        .amount
+        .checked_add(note.amount)
+        .ok_or(StatusCode::CONFLICT)?;
+    entry.old_commitments.push(old_commitment);
+    Ok(())
+}
+
+fn apply_cross_order_output_netting(
+    batch_id: &str,
+    output_notes: &mut Vec<OutputNoteRecord>,
+    matched_order_witnesses: &mut [MatchedOrderWitness],
+    order_execution_reports: &mut [OrderExecutionReport],
+) -> Result<OutputNettingResult, StatusCode> {
+    let mut groups = BTreeMap::<OutputNettingKey, OutputNettingGroup>::new();
+    for witness in matched_order_witnesses.iter() {
+        add_output_to_netting_group(&mut groups, &witness.output_note)?;
+        if let Some(residual_note) = witness.residual_note.as_ref() {
+            add_output_to_netting_group(&mut groups, residual_note)?;
+        }
+    }
+
+    let mut replacements = BTreeMap::<String, Note>::new();
+    let mut netted_records = Vec::with_capacity(groups.len());
+    let mut netted_notes = Vec::with_capacity(groups.len());
+    for (_key, group) in groups.into_iter() {
+        let output_index = netted_records.len();
+        let mut note = group.template.clone();
+        note.amount = group.amount;
+        note.nonce = output_index as u64;
+        let note_commitment = note
+            .commitment()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        for old_commitment in group.old_commitments {
+            replacements.insert(old_commitment, note.clone());
+        }
+        netted_notes.push(note.clone());
+        netted_records.push(OutputNoteRecord {
+            note_commitment,
+            asset_id: note.asset_id.clone(),
+            amount: note.amount,
+            withdraw_authority: note.withdraw_authority.clone(),
+        });
+    }
+
+    for witness in matched_order_witnesses.iter_mut() {
+        let old_output_commitment = witness
+            .output_note
+            .commitment()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .0;
+        witness.output_note = replacements
+            .get(&old_output_commitment)
+            .cloned()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(residual_note) = witness.residual_note.as_mut() {
+            let old_residual_commitment = residual_note
+                .commitment()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .0;
+            *residual_note = replacements
+                .get(&old_residual_commitment)
+                .cloned()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        }
+    }
+
+    for report in order_execution_reports.iter_mut() {
+        if let Some(old_commitment) = report
+            .output_note_commitment
+            .as_ref()
+            .map(|commitment| commitment.0.clone())
+            && let Some(note) = replacements.get(&old_commitment)
+        {
+            report.output_note_commitment = Some(
+                note.commitment()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+        }
+        if let Some(old_commitment) = report
+            .residual_note_commitment
+            .as_ref()
+            .map(|commitment| commitment.0.clone())
+            && let Some(note) = replacements.get(&old_commitment)
+        {
+            report.residual_note_commitment = Some(
+                note.commitment()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            );
+        }
+    }
+
+    *output_notes = netted_records;
+    let mut ciphertexts = Vec::with_capacity(output_notes.len());
+    for (output_index, (note, output_note)) in
+        netted_notes.iter().zip(output_notes.iter()).enumerate()
+    {
+        let output_proof = output_note_merkle_proof(output_notes, &output_note.note_commitment)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        ciphertexts.push(
+            encrypt_output_note_for_owner(
+                batch_id,
+                output_index,
+                note,
+                output_note,
+                &output_proof,
+                &note.owner_public_key,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        );
+    }
+    let bundle = OutputCiphertextBundle::from_ciphertexts(
+        BatchId(batch_id.into()),
+        format!("proof-auction://{batch_id}/output-bundle"),
+        ciphertexts,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let recovery_records = bundle
+        .ciphertexts
+        .iter()
+        .take(output_notes.len())
+        .map(|ciphertext| {
+            ciphertext
+                .recovery
+                .clone()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .collect::<Result<Vec<_>, StatusCode>>()?;
+    let recovery_dummy_commitments = bundle
+        .ciphertexts
+        .iter()
+        .skip(output_notes.len())
+        .map(|ciphertext| {
+            ciphertext
+                .recovery
+                .as_ref()
+                .map(|recovery| recovery.commitment.clone())
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .collect::<Result<Vec<_>, StatusCode>>()?;
+    Ok(OutputNettingResult {
+        bundle,
+        note_preimages: netted_notes,
+        recovery_records,
+        recovery_dummy_commitments,
+    })
+}
+
+fn note_commitment_from_note(note: &Note) -> Result<String, StatusCode> {
+    note.commitment()
+        .map(|commitment| commitment.0)
+        .and_then(|commitment| normalize_felt_hex(&commitment))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn try_deposit_membership_candidate(
+    prior_note_root: &str,
+    activation_commitments: &[String],
+    consumed_commitments: &[String],
+) -> Result<Option<Vec<NoteMembershipWitness>>, StatusCode> {
+    let prior_note_root =
+        normalize_felt_hex(prior_note_root).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let consumed_set = consumed_commitments
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for start_index in 0..activation_commitments.len() {
+        let suffix = &activation_commitments[start_index..];
+        let suffix_set = suffix.iter().cloned().collect::<BTreeSet<_>>();
+        if !consumed_set.is_subset(&suffix_set) {
+            continue;
+        }
+        let (candidate_root, witnesses) =
+            deposit_note_membership_witnesses_for_chain("0x0", suffix, consumed_commitments)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if candidate_root == prior_note_root {
+            return Ok(Some(witnesses));
+        }
+    }
+    Ok(None)
+}
+
+fn derive_deposit_note_membership_witnesses_from_note_root_transitions(
+    prior_note_root: &str,
+    consumed_commitments: &[String],
+    transitions: &[NoteRootTransitionRecord],
+) -> Result<Option<Vec<NoteMembershipWitness>>, StatusCode> {
+    let target_root =
+        normalize_felt_hex(prior_note_root).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if target_root == "0x0" || consumed_commitments.is_empty() || transitions.is_empty() {
+        return Ok(None);
+    }
+
+    let consumed_set = consumed_commitments
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut root = "0x0".to_string();
+    let mut prefixes = Vec::new();
+    let mut batch_roots = Vec::new();
+    let mut active_transitions = Vec::new();
+
+    for transition in transitions {
+        let batch_root = normalize_felt_hex(&transition.batch_root)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let expected_new_root = settlement_state_transition_root(&root, &batch_root)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let recorded_new_root = normalize_felt_hex(&transition.new_root)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if recorded_new_root != expected_new_root {
+            return Err(StatusCode::CONFLICT);
+        }
+        prefixes.push(root.clone());
+        batch_roots.push(batch_root);
+        active_transitions.push(transition.clone());
+        root = expected_new_root;
+        if root == target_root {
+            break;
+        }
+    }
+
+    if root != target_root {
+        return Ok(None);
+    }
+
+    let mut witnesses_by_commitment = BTreeMap::<String, NoteMembershipWitness>::new();
+    for (index, transition) in active_transitions.iter().enumerate() {
+        if transition.kind != 0 {
+            continue;
+        }
+        let key =
+            normalize_felt_hex(&transition.key).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if !consumed_set.contains(&key) {
+            continue;
+        }
+        witnesses_by_commitment.insert(
+            key,
+            NoteMembershipWitness {
+                kind: NoteMembershipKind::Deposit,
+                prefix_root: prefixes[index].clone(),
+                batch_root: batch_roots[index].clone(),
+                merkle_path: Vec::new(),
+                merkle_directions: Vec::new(),
+                suffix_batch_roots: batch_roots[index + 1..].to_vec(),
+            },
+        );
+    }
+
+    let mut witnesses = Vec::with_capacity(consumed_commitments.len());
+    for commitment in consumed_commitments {
+        let Some(witness) = witnesses_by_commitment.get(commitment).cloned() else {
+            return Ok(None);
+        };
+        witnesses.push(witness);
+    }
+    Ok(Some(witnesses))
+}
+
+fn derive_deposit_note_membership_witnesses(
+    prior_note_root: &str,
+    consumed_inputs: &[ConsumedInput],
+    matched_order_witnesses: &[MatchedOrderWitness],
+    deposit_records: &[DepositRecord],
+    note_root_transitions: &[NoteRootTransitionRecord],
+) -> Result<Vec<NoteMembershipWitness>, StatusCode> {
+    if consumed_inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let consumed_commitments = consumed_inputs
+        .iter()
+        .map(|input| normalize_felt_hex(&input.note_commitment.0))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(witnesses) = derive_deposit_note_membership_witnesses_from_note_root_transitions(
+        prior_note_root,
+        &consumed_commitments,
+        note_root_transitions,
+    )? {
+        return Ok(witnesses);
+    }
+
+    let mut candidates = Vec::<Vec<String>>::new();
+    if !deposit_records.is_empty() {
+        candidates.push(
+            deposit_records
+                .iter()
+                .map(|record| normalize_felt_hex(&record.note_commitment.0))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        );
+    }
+
+    let mut funding_notes = matched_order_witnesses
+        .iter()
+        .map(|witness| {
+            Ok((
+                witness.funding_note.nonce,
+                note_commitment_from_note(&witness.funding_note)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, StatusCode>>()?;
+    funding_notes.sort_by_key(|(nonce, commitment)| (*nonce, commitment.clone()));
+    let funding_activation_commitments = funding_notes
+        .into_iter()
+        .map(|(_nonce, commitment)| commitment)
+        .collect::<Vec<_>>();
+    if !funding_activation_commitments.is_empty()
+        && !candidates.contains(&funding_activation_commitments)
+    {
+        candidates.push(funding_activation_commitments);
+    }
+
+    for activation_commitments in candidates {
+        if let Some(witnesses) = try_deposit_membership_candidate(
+            prior_note_root,
+            &activation_commitments,
+            &consumed_commitments,
+        )? {
+            return Ok(witnesses);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+struct SettlementBuildContext<'a> {
+    product_config: &'a ProductConfig,
+    prior_roots: &'a SettlementRoots,
+    deposit_records: &'a [DepositRecord],
+    note_root_transitions: &'a [NoteRootTransitionRecord],
+    prior_settlement_witnesses: &'a [SettlementWitness],
+    privacy_gate: AuctionPrivacyGateWitness,
+    protocol_fee_bps: u128,
+    protocol_fee_recipient: &'a str,
+}
+
 fn build_settlement_artifacts(
     batch_id: &str,
     batch: &BatchSummary,
     pair: &ProductPairConfig,
     records: &[DecryptedOrderRecord],
-    product_config: &ProductConfig,
+    context: SettlementBuildContext<'_>,
 ) -> Result<SettlementArtifacts, StatusCode> {
+    let SettlementBuildContext {
+        product_config,
+        prior_roots,
+        deposit_records,
+        note_root_transitions,
+        prior_settlement_witnesses,
+        privacy_gate,
+        protocol_fee_bps,
+        protocol_fee_recipient,
+    } = context;
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=validate_orders start records={}",
+        batch_id,
+        records.len()
+    );
     for record in records {
         if record.order.pair_id != pair.pair_id {
+            eprintln!(
+                "build_settlement_artifacts batch_id={batch_id} stage=validate_orders failed=pair_id"
+            );
             return Err(StatusCode::CONFLICT);
         }
         if record.order.batch_id != batch.batch_id {
+            eprintln!(
+                "build_settlement_artifacts batch_id={batch_id} stage=validate_orders failed=batch_id"
+            );
             return Err(StatusCode::CONFLICT);
         }
         if record.order.expiry_epoch != batch.epoch_id {
+            eprintln!(
+                "build_settlement_artifacts batch_id={batch_id} stage=validate_orders failed=expiry_epoch"
+            );
             return Err(StatusCode::CONFLICT);
         }
-        product_config
-            .validate_order_funding(&record.order, &record.funding_note)
-            .map_err(|_| StatusCode::CONFLICT)?;
+        if !matches!(
+            record.order.order_type,
+            zylith_core::OrderType::HeartbeatCover
+        ) {
+            product_config
+                .validate_order_funding(&record.order, &record.funding_note)
+                .map_err(|_| {
+                    eprintln!(
+                        "build_settlement_artifacts batch_id={batch_id} stage=validate_orders failed=funding_policy"
+                    );
+                    StatusCode::CONFLICT
+                })?;
+        }
     }
 
-    let clearing_price = compute_candidate_clearing_price(records)?.unwrap_or(0);
-    let fills = compute_fill_plan(records, clearing_price);
+    eprintln!("build_settlement_artifacts batch_id={batch_id} stage=compute_price start");
+    let candidate_clearing_price = compute_candidate_clearing_price(records)?;
+    let candidate_price = candidate_clearing_price.unwrap_or(0);
+    let fills = if privacy_gate.enforced {
+        Vec::new()
+    } else {
+        compute_fill_plan(records, candidate_price)
+    };
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=compute_price ok price={} fills={}",
+        batch_id,
+        candidate_price,
+        fills.len()
+    );
+    let clearing_price = candidate_price;
     let base_asset = pair.base_asset_id.clone();
     let quote_asset = pair.quote_asset_id.clone();
 
@@ -2631,18 +5218,21 @@ fn build_settlement_artifacts(
     let mut consumed_inputs = Vec::with_capacity(fills.len());
     let mut fee_accumulator: BTreeMap<String, u128> = BTreeMap::new();
     let mut output_notes = Vec::with_capacity(fills.len());
-    let mut ciphertexts = Vec::with_capacity(fills.len());
     let mut matched_order_witnesses = Vec::with_capacity(fills.len());
     let mut seen_funding_notes = BTreeMap::<String, String>::new();
     let mut reported_orders = BTreeSet::<String>::new();
     let mut order_execution_reports = Vec::with_capacity(records.len());
 
+    eprintln!("build_settlement_artifacts batch_id={batch_id} stage=build_fills start");
     for fill in fills.iter() {
         let funding_note_commitment = fill
             .funding_note
             .commitment()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         if funding_note_commitment != fill.order.funding_note_ref {
+            eprintln!(
+                "build_settlement_artifacts batch_id={batch_id} stage=build_fills failed=funding_note_ref"
+            );
             return Err(StatusCode::CONFLICT);
         }
         if seen_funding_notes
@@ -2652,6 +5242,9 @@ fn build_settlement_artifacts(
             )
             .is_some()
         {
+            eprintln!(
+                "build_settlement_artifacts batch_id={batch_id} stage=build_fills failed=duplicate_funding_note"
+            );
             return Err(StatusCode::CONFLICT);
         }
 
@@ -2674,7 +5267,7 @@ fn build_settlement_artifacts(
             ),
         };
         let fee_amount = gross_amount
-            .checked_mul(PROTOCOL_FEE_BPS)
+            .checked_mul(protocol_fee_bps)
             .ok_or(StatusCode::CONFLICT)?
             / 10_000;
         let net_amount = gross_amount
@@ -2703,15 +5296,6 @@ fn build_settlement_artifacts(
             .commitment()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let output_note_commitment = note_commitment.clone();
-        ciphertexts.push(
-            encrypt_note_for_owner(
-                batch_id,
-                output_index,
-                &note,
-                &fill.order.recipient_owner_public_key,
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-        );
         output_notes.push(OutputNoteRecord {
             note_commitment: note_commitment.clone(),
             asset_id: note_asset_id,
@@ -2737,15 +5321,6 @@ fn build_settlement_artifacts(
                 .commitment()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             residual_note_commitment = Some(residual_commitment.clone());
-            ciphertexts.push(
-                encrypt_note_for_owner(
-                    batch_id,
-                    residual_output_index,
-                    &residual_note,
-                    &fill.order.recipient_owner_public_key,
-                )
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-            );
             output_notes.push(OutputNoteRecord {
                 note_commitment: residual_commitment,
                 asset_id: residual_asset_id.clone(),
@@ -2816,8 +5391,20 @@ fn build_settlement_artifacts(
         });
     }
 
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=build_fills ok consumed={} outputs={}",
+        batch_id,
+        consumed_inputs.len(),
+        output_notes.len()
+    );
     for record in records {
         if reported_orders.contains(&record.order_commitment.0) {
+            continue;
+        }
+        if matches!(
+            record.order.order_type,
+            zylith_core::OrderType::HeartbeatCover
+        ) {
             continue;
         }
         order_execution_reports.push(OrderExecutionReport {
@@ -2845,15 +5432,155 @@ fn build_settlement_artifacts(
         });
     }
 
-    let output_bundle = OutputCiphertextBundle::from_ciphertexts(
-        BatchId(batch_id.into()),
-        format!("proof-auction://{batch_id}/output-bundle"),
-        ciphertexts,
+    eprintln!("build_settlement_artifacts batch_id={batch_id} stage=output_netting start");
+    let output_netting = apply_cross_order_output_netting(
+        batch_id,
+        &mut output_notes,
+        &mut matched_order_witnesses,
+        &mut order_execution_reports,
+    )?;
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=output_netting ok outputs={} recovery_records={}",
+        batch_id,
+        output_notes.len(),
+        output_netting.recovery_records.len()
+    );
+    let renewal_child_uses = zylith_core::renewal_child_uses_from_matched_witnesses(
+        &matched_order_witnesses,
     )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let renewal_child_uses =
-        zylith_core::renewal_child_uses_from_matched_witnesses(&matched_order_witnesses)
+    .map_err(|_| {
+        eprintln!("build_settlement_artifacts batch_id={batch_id} stage=renewal_child_uses failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let prior_consumed_inputs = prior_settlement_witnesses
+        .iter()
+        .flat_map(|witness| witness.consumed_inputs.iter().cloned())
+        .collect::<Vec<_>>();
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=nullifier_witnesses start prior_consumed={} consumed={}",
+        batch_id,
+        prior_consumed_inputs.len(),
+        consumed_inputs.len()
+    );
+    let (computed_prior_nullifier_root, new_nullifier_root, nullifier_sparse_witnesses) =
+        nullifier_sparse_update_witnesses_for_consumed_inputs(
+            &prior_consumed_inputs,
+            &consumed_inputs,
+        )
+        .map_err(|_| {
+            eprintln!(
+                "build_settlement_artifacts batch_id={batch_id} stage=nullifier_witnesses failed=derive"
+            );
+            StatusCode::CONFLICT
+        })?;
+    if computed_prior_nullifier_root
+        != normalize_felt_hex(&prior_roots.nullifier_root)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        eprintln!(
+            "build_settlement_artifacts batch_id={} stage=nullifier_witnesses failed=root_mismatch computed={} expected={}",
+            batch_id, computed_prior_nullifier_root, prior_roots.nullifier_root
+        );
+        return Err(StatusCode::CONFLICT);
+    }
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=nullifier_witnesses ok new_root={}",
+        batch_id, new_nullifier_root
+    );
+    let prior_renewal_entries = prior_settlement_witnesses
+        .iter()
+        .flat_map(|witness| {
+            witness
+                .renewal_child_uses
+                .iter()
+                .map(|renewal| renewal.child_nullifier.clone())
+        })
+        .collect::<Vec<_>>();
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=renewal_witnesses start prior_entries={} child_uses={}",
+        batch_id,
+        prior_renewal_entries.len(),
+        renewal_child_uses.len()
+    );
+    let (
+        computed_prior_renewal_root,
+        new_renewal_root,
+        renewal_child_sparse_witnesses,
+        renewal_cancel_sparse_witnesses,
+    ) = renewal_sparse_witnesses_for_child_uses(
+        &prior_renewal_entries,
+        &renewal_child_uses,
+        &matched_order_witnesses,
+    )
+    .map_err(|_| {
+        eprintln!(
+            "build_settlement_artifacts batch_id={batch_id} stage=renewal_witnesses failed=derive"
+        );
+        StatusCode::CONFLICT
+    })?;
+    if computed_prior_renewal_root
+        != normalize_felt_hex(&prior_roots.renewal_root)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        eprintln!(
+            "build_settlement_artifacts batch_id={} stage=renewal_witnesses failed=root_mismatch computed={} expected={}",
+            batch_id, computed_prior_renewal_root, prior_roots.renewal_root
+        );
+        return Err(StatusCode::CONFLICT);
+    }
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=renewal_witnesses ok new_root={}",
+        batch_id, new_renewal_root
+    );
+
+    let prior_note_root = if normalize_felt_hex(&prior_roots.note_root)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        == "0x0"
+        && !consumed_inputs.is_empty()
+    {
+        let note_commitments = consumed_inputs
+            .iter()
+            .map(|input| normalize_felt_hex(&input.note_commitment.0))
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        settlement_note_root_after_deposit_chain(&note_commitments)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        prior_roots.note_root.clone()
+    };
+    let prior_nullifier_root = prior_roots.nullifier_root.clone();
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=note_membership start consumed={} deposits={} transitions={}",
+        batch_id,
+        consumed_inputs.len(),
+        deposit_records.len(),
+        note_root_transitions.len()
+    );
+    let note_membership_witnesses = derive_deposit_note_membership_witnesses(
+        &prior_note_root,
+        &consumed_inputs,
+        &matched_order_witnesses,
+        deposit_records,
+        note_root_transitions,
+    )
+    .inspect_err(|status| {
+        eprintln!(
+            "build_settlement_artifacts batch_id={} stage=note_membership failed status={}",
+            batch_id, status
+        );
+    })?;
+    eprintln!(
+        "build_settlement_artifacts batch_id={} stage=note_membership ok witnesses={}",
+        batch_id,
+        note_membership_witnesses.len()
+    );
+
+    let fees = deterministic_protocol_fee_entries(
+        &fee_accumulator,
+        &base_asset,
+        &quote_asset,
+        protocol_fee_recipient,
+    );
 
     let transcript = SettlementTranscript {
         batch_id: BatchId(batch_id.into()),
@@ -2861,20 +5588,22 @@ fn build_settlement_artifacts(
         batch_epoch: batch.epoch_id,
         order_commitment_root: batch.order_commitment_root.clone(),
         encrypted_order_set_commitment: batch.encrypted_order_set_commitment.clone(),
+        prior_note_root: prior_note_root.clone(),
+        prior_nullifier_root: prior_nullifier_root.clone(),
+        prior_renewal_root: prior_roots.renewal_root.clone(),
+        prior_fee_root: prior_roots.fee_root.clone(),
+        new_nullifier_root: new_nullifier_root.clone(),
+        new_renewal_root: new_renewal_root.clone(),
         clearing_price,
         matched_orders,
         consumed_inputs,
         renewal_child_uses: renewal_child_uses.clone(),
-        fees: fee_accumulator
-            .into_iter()
-            .map(|(asset_id, amount)| FeeEntry {
-                asset_id: AssetId(asset_id),
-                amount,
-                recipient: PROTOCOL_FEE_RECIPIENT.into(),
-            })
-            .collect(),
+        fees,
         output_notes,
-        output_ciphertext_bundle_ref: output_bundle.bundle_commitment.clone(),
+        output_note_preimages: output_netting.note_preimages.clone(),
+        output_recovery_records: output_netting.recovery_records.clone(),
+        output_recovery_dummy_commitments: output_netting.recovery_dummy_commitments.clone(),
+        output_ciphertext_bundle_ref: output_netting.bundle.bundle_commitment.clone(),
     };
     let settlement_witness = SettlementWitness {
         batch_id: BatchId(batch_id.into()),
@@ -2885,21 +5614,37 @@ fn build_settlement_artifacts(
         transcript_commitment: settlement_transcript_commitment(&transcript)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         auction_verifier_address: "unbound".into(),
+        prior_note_root,
+        prior_nullifier_root: transcript.prior_nullifier_root.clone(),
+        prior_renewal_root: transcript.prior_renewal_root.clone(),
+        prior_fee_root: transcript.prior_fee_root.clone(),
+        new_nullifier_root: transcript.new_nullifier_root.clone(),
+        new_renewal_root: transcript.new_renewal_root.clone(),
         clearing_price,
         base_asset_id: base_asset,
         quote_asset_id: quote_asset,
         matched_orders: transcript.matched_orders.clone(),
         matched_order_witnesses,
         consumed_inputs: transcript.consumed_inputs.clone(),
+        note_membership_witnesses,
+        nullifier_history: Vec::new(),
+        nullifier_sparse_witnesses,
+        renewal_history: Vec::new(),
+        renewal_child_sparse_witnesses,
+        renewal_cancel_sparse_witnesses,
+        privacy_gate,
         renewal_child_uses,
         fees: transcript.fees.clone(),
         output_notes: transcript.output_notes.clone(),
+        output_note_preimages: transcript.output_note_preimages.clone(),
+        output_recovery_records: transcript.output_recovery_records.clone(),
+        output_recovery_dummy_commitments: transcript.output_recovery_dummy_commitments.clone(),
         output_ciphertext_bundle_ref: transcript.output_ciphertext_bundle_ref.clone(),
     };
 
     Ok(SettlementArtifacts {
         transcript,
-        output_bundle,
+        output_bundle: output_netting.bundle,
         settlement_witness,
         order_execution_reports,
     })
@@ -2931,6 +5676,38 @@ fn residual_for_fill(
                 .ok_or(StatusCode::CONFLICT)?,
         )),
     }
+}
+
+fn deterministic_protocol_fee_entries(
+    fee_accumulator: &BTreeMap<String, u128>,
+    base_asset: &AssetId,
+    quote_asset: &AssetId,
+    protocol_fee_recipient: &str,
+) -> Vec<FeeEntry> {
+    let mut fees = Vec::with_capacity(2);
+    if let Some(amount) = fee_accumulator
+        .get(&base_asset.0)
+        .copied()
+        .filter(|amount| *amount > 0)
+    {
+        fees.push(FeeEntry {
+            asset_id: base_asset.clone(),
+            amount,
+            recipient: protocol_fee_recipient.into(),
+        });
+    }
+    if let Some(amount) = fee_accumulator
+        .get(&quote_asset.0)
+        .copied()
+        .filter(|amount| *amount > 0)
+    {
+        fees.push(FeeEntry {
+            asset_id: quote_asset.clone(),
+            amount,
+            recipient: protocol_fee_recipient.into(),
+        });
+    }
+    fees
 }
 
 fn compute_fill_plan(records: &[DecryptedOrderRecord], clearing_price: u128) -> Vec<OrderFillPlan> {
@@ -3048,6 +5825,9 @@ fn greedy_fill_round(orders: &[OrderFillPlan]) -> Vec<OrderFillPlan> {
 }
 
 fn is_order_eligible(order: &OrderIntent, clearing_price: u128) -> bool {
+    if matches!(order.order_type, zylith_core::OrderType::HeartbeatCover) {
+        return false;
+    }
     if matches!(order.order_type, zylith_core::OrderType::MakerCurve) {
         return maker_curve_capacity_at_price(order, clearing_price) > 0;
     }
@@ -3059,6 +5839,12 @@ fn is_order_eligible(order: &OrderIntent, clearing_price: u128) -> bool {
 }
 
 fn max_fill_at_price(record: &DecryptedOrderRecord, clearing_price: u128) -> u128 {
+    if matches!(
+        record.order.order_type,
+        zylith_core::OrderType::HeartbeatCover
+    ) {
+        return 0;
+    }
     let is_maker_curve = matches!(record.order.order_type, zylith_core::OrderType::MakerCurve);
     let requested_amount = if is_maker_curve {
         maker_curve_capacity_at_price(&record.order, clearing_price)
@@ -3270,7 +6056,6 @@ fn load_starknet_executor_from_env(
                 }
             })
         })
-        .or_else(|| deployment_manifest.map(|manifest| manifest.contracts.auction_verifier.clone()))
         .unwrap_or_else(|| account_address.clone());
 
     Some(StarknetExecutorConfig {
@@ -3388,7 +6173,7 @@ async fn build_native_execution_request(
         .tip(0)
         .prepared()
         .map_err(|_| "failed to prepare native execution request".to_string())?
-        .get_invoke_request(false, mode == NativeTransactionMode::ProofOnly)
+        .get_invoke_request(false, false)
         .await
         .map_err(|error| format!("failed to build native execution request: {error}"))?;
     let transaction = serde_json::to_value(&invoke_request)
@@ -3412,7 +6197,7 @@ async fn prepare_native_execution_fields(
         &executor.private_key,
         "ZYLITH_STARKNET_PRIVATE_KEY",
     )?));
-    let account = SingleOwnerAccount::new(
+    let mut account = SingleOwnerAccount::new(
         provider,
         signer,
         parse_felt(
@@ -3423,12 +6208,15 @@ async fn prepare_native_execution_fields(
         ExecutionEncoding::New,
     );
     let settlement_call_contract = starknet_call_to_call(settlement_call)?;
-    let mut execution_context = fetch_native_gas_prices(account.provider()).await?;
+    let mut execution_context = fetch_native_execution_context(account.provider(), mode).await?;
     if mode == NativeTransactionMode::ProofOnly {
         execution_context.l1_gas_price = 0;
         execution_context.l2_gas_price = 0;
         execution_context.l1_data_gas_price = 0;
     }
+    account.set_block_id(native_block_id_to_starknet_block_id(
+        &execution_context.block_id,
+    )?);
     let nonce = account
         .get_nonce()
         .await
@@ -3496,6 +6284,12 @@ async fn build_native_resource_bounds(
         None
     };
 
+    let l2_gas_floor = if mode == NativeTransactionMode::ProofOnly {
+        DEFAULT_NATIVE_PROOF_ONLY_L2_GAS_FLOOR
+    } else {
+        DEFAULT_NATIVE_L2_GAS_FLOOR
+    };
+
     Ok(NativeResourceBounds {
         l1_gas: env_parse_optional(NATIVE_L1_GAS_MAX_AMOUNT_ENV).unwrap_or_else(|| {
             native_gas_amount_bound(
@@ -3512,7 +6306,7 @@ async fn build_native_resource_bounds(
                     .as_ref()
                     .map(|estimate| estimate.l2_gas_consumed)
                     .unwrap_or_default(),
-                DEFAULT_NATIVE_L2_GAS_FLOOR,
+                l2_gas_floor,
             )
         }),
         l1_data_gas: env_parse_optional(NATIVE_L1_DATA_GAS_MAX_AMOUNT_ENV).unwrap_or_else(|| {
@@ -3584,45 +6378,48 @@ fn native_block_id_to_starknet_block_id(block_id: &NativeBlockId) -> Result<Bloc
     }
 }
 
-async fn fetch_native_gas_prices(
+async fn fetch_native_execution_context(
     provider: &JsonRpcClient<HttpTransport>,
+    mode: NativeTransactionMode,
 ) -> Result<NativeExecutionContext, String> {
     let block = provider
         .get_block_with_tx_hashes(BlockId::Tag(BlockTag::Latest))
         .await
         .map_err(|error| format!("failed to fetch latest block gas prices: {error}"))?;
-    let block = match block {
-        MaybePreConfirmedBlockWithTxHashes::Block(block) => block,
-        MaybePreConfirmedBlockWithTxHashes::PreConfirmedBlock(pre_confirmed) => {
-            let Some(confirmed_block_number) = pre_confirmed.block_number.checked_sub(1) else {
-                return Err("pre-confirmed genesis block cannot be used for native proving".into());
-            };
-            match provider
-                .get_block_with_tx_hashes(BlockId::Number(confirmed_block_number))
-                .await
-                .map_err(|error| {
-                    format!(
-                        "failed to fetch confirmed block {confirmed_block_number} after pre-confirmed latest: {error}"
-                    )
-                })?
-            {
-                MaybePreConfirmedBlockWithTxHashes::Block(block) => block,
-                MaybePreConfirmedBlockWithTxHashes::PreConfirmedBlock(_) => {
-                    return Err(format!(
-                        "block {confirmed_block_number} is still pre-confirmed; confirmed block required for native proving"
-                    ));
-                }
-            }
+    let proving_blocks_back = env_parse_or_default(
+        NATIVE_PROVER_BLOCKS_BACK_ENV,
+        DEFAULT_NATIVE_PROVER_BLOCKS_BACK,
+    );
+    let proof_block_number = |block_number: u64| {
+        if mode == NativeTransactionMode::ProofOnly {
+            block_number.saturating_sub(proving_blocks_back)
+        } else {
+            block_number
         }
     };
-    Ok(NativeExecutionContext {
-        block_id: NativeBlockId::Number {
-            block_number: block.block_number,
-        },
-        l1_gas_price: native_gas_price_bound(block.l1_gas_price.price_in_fri)?,
-        l2_gas_price: native_gas_price_bound(block.l2_gas_price.price_in_fri)?,
-        l1_data_gas_price: native_gas_price_bound(block.l1_data_gas_price.price_in_fri)?,
-    })
+    match block {
+        MaybePreConfirmedBlockWithTxHashes::Block(block) => Ok(NativeExecutionContext {
+            block_id: NativeBlockId::Number {
+                block_number: proof_block_number(block.block_number),
+            },
+            l1_gas_price: native_gas_price_bound(block.l1_gas_price.price_in_fri)?,
+            l2_gas_price: native_gas_price_bound(block.l2_gas_price.price_in_fri)?,
+            l1_data_gas_price: native_gas_price_bound(block.l1_data_gas_price.price_in_fri)?,
+        }),
+        MaybePreConfirmedBlockWithTxHashes::PreConfirmedBlock(block) => {
+            // Starknet RPC `latest` is accepted state. Some providers omit newer confirmed-block
+            // header counters that starknet-rust 0.19 requires, which makes the untagged response
+            // deserialize as the pre-confirmed shape even when the raw block has ACCEPTED_ON_L2.
+            Ok(NativeExecutionContext {
+                block_id: NativeBlockId::Number {
+                    block_number: proof_block_number(block.block_number),
+                },
+                l1_gas_price: native_gas_price_bound(block.l1_gas_price.price_in_fri)?,
+                l2_gas_price: native_gas_price_bound(block.l2_gas_price.price_in_fri)?,
+                l1_data_gas_price: native_gas_price_bound(block.l1_data_gas_price.price_in_fri)?,
+            })
+        }
+    }
 }
 
 fn native_gas_price_bound(price: Felt) -> Result<u128, String> {
@@ -3746,7 +6543,9 @@ async fn submit_native_invoke_with_typed_sdk_retry(
         .iter()
         .map(|value| parse_felt(value, "proof_facts felt"))
         .collect::<Result<Vec<_>, _>>()?;
-    let prepared_invoke = account
+    let signature_binds_proof_facts =
+        env_bool_or_default(NATIVE_SIGNATURE_BINDS_PROOF_FACTS_ENV, true);
+    let mut execution = account
         .execute_v3(vec![starknet_call_to_call(settlement_call)?])
         .nonce(nonce)
         .l1_gas(resource_bounds.l1_gas)
@@ -3756,15 +6555,24 @@ async fn submit_native_invoke_with_typed_sdk_retry(
         .l1_data_gas(resource_bounds.l1_data_gas)
         .l1_data_gas_price(execution_context.l1_data_gas_price)
         .tip(0)
-        .proof(proof.to_owned())
-        .proof_facts(typed_proof_facts)
+        .proof(proof.to_owned());
+    if signature_binds_proof_facts {
+        execution = execution.proof_facts(typed_proof_facts.clone());
+    }
+    let prepared_invoke = execution
         .prepared()
         .map_err(|_| "failed to prepare typed native proof-bearing invoke".to_string())?;
     let expected_tx_hash = prepared_invoke.transaction_hash(false);
-    let invoke_request = prepared_invoke
+    let mut invoke_request = prepared_invoke
         .get_invoke_request(false, false)
         .await
         .map_err(|error| format!("failed to build typed native proof-bearing invoke: {error}"))?;
+    if !signature_binds_proof_facts {
+        // Non-proof-aware RPC debugging path: some providers accept the extra JSON field but do
+        // not propagate it into `tx_info.proof_facts`. Keep this opt-in only; production proof
+        // submission must bind facts in the signed transaction hash.
+        invoke_request.broadcasted_invoke_txn_v3.proof_facts = Some(typed_proof_facts);
+    }
 
     let attempts = env_parse_or_default(
         NATIVE_PROOF_FACTS_SUBMIT_RETRY_ATTEMPTS_ENV,
@@ -4329,18 +7137,27 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecryptedOrderRecord, NativeBlockId, NativeExecutionRequestRecord, NativeProverParams,
-        NativeProverRpcRequest, artifact_id_for, build_batch_liquidity_report,
-        compute_candidate_clearing_price, matched_participant_count,
-        max_single_order_fill_share_bps, native_fee_estimate_requires_proof_facts,
+        DEFAULT_PROTOCOL_FEE_BPS, DEFAULT_PROTOCOL_FEE_RECIPIENT, DecryptedOrderRecord,
+        NativeBlockId, NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
+        SettlementBuildContext, SettlementRoots, artifact_id_for, build_batch_liquidity_report,
+        build_native_proof_program_calldata, build_settlement_artifacts,
+        compute_candidate_clearing_price, decode_bhttp_response,
+        deterministic_settlement_submission_jitter_ms, eligible_order_count,
+        encode_bhttp_json_post, matched_maker_participant_count, matched_participant_count,
+        max_maker_fill_share_bps, max_single_order_fill_share_bps, max_single_owner_fill_share_bps,
+        native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission,
-        native_invoke_error_is_retryable_proof_facts_delay, redact_native_execution_request,
-        redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
-        storage_key,
+        native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
+        redact_native_execution_request, redact_native_prover_request,
+        resolve_batch_registrar_private_key, same_starknet_address, storage_key,
+        validate_batch_nullifier_freshness,
     };
     use zylith_core::{
-        AssetId, BatchId, MatchedOrder, Note, NoteCommitment, Nullifier, OrderIntent, OrderSide,
-        OrderType, PairId, SpendAuthorization, TimeInForce,
+        AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, MatchedOrder, Note,
+        NoteCommitment, Nullifier, NullifierHistoryBatch, OrderIntent, OrderSide, OrderType,
+        PairId, ProductConfig, SettlementWitness, SpendAuthorization, TimeInForce,
+        hash::ordered_felt_list_commitment, note_recognition_public_key_from_raw_key_hex,
+        settlement_nullifier_root_after_history,
     };
 
     #[test]
@@ -4385,6 +7202,92 @@ mod tests {
             redacted.transaction["signature"],
             serde_json::json!(["0xa", "0xb"])
         );
+    }
+
+    #[test]
+    fn ohttp_key_config_hex_accepts_prefixed_and_plain_values() {
+        assert_eq!(
+            parse_ohttp_key_config_hex("0x000102ff").expect("prefixed key config"),
+            vec![0x00, 0x01, 0x02, 0xff]
+        );
+        assert_eq!(
+            parse_ohttp_key_config_hex("000102ff").expect("plain key config"),
+            vec![0x00, 0x01, 0x02, 0xff]
+        );
+
+        assert!(parse_ohttp_key_config_hex("0x").is_err());
+        assert!(parse_ohttp_key_config_hex("not-hex").is_err());
+    }
+
+    #[test]
+    fn ohttp_bhttp_helpers_round_trip_json_request_response() {
+        let server_config = ohttp::KeyConfig::new(
+            1,
+            ohttp::hpke::Kem::X25519Sha256,
+            vec![ohttp::SymmetricSuite::new(
+                ohttp::hpke::Kdf::HkdfSha256,
+                ohttp::hpke::Aead::Aes128Gcm,
+            )],
+        )
+        .expect("server key config");
+        let encoded_config =
+            ohttp::KeyConfig::encode_list(&[&server_config]).expect("encoded key config list");
+        let client =
+            ohttp::ClientRequest::from_encoded_config_list(&encoded_config).expect("ohttp client");
+        let request_body = br#"{"jsonrpc":"2.0","method":"starknet_proveTransaction"}"#;
+        let bhttp_request = encode_bhttp_json_post(request_body).expect("bhttp request");
+        let (encrypted_request, client_response) = client
+            .encapsulate(&bhttp_request)
+            .expect("encrypted request");
+        assert_ne!(encrypted_request, bhttp_request);
+
+        let server = ohttp::Server::new(server_config).expect("ohttp server");
+        let (inner_request, server_response) = server
+            .decapsulate(&encrypted_request)
+            .expect("decrypted request");
+        let mut request_cursor = std::io::Cursor::new(inner_request);
+        let decoded_request =
+            bhttp::Message::read_bhttp(&mut request_cursor).expect("decoded bhttp request");
+        assert_eq!(decoded_request.control().method(), Some(&b"POST"[..]));
+        assert_eq!(decoded_request.control().path(), Some(&b"/"[..]));
+        assert_eq!(decoded_request.content(), request_body);
+
+        let response_body = br#"{"jsonrpc":"2.0","id":1,"result":{"proof":[]}}"#;
+        let mut response = bhttp::Message::response(bhttp::StatusCode::OK);
+        response.put_header(b"content-type".to_vec(), b"application/json".to_vec());
+        response.write_content(response_body);
+        let mut encoded_response = Vec::new();
+        response
+            .write_bhttp(bhttp::Mode::KnownLength, &mut encoded_response)
+            .expect("encoded bhttp response");
+        let encrypted_response = server_response
+            .encapsulate(&encoded_response)
+            .expect("encrypted response");
+        let decrypted_response = client_response
+            .decapsulate(&encrypted_response)
+            .expect("decrypted response");
+        let (status, body) =
+            decode_bhttp_response(&decrypted_response).expect("decoded bhttp response");
+
+        assert_eq!(status, 200);
+        assert_eq!(body, response_body);
+    }
+
+    #[test]
+    fn native_proof_program_calldata_prefixes_verifier_address() {
+        let calldata =
+            build_native_proof_program_calldata("0x123", &["0x2".into(), "0xabc".into()])
+                .expect("proof calldata");
+
+        assert_eq!(calldata, vec!["0x123", "0x2", "0xabc"]);
+    }
+
+    #[test]
+    fn native_proof_program_calldata_rejects_zero_verifier_address() {
+        let error = build_native_proof_program_calldata("0x0", &["0x1".into()])
+            .expect_err("zero verifier must fail");
+
+        assert!(error.contains("auction_verifier_address"));
     }
 
     #[test]
@@ -4588,6 +7491,212 @@ mod tests {
     }
 
     #[test]
+    fn no_cross_artifacts_use_candidate_clearing_price_for_noop_proof() {
+        let product_config = ProductConfig::default_v1();
+        let pair_id = PairId("STRK/USDC".into());
+        let pair = product_config
+            .enabled_pair(&pair_id)
+            .expect("enabled pair")
+            .clone();
+        let records = vec![
+            valid_test_record(
+                0,
+                OrderSide::Buy,
+                1,
+                2,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                20,
+            ),
+            valid_test_record(
+                1,
+                OrderSide::Sell,
+                5,
+                2,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                2,
+            ),
+        ];
+        let order_commitments = records
+            .iter()
+            .map(|record| record.order_commitment.0.clone())
+            .collect::<Vec<_>>();
+        let batch = BatchSummary {
+            batch_id: BatchId("batch-strk-usdc-1".into()),
+            pair_id,
+            epoch_id: 1,
+            close_time_unix_ms: 0,
+            status: BatchStatus::Closed,
+            order_count: records.len() as u64,
+            order_commitment_root: ordered_felt_list_commitment(
+                "zylith/batch-order-root",
+                &order_commitments,
+            )
+            .expect("order root"),
+            encrypted_order_set_commitment: "0x222".into(),
+        };
+
+        let artifacts = build_settlement_artifacts(
+            &batch.batch_id.0,
+            &batch,
+            &pair,
+            &records,
+            SettlementBuildContext {
+                product_config: &product_config,
+                prior_roots: &SettlementRoots::zero(),
+                deposit_records: &[],
+                note_root_transitions: &[],
+                prior_settlement_witnesses: &[],
+                privacy_gate: Default::default(),
+                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
+            },
+        )
+        .expect("no-cross artifacts");
+
+        assert_eq!(compute_candidate_clearing_price(&records).unwrap(), Some(1));
+        assert_eq!(artifacts.transcript.clearing_price, 1);
+        assert!(artifacts.transcript.matched_orders.is_empty());
+        assert!(artifacts.transcript.consumed_inputs.is_empty());
+        assert!(artifacts.transcript.output_notes.is_empty());
+        assert!(artifacts.transcript.fees.is_empty());
+        assert_eq!(artifacts.output_bundle.padded_ciphertext_count, 4);
+        assert_eq!(artifacts.output_bundle.ciphertext_count_bucket, "0-4");
+    }
+
+    #[test]
+    fn settlement_artifacts_net_outputs_across_orders_for_same_recipient() {
+        let product_config = ProductConfig::default_v1();
+        let pair_id = PairId("STRK/USDC".into());
+        let pair = product_config
+            .enabled_pair(&pair_id)
+            .expect("enabled pair")
+            .clone();
+        let mut records = vec![
+            valid_test_record(
+                0,
+                OrderSide::Buy,
+                10,
+                10,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                100,
+            ),
+            valid_test_record(
+                1,
+                OrderSide::Buy,
+                10,
+                10,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                100,
+            ),
+            valid_test_record(
+                2,
+                OrderSide::Sell,
+                10,
+                10,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                10,
+            ),
+            valid_test_record(
+                3,
+                OrderSide::Sell,
+                10,
+                10,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                10,
+            ),
+        ];
+        let buyer_owner_public_key = note_recognition_public_key_from_raw_key_hex(&"11".repeat(32))
+            .expect("buyer owner public key");
+        let seller_owner_public_key =
+            note_recognition_public_key_from_raw_key_hex(&"22".repeat(32))
+                .expect("seller owner public key");
+        for index in [0_usize, 1] {
+            records[index].order.recipient_owner_public_key = buyer_owner_public_key.clone();
+            records[index].order_commitment = records[index]
+                .order
+                .commitment()
+                .expect("buy order commitment");
+        }
+        for index in [2_usize, 3] {
+            records[index].order.recipient_owner_public_key = seller_owner_public_key.clone();
+            records[index].order_commitment = records[index]
+                .order
+                .commitment()
+                .expect("sell order commitment");
+        }
+        let order_commitments = records
+            .iter()
+            .map(|record| record.order_commitment.0.clone())
+            .collect::<Vec<_>>();
+        let batch = BatchSummary {
+            batch_id: BatchId("batch-strk-usdc-1".into()),
+            pair_id,
+            epoch_id: 1,
+            close_time_unix_ms: 0,
+            status: BatchStatus::Closed,
+            order_count: records.len() as u64,
+            order_commitment_root: ordered_felt_list_commitment(
+                "zylith/batch-order-root",
+                &order_commitments,
+            )
+            .expect("order root"),
+            encrypted_order_set_commitment: "0x222".into(),
+        };
+
+        let artifacts = build_settlement_artifacts(
+            &batch.batch_id.0,
+            &batch,
+            &pair,
+            &records,
+            SettlementBuildContext {
+                product_config: &product_config,
+                prior_roots: &SettlementRoots::zero(),
+                deposit_records: &[],
+                note_root_transitions: &[],
+                prior_settlement_witnesses: &[],
+                privacy_gate: Default::default(),
+                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
+            },
+        )
+        .expect("netted artifacts");
+
+        assert_eq!(artifacts.transcript.matched_orders.len(), 4);
+        assert_eq!(artifacts.transcript.output_notes.len(), 2);
+        assert_eq!(artifacts.output_bundle.ciphertext_count_bucket, "0-4");
+        let buy_output = artifacts
+            .transcript
+            .output_notes
+            .iter()
+            .find(|note| note.asset_id.0 == "STRK")
+            .expect("netted buy output");
+        let sell_output = artifacts
+            .transcript
+            .output_notes
+            .iter()
+            .find(|note| note.asset_id.0 == "USDC")
+            .expect("netted sell output");
+        assert_eq!(buy_output.amount, 20);
+        assert_eq!(sell_output.amount, 200);
+        assert_eq!(
+            artifacts.settlement_witness.matched_order_witnesses[0]
+                .output_note
+                .commitment()
+                .expect("buy output commitment"),
+            artifacts.settlement_witness.matched_order_witnesses[1]
+                .output_note
+                .commitment()
+                .expect("buy output commitment"),
+        );
+    }
+
+    #[test]
     fn participant_threshold_counts_distinct_matched_owners() {
         let mut records = vec![
             test_record(
@@ -4632,6 +7741,61 @@ mod tests {
     }
 
     #[test]
+    fn nullifier_freshness_rejects_current_batch_duplicates() {
+        let mut records = vec![
+            test_record(
+                0,
+                OrderSide::Buy,
+                10,
+                2,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                20,
+            ),
+            test_record(
+                1,
+                OrderSide::Sell,
+                5,
+                1,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                1,
+            ),
+        ];
+        records[1].order.funding_nullifier = records[0].order.funding_nullifier.clone();
+        let historical = Vec::<SettlementWitness>::new();
+
+        let error =
+            validate_batch_nullifier_freshness("batch-strk-usdc-1", &records, historical.iter())
+                .expect_err("duplicate current nullifier rejected");
+
+        assert!(error.contains("duplicate funding nullifier"));
+    }
+
+    #[test]
+    fn nullifier_freshness_rejects_historical_replay() {
+        let records = vec![test_record(
+            0,
+            OrderSide::Buy,
+            10,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        )];
+        let historical = [historical_witness_with_nullifier(
+            "batch-strk-usdc-0",
+            records[0].order.funding_nullifier.clone(),
+        )];
+
+        let error =
+            validate_batch_nullifier_freshness("batch-strk-usdc-1", &records, historical.iter())
+                .expect_err("historical nullifier rejected");
+
+        assert!(error.contains("already reserved"));
+    }
+
+    #[test]
     fn dominance_gate_measures_largest_single_order_fill_share() {
         let matched_orders = vec![
             MatchedOrder {
@@ -4648,6 +7812,246 @@ mod tests {
             max_single_order_fill_share_bps(&matched_orders, 100).expect("dominance bps"),
             8000
         );
+    }
+
+    #[test]
+    fn maker_dominance_gate_only_counts_maker_curve_fills() {
+        let mut maker = test_record(
+            0,
+            OrderSide::Sell,
+            5,
+            80,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            80,
+        );
+        maker.order.order_type = OrderType::MakerCurve;
+        let taker = test_record(
+            1,
+            OrderSide::Buy,
+            5,
+            20,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            100,
+        );
+        let matched_orders = vec![
+            MatchedOrder {
+                order_commitment: maker.order_commitment.clone(),
+                filled_amount: 80,
+            },
+            MatchedOrder {
+                order_commitment: taker.order_commitment.clone(),
+                filled_amount: 20,
+            },
+        ];
+
+        assert_eq!(
+            max_maker_fill_share_bps(&[maker, taker], &matched_orders, 100)
+                .expect("maker dominance bps"),
+            8000
+        );
+    }
+
+    #[test]
+    fn eligible_order_gate_counts_orders_executable_at_price() {
+        let buy = test_record(
+            0,
+            OrderSide::Buy,
+            10,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        let sell = test_record(
+            1,
+            OrderSide::Sell,
+            5,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        let out_of_band = test_record(
+            2,
+            OrderSide::Buy,
+            1,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+
+        assert_eq!(eligible_order_count(&[buy, sell, out_of_band], 5), 2);
+    }
+
+    #[test]
+    fn owner_dominance_gate_aggregates_split_orders() {
+        let first = test_record(
+            0,
+            OrderSide::Buy,
+            10,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        let mut second = test_record(
+            1,
+            OrderSide::Buy,
+            10,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        second.funding_note.owner_public_key = first.funding_note.owner_public_key.clone();
+        let mut third = test_record(
+            2,
+            OrderSide::Sell,
+            5,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        third.funding_note.owner_public_key = "cd".repeat(32);
+        let matched_orders = vec![
+            MatchedOrder {
+                order_commitment: first.order_commitment.clone(),
+                filled_amount: 40,
+            },
+            MatchedOrder {
+                order_commitment: second.order_commitment.clone(),
+                filled_amount: 35,
+            },
+            MatchedOrder {
+                order_commitment: third.order_commitment.clone(),
+                filled_amount: 25,
+            },
+        ];
+
+        assert_eq!(
+            max_single_owner_fill_share_bps(&[first, second, third], &matched_orders, 100)
+                .expect("owner dominance bps"),
+            7500
+        );
+    }
+
+    #[test]
+    fn maker_participant_count_uses_distinct_matched_maker_owners() {
+        let mut first = test_record(
+            0,
+            OrderSide::Sell,
+            5,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        first.order.order_type = OrderType::MakerCurve;
+        let mut second = test_record(
+            1,
+            OrderSide::Sell,
+            5,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        second.order.order_type = OrderType::MakerCurve;
+        second.funding_note.owner_public_key = "cd".repeat(32);
+        let taker = test_record(
+            2,
+            OrderSide::Buy,
+            10,
+            2,
+            1,
+            TimeInForce::CurrentBatchOnly,
+            20,
+        );
+        let matched_orders = vec![
+            MatchedOrder {
+                order_commitment: first.order_commitment.clone(),
+                filled_amount: 25,
+            },
+            MatchedOrder {
+                order_commitment: second.order_commitment.clone(),
+                filled_amount: 25,
+            },
+            MatchedOrder {
+                order_commitment: taker.order_commitment.clone(),
+                filled_amount: 50,
+            },
+        ];
+
+        assert_eq!(
+            matched_maker_participant_count(&[first, second, taker], &matched_orders),
+            2
+        );
+    }
+
+    #[test]
+    fn settlement_submission_jitter_is_batch_bound_and_capped() {
+        let same = deterministic_settlement_submission_jitter_ms("batch-strk-usdc-1", 1_000);
+        assert_eq!(
+            same,
+            deterministic_settlement_submission_jitter_ms("batch-strk-usdc-1", 1_000)
+        );
+        assert!(same <= 1_000);
+        assert_eq!(
+            deterministic_settlement_submission_jitter_ms("batch-strk-usdc-1", 0),
+            0
+        );
+    }
+
+    fn historical_witness_with_nullifier(
+        batch_id: &str,
+        nullifier: Nullifier,
+    ) -> SettlementWitness {
+        SettlementWitness {
+            batch_id: BatchId(batch_id.into()),
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 1,
+            order_commitment_root: "0x111".into(),
+            encrypted_order_set_commitment: "0x222".into(),
+            transcript_commitment: "0x333".into(),
+            auction_verifier_address: "0x444".into(),
+            prior_note_root: "0x0".into(),
+            prior_nullifier_root: "0x0".into(),
+            prior_renewal_root: "0x0".into(),
+            prior_fee_root: "0x0".into(),
+            new_nullifier_root: settlement_nullifier_root_after_history(&[NullifierHistoryBatch {
+                repeat_count: 1,
+                nullifiers: vec![nullifier.clone()],
+            }])
+            .expect("sparse nullifier root"),
+            new_renewal_root: "0x0".into(),
+            clearing_price: 1,
+            base_asset_id: AssetId("STRK".into()),
+            quote_asset_id: AssetId("USDC".into()),
+            matched_orders: vec![],
+            matched_order_witnesses: vec![],
+            consumed_inputs: vec![ConsumedInput {
+                note_commitment: NoteCommitment("0xabc".into()),
+                nullifier,
+            }],
+            note_membership_witnesses: vec![],
+            nullifier_history: vec![],
+            nullifier_sparse_witnesses: vec![],
+            renewal_history: vec![],
+            renewal_child_sparse_witnesses: vec![],
+            renewal_cancel_sparse_witnesses: vec![],
+            privacy_gate: Default::default(),
+            renewal_child_uses: vec![],
+            fees: vec![],
+            output_notes: vec![],
+            output_note_preimages: vec![],
+            output_recovery_records: vec![],
+            output_recovery_dummy_commitments: vec![],
+            output_ciphertext_bundle_ref: "bundle".into(),
+        }
     }
 
     fn test_record(
@@ -4673,6 +8077,9 @@ mod tests {
             nonce: index,
             metadata_commitment: format!("0x{:x}", 0x200 + index),
         };
+        let recipient_owner_public_key =
+            note_recognition_public_key_from_raw_key_hex(&format!("{:064x}", 0xcd_u64 + index))
+                .expect("test recipient owner public key");
         let order = OrderIntent {
             pair_id: PairId("STRK/USDC".into()),
             batch_id: BatchId("batch-strk-usdc-1".into()),
@@ -4692,7 +8099,7 @@ mod tests {
             parent_authorization_secret: "0x0".into(),
             funding_note_ref: NoteCommitment(format!("0x{:x}", 0x300 + index)),
             funding_nullifier: Nullifier(format!("0x{:x}", 0x400 + index)),
-            recipient_owner_public_key: "cd".repeat(32),
+            recipient_owner_public_key,
             recipient_spend_authority: "0x789".into(),
             recipient_withdraw_authority: "0xabc".into(),
             recipient_residual_withdraw_authority: "0xabd".into(),
@@ -4707,5 +8114,31 @@ mod tests {
                 signature_s: "0x2".into(),
             },
         }
+    }
+
+    fn valid_test_record(
+        index: u64,
+        side: OrderSide,
+        limit_price: u128,
+        amount: u128,
+        min_fill: u128,
+        time_in_force: TimeInForce,
+        funding_amount: u128,
+    ) -> DecryptedOrderRecord {
+        let mut record = test_record(
+            index,
+            side,
+            limit_price,
+            amount,
+            min_fill,
+            time_in_force,
+            funding_amount,
+        );
+        record.order.funding_note_ref = record
+            .funding_note
+            .commitment()
+            .expect("funding note commitment");
+        record.order_commitment = record.order.commitment().expect("order commitment");
+        record
     }
 }

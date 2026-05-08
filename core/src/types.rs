@@ -1,7 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use starknet_crypto::get_public_key;
+use starknet_crypto::poseidon_hash;
 
 use crate::{
     ProtocolError,
@@ -11,6 +14,23 @@ use crate::{
     },
     keys::UserKeys,
 };
+
+pub const NOTE_RECOGNITION_ALGORITHM: &str =
+    "ecdh-p256+hkdf-sha256+aes-256-gcm/note-recognition-v2";
+pub const OUTPUT_NOTE_PLAINTEXT_PADDED_LEN: usize = 4096;
+pub const OUTPUT_NOTE_CIPHERTEXT_LEN: usize = OUTPUT_NOTE_PLAINTEXT_PADDED_LEN + 16;
+pub const OUTPUT_RECOVERY_FIELD_COUNT: usize = 21;
+pub const OUTPUT_RECOVERY_PROOF_SLOTS: usize = 4;
+const OUTPUT_RECOVERY_BUNDLE_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f62756e646c655f7631";
+const OUTPUT_RECOVERY_RECORD_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f7265635f7631";
+const RENEWAL_CHILD_NULLIFIER_DOMAIN_HEX: &str =
+    "0x362b534b676bb36e394d08e276c8e64e65e3733e5d517a7eb6f438eafe54b61";
+const RENEWAL_PARENT_SECRET_DOMAIN_HEX: &str =
+    "0x7d7cdc3705c6b67855258ca803ee7b93dd4092346289da942f337b30d857667";
+const RENEWAL_PARENT_DOMAIN_HEX: &str =
+    "0x3c16da1b34d6fcc6f6ea27674de3b6cead275b20c1dfafa4abb43515a8974b4";
+const RENEWAL_PARENT_CANCEL_DOMAIN_HEX: &str =
+    "0x26f84b60309c08d4030876815edb467f89f78e5a5f62823af4521f1be502ca3";
 
 mod serde_u128_decimal {
     use std::fmt;
@@ -55,21 +75,7 @@ mod serde_u128_decimal {
         type Value = u128;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a u128 decimal string or unsigned JSON integer")
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.into())
-        }
-
-        fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value)
+            formatter.write_str("a u128 decimal string")
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -93,7 +99,7 @@ mod serde_u128_decimal {
         type Value = Option<u128>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("null or a u128 decimal string/unsigned JSON integer")
+            formatter.write_str("null or a u128 decimal string")
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -166,6 +172,7 @@ pub enum OrderType {
     #[default]
     LimitBatch,
     MakerCurve,
+    HeartbeatCover,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,15 +295,8 @@ impl Note {
                 "note spend authority does not match supplied spend key".into(),
             ));
         }
-        let note_commitment = felt_from_hex_str(&self.commitment()?.0)?;
-        let spend_auth_key = felt_from_hex_str(&spend_auth_key_felt_from_raw_key_hex(
-            &hex::encode(keys.spend_auth_key),
-        ))?;
-
-        Ok(Nullifier(poseidon_chain_hex(
-            domain_felt("zylith/nullifier"),
-            &[note_commitment, spend_auth_key],
-        )))
+        let note_commitment = self.commitment()?;
+        nullifier_from_spend_authority(&note_commitment, &self.spend_authority)
     }
 }
 
@@ -321,11 +321,19 @@ pub fn nullifier_from_spend_auth_key_felt(
     note_commitment: &NoteCommitment,
     spend_auth_key_felt: &str,
 ) -> Result<Nullifier, ProtocolError> {
+    let spend_authority = spend_authority_from_spend_auth_key_felt(spend_auth_key_felt)?;
+    nullifier_from_spend_authority(note_commitment, &spend_authority)
+}
+
+pub fn nullifier_from_spend_authority(
+    note_commitment: &NoteCommitment,
+    spend_authority: &str,
+) -> Result<Nullifier, ProtocolError> {
     let note_commitment = felt_from_hex_str(&note_commitment.0)?;
-    let spend_auth_key = felt_from_hex_str(spend_auth_key_felt)?;
+    let spend_authority = felt_from_hex_str(spend_authority)?;
     Ok(Nullifier(poseidon_chain_hex(
         domain_felt("zylith/nullifier"),
-        &[note_commitment, spend_auth_key],
+        &[note_commitment, spend_authority],
     )))
 }
 
@@ -334,7 +342,7 @@ pub fn renewal_parent_secret_commitment(
 ) -> Result<String, ProtocolError> {
     let parent_authorization_secret = felt_from_hex_str(parent_authorization_secret)?;
     Ok(poseidon_chain_hex(
-        domain_felt("zylith/renewal-parent-secret"),
+        felt_from_hex_str(RENEWAL_PARENT_SECRET_DOMAIN_HEX)?,
         &[parent_authorization_secret],
     ))
 }
@@ -346,7 +354,7 @@ pub fn renewal_parent_commitment(
     let parent_secret_commitment = felt_from_hex_str(parent_secret_commitment)?;
     let parent_cancel_authority = felt_from_hex_str(parent_cancel_authority)?;
     Ok(poseidon_chain_hex(
-        domain_felt("zylith/renewal-parent"),
+        felt_from_hex_str(RENEWAL_PARENT_DOMAIN_HEX)?,
         &[parent_secret_commitment, parent_cancel_authority],
     ))
 }
@@ -374,13 +382,46 @@ pub fn renewal_child_nullifier(
         ));
     }
     Ok(poseidon_chain_hex(
-        domain_felt("zylith/renewal-child-nullifier"),
+        felt_from_hex_str(RENEWAL_CHILD_NULLIFIER_DOMAIN_HEX)?,
         &[
             parent_order_commitment,
             field_from_u64(parent_child_index),
             parent_authorization_secret,
         ],
     ))
+}
+
+pub fn renewal_parent_cancel_marker(
+    parent_secret_commitment: &str,
+    parent_cancel_authority: &str,
+) -> Result<String, ProtocolError> {
+    let parent_secret_commitment = felt_from_hex_str(parent_secret_commitment)?;
+    let parent_cancel_authority = felt_from_hex_str(parent_cancel_authority)?;
+    Ok(poseidon_chain_hex(
+        felt_from_hex_str(RENEWAL_PARENT_CANCEL_DOMAIN_HEX)?,
+        &[parent_secret_commitment, parent_cancel_authority],
+    ))
+}
+
+pub fn renewal_cancel_auth_key_felt_from_raw_key_hex(order_cancellation_key_hex: &str) -> String {
+    encode_starknet_felt("renewal-cancel-auth-key", order_cancellation_key_hex)
+}
+
+pub fn renewal_cancel_authority_from_renewal_cancel_auth_key_felt(
+    renewal_cancel_auth_key_felt: &str,
+) -> Result<String, ProtocolError> {
+    let renewal_cancel_auth_key = felt_from_hex_str(renewal_cancel_auth_key_felt)?;
+    Ok(crate::hash::felt_hex(&get_public_key(
+        &renewal_cancel_auth_key,
+    )))
+}
+
+pub fn renewal_cancel_authority_from_raw_key_hex(
+    order_cancellation_key_hex: &str,
+) -> Result<String, ProtocolError> {
+    renewal_cancel_authority_from_renewal_cancel_auth_key_felt(
+        &renewal_cancel_auth_key_felt_from_raw_key_hex(order_cancellation_key_hex),
+    )
 }
 
 pub fn withdraw_auth_key_felt_from_raw_key_hex(withdraw_auth_key_hex: &str) -> String {
@@ -463,6 +504,7 @@ impl OrderIntent {
         let order_type = match self.order_type {
             OrderType::LimitBatch => field_from_u64(0),
             OrderType::MakerCurve => field_from_u64(1),
+            OrderType::HeartbeatCover => field_from_u64(2),
         };
         let maker_curve_commitment = match self.order_type {
             OrderType::MakerCurve => {
@@ -605,12 +647,22 @@ pub struct SpendAuthorization {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputRecoveryRecord {
+    pub key_tag: String,
+    pub ciphertext_fields: Vec<String>,
+    pub auth_tag: String,
+    pub commitment: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedBlob {
     pub algorithm: String,
     pub key_id: String,
     pub ephemeral_public_key: String,
     pub nonce: String,
     pub ciphertext: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<OutputRecoveryRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,12 +711,16 @@ fn zero_felt_string() -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedOrderIngressRequest {
     pub order_submission: OrderSubmission,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedOrderIngressResponse {
     pub receipt: OrderIngressReceipt,
     pub coordinator_submission: OrderSubmission,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,6 +814,16 @@ pub struct BatchSummary {
     pub order_count: u64,
     pub order_commitment_root: String,
     pub encrypted_order_set_commitment: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicBatchSummary {
+    pub batch_id: BatchId,
+    pub pair_id: PairId,
+    pub epoch_id: u64,
+    pub close_time_unix_ms: u64,
+    pub status: BatchStatus,
+    pub order_count_bucket: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -890,10 +956,24 @@ pub struct OutputNoteRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedOutputNotePayload {
+    pub version: u32,
+    pub batch_id: BatchId,
+    pub output_index: u64,
+    pub note: Note,
+    pub output_note: OutputNoteRecord,
+    pub output_proof: OutputNoteMerkleProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputCiphertextBundle {
     pub batch_id: BatchId,
     pub bundle_commitment: String,
     pub data_availability_ref: String,
+    #[serde(default)]
+    pub ciphertext_count_bucket: String,
+    #[serde(default)]
+    pub padded_ciphertext_count: u64,
     pub ciphertexts: Vec<EncryptedBlob>,
 }
 
@@ -901,16 +981,157 @@ impl OutputCiphertextBundle {
     pub fn from_ciphertexts(
         batch_id: BatchId,
         data_availability_ref: impl Into<String>,
-        ciphertexts: Vec<EncryptedBlob>,
+        mut ciphertexts: Vec<EncryptedBlob>,
     ) -> Result<Self, ProtocolError> {
-        let bundle_commitment = tagged_commitment_sha256("zylith/output-bundle", &ciphertexts)?;
+        let original_ciphertext_count = ciphertexts.len();
+        let padded_ciphertext_count = output_bundle_bucket_size(original_ciphertext_count);
+        for index in ciphertexts.len()..padded_ciphertext_count {
+            ciphertexts.push(dummy_output_ciphertext(&batch_id, index)?);
+        }
+        let bundle_commitment = match output_recovery_bundle_root_from_ciphertexts(&ciphertexts)? {
+            Some(root) => root,
+            None => tagged_commitment_sha256("zylith/output-bundle", &ciphertexts)?,
+        };
         Ok(Self {
             batch_id,
             bundle_commitment,
             data_availability_ref: data_availability_ref.into(),
+            ciphertext_count_bucket: output_bundle_count_bucket_label(original_ciphertext_count),
+            padded_ciphertext_count: padded_ciphertext_count as u64,
             ciphertexts,
         })
     }
+}
+
+pub fn output_recovery_bundle_root_from_ciphertexts(
+    ciphertexts: &[EncryptedBlob],
+) -> Result<Option<String>, ProtocolError> {
+    let mut commitments = Vec::with_capacity(ciphertexts.len());
+    for ciphertext in ciphertexts {
+        let Some(recovery) = ciphertext.recovery.as_ref() else {
+            return Ok(None);
+        };
+        let recomputed = output_recovery_record_commitment(recovery)?;
+        if felt_from_hex_str(&recomputed)? != felt_from_hex_str(&recovery.commitment)? {
+            return Err(ProtocolError::Crypto(
+                "output recovery record commitment mismatch".into(),
+            ));
+        }
+        commitments.push(recovery.commitment.clone());
+    }
+    Ok(Some(output_recovery_bundle_root(&commitments)?))
+}
+
+pub fn output_recovery_bundle_root(commitments: &[String]) -> Result<String, ProtocolError> {
+    let mut state = felt_from_hex_str(OUTPUT_RECOVERY_BUNDLE_DOMAIN_HEX)?;
+    for commitment in commitments {
+        state = poseidon_hash(state, felt_from_hex_str(commitment)?);
+    }
+    Ok(crate::hash::felt_hex(&poseidon_hash(
+        state,
+        field_from_u64(commitments.len() as u64),
+    )))
+}
+
+pub fn output_recovery_record_commitment(
+    record: &OutputRecoveryRecord,
+) -> Result<String, ProtocolError> {
+    if record.ciphertext_fields.len() != OUTPUT_RECOVERY_FIELD_COUNT {
+        return Err(ProtocolError::Crypto(format!(
+            "output recovery record must have {OUTPUT_RECOVERY_FIELD_COUNT} fields"
+        )));
+    }
+    let mut state = felt_from_hex_str(OUTPUT_RECOVERY_RECORD_DOMAIN_HEX)?;
+    state = poseidon_hash(state, felt_from_hex_str(&record.key_tag)?);
+    state = poseidon_hash(state, felt_from_hex_str(&record.auth_tag)?);
+    for field in &record.ciphertext_fields {
+        state = poseidon_hash(state, felt_from_hex_str(field)?);
+    }
+    Ok(crate::hash::felt_hex(&state))
+}
+
+pub fn output_bundle_count_bucket_label(count: usize) -> String {
+    match count {
+        0..=4 => "0-4".into(),
+        5..=8 => "5-8".into(),
+        9..=16 => "9-16".into(),
+        17..=32 => "17-32".into(),
+        33..=64 => "33-64".into(),
+        65..=128 => "65-128".into(),
+        _ => "129+".into(),
+    }
+}
+
+pub fn count_bucket_label(count: u64) -> String {
+    match count {
+        0..=7 => "0-7".into(),
+        8..=31 => "8-31".into(),
+        32..=127 => "32-127".into(),
+        128..=511 => "128-511".into(),
+        _ => "512+".into(),
+    }
+}
+
+pub fn output_bundle_bucket_size(count: usize) -> usize {
+    match count {
+        0..=4 => 4,
+        5..=8 => 8,
+        9..=16 => 16,
+        17..=32 => 32,
+        33..=64 => 64,
+        65..=128 => 128,
+        _ => count.next_power_of_two(),
+    }
+}
+
+fn dummy_output_ciphertext(
+    _batch_id: &BatchId,
+    _output_index: usize,
+) -> Result<EncryptedBlob, ProtocolError> {
+    let mut key_id = [0_u8; 32];
+    let mut nonce = [0_u8; 12];
+    let mut ciphertext = vec![0_u8; OUTPUT_NOTE_CIPHERTEXT_LEN];
+    OsRng.fill_bytes(&mut key_id);
+    OsRng.fill_bytes(&mut nonce);
+    OsRng.fill_bytes(ciphertext.as_mut_slice());
+    let ephemeral_secret = SecretKey::random(&mut OsRng);
+    let ephemeral_public_key = hex::encode(
+        ephemeral_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+
+    Ok(EncryptedBlob {
+        algorithm: NOTE_RECOGNITION_ALGORITHM.into(),
+        key_id: hex::encode(key_id),
+        ephemeral_public_key,
+        nonce: hex::encode(nonce),
+        ciphertext: hex::encode(ciphertext),
+        recovery: Some(dummy_output_recovery_record()?),
+    })
+}
+
+fn dummy_output_recovery_record() -> Result<OutputRecoveryRecord, ProtocolError> {
+    let key_tag = random_field_hex();
+    let auth_tag = random_field_hex();
+    let ciphertext_fields = (0..OUTPUT_RECOVERY_FIELD_COUNT)
+        .map(|_| random_field_hex())
+        .collect::<Vec<_>>();
+    let mut record = OutputRecoveryRecord {
+        key_tag,
+        ciphertext_fields,
+        auth_tag,
+        commitment: "0x0".into(),
+    };
+    record.commitment = output_recovery_record_commitment(&record)?;
+    Ok(record)
+}
+
+fn random_field_hex() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("0x{}", hex::encode(bytes))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -920,6 +1141,18 @@ pub struct SettlementTranscript {
     pub batch_epoch: u64,
     pub order_commitment_root: String,
     pub encrypted_order_set_commitment: String,
+    #[serde(default = "zero_felt_string")]
+    pub prior_note_root: String,
+    #[serde(default = "zero_felt_string")]
+    pub prior_nullifier_root: String,
+    #[serde(default = "zero_felt_string")]
+    pub prior_renewal_root: String,
+    #[serde(default = "zero_felt_string")]
+    pub prior_fee_root: String,
+    #[serde(default = "zero_felt_string")]
+    pub new_nullifier_root: String,
+    #[serde(default = "zero_felt_string")]
+    pub new_renewal_root: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
     pub matched_orders: Vec<MatchedOrder>,
@@ -928,7 +1161,227 @@ pub struct SettlementTranscript {
     pub renewal_child_uses: Vec<RenewalChildUse>,
     pub fees: Vec<FeeEntry>,
     pub output_notes: Vec<OutputNoteRecord>,
+    #[serde(default)]
+    pub output_note_preimages: Vec<Note>,
+    #[serde(default)]
+    pub output_recovery_records: Vec<OutputRecoveryRecord>,
+    #[serde(default)]
+    pub output_recovery_dummy_commitments: Vec<String>,
     pub output_ciphertext_bundle_ref: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootOnlySettlementCommitments {
+    pub prior_note_root: String,
+    pub prior_nullifier_root: String,
+    pub prior_renewal_root: String,
+    pub prior_fee_root: String,
+    pub consumed_note_root: String,
+    pub consumed_nullifier_root: String,
+    pub renewal_child_root: String,
+    pub output_note_root: String,
+    pub fee_root: String,
+    pub new_note_root: String,
+    pub new_nullifier_root: String,
+    pub new_renewal_root: String,
+    pub new_fee_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteMembershipKind {
+    Deposit,
+    SettlementOutput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteMembershipWitness {
+    pub kind: NoteMembershipKind,
+    pub prefix_root: String,
+    pub batch_root: String,
+    #[serde(default)]
+    pub merkle_path: Vec<String>,
+    #[serde(default)]
+    pub merkle_directions: Vec<String>,
+    #[serde(default)]
+    pub suffix_batch_roots: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NullifierHistoryBatch {
+    #[serde(default = "one_u64")]
+    pub repeat_count: u64,
+    pub nullifiers: Vec<Nullifier>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewalStateHistoryBatch {
+    #[serde(default = "one_u64")]
+    pub repeat_count: u64,
+    pub entries: Vec<String>,
+}
+
+fn one_u64() -> u64 {
+    1
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NullifierSparseUpdateWitness {
+    pub key_low: String,
+    pub key_high: String,
+    pub merkle_path: Vec<String>,
+    pub merkle_directions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuctionPrivacyGateWitness {
+    #[serde(default)]
+    pub enforced: bool,
+    #[serde(default, with = "serde_u128_decimal")]
+    pub min_batch_base_liquidity: u128,
+    #[serde(default)]
+    pub min_batch_participants: u64,
+    #[serde(default)]
+    pub min_eligible_orders: u64,
+    #[serde(default)]
+    pub max_single_order_fill_bps: u64,
+    #[serde(default)]
+    pub max_single_owner_fill_bps: u64,
+    #[serde(default)]
+    pub min_maker_participants: u64,
+    #[serde(default)]
+    pub max_maker_fill_bps: u64,
+}
+
+pub const TRANSCRIPT_SHAPE_POLICY_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptShapeMetadata {
+    pub policy_version: u32,
+    pub matched_order_count_bucket: String,
+    pub consumed_input_count_bucket: String,
+    pub renewal_child_count_bucket: String,
+    pub fee_count_bucket: String,
+    pub output_note_count_bucket: String,
+    pub output_ciphertext_count_bucket: String,
+    pub padded_output_ciphertext_count: u64,
+}
+
+pub fn transcript_shape_metadata(
+    transcript: &SettlementTranscript,
+    output_bundle: &OutputCiphertextBundle,
+) -> TranscriptShapeMetadata {
+    TranscriptShapeMetadata {
+        policy_version: TRANSCRIPT_SHAPE_POLICY_VERSION,
+        matched_order_count_bucket: count_bucket_label(transcript.matched_orders.len() as u64),
+        consumed_input_count_bucket: count_bucket_label(transcript.consumed_inputs.len() as u64),
+        renewal_child_count_bucket: count_bucket_label(transcript.renewal_child_uses.len() as u64),
+        fee_count_bucket: count_bucket_label(transcript.fees.len() as u64),
+        output_note_count_bucket: output_bundle_count_bucket_label(transcript.output_notes.len()),
+        output_ciphertext_count_bucket: output_bundle.ciphertext_count_bucket.clone(),
+        padded_output_ciphertext_count: output_bundle.padded_ciphertext_count,
+    }
+}
+
+pub fn validate_transcript_shape_policy(
+    transcript: &SettlementTranscript,
+    output_bundle: &OutputCiphertextBundle,
+) -> Result<TranscriptShapeMetadata, ProtocolError> {
+    if transcript.batch_id != output_bundle.batch_id {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "output bundle batch_id does not match transcript batch_id".into(),
+        ));
+    }
+    if transcript.output_ciphertext_bundle_ref != output_bundle.bundle_commitment {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "transcript output bundle ref does not match output bundle commitment".into(),
+        ));
+    }
+
+    let output_count = transcript.output_notes.len();
+    let expected_padded_count = output_bundle_bucket_size(output_count);
+    let expected_count_bucket = output_bundle_count_bucket_label(output_count);
+    if output_bundle.ciphertexts.len() != expected_padded_count {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "output bundle ciphertext length must be padded to {expected_padded_count}, got {}",
+            output_bundle.ciphertexts.len()
+        )));
+    }
+    if output_bundle.padded_ciphertext_count != expected_padded_count as u64 {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "output bundle padded_ciphertext_count must be {expected_padded_count}, got {}",
+            output_bundle.padded_ciphertext_count
+        )));
+    }
+    if output_bundle.ciphertext_count_bucket != expected_count_bucket {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "output bundle ciphertext_count_bucket must be {expected_count_bucket}, got {}",
+            output_bundle.ciphertext_count_bucket
+        )));
+    }
+    validate_output_ciphertext_bundle_shape(output_bundle)?;
+
+    Ok(transcript_shape_metadata(transcript, output_bundle))
+}
+
+fn validate_output_ciphertext_bundle_shape(
+    output_bundle: &OutputCiphertextBundle,
+) -> Result<(), ProtocolError> {
+    let mut seen_envelopes = BTreeSet::new();
+    for (index, blob) in output_bundle.ciphertexts.iter().enumerate() {
+        if blob.algorithm != NOTE_RECOGNITION_ALGORITHM {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} uses unsupported algorithm"
+            )));
+        }
+        let key_id = hex::decode(&blob.key_id).map_err(|_| {
+            ProtocolError::InvalidSettlementProof(format!("output ciphertext {index} bad key_id"))
+        })?;
+        if key_id.len() != 32 || key_id.iter().all(|byte| *byte == 0) {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} key_id must be a nonzero 32-byte value"
+            )));
+        }
+        let ephemeral_public_key = hex::decode(&blob.ephemeral_public_key).map_err(|_| {
+            ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} bad ephemeral public key"
+            ))
+        })?;
+        if ephemeral_public_key.len() != 65 || ephemeral_public_key.first() != Some(&4) {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} ephemeral public key must be uncompressed P-256"
+            )));
+        }
+        let nonce = hex::decode(&blob.nonce).map_err(|_| {
+            ProtocolError::InvalidSettlementProof(format!("output ciphertext {index} bad nonce"))
+        })?;
+        if nonce.len() != 12 || nonce.iter().all(|byte| *byte == 0) {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} nonce must be a nonzero 12-byte value"
+            )));
+        }
+        let ciphertext = hex::decode(&blob.ciphertext).map_err(|_| {
+            ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} bad ciphertext"
+            ))
+        })?;
+        if ciphertext.len() != OUTPUT_NOTE_CIPHERTEXT_LEN {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} ciphertext length must be {OUTPUT_NOTE_CIPHERTEXT_LEN}"
+            )));
+        }
+        let envelope_id = (
+            blob.key_id.clone(),
+            blob.ephemeral_public_key.clone(),
+            blob.nonce.clone(),
+        );
+        if !seen_envelopes.insert(envelope_id) {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "output ciphertext {index} reuses an encryption envelope"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,16 +1390,83 @@ pub struct PublishedBatchArtifacts {
     pub output_bundle: OutputCiphertextBundle,
     pub settlement_witness: SettlementWitness,
     #[serde(default)]
+    pub published_at_unix_ms: u64,
+    #[serde(default)]
     pub order_execution_reports: Vec<OrderExecutionReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_shape: Option<TranscriptShapeMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicSettlementTranscript {
+    pub batch_id: BatchId,
+    pub pair_id: PairId,
+    pub batch_epoch: u64,
+    pub order_commitment_root: String,
+    pub encrypted_order_set_commitment: String,
+    pub transcript_commitment: String,
+    #[serde(with = "serde_u128_decimal")]
+    pub clearing_price: u128,
+    pub output_bundle_ref: String,
+    pub prior_note_root: String,
+    pub prior_nullifier_root: String,
+    pub prior_renewal_root: String,
+    pub prior_fee_root: String,
+    pub consumed_note_root: String,
+    pub consumed_nullifier_root: String,
+    pub renewal_child_root: String,
+    pub output_note_root: String,
+    pub fee_root: String,
+    pub new_note_root: String,
+    pub new_nullifier_root: String,
+    pub new_renewal_root: String,
+    pub new_fee_root: String,
+    pub transcript_shape: TranscriptShapeMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementRootHistoryBatch {
+    pub batch_id: BatchId,
+    pub pair_id: PairId,
+    pub batch_epoch: u64,
+    pub prior_note_root: String,
+    pub prior_nullifier_root: String,
+    pub prior_renewal_root: String,
+    pub prior_fee_root: String,
+    pub output_note_root: String,
+    pub consumed_nullifier_root: String,
+    pub new_note_root: String,
+    pub new_nullifier_root: String,
+    pub new_renewal_root: String,
+    #[serde(default)]
+    pub consumed_inputs: Vec<ConsumedInput>,
+    #[serde(default)]
+    pub output_notes: Vec<OutputNoteRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementRootHistoryArchive {
+    pub batches: Vec<SettlementRootHistoryBatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedBatchArtifactSummary {
     pub batch_id: BatchId,
+    pub pair_id: PairId,
+    pub batch_epoch: u64,
     pub transcript_commitment: String,
     pub output_bundle_ref: String,
+    pub output_note_root: String,
     pub bundle_commitment: String,
     pub data_availability_ref: String,
+    pub ciphertext_count_bucket: String,
+    pub padded_ciphertext_count: u64,
+    pub matched_order_count_bucket: String,
+    pub consumed_input_count_bucket: String,
+    pub renewal_child_count_bucket: String,
+    pub fee_count_bucket: String,
+    pub output_note_count_bucket: String,
+    pub transcript_shape_policy_version: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -954,11 +1474,81 @@ pub struct PublishedBatchArtifactList {
     pub batches: Vec<PublishedBatchArtifactSummary>,
 }
 
+pub const ARTIFACT_AGGREGATION_POLICY_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactAggregationPolicy {
+    pub policy_version: u32,
+    pub public_artifact_delay_epochs: u64,
+    pub epoch_bucket_size: u64,
+    pub aggregation_scope: String,
+    pub proof_aggregation_mode: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiPairArtifactBundleSummary {
+    pub bundle_id: String,
+    pub epoch_start: u64,
+    pub epoch_end: u64,
+    pub delayed_until_epoch: u64,
+    pub artifact_count_bucket: String,
+    pub pair_count_bucket: String,
+    pub padded_artifact_count: u64,
+    pub aggregate_commitment: String,
+    pub transcript_commitment_root: String,
+    pub output_bundle_root: String,
+    pub data_availability_root: String,
+    pub transcript_shape_policy_version: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiPairArtifactBundleList {
+    pub policy: ArtifactAggregationPolicy,
+    pub bundles: Vec<MultiPairArtifactBundleSummary>,
+}
+
+pub fn artifact_epoch_bucket_start(
+    epoch: u64,
+    epoch_bucket_size: u64,
+) -> Result<u64, ProtocolError> {
+    if epoch_bucket_size == 0 {
+        return Err(ProtocolError::InvalidProductConfig(
+            "artifact epoch bucket size must be non-zero".into(),
+        ));
+    }
+    Ok(epoch - (epoch % epoch_bucket_size))
+}
+
+pub fn artifact_epoch_bucket_end(
+    epoch_start: u64,
+    epoch_bucket_size: u64,
+) -> Result<u64, ProtocolError> {
+    if epoch_bucket_size == 0 {
+        return Err(ProtocolError::InvalidProductConfig(
+            "artifact epoch bucket size must be non-zero".into(),
+        ));
+    }
+    Ok(epoch_start.saturating_add(epoch_bucket_size.saturating_sub(1)))
+}
+
+pub fn artifact_bundle_padded_count(count: usize) -> usize {
+    match count {
+        0..=8 => 8,
+        9..=16 => 16,
+        17..=32 => 32,
+        33..=64 => 64,
+        65..=128 => 128,
+        _ => count.next_power_of_two(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoordinatorStatus {
     pub service: String,
     pub current_batch_id: Option<BatchId>,
-    pub tracked_batches: u64,
+    pub tracked_batches_bucket: String,
+    pub batch_window_ms: u64,
+    pub batch_close_jitter_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1121,6 +1711,35 @@ pub struct WithdrawalSubmissionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputNoteMerkleProof {
+    pub merkle_path: Vec<String>,
+    pub merkle_directions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementOutputWithdrawalCallArguments {
+    pub batch_id: String,
+    pub note_commitment: String,
+    pub asset_id: String,
+    pub amount: String,
+    pub withdraw_authority: String,
+    pub merkle_path: Vec<String>,
+    pub merkle_directions: Vec<String>,
+    pub withdraw_authorization_r: String,
+    pub withdraw_authorization_s: String,
+    pub recipient: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementOutputWithdrawalSubmissionPlan {
+    pub funding_rail: FundingRailKind,
+    pub batch_id: BatchId,
+    pub note_commitment: NoteCommitment,
+    pub starknet_call: StarknetCall,
+    pub encoded_args: SettlementOutputWithdrawalCallArguments,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WithdrawalRecord {
     pub withdrawal_id: u64,
     pub asset_id: AssetId,
@@ -1133,12 +1752,12 @@ pub struct WithdrawalRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositSyncStatus {
     pub service: String,
-    pub rpc_url: String,
-    pub shielded_asset_adapter_address: String,
-    pub cached_deposits: u64,
-    pub synced_deposit_count: u64,
-    pub cached_withdrawals: u64,
-    pub synced_withdrawal_count: u64,
+    pub rpc_configured: bool,
+    pub shielded_asset_adapter_configured: bool,
+    pub cached_deposits_bucket: String,
+    pub synced_deposit_count_bucket: String,
+    pub cached_withdrawals_bucket: String,
+    pub synced_withdrawal_count_bucket: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1152,6 +1771,217 @@ pub struct DepositConfirmationList {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepositRecordList {
+    pub start: u64,
+    pub end: u64,
+    pub count_bucket: String,
+    pub records: Vec<DepositRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalRecordList {
+    pub start: u64,
+    pub end: u64,
+    pub count_bucket: String,
+    pub records: Vec<WithdrawalRecord>,
+}
+
+pub const CLAIM_WINDOW_POLICY_VERSION: u32 = 1;
+pub const WITHDRAWAL_AMOUNT_BUCKET_POLICY_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimWindowPolicy {
+    pub policy_version: u32,
+    pub min_delay_seconds: u64,
+    pub window_seconds: u64,
+    pub max_jitter_seconds: u64,
+    pub urgent_exit_allowed: bool,
+}
+
+impl Default for ClaimWindowPolicy {
+    fn default() -> Self {
+        Self {
+            policy_version: CLAIM_WINDOW_POLICY_VERSION,
+            min_delay_seconds: 300,
+            window_seconds: 900,
+            max_jitter_seconds: 300,
+            urgent_exit_allowed: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalWindowPlan {
+    pub note_commitment: NoteCommitment,
+    pub policy_version: u32,
+    pub settlement_time_unix_ms: u64,
+    pub earliest_withdrawal_unix_ms: u64,
+    pub recommended_withdrawal_unix_ms: u64,
+    pub window_id: u64,
+    pub urgent_exit_allowed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalAmountBucketPolicy {
+    pub policy_version: u32,
+    pub mode: String,
+    pub asset_buckets: BTreeMap<String, Vec<String>>,
+    pub urgent_exit_allowed: bool,
+}
+
+impl Default for WithdrawalAmountBucketPolicy {
+    fn default() -> Self {
+        let mut asset_buckets = BTreeMap::new();
+        for asset in ["STRK", "ETH", "USDC", "strkBTC"] {
+            asset_buckets.insert(asset.into(), default_withdrawal_amount_buckets());
+        }
+        Self {
+            policy_version: WITHDRAWAL_AMOUNT_BUCKET_POLICY_VERSION,
+            mode: "standard_amount_buckets".into(),
+            asset_buckets,
+            urgent_exit_allowed: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalAmountBucketPlan {
+    pub asset_id: AssetId,
+    #[serde(with = "serde_u128_decimal")]
+    pub requested_amount: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub nearest_bucket_amount: u128,
+    pub exact_bucket: bool,
+    pub policy_version: u32,
+    pub urgent_exit_allowed: bool,
+}
+
+pub fn default_withdrawal_amount_buckets() -> Vec<String> {
+    [
+        1_000_000_u128,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+        10_000_000_000,
+        100_000_000_000,
+        1_000_000_000_000,
+        10_000_000_000_000,
+        100_000_000_000_000,
+        1_000_000_000_000_000,
+        10_000_000_000_000_000,
+        100_000_000_000_000_000,
+    ]
+    .into_iter()
+    .map(|amount| amount.to_string())
+    .collect()
+}
+
+pub fn plan_withdrawal_amount_bucket(
+    asset_id: &AssetId,
+    requested_amount: u128,
+    policy: &WithdrawalAmountBucketPolicy,
+) -> Result<WithdrawalAmountBucketPlan, ProtocolError> {
+    if requested_amount == 0 {
+        return Err(ProtocolError::InvalidProductConfig(
+            "withdrawal amount must be non-zero".into(),
+        ));
+    }
+    let buckets = policy
+        .asset_buckets
+        .get(&asset_id.0)
+        .ok_or_else(|| {
+            ProtocolError::InvalidProductConfig(format!(
+                "withdrawal bucket policy does not include asset {}",
+                asset_id.0
+            ))
+        })?
+        .iter()
+        .map(|amount| {
+            amount.parse::<u128>().map_err(|err| {
+                ProtocolError::InvalidProductConfig(format!(
+                    "withdrawal bucket amount '{amount}' is not a decimal u128: {err}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if buckets.is_empty() {
+        return Err(ProtocolError::InvalidProductConfig(
+            "withdrawal bucket policy must include at least one bucket".into(),
+        ));
+    }
+
+    let mut sorted = buckets;
+    sorted.sort_unstable();
+    sorted.dedup();
+    let exact_bucket = sorted.binary_search(&requested_amount).is_ok();
+    let nearest_bucket_amount = sorted
+        .iter()
+        .copied()
+        .min_by_key(|bucket| bucket.abs_diff(requested_amount))
+        .ok_or_else(|| {
+            ProtocolError::InvalidProductConfig(
+                "withdrawal bucket policy must include at least one bucket".into(),
+            )
+        })?;
+
+    Ok(WithdrawalAmountBucketPlan {
+        asset_id: asset_id.clone(),
+        requested_amount,
+        nearest_bucket_amount,
+        exact_bucket,
+        policy_version: policy.policy_version,
+        urgent_exit_allowed: policy.urgent_exit_allowed,
+    })
+}
+
+pub fn plan_withdrawal_window(
+    note_commitment: &NoteCommitment,
+    settlement_time_unix_ms: u64,
+    policy: &ClaimWindowPolicy,
+) -> Result<WithdrawalWindowPlan, ProtocolError> {
+    if policy.window_seconds == 0 {
+        return Err(ProtocolError::InvalidProductConfig(
+            "claim window policy window_seconds must be non-zero".into(),
+        ));
+    }
+
+    let earliest_withdrawal_unix_ms =
+        settlement_time_unix_ms.saturating_add(policy.min_delay_seconds.saturating_mul(1_000));
+    let jitter_bound = policy.max_jitter_seconds.min(policy.window_seconds);
+    let jitter_seconds = if jitter_bound == 0 {
+        0
+    } else {
+        let seed = tagged_commitment_sha256(
+            "zylith/withdrawal-window-jitter",
+            &serde_json::json!({
+                "note_commitment": note_commitment.0,
+                "settlement_time_unix_ms": settlement_time_unix_ms,
+                "policy_version": policy.policy_version,
+            }),
+        )?;
+        let prefix = seed.get(..16).ok_or_else(|| {
+            ProtocolError::Crypto("withdrawal window jitter seed was malformed".into())
+        })?;
+        u64::from_str_radix(prefix, 16)
+            .map_err(|err| ProtocolError::Crypto(format!("invalid jitter seed: {err}")))?
+            % (jitter_bound + 1)
+    };
+    let recommended_withdrawal_unix_ms =
+        earliest_withdrawal_unix_ms.saturating_add(jitter_seconds.saturating_mul(1_000));
+    let window_ms = policy.window_seconds.saturating_mul(1_000);
+
+    Ok(WithdrawalWindowPlan {
+        note_commitment: note_commitment.clone(),
+        policy_version: policy.policy_version,
+        settlement_time_unix_ms,
+        earliest_withdrawal_unix_ms,
+        recommended_withdrawal_unix_ms,
+        window_id: recommended_withdrawal_unix_ms / window_ms,
+        urgent_exit_allowed: policy.urgent_exit_allowed,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementCallArguments {
     pub batch_id: String,
     pub order_commitment_root: String,
@@ -1159,21 +1989,20 @@ pub struct SettlementCallArguments {
     pub transcript_commitment: String,
     pub proof_artifact_commitment: String,
     pub clearing_price: String,
-    pub matched_order_count: String,
     pub output_bundle_ref: String,
-    pub consumed_note_commitments: Vec<String>,
-    pub consumed_nullifiers: Vec<String>,
-    #[serde(default)]
-    pub renewal_parent_order_commitments: Vec<String>,
-    #[serde(default)]
-    pub renewal_child_nullifiers: Vec<String>,
-    pub output_note_commitments: Vec<String>,
-    pub output_note_asset_ids: Vec<String>,
-    pub output_note_amounts: Vec<String>,
-    pub output_note_withdraw_authorities: Vec<String>,
-    pub fee_asset_ids: Vec<String>,
-    pub fee_recipients: Vec<String>,
-    pub fee_amounts: Vec<String>,
+    pub prior_note_root: String,
+    pub prior_nullifier_root: String,
+    pub prior_renewal_root: String,
+    pub prior_fee_root: String,
+    pub consumed_note_root: String,
+    pub consumed_nullifier_root: String,
+    pub renewal_child_root: String,
+    pub output_note_root: String,
+    pub fee_root: String,
+    pub new_note_root: String,
+    pub new_nullifier_root: String,
+    pub new_renewal_root: String,
+    pub new_fee_root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1194,6 +2023,14 @@ pub struct SettlementWitness {
     pub encrypted_order_set_commitment: String,
     pub transcript_commitment: String,
     pub auction_verifier_address: String,
+    pub prior_note_root: String,
+    pub prior_nullifier_root: String,
+    pub prior_renewal_root: String,
+    pub prior_fee_root: String,
+    #[serde(default = "zero_felt_string")]
+    pub new_nullifier_root: String,
+    #[serde(default = "zero_felt_string")]
+    pub new_renewal_root: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
     pub base_asset_id: AssetId,
@@ -1202,9 +2039,29 @@ pub struct SettlementWitness {
     pub matched_order_witnesses: Vec<MatchedOrderWitness>,
     pub consumed_inputs: Vec<ConsumedInput>,
     #[serde(default)]
+    pub note_membership_witnesses: Vec<NoteMembershipWitness>,
+    #[serde(default)]
+    pub nullifier_history: Vec<NullifierHistoryBatch>,
+    #[serde(default)]
+    pub nullifier_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
+    #[serde(default)]
+    pub renewal_history: Vec<RenewalStateHistoryBatch>,
+    #[serde(default)]
+    pub renewal_child_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
+    #[serde(default)]
+    pub renewal_cancel_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
+    #[serde(default)]
+    pub privacy_gate: AuctionPrivacyGateWitness,
+    #[serde(default)]
     pub renewal_child_uses: Vec<RenewalChildUse>,
     pub fees: Vec<FeeEntry>,
     pub output_notes: Vec<OutputNoteRecord>,
+    #[serde(default)]
+    pub output_note_preimages: Vec<Note>,
+    #[serde(default)]
+    pub output_recovery_records: Vec<OutputRecoveryRecord>,
+    #[serde(default)]
+    pub output_recovery_dummy_commitments: Vec<String>,
     pub output_ciphertext_bundle_ref: String,
 }
 
@@ -1265,6 +2122,12 @@ pub struct RecoveryArtifactUpload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryArtifactList {
     pub account_id: String,
+    #[serde(default)]
+    pub sequence_start: u64,
+    #[serde(default)]
+    pub sequence_end: u64,
+    #[serde(default)]
+    pub artifact_count_bucket: String,
     pub artifacts: Vec<RecoveryArtifact>,
 }
 
@@ -1378,6 +2241,8 @@ pub struct ProductPairConfig {
     pub quote_asset_id: AssetId,
     #[serde(with = "serde_u128_decimal")]
     pub min_order_amount: u128,
+    #[serde(default = "default_heartbeat_cover_price", with = "serde_u128_decimal")]
+    pub heartbeat_cover_price: u128,
     pub enabled: bool,
 }
 
@@ -1395,6 +2260,10 @@ impl ProductPairConfig {
             OrderSide::Sell => &self.quote_asset_id,
         }
     }
+}
+
+fn default_heartbeat_cover_price() -> u128 {
+    1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1436,6 +2305,7 @@ impl ProductConfig {
                     base_asset_id: AssetId(base_asset_id.to_owned()),
                     quote_asset_id: AssetId(quote_asset_id.to_owned()),
                     min_order_amount: 1,
+                    heartbeat_cover_price: default_heartbeat_cover_price(),
                     enabled: true,
                 },
             );
@@ -1480,6 +2350,40 @@ impl ProductConfig {
         Ok(Self { assets, pairs })
     }
 
+    pub fn apply_heartbeat_cover_prices_csv(&mut self, value: &str) -> Result<(), ProtocolError> {
+        for entry in value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (pair_id, price) = entry.split_once('=').ok_or_else(|| {
+                ProtocolError::InvalidProductConfig(format!(
+                    "heartbeat cover price entry '{entry}' must use PAIR=PRICE format"
+                ))
+            })?;
+            let price = price.trim().parse::<u128>().map_err(|_| {
+                ProtocolError::InvalidProductConfig(format!(
+                    "heartbeat cover price for '{}' must be a decimal u128",
+                    pair_id.trim()
+                ))
+            })?;
+            if price == 0 {
+                return Err(ProtocolError::InvalidProductConfig(format!(
+                    "heartbeat cover price for '{}' must be positive",
+                    pair_id.trim()
+                )));
+            }
+            let pair_id = pair_id.trim();
+            let pair = self.pairs.get_mut(pair_id).ok_or_else(|| {
+                ProtocolError::InvalidProductConfig(format!(
+                    "heartbeat cover price configured for unknown pair '{pair_id}'"
+                ))
+            })?;
+            pair.heartbeat_cover_price = price;
+        }
+        Ok(())
+    }
+
     pub fn enabled_pairs(&self) -> Vec<PairId> {
         self.pairs
             .values()
@@ -1519,6 +2423,11 @@ impl ProductConfig {
             ));
         }
         match (&order.order_type, order.maker_curve.as_ref()) {
+            (OrderType::HeartbeatCover, _) => {
+                return Err(ProtocolError::InvalidOrder(
+                    "heartbeat cover orders are protocol-generated".into(),
+                ));
+            }
             (OrderType::MakerCurve, Some(curve)) => {
                 curve.validate()?;
                 let curve_base_amount = curve.total_base_amount()?;
@@ -1640,6 +2549,7 @@ impl ProductConfig {
             base_asset_id,
             quote_asset_id,
             min_order_amount: 1,
+            heartbeat_cover_price: default_heartbeat_cover_price(),
             enabled,
         })
     }
@@ -1663,6 +2573,10 @@ pub struct DeploymentProofConfig {
     pub settlement_entrypoint: String,
     #[serde(default)]
     pub proof_entrypoint: String,
+    #[serde(default)]
+    pub proof_program_address: String,
+    #[serde(default)]
+    pub proof_program_hash: String,
     #[serde(default)]
     pub proof_account_address: String,
     #[serde(default)]
@@ -1689,11 +2603,13 @@ pub struct DeploymentManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetId, BatchId, BatchLiquidityReport, BatchStatus, BatchSummary, DeploymentManifest,
-        DepositIntent, FundingRailConfig, FundingRailKind, HiddenMakerCurve, MakerCurvePoint, Note,
-        Nullifier, OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, PairId,
-        ProductConfig, StarknetPrivacyFundingRail, renewal_parent_commitment,
-        renewal_parent_secret_commitment,
+        AssetId, BatchId, BatchLiquidityReport, BatchStatus, BatchSummary, ClaimWindowPolicy,
+        DeploymentManifest, DepositIntent, FeeEntry, FundingRailConfig, FundingRailKind,
+        HiddenMakerCurve, MakerCurvePoint, NOTE_RECOGNITION_ALGORITHM, Note, NoteCommitment,
+        Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIntent, OrderShareBundle, OrderSide,
+        OrderSubmission, OutputCiphertextBundle, OutputNoteRecord, PairId, ProductConfig,
+        SettlementTranscript, StarknetPrivacyFundingRail, TRANSCRIPT_SHAPE_POLICY_VERSION,
+        renewal_parent_commitment, renewal_parent_secret_commitment,
     };
 
     use crate::EncryptedBlob;
@@ -1870,7 +2786,7 @@ mod tests {
         let parsed: DepositIntent = serde_json::from_value(deposit).expect("decimal string amount");
         assert_eq!(parsed.amount, 100);
 
-        let legacy_number = serde_json::json!({
+        let numeric_amount = serde_json::json!({
             "asset_id": "USDC",
             "amount": 100,
             "deposit_nonce": 7,
@@ -1878,9 +2794,10 @@ mod tests {
             "recipient_spend_authority": "0x123",
             "recipient_withdraw_authority": "0x555"
         });
-        let parsed: DepositIntent =
-            serde_json::from_value(legacy_number).expect("legacy numeric amount");
-        assert_eq!(parsed.amount, 100);
+        assert!(
+            serde_json::from_value::<DepositIntent>(numeric_amount).is_err(),
+            "numeric protocol amounts must be rejected"
+        );
 
         let liquidity = BatchLiquidityReport {
             status: "ok".into(),
@@ -2180,6 +3097,7 @@ mod tests {
                     ephemeral_public_key: "04abcdef".into(),
                     nonce: "00".into(),
                     ciphertext: "11".into(),
+                    recovery: None,
                 }),
                 ingress_receipt: None,
                 shares: vec![],
@@ -2193,5 +3111,205 @@ mod tests {
             "cancel-tag-1"
         );
         assert_eq!(json["order_bundle"]["pair_id"], "STRK/USDC");
+    }
+
+    #[test]
+    fn output_ciphertext_bundle_pads_to_bucket_size() {
+        let ciphertext = EncryptedBlob {
+            algorithm: NOTE_RECOGNITION_ALGORITHM.into(),
+            key_id: "01".repeat(32),
+            ephemeral_public_key: "04".to_string() + &"11".repeat(64),
+            nonce: "02".repeat(12),
+            ciphertext: "11".repeat(OUTPUT_NOTE_CIPHERTEXT_LEN),
+            recovery: None,
+        };
+
+        let bundle = crate::OutputCiphertextBundle::from_ciphertexts(
+            BatchId("batch-1".into()),
+            "da://bundle",
+            vec![ciphertext],
+        )
+        .expect("bundle");
+
+        assert_eq!(bundle.padded_ciphertext_count, 4);
+        assert_eq!(bundle.ciphertext_count_bucket, "0-4");
+        assert_eq!(bundle.ciphertexts.len(), 4);
+        for blob in bundle.ciphertexts.iter() {
+            assert_eq!(blob.algorithm, NOTE_RECOGNITION_ALGORITHM);
+            assert_eq!(hex::decode(&blob.key_id).expect("key id").len(), 32);
+            assert_eq!(hex::decode(&blob.nonce).expect("nonce").len(), 12);
+            assert_eq!(
+                hex::decode(&blob.ciphertext).expect("ciphertext").len(),
+                OUTPUT_NOTE_CIPHERTEXT_LEN
+            );
+            assert!(!blob.ephemeral_public_key.is_empty());
+        }
+    }
+
+    #[test]
+    fn empty_output_ciphertext_bundle_is_padded_to_first_bucket() {
+        let bundle = crate::OutputCiphertextBundle::from_ciphertexts(
+            BatchId("batch-empty".into()),
+            "da://empty-bundle",
+            vec![],
+        )
+        .expect("bundle");
+
+        assert_eq!(bundle.padded_ciphertext_count, 4);
+        assert_eq!(bundle.ciphertext_count_bucket, "0-4");
+        assert_eq!(bundle.ciphertexts.len(), 4);
+        assert!(bundle.ciphertexts.iter().all(|blob| {
+            blob.algorithm == NOTE_RECOGNITION_ALGORITHM
+                && blob.ephemeral_public_key.starts_with("04")
+                && hex::decode(&blob.ciphertext)
+                    .map(|ciphertext| ciphertext.len() == OUTPUT_NOTE_CIPHERTEXT_LEN)
+                    .unwrap_or(false)
+        }));
+    }
+
+    #[test]
+    fn transcript_shape_metadata_uses_public_buckets() {
+        let bundle = crate::OutputCiphertextBundle::from_ciphertexts(
+            BatchId("batch-1".into()),
+            "da://bundle",
+            vec![EncryptedBlob {
+                algorithm: NOTE_RECOGNITION_ALGORITHM.into(),
+                key_id: "01".repeat(32),
+                ephemeral_public_key: "04".to_string() + &"11".repeat(64),
+                nonce: "02".repeat(12),
+                ciphertext: "11".repeat(OUTPUT_NOTE_CIPHERTEXT_LEN),
+                recovery: None,
+            }],
+        )
+        .expect("bundle");
+        let transcript = SettlementTranscript {
+            batch_id: BatchId("batch-1".into()),
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 7,
+            order_commitment_root: "0x1".into(),
+            encrypted_order_set_commitment: "0x2".into(),
+            prior_note_root: "0x0".into(),
+            prior_nullifier_root: "0x0".into(),
+            prior_renewal_root: "0x0".into(),
+            prior_fee_root: "0x0".into(),
+            new_nullifier_root: "0x0".into(),
+            new_renewal_root: "0x0".into(),
+            clearing_price: 100,
+            matched_orders: vec![],
+            consumed_inputs: vec![],
+            renewal_child_uses: vec![],
+            fees: vec![FeeEntry {
+                asset_id: AssetId("USDC".into()),
+                amount: 1,
+                recipient: "0x123".into(),
+            }],
+            output_notes: vec![OutputNoteRecord {
+                note_commitment: NoteCommitment("0x456".into()),
+                asset_id: AssetId("USDC".into()),
+                amount: 10,
+                withdraw_authority: "0x789".into(),
+            }],
+            output_note_preimages: vec![],
+            output_recovery_records: vec![],
+            output_recovery_dummy_commitments: vec![],
+            output_ciphertext_bundle_ref: bundle.bundle_commitment.clone(),
+        };
+
+        let shape = crate::transcript_shape_metadata(&transcript, &bundle);
+
+        assert_eq!(shape.policy_version, TRANSCRIPT_SHAPE_POLICY_VERSION);
+        assert_eq!(shape.matched_order_count_bucket, "0-7");
+        assert_eq!(shape.fee_count_bucket, "0-7");
+        assert_eq!(shape.output_note_count_bucket, "0-4");
+        assert_eq!(shape.output_ciphertext_count_bucket, "0-4");
+        assert_eq!(shape.padded_output_ciphertext_count, 4);
+        crate::validate_transcript_shape_policy(&transcript, &bundle).expect("shape policy");
+    }
+
+    #[test]
+    fn transcript_shape_policy_rejects_unpadded_output_bundles() {
+        let output_note = OutputNoteRecord {
+            note_commitment: NoteCommitment("0x123".into()),
+            asset_id: AssetId("USDC".into()),
+            amount: 10,
+            withdraw_authority: "0x456".into(),
+        };
+        let bundle = OutputCiphertextBundle {
+            batch_id: BatchId("batch-1".into()),
+            bundle_commitment: "bundle-ref".into(),
+            data_availability_ref: "da://bundle".into(),
+            ciphertext_count_bucket: "0-4".into(),
+            padded_ciphertext_count: 4,
+            ciphertexts: vec![],
+        };
+        let transcript = SettlementTranscript {
+            batch_id: BatchId("batch-1".into()),
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 7,
+            order_commitment_root: "0x1".into(),
+            encrypted_order_set_commitment: "0x2".into(),
+            prior_note_root: "0x0".into(),
+            prior_nullifier_root: "0x0".into(),
+            prior_renewal_root: "0x0".into(),
+            prior_fee_root: "0x0".into(),
+            new_nullifier_root: "0x0".into(),
+            new_renewal_root: "0x0".into(),
+            clearing_price: 100,
+            matched_orders: vec![],
+            consumed_inputs: vec![],
+            renewal_child_uses: vec![],
+            fees: vec![],
+            output_notes: vec![output_note],
+            output_note_preimages: vec![],
+            output_recovery_records: vec![],
+            output_recovery_dummy_commitments: vec![],
+            output_ciphertext_bundle_ref: "bundle-ref".into(),
+        };
+
+        let error = crate::validate_transcript_shape_policy(&transcript, &bundle)
+            .expect_err("unpadded bundle must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("output bundle ciphertext length must be padded")
+        );
+    }
+
+    #[test]
+    fn withdrawal_window_plan_is_delayed_and_deterministic() {
+        let policy = ClaimWindowPolicy {
+            min_delay_seconds: 30,
+            window_seconds: 120,
+            max_jitter_seconds: 10,
+            ..ClaimWindowPolicy::default()
+        };
+        let note_commitment = NoteCommitment("0xabc".into());
+
+        let first = crate::plan_withdrawal_window(&note_commitment, 1_000_000, &policy)
+            .expect("first plan");
+        let second = crate::plan_withdrawal_window(&note_commitment, 1_000_000, &policy)
+            .expect("second plan");
+
+        assert_eq!(first, second);
+        assert_eq!(first.earliest_withdrawal_unix_ms, 1_030_000);
+        assert!(first.recommended_withdrawal_unix_ms >= first.earliest_withdrawal_unix_ms);
+        assert!(first.recommended_withdrawal_unix_ms <= 1_040_000);
+    }
+
+    #[test]
+    fn withdrawal_amount_bucket_plan_flags_non_standard_exits() {
+        let policy = crate::WithdrawalAmountBucketPolicy::default();
+        let exact =
+            crate::plan_withdrawal_amount_bucket(&AssetId("USDC".into()), 1_000_000, &policy)
+                .expect("exact bucket");
+        assert!(exact.exact_bucket);
+        assert_eq!(exact.nearest_bucket_amount, 1_000_000);
+
+        let off_bucket =
+            crate::plan_withdrawal_amount_bucket(&AssetId("USDC".into()), 1_500_000, &policy)
+                .expect("off bucket");
+        assert!(!off_bucket.exact_bucket);
+        assert_eq!(off_bucket.nearest_bucket_amount, 1_000_000);
     }
 }

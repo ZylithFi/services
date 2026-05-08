@@ -9,23 +9,26 @@ use std::{
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{
     Batch, BatchId, BatchOrderSet, BatchStatus, BatchSummary, CONTROL_PLANE_TOKEN_ENV,
     CoordinatorStatus, OrderCancellationAccepted, OrderCancellationRequest, OrderShareBundle,
-    OrderSubmission, OrderSubmissionAccepted, PairId, ProductConfig, PublishedBatchArtifacts,
-    RecoveryArtifact, RecoveryArtifactList, RecoveryArtifactUpload, SubmittedOrderRecord,
+    OrderSubmission, OrderSubmissionAccepted, PairId, ProductConfig, PublicBatchSummary,
+    PublicSettlementTranscript, PublishedBatchArtifacts, RecoveryArtifact, RecoveryArtifactList,
+    RecoveryArtifactUpload, SubmittedOrderRecord, count_bucket_label,
     derive_order_cancellation_tag, extract_bearer_token,
     hash::{ordered_felt_list_commitment, tagged_field_hex},
+    heartbeat_cover_order_commitments, heartbeat_cover_order_count,
+    root_only_settlement_commitments, settlement_transcript_commitment,
     validate_order_ingress_receipt_for_manifest_with_secrets,
 };
 
-const DEFAULT_BATCH_WINDOW_MS: u64 = 2 * 60 * 1_000;
+const DEFAULT_BATCH_WINDOW_MS: u64 = 30 * 1_000;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_BATCH_STORE_PATH: &str = "coordinator/batches.dev.json";
 const DEFAULT_RECOVERY_STORE_PATH: &str = "coordinator/recovery_artifacts.dev.json";
@@ -33,6 +36,7 @@ const DEFAULT_ARTIFACT_STORE_PATH: &str = "coordinator/published_batch_artifacts
 const DEFAULT_PAIR_IDS: &str = "STRK/ETH,STRK/USDC,STRK/strkBTC";
 const PRODUCT_PAIRS_ENV: &str = "ZYLITH_PRODUCT_PAIRS";
 const COORDINATOR_PAIR_IDS_ENV: &str = "ZYLITH_COORDINATOR_PAIRS";
+const BATCH_WINDOW_MS_ENV: &str = "ZYLITH_BATCH_WINDOW_MS";
 const COORDINATOR_EPOCH_OFFSET_ENV: &str = "ZYLITH_COORDINATOR_EPOCH_OFFSET";
 const ORDER_INGRESS_RECEIPT_SECRET_ENV: &str = "ZYLITH_TRUSTED_INGRESS_RECEIPT_SECRET";
 const ORDER_INGRESS_RECEIPT_PREVIOUS_SECRETS_ENV: &str =
@@ -45,9 +49,14 @@ const COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE_ENV: &str =
     "ZYLITH_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE";
 const COORDINATOR_MAX_ORDERS_PER_BATCH_ENV: &str = "ZYLITH_COORDINATOR_MAX_ORDERS_PER_BATCH";
 const COORDINATOR_EMERGENCY_PAUSED_ENV: &str = "ZYLITH_COORDINATOR_EMERGENCY_PAUSED";
-const DEFAULT_COORDINATOR_MAX_BODY_BYTES: usize = 256 * 1024;
+const COORDINATOR_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_COORDINATOR_ALLOWED_ORIGINS";
+const HEARTBEAT_COVER_SECRET_ENV: &str = "ZYLITH_HEARTBEAT_COVER_SECRET";
+const HEARTBEAT_COVER_PRICES_ENV: &str = "ZYLITH_HEARTBEAT_COVER_PRICES";
+const DEFAULT_COORDINATOR_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE: u64 = 120;
-const DEFAULT_COORDINATOR_MAX_ORDERS_PER_BATCH: u64 = 500;
+const DEFAULT_COORDINATOR_MAX_ORDERS_PER_BATCH: u64 = 32;
+const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = 1;
+const PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS";
 
 #[derive(Clone)]
 struct AppState {
@@ -59,6 +68,7 @@ struct AppState {
     published_batch_artifacts: Arc<RwLock<BTreeMap<String, PublishedBatchArtifacts>>>,
     published_batch_artifacts_store_path: Option<Arc<PathBuf>>,
     internal_api_token: Option<Arc<String>>,
+    batch_window_ms: u64,
     batch_epoch_offset: u64,
     batch_close_jitter_ms: u64,
     order_ingress_receipt_secrets: Arc<Vec<String>>,
@@ -66,7 +76,9 @@ struct AppState {
     allow_direct_private_order_payloads: bool,
     emergency_paused: bool,
     max_orders_per_batch: u64,
+    heartbeat_cover_secret: Arc<String>,
     public_rate_limit_per_minute: u64,
+    public_artifact_delay_epochs: u64,
     rate_limiter: RateLimiter,
 }
 
@@ -98,6 +110,7 @@ struct OrderIngressConfig {
 
 #[derive(Clone, Debug)]
 struct BatchTimingConfig {
+    window_ms: u64,
     epoch_offset: u64,
     close_jitter_ms: u64,
 }
@@ -108,6 +121,8 @@ struct CoordinatorHardeningConfig {
     max_body_bytes: usize,
     public_rate_limit_per_minute: u64,
     max_orders_per_batch: u64,
+    heartbeat_cover_secret: String,
+    public_artifact_delay_epochs: u64,
 }
 
 impl Default for CoordinatorHardeningConfig {
@@ -117,6 +132,8 @@ impl Default for CoordinatorHardeningConfig {
             max_body_bytes: DEFAULT_COORDINATOR_MAX_BODY_BYTES,
             public_rate_limit_per_minute: DEFAULT_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE,
             max_orders_per_batch: DEFAULT_COORDINATOR_MAX_ORDERS_PER_BATCH,
+            heartbeat_cover_secret: "test-heartbeat-cover-secret".into(),
+            public_artifact_delay_epochs: 0,
         }
     }
 }
@@ -203,6 +220,19 @@ fn build_app() -> Result<Router, String> {
             "zylith-coordinator requires {ORDER_INGRESS_RECEIPT_SECRET_ENV} when {REQUIRE_TRUSTED_ORDER_INGRESS_ENV} is enabled"
         ));
     }
+    let batch_window_ms = env::var(BATCH_WINDOW_MS_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("invalid {BATCH_WINDOW_MS_ENV}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_BATCH_WINDOW_MS);
+    if batch_window_ms == 0 {
+        return Err(format!("{BATCH_WINDOW_MS_ENV} must be positive"));
+    }
     let batch_epoch_offset = env::var(COORDINATOR_EPOCH_OFFSET_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -255,6 +285,14 @@ fn build_app() -> Result<Router, String> {
             })
             .transpose()?
             .unwrap_or(DEFAULT_COORDINATOR_MAX_ORDERS_PER_BATCH),
+        heartbeat_cover_secret: load_required_control_plane_token(
+            "zylith-coordinator",
+            HEARTBEAT_COVER_SECRET_ENV,
+        )?,
+        public_artifact_delay_epochs: env_u64_or_default(
+            PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
+            DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
+        )?,
     };
 
     Ok(build_app_with_config(
@@ -266,6 +304,7 @@ fn build_app() -> Result<Router, String> {
         internal_api_token,
         product_config,
         BatchTimingConfig {
+            window_ms: batch_window_ms,
             epoch_offset: batch_epoch_offset,
             close_jitter_ms: batch_close_jitter_ms,
         },
@@ -295,6 +334,7 @@ fn build_app_with_paths(
         ProductConfig::from_enabled_pair_ids_csv(DEFAULT_PAIR_IDS)
             .expect("default coordinator pairs"),
         BatchTimingConfig {
+            window_ms: DEFAULT_BATCH_WINDOW_MS,
             epoch_offset: 0,
             close_jitter_ms: 0,
         },
@@ -327,9 +367,12 @@ fn build_app_with_config(
     let enabled_pairs = product_config.enabled_pairs();
     ensure_open_batches(
         &mut loaded_batches,
+        &product_config,
         &enabled_pairs,
+        batch_timing.window_ms,
         batch_timing.epoch_offset,
         batch_timing.close_jitter_ms,
+        &hardening.heartbeat_cover_secret,
     );
     let app_state = AppState {
         batches: Arc::new(RwLock::new(loaded_batches)),
@@ -350,6 +393,7 @@ fn build_app_with_config(
         )),
         published_batch_artifacts_store_path: published_batch_artifacts_store_path.map(Arc::new),
         internal_api_token: internal_api_token.map(Arc::new),
+        batch_window_ms: batch_timing.window_ms,
         batch_epoch_offset: batch_timing.epoch_offset,
         batch_close_jitter_ms: batch_timing.close_jitter_ms,
         order_ingress_receipt_secrets: Arc::new(order_ingress.receipt_secrets),
@@ -357,7 +401,9 @@ fn build_app_with_config(
         allow_direct_private_order_payloads: order_ingress.allow_direct_private_payloads,
         emergency_paused: hardening.emergency_paused,
         max_orders_per_batch: hardening.max_orders_per_batch,
+        heartbeat_cover_secret: Arc::new(hardening.heartbeat_cover_secret),
         public_rate_limit_per_minute: hardening.public_rate_limit_per_minute,
+        public_artifact_delay_epochs: hardening.public_artifact_delay_epochs,
         rate_limiter: RateLimiter::default(),
     };
 
@@ -383,6 +429,10 @@ fn build_app_with_config(
             get(get_batch_orders),
         )
         .route(
+            "/api/internal/batches/{batch_id}/transcript",
+            get(get_internal_published_transcript),
+        )
+        .route(
             "/api/internal/batches/{batch_id}/artifacts",
             post(publish_batch_artifacts),
         )
@@ -393,6 +443,10 @@ fn build_app_with_config(
         .route(
             "/api/recovery/{account_id}/artifacts",
             get(list_recovery_artifacts).post(upload_recovery_artifact),
+        )
+        .route(
+            "/api/recovery/{account_id}/artifacts/range/{start_sequence}/{end_sequence}",
+            get(list_recovery_artifacts_range),
         )
         .route("/api/orders", post(submit_order))
         .route("/api/orders/cancel", post(cancel_order))
@@ -405,12 +459,7 @@ fn build_app_with_config(
         .route("/api/maker/batches/{batch_id}", get(get_maker_batch))
         .with_state(app_state)
         .layer(DefaultBodyLimit::max(hardening.max_body_bytes))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers(Any),
-        )
+        .layer(service_cors_layer(COORDINATOR_ALLOWED_ORIGINS_ENV))
 }
 
 async fn health(State(state): State<AppState>) -> Json<CoordinatorStatus> {
@@ -418,9 +467,12 @@ async fn health(State(state): State<AppState>) -> Json<CoordinatorStatus> {
     let enabled_pairs = state.product_config.enabled_pairs();
     let changed = advance_batch_lifecycle(
         &mut batches,
+        &state.product_config,
         &enabled_pairs,
+        state.batch_window_ms,
         state.batch_epoch_offset,
         state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
     );
     if changed {
         let _ = persist_batch_store_if_configured(&state, &batches);
@@ -432,39 +484,49 @@ async fn health(State(state): State<AppState>) -> Json<CoordinatorStatus> {
     Json(CoordinatorStatus {
         service: "zylith-coordinator".into(),
         current_batch_id,
-        tracked_batches: batches.len() as u64,
+        tracked_batches_bucket: count_bucket_label(batches.len() as u64),
+        batch_window_ms: state.batch_window_ms,
+        batch_close_jitter_ms: state.batch_close_jitter_ms,
     })
 }
 
-async fn list_batches(State(state): State<AppState>) -> Json<Vec<BatchSummary>> {
+async fn list_batches(State(state): State<AppState>) -> Json<Vec<PublicBatchSummary>> {
     let mut batches = state.batches.write().await;
     let enabled_pairs = state.product_config.enabled_pairs();
     let changed = advance_batch_lifecycle(
         &mut batches,
+        &state.product_config,
         &enabled_pairs,
+        state.batch_window_ms,
         state.batch_epoch_offset,
         state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
     );
     if changed {
         let _ = persist_batch_store_if_configured(&state, &batches);
     }
-    Json(batches.values().map(summary_from_record).collect())
+    Json(batches.values().map(public_summary_from_record).collect())
 }
 
-async fn current_batch(State(state): State<AppState>) -> Result<Json<BatchSummary>, StatusCode> {
+async fn current_batch(
+    State(state): State<AppState>,
+) -> Result<Json<PublicBatchSummary>, StatusCode> {
     let mut batches = state.batches.write().await;
     let enabled_pairs = state.product_config.enabled_pairs();
     let changed = advance_batch_lifecycle(
         &mut batches,
+        &state.product_config,
         &enabled_pairs,
+        state.batch_window_ms,
         state.batch_epoch_offset,
         state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
     );
     if changed {
         persist_batch_store_if_configured(&state, &batches)?;
     }
     current_open_batch_for_default_pair(&state.product_config, batches.values())
-        .map(summary_from_record)
+        .map(public_summary_from_record)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -472,7 +534,7 @@ async fn current_batch(State(state): State<AppState>) -> Result<Json<BatchSummar
 async fn current_pair_batch(
     State(state): State<AppState>,
     Path((base, quote)): Path<(String, String)>,
-) -> Result<Json<BatchSummary>, StatusCode> {
+) -> Result<Json<PublicBatchSummary>, StatusCode> {
     let pair_id = PairId(format!("{base}/{quote}"));
     if state.product_config.enabled_pair(&pair_id).is_none() {
         return Err(StatusCode::NOT_FOUND);
@@ -482,16 +544,19 @@ async fn current_pair_batch(
     let enabled_pairs = state.product_config.enabled_pairs();
     let changed = advance_batch_lifecycle(
         &mut batches,
+        &state.product_config,
         &enabled_pairs,
+        state.batch_window_ms,
         state.batch_epoch_offset,
         state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
     );
     if changed {
         persist_batch_store_if_configured(&state, &batches)?;
     }
 
     current_open_batch_for_pair(batches.values(), &pair_id)
-        .map(summary_from_record)
+        .map(public_summary_from_record)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -499,11 +564,11 @@ async fn current_pair_batch(
 async fn get_batch(
     State(state): State<AppState>,
     Path(batch_id): Path<String>,
-) -> Result<Json<BatchSummary>, StatusCode> {
+) -> Result<Json<PublicBatchSummary>, StatusCode> {
     let batches = state.batches.read().await;
     batches
         .get(&batch_id)
-        .map(summary_from_record)
+        .map(public_summary_from_record)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -514,7 +579,20 @@ async fn get_batch_orders(
     Path(batch_id): Path<String>,
 ) -> Result<Json<BatchOrderSet>, StatusCode> {
     require_internal_auth(&state, &headers)?;
-    let batches = state.batches.read().await;
+    let mut batches = state.batches.write().await;
+    let enabled_pairs = state.product_config.enabled_pairs();
+    let changed = advance_batch_lifecycle(
+        &mut batches,
+        &state.product_config,
+        &enabled_pairs,
+        state.batch_window_ms,
+        state.batch_epoch_offset,
+        state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
+    );
+    if changed {
+        persist_batch_store_if_configured(&state, &batches)?;
+    }
     let record = batches.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(BatchOrderSet {
@@ -526,7 +604,27 @@ async fn get_batch_orders(
 async fn get_published_transcript(
     State(state): State<AppState>,
     Path(batch_id): Path<String>,
+) -> Result<Json<PublicSettlementTranscript>, StatusCode> {
+    let artifacts = state.published_batch_artifacts.read().await;
+    let published = artifacts.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    if !is_public_artifact_visible(
+        &artifacts,
+        published,
+        published.transcript.batch_epoch,
+        state.public_artifact_delay_epochs,
+        state.batch_window_ms,
+    ) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    public_settlement_transcript(published).map(Json)
+}
+
+async fn get_internal_published_transcript(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<String>,
 ) -> Result<Json<zylith_core::SettlementTranscript>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
     let artifacts = state.published_batch_artifacts.read().await;
     let published = artifacts.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(published.transcript.clone()))
@@ -538,7 +636,80 @@ async fn get_published_output_bundle(
 ) -> Result<Json<zylith_core::OutputCiphertextBundle>, StatusCode> {
     let artifacts = state.published_batch_artifacts.read().await;
     let published = artifacts.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    if !is_public_artifact_visible(
+        &artifacts,
+        published,
+        published.transcript.batch_epoch,
+        state.public_artifact_delay_epochs,
+        state.batch_window_ms,
+    ) {
+        return Err(StatusCode::NOT_FOUND);
+    }
     Ok(Json(published.output_bundle.clone()))
+}
+
+fn is_public_artifact_visible(
+    artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
+    published: &PublishedBatchArtifacts,
+    batch_epoch: u64,
+    delay_epochs: u64,
+    batch_window_ms: u64,
+) -> bool {
+    if delay_epochs == 0 {
+        return true;
+    }
+    let Some(max_epoch) = artifacts
+        .values()
+        .map(|published| published.transcript.batch_epoch)
+        .max()
+    else {
+        return false;
+    };
+    let Some(cutoff) = max_epoch.checked_sub(delay_epochs) else {
+        return false;
+    };
+    if batch_epoch <= cutoff {
+        return true;
+    }
+    let delay_ms = delay_epochs.saturating_mul(batch_window_ms);
+    published.published_at_unix_ms != 0
+        && now_unix_ms() >= published.published_at_unix_ms.saturating_add(delay_ms)
+}
+
+fn public_settlement_transcript(
+    published: &PublishedBatchArtifacts,
+) -> Result<PublicSettlementTranscript, StatusCode> {
+    let roots = root_only_settlement_commitments(&published.transcript)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transcript_commitment = settlement_transcript_commitment(&published.transcript)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transcript_shape = published.transcript_shape.clone().unwrap_or_else(|| {
+        zylith_core::transcript_shape_metadata(&published.transcript, &published.output_bundle)
+    });
+    Ok(PublicSettlementTranscript {
+        batch_id: published.transcript.batch_id.clone(),
+        pair_id: published.transcript.pair_id.clone(),
+        batch_epoch: published.transcript.batch_epoch,
+        order_commitment_root: published.transcript.order_commitment_root.clone(),
+        encrypted_order_set_commitment: published.transcript.encrypted_order_set_commitment.clone(),
+        transcript_commitment,
+        clearing_price: published.transcript.clearing_price,
+        output_bundle_ref: published.transcript.output_ciphertext_bundle_ref.clone(),
+        prior_note_root: roots.prior_note_root,
+        prior_nullifier_root: roots.prior_nullifier_root,
+        prior_renewal_root: roots.prior_renewal_root,
+        prior_fee_root: roots.prior_fee_root,
+        consumed_note_root: roots.consumed_note_root,
+        consumed_nullifier_root: roots.consumed_nullifier_root,
+        renewal_child_root: roots.renewal_child_root,
+        output_note_root: roots.output_note_root,
+        fee_root: roots.fee_root,
+        new_note_root: roots.new_note_root,
+        new_nullifier_root: roots.new_nullifier_root,
+        new_renewal_root: roots.new_renewal_root,
+        new_fee_root: roots.new_fee_root,
+        transcript_shape,
+    })
 }
 
 async fn get_published_witness(
@@ -556,11 +727,23 @@ async fn publish_batch_artifacts(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(batch_id): Path<String>,
-    Json(request): Json<PublishedBatchArtifacts>,
+    Json(mut request): Json<PublishedBatchArtifacts>,
 ) -> Result<Json<PublishedBatchArtifacts>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     if request.transcript.batch_id.0 != batch_id || request.output_bundle.batch_id.0 != batch_id {
         return Err(StatusCode::BAD_REQUEST);
+    }
+    let expected_shape =
+        zylith_core::validate_transcript_shape_policy(&request.transcript, &request.output_bundle)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if let Some(provided_shape) = request.transcript_shape.as_ref()
+        && provided_shape != &expected_shape
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    request.transcript_shape = Some(expected_shape);
+    if request.published_at_unix_ms == 0 {
+        request.published_at_unix_ms = now_unix_ms();
     }
 
     let mut artifacts = state.published_batch_artifacts.write().await;
@@ -607,6 +790,60 @@ async fn list_recovery_artifacts(
 
     Ok(Json(RecoveryArtifactList {
         account_id,
+        sequence_start: artifacts
+            .first()
+            .map(|artifact| artifact.sequence)
+            .unwrap_or(0),
+        sequence_end: artifacts
+            .last()
+            .map(|artifact| artifact.sequence)
+            .unwrap_or(0),
+        artifact_count_bucket: count_bucket_label(artifacts.len() as u64),
+        artifacts,
+    }))
+}
+
+async fn list_recovery_artifacts_range(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, start_sequence, end_sequence)): Path<(String, u64, u64)>,
+) -> Result<Json<RecoveryArtifactList>, StatusCode> {
+    enforce_rate_limit(
+        &state.rate_limiter,
+        &headers,
+        "recovery-list-range",
+        state.public_rate_limit_per_minute,
+    )?;
+    if start_sequence > end_sequence {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let provided_auth_tag = require_recovery_auth_header(&headers)?;
+    let recovery_artifacts = state.recovery_artifacts.read().await;
+    let artifacts = if let Some(account) = recovery_artifacts.get(&account_id) {
+        if let Some(expected) = &account.recovery_auth_tag {
+            if !zylith_core::constant_time_eq(expected, &provided_auth_tag) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        } else {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        account
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.sequence >= start_sequence && artifact.sequence <= end_sequence
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(RecoveryArtifactList {
+        account_id,
+        sequence_start: start_sequence,
+        sequence_end: end_sequence,
+        artifact_count_bucket: count_bucket_label(artifacts.len() as u64),
         artifacts,
     }))
 }
@@ -686,9 +923,12 @@ async fn submit_order_inner(
     let enabled_pairs = state.product_config.enabled_pairs();
     advance_batch_lifecycle(
         &mut batches,
+        &state.product_config,
         &enabled_pairs,
+        state.batch_window_ms,
         state.batch_epoch_offset,
         state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
     );
     if state
         .product_config
@@ -711,10 +951,13 @@ async fn submit_order_inner(
         .entry(batch_key.clone())
         .or_insert_with(|| BatchRecord {
             batch: empty_batch(
+                &state.product_config,
                 &order_bundle.pair_id,
                 expected_epoch,
                 accepted_at_unix_ms,
+                state.batch_window_ms,
                 state.batch_close_jitter_ms,
+                state.heartbeat_cover_secret.as_str(),
             ),
             order_count: 0,
             orders: vec![],
@@ -740,7 +983,11 @@ async fn submit_order_inner(
             received_at_unix_ms: accepted_at_unix_ms,
             order_bundle: order_bundle.clone(),
         });
-        refresh_batch_commitments(record)?;
+        refresh_batch_commitments(
+            record,
+            &state.product_config,
+            state.heartbeat_cover_secret.as_str(),
+        )?;
         record.batch.batch_id.clone()
     };
     persist_batch_store_if_configured(&state, &batches)?;
@@ -812,9 +1059,12 @@ async fn cancel_order_inner(
     let enabled_pairs = state.product_config.enabled_pairs();
     advance_batch_lifecycle(
         &mut batches,
+        &state.product_config,
         &enabled_pairs,
+        state.batch_window_ms,
         state.batch_epoch_offset,
         state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
     );
     let record = batches
         .get_mut(&request.batch_id.0)
@@ -836,7 +1086,11 @@ async fn cancel_order_inner(
 
     record.orders.remove(order_index);
     record.order_count = record.orders.len() as u64;
-    refresh_batch_commitments(record)?;
+    refresh_batch_commitments(
+        record,
+        &state.product_config,
+        state.heartbeat_cover_secret.as_str(),
+    )?;
     persist_batch_store_if_configured(&state, &batches)?;
 
     Ok(Json(OrderCancellationAccepted {
@@ -852,7 +1106,20 @@ async fn get_maker_batch(
     Path(batch_id): Path<String>,
 ) -> Result<Json<BatchOrderSet>, StatusCode> {
     require_internal_auth(&state, &headers)?;
-    let batches = state.batches.read().await;
+    let mut batches = state.batches.write().await;
+    let enabled_pairs = state.product_config.enabled_pairs();
+    let changed = advance_batch_lifecycle(
+        &mut batches,
+        &state.product_config,
+        &enabled_pairs,
+        state.batch_window_ms,
+        state.batch_epoch_offset,
+        state.batch_close_jitter_ms,
+        state.heartbeat_cover_secret.as_str(),
+    );
+    if changed {
+        persist_batch_store_if_configured(&state, &batches)?;
+    }
     let record = batches.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(BatchOrderSet {
         batch: summary_from_record(record),
@@ -899,20 +1166,41 @@ fn summary_from_record(record: &BatchRecord) -> BatchSummary {
         epoch_id: record.batch.epoch_id,
         close_time_unix_ms: record.batch.close_time_unix_ms,
         status: record.batch.status.clone(),
-        order_count: record.order_count,
+        order_count: heartbeat_cover_order_count(record.orders.len()) as u64,
         order_commitment_root: record.batch.order_commitment_root.clone(),
         encrypted_order_set_commitment: record.batch.encrypted_order_set_commitment.clone(),
     }
 }
 
-fn load_product_config() -> Result<ProductConfig, String> {
-    if let Ok(value) = env::var(PRODUCT_PAIRS_ENV).or_else(|_| env::var(COORDINATOR_PAIR_IDS_ENV)) {
-        return ProductConfig::from_enabled_pair_ids_csv(&value)
-            .map_err(|error| format!("configured product pairs are invalid: {error}"));
+fn public_summary_from_record(record: &BatchRecord) -> PublicBatchSummary {
+    PublicBatchSummary {
+        batch_id: record.batch.batch_id.clone(),
+        pair_id: record.batch.pair_id.clone(),
+        epoch_id: record.batch.epoch_id,
+        close_time_unix_ms: record.batch.close_time_unix_ms,
+        status: record.batch.status.clone(),
+        order_count_bucket: count_bucket_label(
+            heartbeat_cover_order_count(record.orders.len()) as u64
+        ),
     }
+}
 
-    ProductConfig::from_enabled_pair_ids_csv(DEFAULT_PAIR_IDS)
-        .map_err(|error| format!("default coordinator pairs are invalid: {error}"))
+fn load_product_config() -> Result<ProductConfig, String> {
+    let mut product_config = if let Ok(value) =
+        env::var(PRODUCT_PAIRS_ENV).or_else(|_| env::var(COORDINATOR_PAIR_IDS_ENV))
+    {
+        ProductConfig::from_enabled_pair_ids_csv(&value)
+            .map_err(|error| format!("configured product pairs are invalid: {error}"))?
+    } else {
+        ProductConfig::from_enabled_pair_ids_csv(DEFAULT_PAIR_IDS)
+            .map_err(|error| format!("default coordinator pairs are invalid: {error}"))?
+    };
+    if let Ok(value) = env::var(HEARTBEAT_COVER_PRICES_ENV) {
+        product_config
+            .apply_heartbeat_cover_prices_csv(&value)
+            .map_err(|error| format!("configured heartbeat cover prices are invalid: {error}"))?;
+    }
+    Ok(product_config)
 }
 
 fn env_bool_or_default(env_name: &str, default: bool) -> bool {
@@ -920,6 +1208,19 @@ fn env_bool_or_default(env_name: &str, default: bool) -> bool {
         .ok()
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(default)
+}
+
+fn env_u64_or_default(env_name: &str, default: u64) -> Result<u64, String> {
+    env::var(env_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("invalid {env_name}"))
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
 fn load_receipt_secret_keyring() -> Vec<String> {
@@ -956,6 +1257,38 @@ fn load_required_control_plane_token(service_name: &str, env_name: &str) -> Resu
                 Ok(value)
             }
         })
+}
+
+fn service_cors_layer(env_name: &str) -> CorsLayer {
+    let base = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(Any);
+    match allowed_origins_from_env(env_name) {
+        Some(origins) => base.allow_origin(AllowOrigin::list(origins)),
+        None => base.allow_origin(Any),
+    }
+}
+
+fn allowed_origins_from_env(env_name: &str) -> Option<Vec<HeaderValue>> {
+    let value = env::var(env_name).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let origins = value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            HeaderValue::from_str(origin)
+                .unwrap_or_else(|_| panic!("{env_name} contains invalid origin '{origin}'"))
+        })
+        .collect::<Vec<_>>();
+    if origins.is_empty() {
+        None
+    } else {
+        Some(origins)
+    }
 }
 
 fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
@@ -1014,7 +1347,7 @@ fn enforce_rate_limit(
 }
 
 fn rate_limit_subject(headers: &HeaderMap) -> String {
-    for header in ["x-zylith-client-id", "x-forwarded-for", "x-real-ip"] {
+    for header in ["x-forwarded-for", "x-real-ip"] {
         if let Some(value) = headers
             .get(header)
             .and_then(|value| value.to_str().ok())
@@ -1064,16 +1397,22 @@ fn current_open_batch_for_pair<'a>(
 
 fn advance_batch_lifecycle(
     batches: &mut BTreeMap<String, BatchRecord>,
+    product_config: &ProductConfig,
     enabled_pairs: &[PairId],
+    batch_window_ms: u64,
     batch_epoch_offset: u64,
     batch_close_jitter_ms: u64,
+    heartbeat_cover_secret: &str,
 ) -> bool {
     let mut changed = close_expired_open_batches(batches);
     if ensure_open_batches(
         batches,
+        product_config,
         enabled_pairs,
+        batch_window_ms,
         batch_epoch_offset,
         batch_close_jitter_ms,
+        heartbeat_cover_secret,
     ) {
         changed = true;
     }
@@ -1085,11 +1424,7 @@ fn close_expired_open_batches(batches: &mut BTreeMap<String, BatchRecord>) -> bo
     let mut changed = false;
     for record in batches.values_mut() {
         if record.batch.status == BatchStatus::Open && record.batch.close_time_unix_ms <= now {
-            record.batch.status = if record.order_count == 0 {
-                BatchStatus::Cancelled
-            } else {
-                BatchStatus::Closed
-            };
+            record.batch.status = BatchStatus::Closed;
             changed = true;
         }
     }
@@ -1098,9 +1433,12 @@ fn close_expired_open_batches(batches: &mut BTreeMap<String, BatchRecord>) -> bo
 
 fn ensure_open_batches(
     batches: &mut BTreeMap<String, BatchRecord>,
+    product_config: &ProductConfig,
     enabled_pairs: &[PairId],
+    batch_window_ms: u64,
     batch_epoch_offset: u64,
     batch_close_jitter_ms: u64,
+    heartbeat_cover_secret: &str,
 ) -> bool {
     let mut changed = false;
     for pair_id in enabled_pairs {
@@ -1113,7 +1451,15 @@ fn ensure_open_batches(
         batches.insert(
             batch_key(pair_id, epoch_id),
             BatchRecord {
-                batch: empty_batch(pair_id, epoch_id, close_time_unix_ms, batch_close_jitter_ms),
+                batch: empty_batch(
+                    product_config,
+                    pair_id,
+                    epoch_id,
+                    close_time_unix_ms,
+                    batch_window_ms,
+                    batch_close_jitter_ms,
+                    heartbeat_cover_secret,
+                ),
                 order_count: 0,
                 orders: vec![],
             },
@@ -1168,20 +1514,31 @@ fn batch_key(pair_id: &PairId, epoch_id: u64) -> String {
 }
 
 fn empty_batch(
+    product_config: &ProductConfig,
     pair_id: &PairId,
     epoch_id: u64,
     opened_at_unix_ms: u64,
+    batch_window_ms: u64,
     batch_close_jitter_ms: u64,
+    heartbeat_cover_secret: &str,
 ) -> Batch {
-    let (order_commitment_root, encrypted_order_set_commitment) =
-        compute_batch_commitments(&[]).unwrap_or_else(|_| ("".into(), "".into()));
+    let batch_id = BatchId(batch_key(pair_id, epoch_id));
+    let (order_commitment_root, encrypted_order_set_commitment) = compute_batch_commitments_for(
+        product_config,
+        heartbeat_cover_secret,
+        pair_id,
+        &batch_id,
+        epoch_id,
+        &[],
+    )
+    .unwrap_or_else(|_| ("".into(), "".into()));
     let close_jitter_ms =
         deterministic_batch_close_jitter_ms(pair_id, epoch_id, batch_close_jitter_ms);
     Batch {
-        batch_id: BatchId(batch_key(pair_id, epoch_id)),
+        batch_id,
         pair_id: pair_id.clone(),
         epoch_id,
-        close_time_unix_ms: opened_at_unix_ms + DEFAULT_BATCH_WINDOW_MS + close_jitter_ms,
+        close_time_unix_ms: opened_at_unix_ms + batch_window_ms + close_jitter_ms,
         status: BatchStatus::Open,
         order_commitment_root,
         encrypted_order_set_commitment,
@@ -1202,25 +1559,89 @@ fn deterministic_batch_close_jitter_ms(pair_id: &PairId, epoch_id: u64, max_jitt
     accumulator % max_jitter_ms.saturating_add(1)
 }
 
-fn refresh_batch_commitments(record: &mut BatchRecord) -> Result<(), StatusCode> {
-    let (order_commitment_root, encrypted_order_set_commitment) =
-        compute_batch_commitments(&record.orders)?;
+fn refresh_batch_commitments(
+    record: &mut BatchRecord,
+    product_config: &ProductConfig,
+    heartbeat_cover_secret: &str,
+) -> Result<(), StatusCode> {
+    let (order_commitment_root, encrypted_order_set_commitment) = compute_batch_commitments_for(
+        product_config,
+        heartbeat_cover_secret,
+        &record.batch.pair_id,
+        &record.batch.batch_id,
+        record.batch.epoch_id,
+        &record.orders,
+    )?;
     record.batch.order_commitment_root = order_commitment_root;
     record.batch.encrypted_order_set_commitment = encrypted_order_set_commitment;
     Ok(())
 }
 
-fn compute_batch_commitments(
+fn compute_batch_commitments_for(
+    product_config: &ProductConfig,
+    heartbeat_cover_secret: &str,
+    pair_id: &PairId,
+    batch_id: &BatchId,
+    epoch_id: u64,
     orders: &[SubmittedOrderRecord],
 ) -> Result<(String, String), StatusCode> {
+    let pair = product_config
+        .enabled_pair(pair_id)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let batch = BatchSummary {
+        batch_id: batch_id.clone(),
+        pair_id: pair_id.clone(),
+        epoch_id,
+        close_time_unix_ms: 0,
+        status: BatchStatus::Closed,
+        order_count: heartbeat_cover_order_count(orders.len()) as u64,
+        order_commitment_root: "0x0".into(),
+        encrypted_order_set_commitment: "0x0".into(),
+    };
+    let cover_commitments = heartbeat_cover_order_commitments(
+        heartbeat_cover_secret,
+        &batch,
+        &pair.base_asset_id,
+        &pair.quote_asset_id,
+        pair.heartbeat_cover_price,
+        orders.len(),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let order_commitments = orders
         .iter()
         .map(|record| record.order_bundle.order_commitment.0.clone())
+        .chain(
+            cover_commitments
+                .iter()
+                .map(|commitment| commitment.0.clone()),
+        )
         .collect::<Vec<_>>();
-    let encrypted_order_set = orders
+    let mut encrypted_order_set = orders
         .iter()
         .map(|record| record.order_bundle.clone())
         .collect::<Vec<_>>();
+    for commitment in cover_commitments.iter() {
+        let cancellation_auth_tag = tagged_field_hex(
+            "zylith/heartbeat-cover/cancel-tag-v1",
+            &serde_json::json!({
+                "batch_id": batch_id.0,
+                "pair_id": pair_id.0,
+                "epoch_id": epoch_id,
+                "order_commitment": commitment.0,
+            }),
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        encrypted_order_set.push(OrderShareBundle {
+            order_commitment: commitment.clone(),
+            cancellation_auth_tag,
+            pair_id: pair_id.clone(),
+            batch_id: batch_id.clone(),
+            epoch_id,
+            transport_envelope: None,
+            ingress_receipt: None,
+            shares: Vec::new(),
+        });
+    }
 
     let order_root = ordered_felt_list_commitment("zylith/batch-order-root", &order_commitments)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1354,8 +1775,9 @@ fn atomic_write(path: &FsPath, contents: &str) -> Result<(), StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchTimingConfig, OrderIngressConfig, build_app_with_config, build_app_with_paths,
-        deterministic_batch_close_jitter_ms,
+        BatchRecord, BatchTimingConfig, DEFAULT_BATCH_WINDOW_MS, OrderIngressConfig,
+        build_app_with_config, build_app_with_paths, close_expired_open_batches,
+        deterministic_batch_close_jitter_ms, empty_batch, now_unix_ms,
     };
     use axum::http::StatusCode;
     use axum::{
@@ -1363,7 +1785,7 @@ mod tests {
         http::{Method, Request},
     };
     use http_body_util::BodyExt;
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
     use tower::ServiceExt;
     use zylith_core::{
         EncryptedRecoveryPayload, OrderCancellationRequest, OrderShareBundle, OrderSubmission,
@@ -1387,11 +1809,40 @@ mod tests {
         assert_eq!(deterministic_batch_close_jitter_ms(&pair, 7, 0), 0);
     }
 
+    #[test]
+    fn empty_expired_batches_close_as_pair_heartbeat_not_cancelled() {
+        let pair = PairId("STRK/USDC".into());
+        let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
+        let mut batch = empty_batch(
+            &product,
+            &pair,
+            1,
+            1,
+            DEFAULT_BATCH_WINDOW_MS,
+            0,
+            "test-heartbeat-cover-secret",
+        );
+        batch.close_time_unix_ms = 1;
+        let mut batches = BTreeMap::from([(
+            batch.batch_id.0.clone(),
+            BatchRecord {
+                batch,
+                order_count: 0,
+                orders: Vec::new(),
+            },
+        )]);
+
+        assert!(close_expired_open_batches(&mut batches));
+        let record = batches.values().next().expect("closed batch");
+        assert_eq!(record.batch.status, zylith_core::BatchStatus::Closed);
+    }
+
     #[tokio::test]
     async fn health_endpoint_returns_ok() {
         let app = build_app_with_paths(None, None, None, None);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/health")
@@ -1410,6 +1861,7 @@ mod tests {
         let app = build_app_with_paths(None, None, None, None);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/batches/current")
@@ -1442,6 +1894,7 @@ mod tests {
             None,
             ProductConfig::from_enabled_pair_ids_csv("STRK/USDC,STRK/ETH").expect("product"),
             BatchTimingConfig {
+                window_ms: DEFAULT_BATCH_WINDOW_MS,
                 epoch_offset: 0,
                 close_jitter_ms: 0,
             },
@@ -1527,7 +1980,9 @@ mod tests {
             .expect("body")
             .to_bytes();
         let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
-        assert_eq!(json["order_count"], 1);
+        assert_eq!(json["order_count_bucket"], "0-7");
+        assert!(json.get("order_count").is_none());
+        assert!(json.get("order_commitment_root").is_none());
     }
 
     #[tokio::test]
@@ -1543,6 +1998,7 @@ mod tests {
             ProductConfig::from_enabled_pair_ids_csv(super::DEFAULT_PAIR_IDS)
                 .expect("default coordinator pairs"),
             BatchTimingConfig {
+                window_ms: DEFAULT_BATCH_WINDOW_MS,
                 epoch_offset: 0,
                 close_jitter_ms: 0,
             },
@@ -1565,6 +2021,7 @@ mod tests {
                 ephemeral_public_key: "04abcdef".into(),
                 nonce: "00".into(),
                 ciphertext: "11".into(),
+                recovery: None,
             }),
             ingress_receipt: None,
             shares: vec![],
@@ -1760,7 +2217,7 @@ mod tests {
             .to_bytes();
         let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
         assert_eq!(json["batch_id"], "batch-strk-usdc-1");
-        assert_eq!(json["order_count"], 0);
+        assert_eq!(json["order_count_bucket"], "0-7");
     }
 
     #[tokio::test]
@@ -1893,7 +2350,7 @@ mod tests {
             .expect("body")
             .to_bytes();
         let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
-        assert_eq!(json["order_count"], 0);
+        assert_eq!(json["order_count_bucket"], "0-7");
     }
 
     #[tokio::test]
@@ -1941,6 +2398,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/api/recovery/account-1/artifacts")
@@ -1962,6 +2420,30 @@ mod tests {
         let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
         assert_eq!(json["account_id"], "account-1");
         assert_eq!(json["artifacts"][0]["artifact_id"], "artifact-1");
+        assert_eq!(json["artifact_count_bucket"], "0-7");
+
+        let range_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recovery/account-1/artifacts/range/0/128")
+                    .method(Method::GET)
+                    .header(zylith_core::RECOVERY_AUTH_HEADER, TEST_RECOVERY_AUTH)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(range_response.status(), StatusCode::OK);
+        let body = range_response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert_eq!(json["sequence_start"], 0);
+        assert_eq!(json["sequence_end"], 128);
+        assert_eq!(json["artifact_count_bucket"], "0-7");
 
         let persisted = std::fs::read_to_string(&temp_path).expect("persisted file");
         assert!(persisted.contains("artifact-1"));
@@ -1983,6 +2465,23 @@ mod tests {
         );
 
         let batch_id = "batch-strk-usdc-9";
+        let output_bundle = zylith_core::OutputCiphertextBundle::from_ciphertexts(
+            zylith_core::BatchId(batch_id.into()),
+            "da-ref",
+            vec![],
+        )
+        .expect("output bundle");
+        let output_bundle_ref = output_bundle.bundle_commitment.clone();
+        let output_recovery_dummy_commitments = output_bundle
+            .ciphertexts
+            .iter()
+            .filter_map(|ciphertext| {
+                ciphertext
+                    .recovery
+                    .as_ref()
+                    .map(|recovery| recovery.commitment.clone())
+            })
+            .collect::<Vec<_>>();
         let published = PublishedBatchArtifacts {
             transcript: zylith_core::SettlementTranscript {
                 batch_id: zylith_core::BatchId(batch_id.into()),
@@ -1990,20 +2489,24 @@ mod tests {
                 batch_epoch: 9,
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 matched_orders: vec![],
                 consumed_inputs: vec![],
                 renewal_child_uses: vec![],
                 fees: vec![],
                 output_notes: vec![],
-                output_ciphertext_bundle_ref: "bundle-ref".into(),
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments: output_recovery_dummy_commitments.clone(),
+                output_ciphertext_bundle_ref: output_bundle_ref.clone(),
             },
-            output_bundle: zylith_core::OutputCiphertextBundle {
-                batch_id: zylith_core::BatchId(batch_id.into()),
-                bundle_commitment: "bundle-commitment".into(),
-                data_availability_ref: "da-ref".into(),
-                ciphertexts: vec![],
-            },
+            output_bundle,
             settlement_witness: zylith_core::SettlementWitness {
                 batch_id: zylith_core::BatchId(batch_id.into()),
                 pair_id: zylith_core::PairId("STRK/USDC".into()),
@@ -2012,18 +2515,36 @@ mod tests {
                 encrypted_order_set_commitment: "0x222".into(),
                 transcript_commitment: "transcript-commitment".into(),
                 auction_verifier_address: "0x0".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 base_asset_id: zylith_core::AssetId("STRK".into()),
                 quote_asset_id: zylith_core::AssetId("USDC".into()),
                 matched_orders: vec![],
                 matched_order_witnesses: vec![],
                 consumed_inputs: vec![],
+                note_membership_witnesses: vec![],
+                nullifier_history: vec![],
+                nullifier_sparse_witnesses: vec![],
+                renewal_history: vec![],
+                renewal_child_sparse_witnesses: vec![],
+                renewal_cancel_sparse_witnesses: vec![],
+                privacy_gate: Default::default(),
                 renewal_child_uses: vec![],
                 fees: vec![],
                 output_notes: vec![],
-                output_ciphertext_bundle_ref: "bundle-ref".into(),
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments,
+                output_ciphertext_bundle_ref: output_bundle_ref.clone(),
             },
+            published_at_unix_ms: now_unix_ms(),
             order_execution_reports: vec![],
+            transcript_shape: None,
         };
 
         let response = app
@@ -2057,6 +2578,47 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(transcript_response.status(), StatusCode::OK);
+        let public_body = transcript_response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let public_json = serde_json::from_slice::<serde_json::Value>(&public_body).expect("json");
+        assert_eq!(public_json["batch_id"], batch_id);
+        assert_eq!(public_json["output_bundle_ref"], output_bundle_ref);
+        assert!(public_json["transcript_shape"].is_object());
+        assert!(public_json.get("matched_orders").is_none());
+        assert!(public_json.get("consumed_inputs").is_none());
+        assert!(public_json.get("output_notes").is_none());
+        assert!(public_json.get("fees").is_none());
+
+        let internal_transcript_response = app
+            .clone()
+            .oneshot(
+                auth_request(
+                    Request::builder()
+                        .uri(format!("/api/internal/batches/{batch_id}/transcript"))
+                        .method(Method::GET),
+                )
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(internal_transcript_response.status(), StatusCode::OK);
+        let internal_body = internal_transcript_response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let internal_json =
+            serde_json::from_slice::<serde_json::Value>(&internal_body).expect("json");
+        assert!(internal_json.get("matched_orders").is_some());
+        assert!(internal_json.get("consumed_inputs").is_some());
+        assert!(internal_json.get("output_notes").is_some());
+        assert!(internal_json.get("fees").is_some());
 
         let output_bundle_response = app
             .oneshot(
@@ -2071,7 +2633,7 @@ mod tests {
         assert_eq!(output_bundle_response.status(), StatusCode::OK);
 
         let persisted = std::fs::read_to_string(&temp_path).expect("persisted file");
-        assert!(persisted.contains("bundle-commitment"));
+        assert!(persisted.contains(&output_bundle_ref));
         let _ = std::fs::remove_file(temp_path);
     }
 

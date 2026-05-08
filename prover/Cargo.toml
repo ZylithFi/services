@@ -7,7 +7,9 @@ authors.workspace = true
 
 [dependencies]
 axum = "0.8"
+bhttp = "0.7"
 hex = "0.4"
+ohttp = "0.7"
 p256 = { version = "0.13", features = ["ecdh"] }
 rand_core = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

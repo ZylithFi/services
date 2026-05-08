@@ -1,3 +1,4 @@
+use bip39::{Language, Mnemonic};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,12 @@ impl RecoverySeed {
         hex::encode(self.0)
     }
 
+    pub fn to_mnemonic(&self) -> Result<String, ProtocolError> {
+        Mnemonic::from_entropy_in(Language::English, &self.0)
+            .map(|mnemonic| mnemonic.to_string())
+            .map_err(|error| ProtocolError::InvalidRecoveryPhrase(error.to_string()))
+    }
+
     pub fn from_hex(encoded: &str) -> Result<Self, ProtocolError> {
         let decoded = hex::decode(encoded)?;
         if decoded.len() != 32 {
@@ -34,6 +41,19 @@ impl RecoverySeed {
 
         let mut seed = [0_u8; 32];
         seed.copy_from_slice(&decoded);
+        Ok(Self(seed))
+    }
+
+    pub fn from_mnemonic(phrase: &str) -> Result<Self, ProtocolError> {
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
+            .map_err(|error| ProtocolError::InvalidRecoveryPhrase(error.to_string()))?;
+        let entropy = mnemonic.to_entropy();
+        if entropy.len() != 32 {
+            return Err(ProtocolError::InvalidSeedLength(entropy.len()));
+        }
+
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(&entropy);
         Ok(Self(seed))
     }
 }
@@ -65,6 +85,15 @@ mod tests {
         let seed = RecoverySeed::generate();
         let encoded = seed.to_hex();
         let decoded = RecoverySeed::from_hex(&encoded).expect("seed hex should parse");
+        assert_eq!(seed, decoded);
+    }
+
+    #[test]
+    fn mnemonic_roundtrip_is_stable_and_uses_24_words() {
+        let seed = RecoverySeed([11_u8; 32]);
+        let phrase = seed.to_mnemonic().expect("mnemonic");
+        assert_eq!(phrase.split_whitespace().count(), 24);
+        let decoded = RecoverySeed::from_mnemonic(&phrase).expect("seed from phrase");
         assert_eq!(seed, decoded);
     }
 
