@@ -39,7 +39,7 @@ use crate::{
     },
     types::{
         NOTE_RECOGNITION_ALGORITHM, OUTPUT_NOTE_PLAINTEXT_PADDED_LEN, OUTPUT_RECOVERY_FIELD_COUNT,
-        OUTPUT_RECOVERY_PROOF_SLOTS, nullifier_from_spend_authority, output_recovery_bundle_root,
+        OUTPUT_RECOVERY_PROOF_SLOTS, nullifier_from_note_secret, output_recovery_bundle_root,
         output_recovery_record_commitment, renewal_child_nullifier, renewal_parent_cancel_marker,
         spend_auth_key_felt_from_raw_key_hex, spend_authority_from_raw_key_hex,
         withdraw_authority_from_raw_key_hex,
@@ -579,10 +579,10 @@ fn validate_private_order_spend_authorization(
 
 fn validate_note_nullifier(note: &Note, nullifier: &crate::Nullifier) -> Result<(), ProtocolError> {
     let note_commitment = note.commitment()?;
-    let expected = nullifier_from_spend_authority(&note_commitment, &note.spend_authority)?;
+    let expected = nullifier_from_note_secret(&note_commitment, &note.blinding)?;
     if expected != *nullifier {
         return Err(ProtocolError::Crypto(
-            "funding nullifier does not match note commitment and spend authority".into(),
+            "funding nullifier does not match note commitment and note secret".into(),
         ));
     }
     Ok(())
@@ -674,7 +674,7 @@ pub fn build_heartbeat_cover_orders(
         };
         let funding_note_ref = funding_note.commitment()?;
         let funding_nullifier =
-            nullifier_from_spend_authority(&funding_note_ref, &spend_authority)?;
+            nullifier_from_note_secret(&funding_note_ref, &funding_note.blinding)?;
         let order = OrderIntent {
             pair_id: batch.pair_id.clone(),
             batch_id: batch.batch_id.clone(),
@@ -5296,7 +5296,7 @@ mod tests {
         PrivateExecutionKeyRegistry, PrivateOrderPayload, ProtocolError, RecoveryArtifactKind,
         RecoverySeed, SettlementTranscript, SettlementWitness,
         hash::{encode_starknet_felt, ordered_felt_list_commitment},
-        nullifier_from_spend_auth_key_felt, spend_auth_key_felt_from_raw_key_hex,
+        nullifier_from_note_secret, spend_auth_key_felt_from_raw_key_hex,
         spend_authority_from_raw_key_hex,
     };
 
@@ -7426,11 +7426,8 @@ mod tests {
     }
 
     fn sample_nullifier(note: &Note) -> Nullifier {
-        nullifier_from_spend_auth_key_felt(
-            &note.commitment().expect("note commitment"),
-            &sample_spend_auth_key(),
-        )
-        .expect("sample nullifier")
+        nullifier_from_note_secret(&note.commitment().expect("note commitment"), &note.blinding)
+            .expect("sample nullifier")
     }
 
     #[test]

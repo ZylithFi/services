@@ -296,7 +296,7 @@ impl Note {
             ));
         }
         let note_commitment = self.commitment()?;
-        nullifier_from_spend_authority(&note_commitment, &self.spend_authority)
+        nullifier_from_note_secret(&note_commitment, &self.blinding)
     }
 }
 
@@ -317,23 +317,15 @@ pub fn spend_authority_from_raw_key_hex(spend_auth_key_hex: &str) -> Result<Stri
     ))
 }
 
-pub fn nullifier_from_spend_auth_key_felt(
+pub fn nullifier_from_note_secret(
     note_commitment: &NoteCommitment,
-    spend_auth_key_felt: &str,
-) -> Result<Nullifier, ProtocolError> {
-    let spend_authority = spend_authority_from_spend_auth_key_felt(spend_auth_key_felt)?;
-    nullifier_from_spend_authority(note_commitment, &spend_authority)
-}
-
-pub fn nullifier_from_spend_authority(
-    note_commitment: &NoteCommitment,
-    spend_authority: &str,
+    note_secret: &str,
 ) -> Result<Nullifier, ProtocolError> {
     let note_commitment = felt_from_hex_str(&note_commitment.0)?;
-    let spend_authority = felt_from_hex_str(spend_authority)?;
+    let note_secret = felt_from_hex_str(note_secret)?;
     Ok(Nullifier(poseidon_chain_hex(
         domain_felt("zylith/nullifier"),
-        &[note_commitment, spend_authority],
+        &[note_commitment, note_secret],
     )))
 }
 
@@ -2613,7 +2605,10 @@ mod tests {
     };
 
     use crate::EncryptedBlob;
-    use crate::{RecoverySeed, derive_user_keys, spend_authority_from_raw_key_hex};
+    use crate::{
+        RecoverySeed, derive_user_keys, nullifier_from_note_secret,
+        spend_authority_from_raw_key_hex,
+    };
 
     #[test]
     fn note_commitments_are_deterministic() {
@@ -2634,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn nullifier_derivation_uses_spend_key() {
+    fn nullifier_derivation_uses_note_secret() {
         let seed = RecoverySeed([3_u8; 32]);
         let keys = derive_user_keys(&seed);
         let spend_authority =
@@ -2652,7 +2647,9 @@ mod tests {
 
         let nullifier = note.nullifier(&keys).expect("nullifier");
         let commitment = note.commitment().expect("commitment");
+        let expected = nullifier_from_note_secret(&commitment, &note.blinding).expect("expected");
 
+        assert_eq!(nullifier, expected);
         assert_ne!(nullifier.0, commitment.0);
     }
 
