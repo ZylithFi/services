@@ -56,9 +56,8 @@ use zylith_core::{
     SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
     TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, build_admission_serialized_input,
-    build_auction_result_serialized_input, build_auction_serialized_input,
-    build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
-    create_order_ingress_receipt, decrypt_order_bundle,
+    build_auction_result_serialized_input, build_heartbeat_cover_orders, build_output_note,
+    build_settlement_submission_plan, create_order_ingress_receipt, decrypt_order_bundle,
     deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
     extract_bearer_token, format_bearer_token, native_settlement_message_hash,
     nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
@@ -116,7 +115,6 @@ const NATIVE_PROOF_PROGRAM_ADDRESS_ENV: &str = "ZYLITH_NATIVE_PROOF_PROGRAM_ADDR
 const NATIVE_PROOF_ENTRYPOINT_ENV: &str = "ZYLITH_NATIVE_PROOF_ENTRYPOINT";
 const NATIVE_PROOF_AGGREGATE_ENTRYPOINT_ENV: &str = "ZYLITH_NATIVE_PROOF_AGGREGATE_ENTRYPOINT";
 const NATIVE_PROOF_AGGREGATOR_URL_ENV: &str = "ZYLITH_NATIVE_PROOF_AGGREGATOR_URL";
-const NATIVE_SPLIT_AUCTION_PROOF_REQUIRED_ENV: &str = "ZYLITH_NATIVE_SPLIT_AUCTION_PROOF_REQUIRED";
 const NATIVE_PROOF_SMOKE_ZERO_ROOTS_ENV: &str = "ZYLITH_NATIVE_PROOF_SMOKE_ZERO_ROOTS";
 const AUCTION_PROVER_KEYS_PATH_ENV: &str = "ZYLITH_AUCTION_PROVER_KEYS_PATH";
 const AUCTION_PROVER_ALLOW_KEYGEN_ENV: &str = "ZYLITH_AUCTION_PROVER_ALLOW_KEYGEN";
@@ -178,7 +176,6 @@ struct AppState {
     native_proof_program_address: String,
     native_proof_entrypoint: String,
     native_proof_aggregate_entrypoint: String,
-    native_split_auction_proof_required: bool,
     native_tx_prover_url: Option<String>,
     native_tx_prover_ohttp: Option<NativeProverOhttpConfig>,
     native_proof_aggregator_url: Option<String>,
@@ -280,7 +277,6 @@ struct AppConfig {
     native_proof_program_address: String,
     native_proof_entrypoint: String,
     native_proof_aggregate_entrypoint: String,
-    native_split_auction_proof_required: bool,
     native_tx_prover_url: Option<String>,
     native_tx_prover_ohttp: Option<NativeProverOhttpConfig>,
     native_proof_aggregator_url: Option<String>,
@@ -516,7 +512,6 @@ struct NativeProofAggregationRecord {
 struct NativeAggregationPreparedMember {
     witness: SettlementWitness,
     settlement_plan: SettlementSubmissionPlan,
-    auction_order_witnesses: Vec<AuctionOrderWitness>,
     proof_message_hash: String,
 }
 
@@ -610,7 +605,7 @@ fn build_app() -> Result<Router, String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "compile_auction_aggregate_proof".into());
+        .unwrap_or_else(|| "compile_settlement_aggregate_proof".into());
     let native_tx_prover_url = env::var("ZYLITH_NATIVE_TX_PROVER_URL").ok();
     let native_tx_prover_ohttp = load_native_prover_ohttp_config()?;
     let native_proof_aggregator_url = env::var(NATIVE_PROOF_AGGREGATOR_URL_ENV)
@@ -658,10 +653,6 @@ fn build_app() -> Result<Router, String> {
         native_proof_program_address,
         native_proof_entrypoint,
         native_proof_aggregate_entrypoint,
-        native_split_auction_proof_required: env_bool_or_default(
-            NATIVE_SPLIT_AUCTION_PROOF_REQUIRED_ENV,
-            false,
-        ),
         native_tx_prover_url,
         native_tx_prover_ohttp,
         native_proof_aggregator_url,
@@ -871,7 +862,6 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         native_proof_program_address,
         native_proof_entrypoint,
         native_proof_aggregate_entrypoint,
-        native_split_auction_proof_required,
         native_tx_prover_url,
         native_tx_prover_ohttp,
         native_proof_aggregator_url,
@@ -918,6 +908,14 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
     if protocol_fee_recipient.trim().is_empty() {
         return Err("protocol fee recipient must not be empty".into());
     }
+    if native_proof_entrypoint != "compile_settlement_proof" {
+        return Err("native proof entrypoint must be compile_settlement_proof".into());
+    }
+    if native_proof_aggregate_entrypoint != "compile_settlement_aggregate_proof" {
+        return Err(
+            "native aggregate proof entrypoint must be compile_settlement_aggregate_proof".into(),
+        );
+    }
 
     ensure_prover_dirs(&data_dir)?;
     let auction_key_registry = PrivateExecutionKeyRegistry {
@@ -937,7 +935,6 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         native_proof_program_address,
         native_proof_entrypoint,
         native_proof_aggregate_entrypoint,
-        native_split_auction_proof_required,
         native_tx_prover_url,
         native_tx_prover_ohttp,
         native_proof_aggregator_url,
@@ -1349,7 +1346,7 @@ fn env_bool_or_default(env_name: &str, default: bool) -> bool {
 }
 
 fn load_native_prover_ohttp_config() -> Result<Option<NativeProverOhttpConfig>, String> {
-    if !env_bool_or_default(NATIVE_TX_PROVER_OHTTP_ENABLED_ENV, false) {
+    if !env_bool_or_default(NATIVE_TX_PROVER_OHTTP_ENABLED_ENV, true) {
         return Ok(None);
     }
     let relay_url = env::var(NATIVE_TX_PROVER_OHTTP_RELAY_URL_ENV)
@@ -1581,6 +1578,12 @@ async fn submit_native_proof_aggregation(
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
     let aggregate = run_true_native_proof_aggregation(&state, start_epoch, end_epoch).await?;
+    for batch_id in &aggregate.member_batches {
+        if let Err(error) = prove_and_record_auction_result(&state, &batch_id.0, true).await {
+            set_onchain_submission_error(&state, &batch_id.0, error).await?;
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    }
     let tx_hash = submit_native_invoke_with_typed_sdk_retry(
         &state,
         state
@@ -1809,13 +1812,9 @@ async fn prepare_native_aggregation_members(
             &statement_message,
         )
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
-        let auction_order_witnesses = fetch_auction_order_witnesses(state, &witness.batch_id.0)
-            .await
-            .map_err(|_| StatusCode::CONFLICT)?;
         members.push(NativeAggregationPreparedMember {
             witness,
             settlement_plan,
-            auction_order_witnesses,
             proof_message_hash: proof_message,
         });
     }
@@ -2042,9 +2041,8 @@ fn build_native_aggregate_proof_program_call(
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     let mut aggregate_payload = vec![encode_usize_hex(members.len())];
     for member in members {
-        let serialized =
-            build_auction_serialized_input(&member.witness, &member.auction_order_witnesses)
-                .map_err(|_| StatusCode::CONFLICT)?;
+        let serialized = zylith_core::build_stwo_serialized_input(&member.witness)
+            .map_err(|_| StatusCode::CONFLICT)?;
         aggregate_payload.extend(serialized);
     }
     let mut calldata = Vec::with_capacity(aggregate_payload.len() + 2);
@@ -2207,10 +2205,7 @@ async fn run_proof_job(
 
     match proof_result {
         Ok(artifact) => {
-            if state.native_split_auction_proof_required
-                && state.native_tx_prover_url.is_some()
-                && let Err(error) = prove_and_record_auction_result(&state, &batch_id, false).await
-            {
+            if let Err(error) = prove_and_record_auction_result(&state, &batch_id, false).await {
                 set_job_error(&state, &batch_id, error).await?;
                 return Err(StatusCode::BAD_GATEWAY);
             }
@@ -2300,9 +2295,7 @@ async fn submit_onchain(
         return Err(StatusCode::CONFLICT);
     }
 
-    if state.native_split_auction_proof_required
-        && let Err(error) = prove_and_record_auction_result(&state, &batch_id, true).await
-    {
+    if let Err(error) = prove_and_record_auction_result(&state, &batch_id, true).await {
         set_onchain_submission_error(&state, &batch_id, error).await?;
         return Err(StatusCode::BAD_GATEWAY);
     }
@@ -3793,7 +3786,7 @@ async fn execute_stwo_prover(
     state: &AppState,
     batch_id: &str,
     settlement_witness: &SettlementWitness,
-    auction_order_witnesses: &[AuctionOrderWitness],
+    _auction_order_witnesses: &[AuctionOrderWitness],
 ) -> Result<ProofArtifactRecord, String> {
     let manifest_workdir = state
         .stwo_manifest_path
@@ -3804,9 +3797,8 @@ async fn execute_stwo_prover(
         .map_err(status_to_error)?;
 
     persist_json_file(&paths.witness_path, settlement_witness).map_err(status_to_error)?;
-    let serialized_input =
-        build_auction_serialized_input(settlement_witness, auction_order_witnesses)
-            .map_err(|error| format!("failed to serialize auction witness for S-two: {error}"))?;
+    let serialized_input = zylith_core::build_stwo_serialized_input(settlement_witness)
+        .map_err(|error| format!("failed to serialize settlement witness for S-two: {error}"))?;
     persist_json_file(&paths.public_inputs_path, &serialized_input).map_err(status_to_error)?;
 
     let mut prove_command = build_stwo_prove_command(
@@ -3935,7 +3927,7 @@ async fn execute_native_transaction_prover(
     batch_id: &str,
     transcript: &SettlementTranscript,
     settlement_witness: &SettlementWitness,
-    auction_order_witnesses: &[AuctionOrderWitness],
+    _auction_order_witnesses: &[AuctionOrderWitness],
 ) -> Result<ProofArtifactRecord, String> {
     let tx_prover_url = state
         .native_tx_prover_url
@@ -3970,15 +3962,10 @@ async fn execute_native_transaction_prover(
     if settlement_witness.transcript_commitment != transcript_commitment {
         return Err("settlement witness commitment does not match transcript".into());
     }
-    let serialized_native_witness = if state.native_proof_entrypoint == "compile_settlement_proof" {
-        zylith_core::build_stwo_serialized_input(settlement_witness).map_err(|error| {
+    let serialized_native_witness = zylith_core::build_stwo_serialized_input(settlement_witness)
+        .map_err(|error| {
             format!("failed to serialize settlement witness for native proof: {error}")
-        })?
-    } else {
-        build_auction_serialized_input(settlement_witness, auction_order_witnesses).map_err(
-            |error| format!("failed to serialize auction witness for native proof: {error}"),
-        )?
-    };
+        })?;
     let proof_program_calldata = build_native_proof_program_calldata(
         &state.auction_verifier_address,
         &serialized_native_witness,

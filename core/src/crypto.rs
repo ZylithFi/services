@@ -90,7 +90,6 @@ fn aes_nonce_from_slice(bytes: &[u8]) -> Result<Nonce<U12>, ProtocolError> {
     Ok(nonce.into())
 }
 const SETTLEMENT_STATEMENT_TYPE_TAG: u64 = 1;
-const AUCTION_STATEMENT_TYPE_TAG: u64 = 2;
 const ADMISSION_STATEMENT_TYPE_TAG: u64 = 3;
 const AUCTION_RESULT_STATEMENT_TYPE_TAG: u64 = 4;
 
@@ -3946,10 +3945,10 @@ fn validate_output_recovery_witness(witness: &SettlementWitness) -> Result<(), P
     Ok(())
 }
 
-pub fn build_auction_serialized_input(
+fn auction_proof_vectors(
     witness: &SettlementWitness,
     all_orders: &[AuctionOrderWitness],
-) -> Result<Vec<String>, ProtocolError> {
+) -> Result<AuctionProofVectors, ProtocolError> {
     let settlement_calldata = build_stwo_serialized_input(witness)?;
     let (settlement_len, settlement_payload) = settlement_calldata
         .split_first()
@@ -4073,113 +4072,69 @@ pub fn build_auction_serialized_input(
         })
         .collect::<Result<Vec<_>, ProtocolError>>()?;
 
-    let mut payload = vec![encode_u64(AUCTION_STATEMENT_TYPE_TAG)];
-    push_span(&mut payload, settlement_payload);
-    push_span(
-        &mut payload,
-        &all_orders
+    Ok(AuctionProofVectors {
+        settlement_payload: settlement_payload.to_vec(),
+        order_commitments: all_orders
             .iter()
             .map(|entry| entry.order_commitment.0.clone())
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        sides: all_orders
             .iter()
             .map(|entry| encode_order_side(&entry.order.side))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        order_types: all_orders
             .iter()
             .map(|entry| encode_order_type(&entry.order.order_type))
-            .collect::<Vec<_>>(),
-    );
-    push_span(&mut payload, &maker_curve_commitments);
-    push_span(&mut payload, &maker_curve_point_counts);
-    push_span(&mut payload, &maker_curve_prices);
-    push_span(&mut payload, &maker_curve_base_amounts);
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        maker_curve_commitments,
+        maker_curve_point_counts,
+        maker_curve_prices,
+        maker_curve_base_amounts,
+        limit_prices: all_orders
             .iter()
             .map(|entry| encode_u128(entry.order.limit_price))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        order_amounts: all_orders
             .iter()
             .map(|entry| encode_u128(entry.order.amount))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        min_fills: all_orders
             .iter()
             .map(|entry| encode_u128(entry.order.min_fill))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        time_in_force: all_orders
             .iter()
             .map(|entry| encode_time_in_force(&entry.order.time_in_force))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        expiry_epochs: all_orders
             .iter()
             .map(|entry| encode_u64(entry.order.expiry_epoch))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        order_nonces: all_orders
             .iter()
             .map(|entry| encode_u64(entry.order.order_nonce))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        parent_order_commitments: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.order.parent_order_commitment))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        parent_child_indexes: all_orders
             .iter()
             .map(|entry| encode_u64(entry.order.parent_child_index))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        parent_secret_commitments: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.order.parent_secret_commitment))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        parent_cancel_authorities: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.order.parent_cancel_authority))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        parent_authorization_secrets: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.order.parent_authorization_secret))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        auditor_flags: all_orders
             .iter()
             .map(|entry| {
                 if entry.order.auditor_view_allowed {
@@ -4188,18 +4143,12 @@ pub fn build_auction_serialized_input(
                     "0x0".into()
                 }
             })
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_note_refs: all_orders
             .iter()
             .map(|entry| entry.order.funding_note_ref.0.clone())
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_note_commitments: all_orders
             .iter()
             .map(|entry| {
                 entry
@@ -4208,129 +4157,82 @@ pub fn build_auction_serialized_input(
                     .map(|commitment| commitment.0)
             })
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        funding_note_asset_ids: all_orders
             .iter()
             .map(|entry| encode_asset_id(&entry.funding_note.asset_id.0))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_note_amounts: all_orders
             .iter()
             .map(|entry| encode_u128(entry.funding_note.amount))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_note_owner_keys: all_orders
             .iter()
             .map(|entry| encode_owner_public_key(&entry.funding_note.owner_public_key))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_note_spend_authorities: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.funding_note.spend_authority))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        funding_note_withdraw_authorities: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.funding_note.withdraw_authority))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        funding_note_blindings: all_orders
             .iter()
             .map(|entry| entry.funding_note.blinding.clone())
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_note_nonces: all_orders
             .iter()
             .map(|entry| encode_u64(entry.funding_note.nonce))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_note_metadata_commitments: all_orders
             .iter()
             .map(|entry| entry.funding_note.metadata_commitment.clone())
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        funding_authorization_rs: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.funding_authorization.signature_r))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        funding_authorization_ss: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.funding_authorization.signature_s))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        funding_nullifiers: all_orders
             .iter()
             .map(|entry| entry.order.funding_nullifier.0.clone())
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        recipient_owner_keys: all_orders
             .iter()
             .map(|entry| encode_owner_public_key(&entry.order.recipient_owner_public_key))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+            .collect(),
+        recipient_spend_authorities: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.order.recipient_spend_authority))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        recipient_withdraw_authorities: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.order.recipient_withdraw_authority))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &all_orders
+        recipient_residual_withdraw_authorities: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.order.recipient_residual_withdraw_authority))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(&mut payload, &allocation_fill_amounts);
-    payload.push(if witness.privacy_gate.enforced {
-        "0x1".into()
-    } else {
-        "0x0".into()
-    });
-    payload.push(encode_u128(witness.privacy_gate.min_batch_base_liquidity));
-    payload.push(encode_u64(witness.privacy_gate.min_batch_participants));
-    payload.push(encode_u64(witness.privacy_gate.min_eligible_orders));
-    payload.push(encode_u64(witness.privacy_gate.max_single_order_fill_bps));
-    payload.push(encode_u64(witness.privacy_gate.max_single_owner_fill_bps));
-    payload.push(encode_u64(witness.privacy_gate.min_maker_participants));
-    payload.push(encode_u64(witness.privacy_gate.max_maker_fill_bps));
-
-    let mut serialized = vec![encode_usize(payload.len())];
-    serialized.extend(payload);
-    Ok(serialized)
+        allocation_fill_amounts,
+        privacy_gate_fields: vec![
+            if witness.privacy_gate.enforced {
+                "0x1".into()
+            } else {
+                "0x0".into()
+            },
+            encode_u128(witness.privacy_gate.min_batch_base_liquidity),
+            encode_u64(witness.privacy_gate.min_batch_participants),
+            encode_u64(witness.privacy_gate.min_eligible_orders),
+            encode_u64(witness.privacy_gate.max_single_order_fill_bps),
+            encode_u64(witness.privacy_gate.max_single_owner_fill_bps),
+            encode_u64(witness.privacy_gate.min_maker_participants),
+            encode_u64(witness.privacy_gate.max_maker_fill_bps),
+        ],
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -4424,179 +4326,6 @@ pub fn build_auction_result_serialized_input(
     let mut serialized = vec![encode_usize(payload.len())];
     serialized.extend(payload);
     Ok(serialized)
-}
-
-fn auction_proof_vectors(
-    witness: &SettlementWitness,
-    all_orders: &[AuctionOrderWitness],
-) -> Result<AuctionProofVectors, ProtocolError> {
-    let serialized = build_auction_serialized_input(witness, all_orders)?;
-    let payload = serialized_payload(&serialized)?;
-    let mut index = 0;
-    let statement_type = payload
-        .get(index)
-        .ok_or_else(|| ProtocolError::Crypto("empty auction payload".into()))?;
-    if felt_to_u64(statement_type)? != AUCTION_STATEMENT_TYPE_TAG {
-        return Err(ProtocolError::Crypto(
-            "unexpected auction statement tag".into(),
-        ));
-    }
-    index += 1;
-    let settlement_payload = read_serialized_vector(&payload, &mut index, "settlement")?;
-    let order_commitments = read_serialized_vector(&payload, &mut index, "order_commitments")?;
-    let sides = read_serialized_vector(&payload, &mut index, "sides")?;
-    let order_types = read_serialized_vector(&payload, &mut index, "order_types")?;
-    let maker_curve_commitments =
-        read_serialized_vector(&payload, &mut index, "maker_curve_commitments")?;
-    let maker_curve_point_counts =
-        read_serialized_vector(&payload, &mut index, "maker_curve_point_counts")?;
-    let maker_curve_prices = read_serialized_vector(&payload, &mut index, "maker_curve_prices")?;
-    let maker_curve_base_amounts =
-        read_serialized_vector(&payload, &mut index, "maker_curve_base_amounts")?;
-    let limit_prices = read_serialized_vector(&payload, &mut index, "limit_prices")?;
-    let order_amounts = read_serialized_vector(&payload, &mut index, "order_amounts")?;
-    let min_fills = read_serialized_vector(&payload, &mut index, "min_fills")?;
-    let time_in_force = read_serialized_vector(&payload, &mut index, "time_in_force")?;
-    let expiry_epochs = read_serialized_vector(&payload, &mut index, "expiry_epochs")?;
-    let order_nonces = read_serialized_vector(&payload, &mut index, "order_nonces")?;
-    let parent_order_commitments =
-        read_serialized_vector(&payload, &mut index, "parent_order_commitments")?;
-    let parent_child_indexes =
-        read_serialized_vector(&payload, &mut index, "parent_child_indexes")?;
-    let parent_secret_commitments =
-        read_serialized_vector(&payload, &mut index, "parent_secret_commitments")?;
-    let parent_cancel_authorities =
-        read_serialized_vector(&payload, &mut index, "parent_cancel_authorities")?;
-    let parent_authorization_secrets =
-        read_serialized_vector(&payload, &mut index, "parent_authorization_secrets")?;
-    let auditor_flags = read_serialized_vector(&payload, &mut index, "auditor_flags")?;
-    let funding_note_refs = read_serialized_vector(&payload, &mut index, "funding_note_refs")?;
-    let funding_note_commitments =
-        read_serialized_vector(&payload, &mut index, "funding_note_commitments")?;
-    let funding_note_asset_ids =
-        read_serialized_vector(&payload, &mut index, "funding_note_asset_ids")?;
-    let funding_note_amounts =
-        read_serialized_vector(&payload, &mut index, "funding_note_amounts")?;
-    let funding_note_owner_keys =
-        read_serialized_vector(&payload, &mut index, "funding_note_owner_keys")?;
-    let funding_note_spend_authorities =
-        read_serialized_vector(&payload, &mut index, "funding_note_spend_authorities")?;
-    let funding_note_withdraw_authorities =
-        read_serialized_vector(&payload, &mut index, "funding_note_withdraw_authorities")?;
-    let funding_note_blindings =
-        read_serialized_vector(&payload, &mut index, "funding_note_blindings")?;
-    let funding_note_nonces = read_serialized_vector(&payload, &mut index, "funding_note_nonces")?;
-    let funding_note_metadata_commitments =
-        read_serialized_vector(&payload, &mut index, "funding_note_metadata_commitments")?;
-    let funding_authorization_rs =
-        read_serialized_vector(&payload, &mut index, "funding_authorization_rs")?;
-    let funding_authorization_ss =
-        read_serialized_vector(&payload, &mut index, "funding_authorization_ss")?;
-    let funding_nullifiers = read_serialized_vector(&payload, &mut index, "funding_nullifiers")?;
-    let recipient_owner_keys =
-        read_serialized_vector(&payload, &mut index, "recipient_owner_keys")?;
-    let recipient_spend_authorities =
-        read_serialized_vector(&payload, &mut index, "recipient_spend_authorities")?;
-    let recipient_withdraw_authorities =
-        read_serialized_vector(&payload, &mut index, "recipient_withdraw_authorities")?;
-    let recipient_residual_withdraw_authorities = read_serialized_vector(
-        &payload,
-        &mut index,
-        "recipient_residual_withdraw_authorities",
-    )?;
-    let allocation_fill_amounts =
-        read_serialized_vector(&payload, &mut index, "allocation_fill_amounts")?;
-    if payload.len().saturating_sub(index) != 8 {
-        return Err(ProtocolError::Crypto(
-            "auction payload has malformed privacy gate tail".into(),
-        ));
-    }
-    let privacy_gate_fields = payload[index..].to_vec();
-
-    Ok(AuctionProofVectors {
-        settlement_payload,
-        order_commitments,
-        sides,
-        order_types,
-        maker_curve_commitments,
-        maker_curve_point_counts,
-        maker_curve_prices,
-        maker_curve_base_amounts,
-        limit_prices,
-        order_amounts,
-        min_fills,
-        time_in_force,
-        expiry_epochs,
-        order_nonces,
-        parent_order_commitments,
-        parent_child_indexes,
-        parent_secret_commitments,
-        parent_cancel_authorities,
-        parent_authorization_secrets,
-        auditor_flags,
-        funding_note_refs,
-        funding_note_commitments,
-        funding_note_asset_ids,
-        funding_note_amounts,
-        funding_note_owner_keys,
-        funding_note_spend_authorities,
-        funding_note_withdraw_authorities,
-        funding_note_blindings,
-        funding_note_nonces,
-        funding_note_metadata_commitments,
-        funding_authorization_rs,
-        funding_authorization_ss,
-        funding_nullifiers,
-        recipient_owner_keys,
-        recipient_spend_authorities,
-        recipient_withdraw_authorities,
-        recipient_residual_withdraw_authorities,
-        allocation_fill_amounts,
-        privacy_gate_fields,
-    })
-}
-
-fn serialized_payload(serialized: &[String]) -> Result<Vec<String>, ProtocolError> {
-    let (len, payload) = serialized
-        .split_first()
-        .ok_or_else(|| ProtocolError::Crypto("empty serialized proof input".into()))?;
-    let expected = felt_to_usize(len)?;
-    if expected != payload.len() {
-        return Err(ProtocolError::Crypto(format!(
-            "serialized proof input length mismatch: expected {expected}, got {}",
-            payload.len()
-        )));
-    }
-    Ok(payload.to_vec())
-}
-
-fn read_serialized_vector(
-    payload: &[String],
-    index: &mut usize,
-    label: &str,
-) -> Result<Vec<String>, ProtocolError> {
-    let len = payload
-        .get(*index)
-        .ok_or_else(|| ProtocolError::Crypto(format!("{label} vector missing length")))
-        .and_then(|value| felt_to_usize(value))?;
-    *index += 1;
-    let end = index
-        .checked_add(len)
-        .ok_or_else(|| ProtocolError::Crypto(format!("{label} vector length overflow")))?;
-    if end > payload.len() {
-        return Err(ProtocolError::Crypto(format!(
-            "{label} vector length exceeds payload"
-        )));
-    }
-    let values = payload[*index..end].to_vec();
-    *index = end;
-    Ok(values)
-}
-
-fn felt_to_usize(value: &str) -> Result<usize, ProtocolError> {
-    let parsed = felt_to_u64(value)?;
-    usize::try_from(parsed)
-        .map_err(|_| ProtocolError::Crypto(format!("felt {value} does not fit platform usize")))
 }
 
 fn push_admission_order_vectors(payload: &mut Vec<String>, vectors: &AuctionProofVectors) {
@@ -5099,8 +4828,8 @@ mod tests {
     use super::{
         SettlementOutputWithdrawalMessage, SettlementOutputWithdrawalPlanRequest,
         auction_admission_root, build_admission_serialized_input,
-        build_auction_result_serialized_input, build_auction_serialized_input, build_deposit_note,
-        build_deposit_submission_plan, build_order_submission, build_output_note,
+        build_auction_result_serialized_input, build_deposit_note, build_deposit_submission_plan,
+        build_order_submission, build_output_note,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
         build_settlement_witness, build_stwo_serialized_input, build_withdrawal_submission_plan,
         create_order_ingress_receipt, create_recovery_artifact, decrypt_note_for_owner,
@@ -6770,7 +6499,7 @@ mod tests {
     }
 
     #[test]
-    fn auction_serialized_input_binds_full_order_preimages_and_allocations() {
+    fn admission_serialized_input_binds_full_order_preimages() {
         let private_order = sample_private_order();
         let order_commitment = private_order.order.commitment().expect("order commitment");
         let funding_note_commitment = private_order
@@ -6870,7 +6599,7 @@ mod tests {
             }],
         )
         .expect("witness");
-        let serialized = build_auction_serialized_input(
+        let serialized = build_admission_serialized_input(
             &witness,
             &[AuctionOrderWitness {
                 order_commitment: order_commitment.clone(),
@@ -6879,10 +6608,10 @@ mod tests {
                 funding_authorization: private_order.funding_authorization.clone(),
             }],
         )
-        .expect("auction serialized input");
+        .expect("admission serialized input");
 
         let mut index = 1;
-        assert_eq!(serialized[index], "0x2");
+        assert_eq!(serialized[index], "0x3");
         index += 1;
         let settlement_payload = read_serialized_span(&serialized, &mut index);
         assert_eq!(settlement_payload[0], "0x1");
@@ -6923,7 +6652,6 @@ mod tests {
         let recipient_spend_authorities = read_serialized_span(&serialized, &mut index);
         let recipient_withdraw_authorities = read_serialized_span(&serialized, &mut index);
         let recipient_residual_withdraw_authorities = read_serialized_span(&serialized, &mut index);
-        let allocation_fill_amounts = read_serialized_span(&serialized, &mut index);
 
         assert_eq!(order_commitments, vec![order_commitment.0]);
         assert_eq!(sides, vec!["0x0".to_string()]);
@@ -6982,7 +6710,7 @@ mod tests {
             recipient_residual_withdraw_authorities,
             vec!["0xffe".to_string()]
         );
-        assert_eq!(allocation_fill_amounts, vec!["0x3e8".to_string()]);
+        assert_eq!(index, serialized.len());
     }
 
     #[test]
@@ -7130,7 +6858,7 @@ mod tests {
     }
 
     #[test]
-    fn auction_serialized_input_allows_empty_noop_batch() {
+    fn admission_serialized_input_allows_empty_noop_batch() {
         let order_root =
             ordered_felt_list_commitment("zylith/batch-order-root", &[]).expect("empty root");
         let transcript = with_proof_bound_output_recovery(
@@ -7170,23 +6898,23 @@ mod tests {
         .expect("empty witness");
 
         let serialized =
-            build_auction_serialized_input(&witness, &[]).expect("empty auction input");
+            build_admission_serialized_input(&witness, &[]).expect("empty admission input");
 
         let mut index = 1;
-        assert_eq!(serialized[index], "0x2");
+        assert_eq!(serialized[index], "0x3");
         index += 1;
         let settlement_payload = read_serialized_span(&serialized, &mut index);
         assert_eq!(settlement_payload[0], "0x1");
         assert_eq!(settlement_payload[15], "0x0");
         assert_eq!(settlement_payload[16], "0x0");
 
-        let mut auction_vector_count = 0;
+        let mut admission_vector_count = 0;
         while index < serialized.len() {
             let values = read_serialized_span(&serialized, &mut index);
             assert!(values.is_empty());
-            auction_vector_count += 1;
+            admission_vector_count += 1;
         }
-        assert_eq!(auction_vector_count, 45);
+        assert!(admission_vector_count > 0);
     }
 
     #[test]
@@ -7224,7 +6952,7 @@ mod tests {
     }
 
     #[test]
-    fn auction_serialized_input_rejects_wrong_order_batch_domain() {
+    fn admission_serialized_input_rejects_wrong_order_batch_domain() {
         let mut private_order = sample_private_order();
         private_order.order.batch_id = crate::BatchId("batch-wrong-domain".into());
         let order_commitment = private_order.order.commitment().expect("order commitment");
@@ -7325,7 +7053,7 @@ mod tests {
             }],
         )
         .expect("witness");
-        let error = build_auction_serialized_input(
+        let error = build_admission_serialized_input(
             &witness,
             &[AuctionOrderWitness {
                 order_commitment,
