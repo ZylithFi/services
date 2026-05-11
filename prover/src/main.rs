@@ -55,17 +55,19 @@ use zylith_core::{
     SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTranscript,
     SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
     TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
-    auction_result_proof_message_hash_for_program, build_admission_serialized_input,
-    build_auction_result_serialized_input, build_heartbeat_cover_orders, build_output_note,
-    build_settlement_submission_plan, create_order_ingress_receipt, decrypt_order_bundle,
+    auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
+    build_admission_serialized_input, build_auction_result_serialized_input,
+    build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
+    create_order_ingress_receipt, decrypt_order_bundle,
     deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
     extract_bearer_token, format_bearer_token, native_settlement_message_hash,
     nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
     private_execution_key_registry_fingerprint, private_order_payload_commitment,
-    proof_artifact_commitment, renewal_sparse_witnesses_for_child_uses,
-    sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
-    settlement_proof_message_hash_for_program, settlement_state_transition_root,
-    settlement_transcript_commitment, validate_order_ingress_receipt_for_manifest_with_secrets,
+    proof_artifact_commitment, quote_amount_for_base_amount,
+    renewal_sparse_witnesses_for_child_uses, sanitize_order_submission_for_coordinator,
+    settlement_note_root_after_deposit_chain, settlement_proof_message_hash_for_program,
+    settlement_state_transition_root, settlement_transcript_commitment,
+    validate_order_ingress_receipt_for_manifest_with_secrets,
 };
 
 const DEFAULT_COORDINATOR_URL: &str = "http://127.0.0.1:3000";
@@ -2786,7 +2788,7 @@ async fn prepare_private_auction_batch_inner(
                     .ok_or(StatusCode::CONFLICT)
             })?;
     let candidate_clearing_price = if artifacts.transcript.matched_orders.is_empty() {
-        compute_candidate_clearing_price(&records)?
+        compute_candidate_clearing_price(&records, pair.price_base_scale)?
     } else {
         Some(artifacts.transcript.clearing_price)
     };
@@ -2795,6 +2797,7 @@ async fn prepare_private_auction_batch_inner(
         artifacts.transcript.clearing_price,
         matched_volume,
         state.min_batch_base_liquidity,
+        pair.price_base_scale,
     );
     let below_minimum_liquidity = state.min_batch_base_liquidity > 0
         && matched_volume > 0
@@ -2805,7 +2808,7 @@ async fn prepare_private_auction_batch_inner(
         && matched_participant_count > 0
         && matched_participant_count < state.min_batch_participants;
     let eligible_order_count = candidate_clearing_price
-        .map(|price| eligible_order_count(&records, price))
+        .map(|price| eligible_order_count(&records, price, pair.price_base_scale))
         .unwrap_or(0);
     let below_minimum_eligible_orders = state.min_eligible_orders > 0
         && eligible_order_count > 0
@@ -3237,6 +3240,7 @@ fn root_history_batch_to_witness(
         new_nullifier_root: batch.new_nullifier_root,
         new_renewal_root: batch.new_renewal_root,
         clearing_price: 0,
+        price_base_scale: 1,
         base_asset_id: AssetId("ROOT_HISTORY".into()),
         quote_asset_id: AssetId("ROOT_HISTORY".into()),
         matched_orders: Vec::new(),
@@ -3361,11 +3365,16 @@ fn max_maker_fill_share_bps(
     Ok(bps.min(u64::MAX as u128) as u64)
 }
 
-fn eligible_order_count(records: &[DecryptedOrderRecord], price: u128) -> u64 {
+fn eligible_order_count(
+    records: &[DecryptedOrderRecord],
+    price: u128,
+    price_base_scale: u128,
+) -> u64 {
     records
         .iter()
         .filter(|record| {
-            is_order_eligible(&record.order, price) && max_fill_at_price(record, price) > 0
+            is_order_eligible(&record.order, price)
+                && max_fill_at_price(record, price, price_base_scale) > 0
         })
         .count() as u64
 }
@@ -4473,6 +4482,7 @@ async fn fetch_witness(state: &AppState, batch_id: &str) -> Result<SettlementWit
 
 fn compute_candidate_clearing_price(
     records: &[DecryptedOrderRecord],
+    price_base_scale: u128,
 ) -> Result<Option<u128>, StatusCode> {
     let mut candidate_prices: Vec<u128> = records
         .iter()
@@ -4502,7 +4512,7 @@ fn compute_candidate_clearing_price(
     let mut best: Option<(u128, u128, u128)> = None;
 
     for price in candidate_prices {
-        let (matched, imbalance) = stable_pruned_score_at_price(records, price)?;
+        let (matched, imbalance) = stable_pruned_score_at_price(records, price, price_base_scale)?;
 
         match best {
             None => best = Some((price, matched, imbalance)),
@@ -4524,15 +4534,16 @@ fn compute_candidate_clearing_price(
 fn stable_pruned_score_at_price(
     records: &[DecryptedOrderRecord],
     price: u128,
+    price_base_scale: u128,
 ) -> Result<(u128, u128), StatusCode> {
-    let active_flags = stable_active_flags(records, price);
+    let active_flags = stable_active_flags(records, price, price_base_scale);
     let buy_demand = records
         .iter()
         .zip(active_flags.iter())
         .filter(|(record, active)| **active && matches!(record.order.side, OrderSide::Buy))
         .try_fold(0_u128, |total, (record, _)| {
             total
-                .checked_add(max_fill_at_price(record, price))
+                .checked_add(max_fill_at_price(record, price, price_base_scale))
                 .ok_or(StatusCode::CONFLICT)
         })?;
     let sell_supply = records
@@ -4541,7 +4552,7 @@ fn stable_pruned_score_at_price(
         .filter(|(record, active)| **active && matches!(record.order.side, OrderSide::Sell))
         .try_fold(0_u128, |total, (record, _)| {
             total
-                .checked_add(max_fill_at_price(record, price))
+                .checked_add(max_fill_at_price(record, price, price_base_scale))
                 .ok_or(StatusCode::CONFLICT)
         })?;
     Ok((
@@ -4550,10 +4561,14 @@ fn stable_pruned_score_at_price(
     ))
 }
 
-fn stable_active_flags(records: &[DecryptedOrderRecord], price: u128) -> Vec<bool> {
+fn stable_active_flags(
+    records: &[DecryptedOrderRecord],
+    price: u128,
+    price_base_scale: u128,
+) -> Vec<bool> {
     let mut active_flags = records
         .iter()
-        .map(|record| max_fill_at_price(record, price) > 0)
+        .map(|record| max_fill_at_price(record, price, price_base_scale) > 0)
         .collect::<Vec<_>>();
 
     for _ in 0..records.len() {
@@ -4564,7 +4579,13 @@ fn stable_active_flags(records: &[DecryptedOrderRecord], price: u128) -> Vec<boo
                 if !*active {
                     return false;
                 }
-                let fill = expected_fill_with_active_flags(records, &active_flags, index, price);
+                let fill = expected_fill_with_active_flags(
+                    records,
+                    &active_flags,
+                    index,
+                    price,
+                    price_base_scale,
+                );
                 if fill == 0 {
                     return true;
                 }
@@ -4587,19 +4608,31 @@ fn expected_fill_with_active_flags(
     active_flags: &[bool],
     target_index: usize,
     price: u128,
+    price_base_scale: u128,
 ) -> u128 {
     if !active_flags[target_index] {
         return 0;
     }
     let target = &records[target_index];
-    let max_fill = max_fill_at_price(target, price);
+    let max_fill = max_fill_at_price(target, price, price_base_scale);
     let opposite_side = match target.order.side {
         OrderSide::Buy => OrderSide::Sell,
         OrderSide::Sell => OrderSide::Buy,
     };
-    let opposite_total = active_capacity_total(records, active_flags, &opposite_side, price);
-    let priority_capacity =
-        active_priority_capacity_before(records, active_flags, target_index, price);
+    let opposite_total = active_capacity_total(
+        records,
+        active_flags,
+        &opposite_side,
+        price,
+        price_base_scale,
+    );
+    let priority_capacity = active_priority_capacity_before(
+        records,
+        active_flags,
+        target_index,
+        price,
+        price_base_scale,
+    );
     if opposite_total <= priority_capacity {
         return 0;
     }
@@ -4611,12 +4644,13 @@ fn active_capacity_total(
     active_flags: &[bool],
     side: &OrderSide,
     price: u128,
+    price_base_scale: u128,
 ) -> u128 {
     records
         .iter()
         .zip(active_flags.iter())
         .filter(|(record, active)| **active && &record.order.side == side)
-        .map(|(record, _)| max_fill_at_price(record, price))
+        .map(|(record, _)| max_fill_at_price(record, price, price_base_scale))
         .sum()
 }
 
@@ -4625,6 +4659,7 @@ fn active_priority_capacity_before(
     active_flags: &[bool],
     target_index: usize,
     price: u128,
+    price_base_scale: u128,
 ) -> u128 {
     let target = &records[target_index].order;
     records
@@ -4646,17 +4681,18 @@ fn active_priority_capacity_before(
                 }
             }
         })
-        .map(|(_, (record, _))| max_fill_at_price(record, price))
+        .map(|(_, (record, _))| max_fill_at_price(record, price, price_base_scale))
         .sum()
 }
 
 fn sum_fill_at_price<'a>(
     mut records: impl Iterator<Item = &'a DecryptedOrderRecord>,
     price: u128,
+    price_base_scale: u128,
 ) -> Result<u128, StatusCode> {
     records.try_fold(0_u128, |total, record| {
         total
-            .checked_add(max_fill_at_price(record, price))
+            .checked_add(max_fill_at_price(record, price, price_base_scale))
             .ok_or(StatusCode::CONFLICT)
     })
 }
@@ -4666,11 +4702,12 @@ fn build_batch_liquidity_report(
     clearing_price: u128,
     matched_base_volume: u128,
     min_base_liquidity: u128,
+    price_base_scale: u128,
 ) -> zylith_core::BatchLiquidityReport {
     let diagnostic_price = if clearing_price > 0 {
         Some(clearing_price)
     } else {
-        compute_candidate_clearing_price(records).unwrap_or_default()
+        compute_candidate_clearing_price(records, price_base_scale).unwrap_or_default()
     };
 
     let Some(price) = diagnostic_price else {
@@ -4689,7 +4726,8 @@ fn build_batch_liquidity_report(
     let eligible_orders = records
         .iter()
         .filter(|record| {
-            is_order_eligible(&record.order, price) && max_fill_at_price(record, price) > 0
+            is_order_eligible(&record.order, price)
+                && max_fill_at_price(record, price, price_base_scale) > 0
         })
         .collect::<Vec<_>>();
     let buy_base_demand = sum_fill_at_price(
@@ -4698,6 +4736,7 @@ fn build_batch_liquidity_report(
             .copied()
             .filter(|record| matches!(record.order.side, OrderSide::Buy)),
         price,
+        price_base_scale,
     )
     .unwrap_or(0);
     let sell_base_supply = sum_fill_at_price(
@@ -4706,6 +4745,7 @@ fn build_batch_liquidity_report(
             .copied()
             .filter(|record| matches!(record.order.side, OrderSide::Sell)),
         price,
+        price_base_scale,
     )
     .unwrap_or(0);
     let crossing_order_count = eligible_orders.len() as u64;
@@ -5184,12 +5224,13 @@ fn build_settlement_artifacts(
     }
 
     eprintln!("build_settlement_artifacts batch_id={batch_id} stage=compute_price start");
-    let candidate_clearing_price = compute_candidate_clearing_price(records)?;
+    let candidate_clearing_price =
+        compute_candidate_clearing_price(records, pair.price_base_scale)?;
     let candidate_price = candidate_clearing_price.unwrap_or(0);
     let fills = if privacy_gate.enforced {
         Vec::new()
     } else {
-        compute_fill_plan(records, candidate_price)
+        compute_fill_plan(records, candidate_price, pair.price_base_scale)
     };
     eprintln!(
         "build_settlement_artifacts batch_id={} stage=compute_price ok price={} fills={}",
@@ -5248,9 +5289,12 @@ fn build_settlement_artifacts(
             OrderSide::Buy => (base_asset.clone(), fill.filled_amount),
             OrderSide::Sell => (
                 quote_asset.clone(),
-                fill.filled_amount
-                    .checked_mul(clearing_price)
-                    .ok_or(StatusCode::CONFLICT)?,
+                quote_amount_for_base_amount(
+                    fill.filled_amount,
+                    clearing_price,
+                    pair.price_base_scale,
+                )
+                .map_err(|_| StatusCode::CONFLICT)?,
             ),
         };
         let fee_amount = gross_amount
@@ -5290,7 +5334,8 @@ fn build_settlement_artifacts(
             withdraw_authority: note.withdraw_authority.clone(),
         });
 
-        let (residual_asset_id, residual_amount) = residual_for_fill(fill, clearing_price)?;
+        let (residual_asset_id, residual_amount) =
+            residual_for_fill(fill, clearing_price, pair.price_base_scale)?;
         let mut residual_note_commitment = None;
         let residual_note = if residual_amount > 0 {
             let residual_output_index = output_notes.len();
@@ -5582,6 +5627,7 @@ fn build_settlement_artifacts(
         new_nullifier_root: new_nullifier_root.clone(),
         new_renewal_root: new_renewal_root.clone(),
         clearing_price,
+        price_base_scale: pair.price_base_scale,
         matched_orders,
         consumed_inputs,
         renewal_child_uses: renewal_child_uses.clone(),
@@ -5608,6 +5654,7 @@ fn build_settlement_artifacts(
         new_nullifier_root: transcript.new_nullifier_root.clone(),
         new_renewal_root: transcript.new_renewal_root.clone(),
         clearing_price,
+        price_base_scale: pair.price_base_scale,
         base_asset_id: base_asset,
         quote_asset_id: quote_asset,
         matched_orders: transcript.matched_orders.clone(),
@@ -5640,13 +5687,13 @@ fn build_settlement_artifacts(
 fn residual_for_fill(
     fill: &OrderFillPlan,
     clearing_price: u128,
+    price_base_scale: u128,
 ) -> Result<(AssetId, u128), StatusCode> {
     match fill.order.side {
         OrderSide::Buy => {
-            let spent = fill
-                .filled_amount
-                .checked_mul(clearing_price)
-                .ok_or(StatusCode::CONFLICT)?;
+            let spent =
+                quote_amount_for_base_amount(fill.filled_amount, clearing_price, price_base_scale)
+                    .map_err(|_| StatusCode::CONFLICT)?;
             Ok((
                 fill.funding_note.asset_id.clone(),
                 fill.funding_note
@@ -5697,7 +5744,11 @@ fn deterministic_protocol_fee_entries(
     fees
 }
 
-fn compute_fill_plan(records: &[DecryptedOrderRecord], clearing_price: u128) -> Vec<OrderFillPlan> {
+fn compute_fill_plan(
+    records: &[DecryptedOrderRecord],
+    clearing_price: u128,
+    price_base_scale: u128,
+) -> Vec<OrderFillPlan> {
     if clearing_price == 0 {
         return Vec::new();
     }
@@ -5710,7 +5761,7 @@ fn compute_fill_plan(records: &[DecryptedOrderRecord], clearing_price: u128) -> 
             order: record.order.clone(),
             funding_note: record.funding_note.clone(),
             funding_authorization: record.funding_authorization.clone(),
-            available_amount: max_fill_at_price(record, clearing_price),
+            available_amount: max_fill_at_price(record, clearing_price, price_base_scale),
             filled_amount: 0,
         })
         .filter(|fill| fill.available_amount > 0)
@@ -5825,7 +5876,11 @@ fn is_order_eligible(order: &OrderIntent, clearing_price: u128) -> bool {
     }
 }
 
-fn max_fill_at_price(record: &DecryptedOrderRecord, clearing_price: u128) -> u128 {
+fn max_fill_at_price(
+    record: &DecryptedOrderRecord,
+    clearing_price: u128,
+    price_base_scale: u128,
+) -> u128 {
     if matches!(
         record.order.order_type,
         zylith_core::OrderType::HeartbeatCover
@@ -5847,7 +5902,12 @@ fn max_fill_at_price(record: &DecryptedOrderRecord, clearing_price: u128) -> u12
             if clearing_price == 0 {
                 return 0;
             }
-            let affordable_amount = record.funding_note.amount / clearing_price;
+            let affordable_amount = base_amount_affordable_for_quote(
+                record.funding_note.amount,
+                clearing_price,
+                price_base_scale,
+            )
+            .unwrap_or(u128::MAX);
             requested_amount.min(affordable_amount)
         }
         OrderSide::Sell => requested_amount.min(record.funding_note.amount),
@@ -7444,7 +7504,10 @@ mod tests {
             ),
         ];
 
-        assert_eq!(compute_candidate_clearing_price(&records).unwrap(), Some(6));
+        assert_eq!(
+            compute_candidate_clearing_price(&records, 1).unwrap(),
+            Some(6)
+        );
     }
 
     #[test]
@@ -7470,7 +7533,7 @@ mod tests {
             ),
         ];
 
-        let report = build_batch_liquidity_report(&records, 5, 2, 3);
+        let report = build_batch_liquidity_report(&records, 5, 2, 3, 1);
 
         assert_eq!(report.status, "below_minimum");
         assert_eq!(report.matched_base_volume, 2);
@@ -7542,7 +7605,10 @@ mod tests {
         )
         .expect("no-cross artifacts");
 
-        assert_eq!(compute_candidate_clearing_price(&records).unwrap(), Some(1));
+        assert_eq!(
+            compute_candidate_clearing_price(&records, 1).unwrap(),
+            Some(1)
+        );
         assert_eq!(artifacts.transcript.clearing_price, 1);
         assert!(artifacts.transcript.matched_orders.is_empty());
         assert!(artifacts.transcript.consumed_inputs.is_empty());
@@ -7554,8 +7620,13 @@ mod tests {
 
     #[test]
     fn settlement_artifacts_net_outputs_across_orders_for_same_recipient() {
-        let product_config = ProductConfig::default_v1();
+        let mut product_config = ProductConfig::default_v1();
         let pair_id = PairId("STRK/USDC".into());
+        product_config
+            .pairs
+            .get_mut(&pair_id.0)
+            .expect("test pair")
+            .price_base_scale = 1;
         let pair = product_config
             .enabled_pair(&pair_id)
             .expect("enabled pair")
@@ -7870,7 +7941,7 @@ mod tests {
             20,
         );
 
-        assert_eq!(eligible_order_count(&[buy, sell, out_of_band], 5), 2);
+        assert_eq!(eligible_order_count(&[buy, sell, out_of_band], 5, 1), 2);
     }
 
     #[test]
@@ -8016,6 +8087,7 @@ mod tests {
             .expect("sparse nullifier root"),
             new_renewal_root: "0x0".into(),
             clearing_price: 1,
+            price_base_scale: 1,
             base_asset_id: AssetId("STRK".into()),
             quote_asset_id: AssetId("USDC".into()),
             matched_orders: vec![],

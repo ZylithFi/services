@@ -1714,6 +1714,7 @@ pub fn settlement_transcript_commitment(
         )?)?,
     );
     state = poseidon_hash(state, Felt::from(transcript.clearing_price));
+    state = poseidon_hash(state, Felt::from(transcript.price_base_scale));
     state = poseidon_hash(
         state,
         felt_from_hex_str(&encode_output_bundle_ref(
@@ -2633,6 +2634,7 @@ pub fn build_settlement_submission_plan(
         transcript_commitment: normalize_felt_hex(&transcript_commitment)?,
         proof_artifact_commitment: normalized_proof_artifact_commitment.clone(),
         clearing_price: encode_u128(transcript.clearing_price),
+        price_base_scale: encode_u128(transcript.price_base_scale),
         output_bundle_ref: encode_output_bundle_ref(&transcript.output_ciphertext_bundle_ref)?,
         prior_note_root: roots.prior_note_root,
         prior_nullifier_root: roots.prior_nullifier_root,
@@ -2830,6 +2832,11 @@ pub fn build_settlement_witness(
                 .into(),
         ));
     }
+    if transcript.price_base_scale == 0 {
+        return Err(ProtocolError::Crypto(
+            "settlement transcript price_base_scale must be non-zero".into(),
+        ));
+    }
     Ok(SettlementWitness {
         batch_id: transcript.batch_id.clone(),
         pair_id: pair_id.clone(),
@@ -2845,6 +2852,7 @@ pub fn build_settlement_witness(
         new_nullifier_root: normalize_felt_hex(&transcript.new_nullifier_root)?,
         new_renewal_root: normalize_felt_hex(&transcript.new_renewal_root)?,
         clearing_price: transcript.clearing_price,
+        price_base_scale: transcript.price_base_scale,
         base_asset_id,
         quote_asset_id,
         matched_orders: transcript.matched_orders.clone(),
@@ -3049,6 +3057,7 @@ pub fn build_stwo_serialized_input(
         encode_asset_id(&witness.base_asset_id.0),
         encode_asset_id(&witness.quote_asset_id.0),
         encode_u128(witness.clearing_price),
+        encode_u128(witness.price_base_scale),
         encode_u64(witness.matched_orders.len() as u64),
         encode_output_bundle_ref(&witness.output_ciphertext_bundle_ref)?,
         normalize_felt_hex(&witness.prior_note_root)?,
@@ -4761,6 +4770,7 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
         args.proof_artifact_commitment.clone(),
     ];
     calldata.push(args.clearing_price.clone());
+    calldata.push(args.price_base_scale.clone());
     calldata.push(args.output_bundle_ref.clone());
     calldata.push(args.prior_note_root.clone());
     calldata.push(args.prior_nullifier_root.clone());
@@ -4956,6 +4966,7 @@ mod tests {
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 321,
+                price_base_scale: 1,
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 111,
@@ -5566,6 +5577,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 145,
+            price_base_scale: 1,
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-1".into()),
                 filled_amount: 500,
@@ -5609,7 +5621,7 @@ mod tests {
         assert_eq!(plan.proof_artifact_commitment, proof_commitment);
         assert_ne!(plan.encoded_args.consumed_note_root, "0x0");
         assert_ne!(plan.encoded_args.output_note_root, "0x0");
-        assert_eq!(plan.settlement_call.calldata.len(), 20);
+        assert_eq!(plan.settlement_call.calldata.len(), 21);
     }
 
     #[test]
@@ -5627,6 +5639,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 145,
+            price_base_scale: 1,
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -5651,6 +5664,10 @@ mod tests {
             plan.settlement_call.calldata[5],
             plan.encoded_args.clearing_price
         );
+        assert_eq!(
+            plan.settlement_call.calldata[6],
+            plan.encoded_args.price_base_scale
+        );
     }
 
     #[test]
@@ -5668,6 +5685,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 300,
+            price_base_scale: 1,
             matched_orders: vec![
                 crate::MatchedOrder {
                     order_commitment: crate::OrderCommitment(
@@ -5735,7 +5753,7 @@ mod tests {
             settlement_transcript_commitment(&transcript).expect("transcript commitment");
         let plan = build_settlement_submission_plan(&transcript, "0x123", "0x456").expect("plan");
         assert_eq!(commitment, plan.encoded_args.transcript_commitment);
-        assert_eq!(plan.settlement_call.calldata.len(), 20);
+        assert_eq!(plan.settlement_call.calldata.len(), 21);
     }
 
     #[test]
@@ -5771,6 +5789,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 200,
+            price_base_scale: 1,
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-2".into()),
                 filled_amount: 700,
@@ -5861,6 +5880,7 @@ mod tests {
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 321,
+                price_base_scale: 1,
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: crate::OrderCommitment("order-3".into()),
                     filled_amount: 111,
@@ -5951,6 +5971,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 321,
+            price_base_scale: 1,
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-mismatched-witness".into()),
                 filled_amount: 111,
@@ -6003,6 +6024,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 321,
+            price_base_scale: 1,
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-missing-membership".into()),
                 filled_amount: 111,
@@ -6257,6 +6279,7 @@ mod tests {
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 321,
+                price_base_scale: 1,
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: crate::OrderCommitment("order-asset-owner".into()),
                     filled_amount: 111,
@@ -6329,7 +6352,7 @@ mod tests {
         let owner_key = encode_starknet_felt("owner-public-key", &owner_public_key);
 
         let mut index = 1;
-        index += 30;
+        index += 31;
 
         let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
         let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
@@ -6526,6 +6549,7 @@ mod tests {
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
+                price_base_scale: 1,
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 1000,
@@ -6741,6 +6765,7 @@ mod tests {
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
+                price_base_scale: 1,
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 1000,
@@ -6875,6 +6900,7 @@ mod tests {
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 0,
+                price_base_scale: 1,
                 matched_orders: vec![],
                 consumed_inputs: vec![],
                 renewal_child_uses: vec![],
@@ -6906,7 +6932,8 @@ mod tests {
         let settlement_payload = read_serialized_span(&serialized, &mut index);
         assert_eq!(settlement_payload[0], "0x1");
         assert_eq!(settlement_payload[15], "0x0");
-        assert_eq!(settlement_payload[16], "0x0");
+        assert_eq!(settlement_payload[16], "0x1");
+        assert_eq!(settlement_payload[17], "0x0");
 
         let mut admission_vector_count = 0;
         while index < serialized.len() {
@@ -6932,6 +6959,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 0,
+            price_base_scale: 1,
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -6980,6 +7008,7 @@ mod tests {
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
+                price_base_scale: 1,
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 1000,

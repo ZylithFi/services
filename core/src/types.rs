@@ -1147,6 +1147,8 @@ pub struct SettlementTranscript {
     pub new_renewal_root: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
+    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    pub price_base_scale: u128,
     pub matched_orders: Vec<MatchedOrder>,
     pub consumed_inputs: Vec<ConsumedInput>,
     #[serde(default)]
@@ -1399,6 +1401,8 @@ pub struct PublicSettlementTranscript {
     pub transcript_commitment: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
+    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    pub price_base_scale: u128,
     pub output_bundle_ref: String,
     pub prior_note_root: String,
     pub prior_nullifier_root: String,
@@ -1981,6 +1985,7 @@ pub struct SettlementCallArguments {
     pub transcript_commitment: String,
     pub proof_artifact_commitment: String,
     pub clearing_price: String,
+    pub price_base_scale: String,
     pub output_bundle_ref: String,
     pub prior_note_root: String,
     pub prior_nullifier_root: String,
@@ -2025,6 +2030,8 @@ pub struct SettlementWitness {
     pub new_renewal_root: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
+    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    pub price_base_scale: u128,
     pub base_asset_id: AssetId,
     pub quote_asset_id: AssetId,
     pub matched_orders: Vec<MatchedOrder>,
@@ -2223,6 +2230,8 @@ pub struct ProductAssetConfig {
     pub asset_id: AssetId,
     #[serde(with = "serde_u128_decimal")]
     pub min_trade_amount: u128,
+    #[serde(default = "default_asset_decimals")]
+    pub decimals: u8,
     pub enabled: bool,
 }
 
@@ -2233,6 +2242,8 @@ pub struct ProductPairConfig {
     pub quote_asset_id: AssetId,
     #[serde(with = "serde_u128_decimal")]
     pub min_order_amount: u128,
+    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    pub price_base_scale: u128,
     #[serde(default = "default_heartbeat_cover_price", with = "serde_u128_decimal")]
     pub heartbeat_cover_price: u128,
     pub enabled: bool,
@@ -2258,6 +2269,57 @@ fn default_heartbeat_cover_price() -> u128 {
     1
 }
 
+fn default_price_base_scale() -> u128 {
+    1
+}
+
+fn default_asset_decimals() -> u8 {
+    18
+}
+
+pub fn known_asset_decimals(asset_id: &AssetId) -> u8 {
+    match asset_id.0.as_str() {
+        "USDC" => 6,
+        "strkBTC" => 8,
+        "STRK" | "ETH" => 18,
+        _ => default_asset_decimals(),
+    }
+}
+
+pub fn asset_amount_scale(asset_id: &AssetId) -> u128 {
+    10_u128.pow(u32::from(known_asset_decimals(asset_id)))
+}
+
+pub fn quote_amount_for_base_amount(
+    base_amount: u128,
+    price: u128,
+    price_base_scale: u128,
+) -> Result<u128, ProtocolError> {
+    if price_base_scale == 0 {
+        return Err(ProtocolError::InvalidProductConfig(
+            "price_base_scale must be non-zero".into(),
+        ));
+    }
+    base_amount
+        .checked_mul(price)
+        .and_then(|value| value.checked_div(price_base_scale))
+        .ok_or_else(|| ProtocolError::InvalidOrder("quote amount overflows u128".into()))
+}
+
+pub fn base_amount_affordable_for_quote(
+    quote_amount: u128,
+    price: u128,
+    price_base_scale: u128,
+) -> Result<u128, ProtocolError> {
+    if price == 0 || price_base_scale == 0 {
+        return Ok(0);
+    }
+    quote_amount
+        .checked_mul(price_base_scale)
+        .and_then(|value| value.checked_div(price))
+        .ok_or_else(|| ProtocolError::InvalidOrder("affordable base amount overflows u128".into()))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductConfig {
     pub assets: BTreeMap<String, ProductAssetConfig>,
@@ -2279,6 +2341,7 @@ impl ProductConfig {
                 ProductAssetConfig {
                     asset_id: AssetId(asset_id.to_owned()),
                     min_trade_amount: 1,
+                    decimals: known_asset_decimals(&AssetId(asset_id.to_owned())),
                     enabled: true,
                 },
             );
@@ -2297,6 +2360,7 @@ impl ProductConfig {
                     base_asset_id: AssetId(base_asset_id.to_owned()),
                     quote_asset_id: AssetId(quote_asset_id.to_owned()),
                     min_order_amount: 1,
+                    price_base_scale: asset_amount_scale(&AssetId(base_asset_id.to_owned())),
                     heartbeat_cover_price: default_heartbeat_cover_price(),
                     enabled: true,
                 },
@@ -2333,6 +2397,7 @@ impl ProductConfig {
                     .or_insert_with(|| ProductAssetConfig {
                         asset_id: asset_id.clone(),
                         min_trade_amount: 1,
+                        decimals: known_asset_decimals(asset_id),
                         enabled: true,
                     });
             }
@@ -2484,23 +2549,21 @@ impl ProductConfig {
                     ));
                 };
                 curve.points.iter().try_fold(0u128, |total, point| {
-                    let quote_amount =
-                        point.price.checked_mul(point.base_amount).ok_or_else(|| {
-                            ProtocolError::InvalidOrder(
-                                "maker curve buy funding overflows u128".into(),
-                            )
-                        })?;
+                    let quote_amount = quote_amount_for_base_amount(
+                        point.base_amount,
+                        point.price,
+                        pair.price_base_scale,
+                    )?;
                     total.checked_add(quote_amount).ok_or_else(|| {
                         ProtocolError::InvalidOrder("maker curve buy funding overflows u128".into())
                     })
                 })?
             }
-            OrderSide::Buy => order
-                .min_fill
-                .checked_mul(order.limit_price)
-                .ok_or_else(|| {
-                    ProtocolError::InvalidOrder("minimum buy funding overflows u128".into())
-                })?,
+            OrderSide::Buy => quote_amount_for_base_amount(
+                order.min_fill,
+                order.limit_price,
+                pair.price_base_scale,
+            )?,
             OrderSide::Sell if matches!(order.order_type, OrderType::MakerCurve) => order.amount,
             OrderSide::Sell => order.min_fill,
         };
@@ -2535,12 +2598,14 @@ impl ProductConfig {
         }
         let base_asset_id = AssetId(base.to_owned());
         let quote_asset_id = AssetId(quote.to_owned());
+        let price_base_scale = asset_amount_scale(&base_asset_id);
 
         Ok(ProductPairConfig {
             pair_id,
             base_asset_id,
             quote_asset_id,
             min_order_amount: 1,
+            price_base_scale,
             heartbeat_cover_price: default_heartbeat_cover_price(),
             enabled,
         })
@@ -3192,6 +3257,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 100,
+            price_base_scale: 1,
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -3252,6 +3318,7 @@ mod tests {
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 100,
+            price_base_scale: 1,
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
