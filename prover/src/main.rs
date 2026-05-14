@@ -52,15 +52,16 @@ use zylith_core::{
     OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
     PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
     ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublishedBatchArtifacts,
-    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTranscript,
-    SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
+    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTimestampUpdate,
+    SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
     TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
     build_admission_serialized_input, build_auction_result_serialized_input,
     build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
     create_order_ingress_receipt, decrypt_order_bundle,
     deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
-    extract_bearer_token, format_bearer_token, native_settlement_message_hash,
+    extract_bearer_token, format_bearer_token, funding_input_set_commitment,
+    funding_nullifier_set_commitment, native_settlement_message_hash, nullifier_from_note_secret,
     nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
     private_execution_key_registry_fingerprint, private_order_payload_commitment,
     proof_artifact_commitment, quote_amount_for_base_amount,
@@ -362,6 +363,7 @@ struct DecryptedOrderRecord {
     order_commitment: OrderCommitment,
     order: OrderIntent,
     funding_note: Note,
+    funding_notes: Vec<Note>,
     funding_authorization: zylith_core::SpendAuthorization,
 }
 
@@ -379,6 +381,7 @@ struct OrderFillPlan {
     order_commitment: OrderCommitment,
     order: OrderIntent,
     funding_note: Note,
+    funding_notes: Vec<Note>,
     funding_authorization: zylith_core::SpendAuthorization,
     available_amount: u128,
     filled_amount: u128,
@@ -1230,7 +1233,14 @@ async fn ingest_private_order_payload(
     }
     state
         .product_config
-        .validate_order_funding(&private_payload.order, &private_payload.funding_note)
+        .validate_order_funding_notes(
+            &private_payload.order,
+            &private_payload
+                .effective_funding_notes()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     validate_private_order_risk_limits(&state, &private_payload.order)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1614,6 +1624,7 @@ async fn submit_native_proof_aggregation(
         revert_reason: None,
         block_number: None,
         block_hash: None,
+        block_timestamp_unix_ms: None,
         submission_mode: "native-aggregate-proof-facts".into(),
         settlement_contract_address: aggregate.settlement_call.contract_address.clone(),
     };
@@ -1630,6 +1641,12 @@ async fn submit_native_proof_aggregation(
             )
             .await,
         );
+        if let Some(block_number) = submission.block_number
+            && let Ok(block_timestamp) =
+                fetch_block_timestamp_unix_ms(&provider, block_number).await
+        {
+            submission.block_timestamp_unix_ms = Some(block_timestamp);
+        }
     }
     Ok(Json(submission))
 }
@@ -2207,7 +2224,9 @@ async fn run_proof_job(
 
     match proof_result {
         Ok(artifact) => {
-            if let Err(error) = prove_and_record_auction_result(&state, &batch_id, false).await {
+            if state.native_tx_prover_url.is_some()
+                && let Err(error) = prove_and_record_auction_result(&state, &batch_id, false).await
+            {
                 set_job_error(&state, &batch_id, error).await?;
                 return Err(StatusCode::BAD_GATEWAY);
             }
@@ -2330,6 +2349,11 @@ async fn submit_onchain(
         )?;
     }
     sync_job_with_onchain_submission(&state, &batch_id, &submission).await?;
+    if let Err(error) =
+        publish_settlement_timestamp_to_artifact_stores(&state, &batch_id, &submission).await
+    {
+        eprintln!("failed to publish settlement timestamp for batch {batch_id}: {error}");
+    }
 
     Ok(Json(submission))
 }
@@ -2949,11 +2973,20 @@ async fn decrypt_private_auction_orders(
             .map_err(|_| StatusCode::CONFLICT)?;
         validate_private_order_risk_limits(state, &payload.order)
             .map_err(|_| StatusCode::CONFLICT)?;
+        let funding_notes = payload
+            .effective_funding_notes()
+            .into_iter()
+            .cloned()
+            .collect();
+        let funding_note = payload.funding_note.clone();
+        let order = payload.order;
+        let funding_authorization = payload.funding_authorization;
         records.push(DecryptedOrderRecord {
             order_commitment: record.order_bundle.order_commitment.clone(),
-            order: payload.order,
-            funding_note: payload.funding_note,
-            funding_authorization: payload.funding_authorization,
+            order,
+            funding_note,
+            funding_notes,
+            funding_authorization,
         });
     }
     let cover_orders = build_heartbeat_cover_orders(
@@ -2965,11 +2998,23 @@ async fn decrypt_private_auction_orders(
         records.len(),
     )
     .map_err(|_| StatusCode::CONFLICT)?;
-    records.extend(cover_orders.into_iter().map(|cover| DecryptedOrderRecord {
-        order_commitment: cover.order_commitment,
-        order: cover.payload.order,
-        funding_note: cover.payload.funding_note,
-        funding_authorization: cover.payload.funding_authorization,
+    records.extend(cover_orders.into_iter().map(|cover| {
+        let funding_notes = cover
+            .payload
+            .effective_funding_notes()
+            .into_iter()
+            .cloned()
+            .collect();
+        let funding_note = cover.payload.funding_note.clone();
+        let order = cover.payload.order;
+        let funding_authorization = cover.payload.funding_authorization;
+        DecryptedOrderRecord {
+            order_commitment: cover.order_commitment,
+            order,
+            funding_note,
+            funding_notes,
+            funding_authorization,
+        }
     }));
 
     let root = ordered_felt_list_commitment(
@@ -2993,10 +3038,17 @@ fn validate_batch_nullifier_freshness<'a>(
 ) -> Result<(), String> {
     let mut current_nullifiers = BTreeSet::new();
     for record in records {
-        let nullifier = normalize_felt_hex(&record.order.funding_nullifier.0)
-            .map_err(|error| format!("invalid funding nullifier: {error}"))?;
-        if !current_nullifiers.insert(nullifier) {
-            return Err("duplicate funding nullifier in current batch".into());
+        for note in &record.funding_notes {
+            let commitment = note
+                .commitment()
+                .map_err(|error| format!("invalid funding note: {error}"))?;
+            let nullifier = nullifier_from_note_secret(&commitment, &note.blinding)
+                .map_err(|error| format!("invalid funding nullifier: {error}"))?;
+            let nullifier = normalize_felt_hex(&nullifier.0)
+                .map_err(|error| format!("invalid funding nullifier: {error}"))?;
+            if !current_nullifiers.insert(nullifier) {
+                return Err("duplicate funding nullifier in current batch".into());
+            }
         }
     }
 
@@ -3036,6 +3088,7 @@ async fn fetch_auction_order_witnesses(
             order_commitment: record.order_commitment,
             order: record.order,
             funding_note: record.funding_note,
+            funding_notes: record.funding_notes,
             funding_authorization: record.funding_authorization,
         })
         .collect())
@@ -3507,6 +3560,7 @@ async fn publish_batch_artifacts_to_coordinator(
         output_bundle: artifacts.output_bundle.clone(),
         settlement_witness: artifacts.settlement_witness.clone(),
         published_at_unix_ms: now_unix_ms(),
+        settled_at_unix_ms: None,
         order_execution_reports: artifacts.order_execution_reports.clone(),
         transcript_shape: Some(transcript_shape),
     };
@@ -3739,6 +3793,53 @@ async fn sync_job_with_onchain_submission(
     persist_record(state.data_dir.as_ref(), PROOF_JOBS_DIR, batch_id, status)?;
 
     Ok(status.clone())
+}
+
+async fn publish_settlement_timestamp_to_artifact_stores(
+    state: &AppState,
+    batch_id: &str,
+    submission: &OnchainSubmissionRecord,
+) -> Result<(), String> {
+    if submission.execution_status.as_deref() != Some("SUCCEEDED")
+        || !matches!(
+            submission.finality_status.as_deref(),
+            Some("ACCEPTED_ON_L1" | "ACCEPTED_ON_L2")
+        )
+    {
+        return Ok(());
+    }
+    let Some(settled_at_unix_ms) = submission
+        .block_timestamp_unix_ms
+        .or(submission.confirmed_at_unix_ms)
+    else {
+        return Ok(());
+    };
+    let payload = SettlementTimestampUpdate { settled_at_unix_ms };
+    let targets = [
+        format!(
+            "{}/api/internal/batches/{batch_id}/settled-at",
+            state.coordinator_url
+        ),
+        format!(
+            "{}/api/internal/batches/{batch_id}/settled-at",
+            state.indexer_url
+        ),
+    ];
+    for target in targets {
+        apply_internal_auth(
+            state.http_client.post(&target).json(&payload),
+            state
+                .internal_api_token
+                .as_ref()
+                .map(|token| token.as_str()),
+        )
+        .send()
+        .await
+        .map_err(|error| format!("settlement timestamp publish failed for {target}: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("settlement timestamp publish rejected by {target}: {error}"))?;
+    }
+    Ok(())
 }
 
 async fn set_job_error(
@@ -5125,11 +5226,12 @@ fn derive_deposit_note_membership_witnesses(
 
     let mut funding_notes = matched_order_witnesses
         .iter()
-        .map(|witness| {
-            Ok((
-                witness.funding_note.nonce,
-                note_commitment_from_note(&witness.funding_note)?,
-            ))
+        .flat_map(|witness| {
+            witness
+                .effective_funding_notes()
+                .into_iter()
+                .map(|note| Ok((note.nonce, note_commitment_from_note(note)?)))
+                .collect::<Vec<Result<(u64, String), StatusCode>>>()
         })
         .collect::<Result<Vec<_>, StatusCode>>()?;
     funding_notes.sort_by_key(|(nonce, commitment)| (*nonce, commitment.clone()));
@@ -5213,7 +5315,7 @@ fn build_settlement_artifacts(
             zylith_core::OrderType::HeartbeatCover
         ) {
             product_config
-                .validate_order_funding(&record.order, &record.funding_note)
+                .validate_order_funding_notes(&record.order, &record.funding_notes)
                 .map_err(|_| {
                     eprintln!(
                         "build_settlement_artifacts batch_id={batch_id} stage=validate_orders failed=funding_policy"
@@ -5243,7 +5345,7 @@ fn build_settlement_artifacts(
     let quote_asset = pair.quote_asset_id.clone();
 
     let mut matched_orders = Vec::with_capacity(fills.len());
-    let mut consumed_inputs = Vec::with_capacity(fills.len());
+    let mut consumed_inputs = Vec::with_capacity(fills.len() * 2);
     let mut fee_accumulator: BTreeMap<String, u128> = BTreeMap::new();
     let mut output_notes = Vec::with_capacity(fills.len());
     let mut matched_order_witnesses = Vec::with_capacity(fills.len());
@@ -5253,37 +5355,66 @@ fn build_settlement_artifacts(
 
     eprintln!("build_settlement_artifacts batch_id={batch_id} stage=build_fills start");
     for fill in fills.iter() {
-        let funding_note_commitment = fill
-            .funding_note
-            .commitment()
+        let funding_note_commitments = fill
+            .funding_notes
+            .iter()
+            .map(|note| note.commitment())
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if funding_note_commitment != fill.order.funding_note_ref {
+        let funding_nullifiers = fill
+            .funding_notes
+            .iter()
+            .zip(funding_note_commitments.iter())
+            .map(|(note, commitment)| nullifier_from_note_secret(commitment, &note.blinding))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if funding_input_set_commitment(&funding_note_commitments)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            != fill.order.funding_note_ref
+        {
             eprintln!(
                 "build_settlement_artifacts batch_id={batch_id} stage=build_fills failed=funding_note_ref"
             );
             return Err(StatusCode::CONFLICT);
         }
-        if seen_funding_notes
-            .insert(
-                funding_note_commitment.0.clone(),
-                fill.order_commitment.0.clone(),
-            )
-            .is_some()
+        if funding_nullifier_set_commitment(&funding_nullifiers)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            != fill.order.funding_nullifier
         {
             eprintln!(
-                "build_settlement_artifacts batch_id={batch_id} stage=build_fills failed=duplicate_funding_note"
+                "build_settlement_artifacts batch_id={batch_id} stage=build_fills failed=funding_nullifier_ref"
             );
             return Err(StatusCode::CONFLICT);
+        }
+        for funding_note_commitment in &funding_note_commitments {
+            if seen_funding_notes
+                .insert(
+                    funding_note_commitment.0.clone(),
+                    fill.order_commitment.0.clone(),
+                )
+                .is_some()
+            {
+                eprintln!(
+                    "build_settlement_artifacts batch_id={batch_id} stage=build_fills failed=duplicate_funding_note"
+                );
+                return Err(StatusCode::CONFLICT);
+            }
         }
 
         matched_orders.push(MatchedOrder {
             order_commitment: fill.order_commitment.clone(),
             filled_amount: fill.filled_amount,
         });
-        consumed_inputs.push(ConsumedInput {
-            note_commitment: funding_note_commitment,
-            nullifier: fill.order.funding_nullifier.clone(),
-        });
+        consumed_inputs.extend(
+            funding_note_commitments
+                .iter()
+                .cloned()
+                .zip(funding_nullifiers.iter().cloned())
+                .map(|(note_commitment, nullifier)| ConsumedInput {
+                    note_commitment,
+                    nullifier,
+                }),
+        );
 
         let (asset_id, gross_amount) = match fill.order.side {
             OrderSide::Buy => (base_asset.clone(), fill.filled_amount),
@@ -5392,8 +5523,10 @@ fn build_settlement_artifacts(
         matched_order_witnesses.push(MatchedOrderWitness {
             order_commitment: fill.order_commitment.clone(),
             funding_note: fill.funding_note.clone(),
+            funding_notes: fill.funding_notes.clone(),
             funding_note_ref: fill.order.funding_note_ref.clone(),
             funding_nullifier: fill.order.funding_nullifier.clone(),
+            funding_nullifiers,
             funding_authorization: fill.funding_authorization.clone(),
             side: fill.order.side.clone(),
             order_type: fill.order.order_type.clone(),
@@ -5689,6 +5822,7 @@ fn residual_for_fill(
     clearing_price: u128,
     price_base_scale: u128,
 ) -> Result<(AssetId, u128), StatusCode> {
+    let funding_total = funding_note_total(&fill.funding_notes).ok_or(StatusCode::CONFLICT)?;
     match fill.order.side {
         OrderSide::Buy => {
             let spent =
@@ -5696,20 +5830,24 @@ fn residual_for_fill(
                     .map_err(|_| StatusCode::CONFLICT)?;
             Ok((
                 fill.funding_note.asset_id.clone(),
-                fill.funding_note
-                    .amount
+                funding_total
                     .checked_sub(spent)
                     .ok_or(StatusCode::CONFLICT)?,
             ))
         }
         OrderSide::Sell => Ok((
             fill.funding_note.asset_id.clone(),
-            fill.funding_note
-                .amount
+            funding_total
                 .checked_sub(fill.filled_amount)
                 .ok_or(StatusCode::CONFLICT)?,
         )),
     }
+}
+
+fn funding_note_total(notes: &[Note]) -> Option<u128> {
+    notes
+        .iter()
+        .try_fold(0u128, |total, note| total.checked_add(note.amount))
 }
 
 fn deterministic_protocol_fee_entries(
@@ -5760,6 +5898,7 @@ fn compute_fill_plan(
             order_commitment: record.order_commitment.clone(),
             order: record.order.clone(),
             funding_note: record.funding_note.clone(),
+            funding_notes: record.funding_notes.clone(),
             funding_authorization: record.funding_authorization.clone(),
             available_amount: max_fill_at_price(record, clearing_price, price_base_scale),
             filled_amount: 0,
@@ -5902,15 +6041,20 @@ fn max_fill_at_price(
             if clearing_price == 0 {
                 return 0;
             }
-            let affordable_amount = base_amount_affordable_for_quote(
-                record.funding_note.amount,
-                clearing_price,
-                price_base_scale,
-            )
-            .unwrap_or(u128::MAX);
+            let Some(funding_total) = funding_note_total(&record.funding_notes) else {
+                return 0;
+            };
+            let affordable_amount =
+                base_amount_affordable_for_quote(funding_total, clearing_price, price_base_scale)
+                    .unwrap_or(u128::MAX);
             requested_amount.min(affordable_amount)
         }
-        OrderSide::Sell => requested_amount.min(record.funding_note.amount),
+        OrderSide::Sell => {
+            let Some(funding_total) = funding_note_total(&record.funding_notes) else {
+                return 0;
+            };
+            requested_amount.min(funding_total)
+        }
     };
 
     if available_amount < record.order.min_fill {
@@ -6437,18 +6581,13 @@ async fn fetch_native_execution_context(
         NATIVE_PROVER_BLOCKS_BACK_ENV,
         DEFAULT_NATIVE_PROVER_BLOCKS_BACK,
     );
-    let proof_block_number = |block_number: u64| {
-        if mode == NativeTransactionMode::ProofOnly {
-            block_number.saturating_sub(proving_blocks_back)
-        } else {
-            block_number
-        }
-    };
     match block {
         MaybePreConfirmedBlockWithTxHashes::Block(block) => Ok(NativeExecutionContext {
-            block_id: NativeBlockId::Number {
-                block_number: proof_block_number(block.block_number),
-            },
+            block_id: native_execution_context_block_id(
+                mode,
+                block.block_number,
+                proving_blocks_back,
+            ),
             l1_gas_price: native_gas_price_bound(block.l1_gas_price.price_in_fri)?,
             l2_gas_price: native_gas_price_bound(block.l2_gas_price.price_in_fri)?,
             l1_data_gas_price: native_gas_price_bound(block.l1_data_gas_price.price_in_fri)?,
@@ -6458,14 +6597,29 @@ async fn fetch_native_execution_context(
             // header counters that starknet-rust 0.19 requires, which makes the untagged response
             // deserialize as the pre-confirmed shape even when the raw block has ACCEPTED_ON_L2.
             Ok(NativeExecutionContext {
-                block_id: NativeBlockId::Number {
-                    block_number: proof_block_number(block.block_number),
-                },
+                block_id: native_execution_context_block_id(
+                    mode,
+                    block.block_number,
+                    proving_blocks_back,
+                ),
                 l1_gas_price: native_gas_price_bound(block.l1_gas_price.price_in_fri)?,
                 l2_gas_price: native_gas_price_bound(block.l2_gas_price.price_in_fri)?,
                 l1_data_gas_price: native_gas_price_bound(block.l1_data_gas_price.price_in_fri)?,
             })
         }
+    }
+}
+
+fn native_execution_context_block_id(
+    mode: NativeTransactionMode,
+    latest_block_number: u64,
+    proving_blocks_back: u64,
+) -> NativeBlockId {
+    match mode {
+        NativeTransactionMode::ProofOnly => NativeBlockId::Number {
+            block_number: latest_block_number.saturating_sub(proving_blocks_back),
+        },
+        NativeTransactionMode::SubmitOnchain => NativeBlockId::Tag("latest".into()),
     }
 }
 
@@ -6542,6 +6696,7 @@ async fn submit_native_plan_onchain(
         revert_reason: None,
         block_number: None,
         block_hash: None,
+        block_timestamp_unix_ms: None,
         submission_mode: "native-proof-facts".into(),
         settlement_contract_address,
     };
@@ -6550,6 +6705,11 @@ async fn submit_native_plan_onchain(
         &mut submission,
         wait_for_receipt(&provider, parse_felt(&tx_hash, "transaction hash")?).await,
     );
+    if let Some(block_number) = submission.block_number
+        && let Ok(block_timestamp) = fetch_block_timestamp_unix_ms(&provider, block_number).await
+    {
+        submission.block_timestamp_unix_ms = Some(block_timestamp);
+    }
 
     Ok(submission)
 }
@@ -6762,6 +6922,23 @@ async fn wait_for_accepted_receipt(
     }
 
     None
+}
+
+async fn fetch_block_timestamp_unix_ms(
+    provider: &JsonRpcClient<HttpTransport>,
+    block_number: u64,
+) -> Result<u64, String> {
+    let block = provider
+        .get_block_with_tx_hashes(BlockId::Number(block_number))
+        .await
+        .map_err(|error| format!("failed to fetch settlement block timestamp: {error}"))?;
+    let timestamp = match block {
+        MaybePreConfirmedBlockWithTxHashes::Block(block) => block.timestamp,
+        MaybePreConfirmedBlockWithTxHashes::PreConfirmedBlock(block) => block.timestamp,
+    };
+    timestamp
+        .checked_mul(1_000)
+        .ok_or_else(|| "settlement block timestamp overflow".to_string())
 }
 
 fn populate_submission_receipt_status(
@@ -7186,13 +7363,13 @@ mod tests {
     use super::{
         DEFAULT_PROTOCOL_FEE_BPS, DEFAULT_PROTOCOL_FEE_RECIPIENT, DecryptedOrderRecord,
         NativeBlockId, NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
-        SettlementBuildContext, SettlementRoots, artifact_id_for, build_batch_liquidity_report,
-        build_native_proof_program_calldata, build_settlement_artifacts,
-        compute_candidate_clearing_price, decode_bhttp_response,
+        NativeTransactionMode, SettlementBuildContext, SettlementRoots, artifact_id_for,
+        build_batch_liquidity_report, build_native_proof_program_calldata,
+        build_settlement_artifacts, compute_candidate_clearing_price, decode_bhttp_response,
         deterministic_settlement_submission_jitter_ms, eligible_order_count,
         encode_bhttp_json_post, matched_maker_participant_count, matched_participant_count,
         max_maker_fill_share_bps, max_single_order_fill_share_bps, max_single_owner_fill_share_bps,
-        native_fee_estimate_requires_proof_facts,
+        native_execution_context_block_id, native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
         redact_native_execution_request, redact_native_prover_request,
@@ -7204,7 +7381,7 @@ mod tests {
         NoteCommitment, Nullifier, NullifierHistoryBatch, OrderIntent, OrderSide, OrderType,
         PairId, ProductConfig, SettlementWitness, SpendAuthorization, TimeInForce,
         hash::ordered_felt_list_commitment, note_recognition_public_key_from_raw_key_hex,
-        settlement_nullifier_root_after_history,
+        nullifier_from_note_secret, settlement_nullifier_root_after_history,
     };
 
     #[test]
@@ -7372,6 +7549,19 @@ mod tests {
         assert!(!native_fee_estimate_requires_proof_facts(
             "Execution failed: UNKNOWN_BATCH"
         ));
+    }
+
+    #[test]
+    fn native_execution_context_pins_proof_but_uses_latest_for_submit() {
+        match native_execution_context_block_id(NativeTransactionMode::ProofOnly, 100, 7) {
+            NativeBlockId::Number { block_number } => assert_eq!(block_number, 93),
+            other => panic!("proof context must use numbered block, got {other:?}"),
+        }
+
+        match native_execution_context_block_id(NativeTransactionMode::SubmitOnchain, 100, 7) {
+            NativeBlockId::Tag(tag) => assert_eq!(tag, "latest"),
+            other => panic!("submit context must use latest block, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7821,6 +8011,8 @@ mod tests {
             ),
         ];
         records[1].order.funding_nullifier = records[0].order.funding_nullifier.clone();
+        records[1].funding_note = records[0].funding_note.clone();
+        records[1].funding_notes = vec![records[0].funding_note.clone()];
         let historical = Vec::<SettlementWitness>::new();
 
         let error =
@@ -8139,6 +8331,12 @@ mod tests {
         let recipient_owner_public_key =
             note_recognition_public_key_from_raw_key_hex(&format!("{:064x}", 0xcd_u64 + index))
                 .expect("test recipient owner public key");
+        let funding_note_ref = funding_note
+            .commitment()
+            .expect("test funding note commitment");
+        let funding_nullifier =
+            nullifier_from_note_secret(&funding_note_ref, &funding_note.blinding)
+                .expect("test funding nullifier");
         let order = OrderIntent {
             pair_id: PairId("STRK/USDC".into()),
             batch_id: BatchId("batch-strk-usdc-1".into()),
@@ -8156,8 +8354,8 @@ mod tests {
             parent_secret_commitment: "0x0".into(),
             parent_cancel_authority: "0x0".into(),
             parent_authorization_secret: "0x0".into(),
-            funding_note_ref: NoteCommitment(format!("0x{:x}", 0x300 + index)),
-            funding_nullifier: Nullifier(format!("0x{:x}", 0x400 + index)),
+            funding_note_ref,
+            funding_nullifier,
             recipient_owner_public_key,
             recipient_spend_authority: "0x789".into(),
             recipient_withdraw_authority: "0xabc".into(),
@@ -8167,6 +8365,7 @@ mod tests {
         DecryptedOrderRecord {
             order_commitment: zylith_core::OrderCommitment(format!("0x{:x}", 0x500 + index)),
             order,
+            funding_notes: vec![funding_note.clone()],
             funding_note,
             funding_authorization: SpendAuthorization {
                 signature_r: "0x1".into(),
@@ -8197,6 +8396,11 @@ mod tests {
             .funding_note
             .commitment()
             .expect("funding note commitment");
+        record.order.funding_nullifier = nullifier_from_note_secret(
+            &record.order.funding_note_ref,
+            &record.funding_note.blinding,
+        )
+        .expect("funding nullifier");
         record.order_commitment = record.order.commitment().expect("order commitment");
         record
     }

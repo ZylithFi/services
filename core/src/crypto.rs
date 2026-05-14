@@ -28,21 +28,24 @@ use crate::{
     OutputNoteRecord, OutputRecoveryRecord, OwnedOutputNotePayload, PairId,
     PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyRegistry, PrivateOrderPayload,
     ProtocolError, RecoveryArtifact, RecoveryArtifactKind, RecoverySeed, RenewalChildUse,
-    RenewalStateHistoryBatch, RootOnlySettlementCommitments, SettlementCallArguments,
-    SettlementOutputWithdrawalCallArguments, SettlementOutputWithdrawalSubmissionPlan,
-    SettlementSubmissionPlan, SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce,
-    WithdrawalCallArguments, WithdrawalSubmissionPlan, derive_user_keys,
+    RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
+    RenewalParentCancelSubmissionPlan, RenewalStateHistoryBatch, RootOnlySettlementCommitments,
+    SettlementCallArguments, SettlementOutputWithdrawalCallArguments,
+    SettlementOutputWithdrawalSubmissionPlan, SettlementSubmissionPlan, SettlementTranscript,
+    SettlementWitness, StarknetCall, TimeInForce, WithdrawalCallArguments,
+    WithdrawalSubmissionPlan, derive_user_keys,
     hash::{
         domain_felt, domain_felt_hex, encode_starknet_felt, felt_from_hex_str, felt_hex,
         normalize_felt_hex, poseidon_chain_hex, tagged_commitment_sha256, tagged_field_hex,
         tagged_sha256_bytes, tagged_sha256_hex,
     },
     types::{
-        NOTE_RECOGNITION_ALGORITHM, OUTPUT_NOTE_PLAINTEXT_PADDED_LEN, OUTPUT_RECOVERY_FIELD_COUNT,
-        OUTPUT_RECOVERY_PROOF_SLOTS, nullifier_from_note_secret, output_recovery_bundle_root,
-        output_recovery_record_commitment, renewal_child_nullifier, renewal_parent_cancel_marker,
-        spend_auth_key_felt_from_raw_key_hex, spend_authority_from_raw_key_hex,
-        withdraw_authority_from_raw_key_hex,
+        MAX_ORDER_FUNDING_INPUTS, NOTE_RECOGNITION_ALGORITHM, OUTPUT_NOTE_PLAINTEXT_PADDED_LEN,
+        OUTPUT_RECOVERY_FIELD_COUNT, OUTPUT_RECOVERY_PROOF_SLOTS, RENEWAL_PARENT_CANCEL_DOMAIN_HEX,
+        funding_input_set_commitment, funding_nullifier_set_commitment, nullifier_from_note_secret,
+        output_recovery_bundle_root, output_recovery_record_commitment, renewal_child_nullifier,
+        renewal_parent_cancel_marker, spend_auth_key_felt_from_raw_key_hex,
+        spend_authority_from_raw_key_hex, withdraw_authority_from_raw_key_hex,
     },
 };
 
@@ -71,6 +74,7 @@ pub const NULLIFIER_SPARSE_TREE_DEPTH: usize = 64;
 const NULLIFIER_KEY_LOW_BITS: usize = NULLIFIER_SPARSE_TREE_DEPTH;
 const NULLIFIER_KEY_HIGH_BITS: usize = 124;
 const NULLIFIER_KEY_HIGH_BOUND: u128 = 1_u128 << NULLIFIER_KEY_HIGH_BITS;
+pub const RENEWAL_SPARSE_TREE_DEPTH: usize = 128;
 const SETTLEMENT_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f736574746c655f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
@@ -151,13 +155,7 @@ pub fn build_order_submission(
     let order_commitment = payload.order.commitment()?;
     let cancellation_auth_tag =
         derive_order_cancellation_auth_tag(order_cancellation_key_hex, &order_commitment)?;
-    let funding_note_commitment = payload.funding_note.commitment()?;
-    if funding_note_commitment != payload.order.funding_note_ref {
-        return Err(ProtocolError::Crypto(
-            "funding note commitment does not match order funding_note_ref".into(),
-        ));
-    }
-    validate_private_order_spend_authorization(payload, &funding_note_commitment)?;
+    validate_private_order_spend_authorization(payload)?;
 
     let plaintext = serde_json::to_vec(payload)?;
     let split_shares = split_into_xor_shares(&plaintext, registry.keys.len());
@@ -539,23 +537,58 @@ pub fn reconstruct_order_from_shares(
         ));
     }
 
-    let funding_note_commitment = payload.funding_note.commitment()?;
-    if funding_note_commitment != payload.order.funding_note_ref {
-        return Err(ProtocolError::Crypto(
-            "funding note commitment did not match shared order payload".into(),
-        ));
-    }
-    validate_private_order_spend_authorization(&payload, &funding_note_commitment)?;
+    validate_private_order_spend_authorization(&payload)?;
 
     Ok(payload)
 }
 
 fn validate_private_order_spend_authorization(
     payload: &PrivateOrderPayload,
-    funding_note_commitment: &crate::NoteCommitment,
 ) -> Result<(), ProtocolError> {
     let expected_order_commitment = payload.order.commitment()?;
-    let public_key = felt_from_hex_str(&payload.funding_note.spend_authority)?;
+    let funding_notes = payload.effective_funding_notes();
+    if funding_notes.is_empty() || funding_notes.len() > MAX_ORDER_FUNDING_INPUTS {
+        return Err(ProtocolError::Crypto("invalid funding input count".into()));
+    }
+    let first_spend_authority = funding_notes[0].spend_authority.clone();
+    let first_owner_public_key = funding_notes[0].owner_public_key.clone();
+    let mut commitments = Vec::with_capacity(funding_notes.len());
+    let mut nullifiers = Vec::with_capacity(funding_notes.len());
+    let mut seen_commitments = BTreeSet::new();
+    for note in funding_notes {
+        if note.spend_authority != first_spend_authority {
+            return Err(ProtocolError::Crypto(
+                "multi-note funding inputs must share spend authority".into(),
+            ));
+        }
+        if note.owner_public_key != first_owner_public_key {
+            return Err(ProtocolError::Crypto(
+                "multi-note funding inputs must share note owner".into(),
+            ));
+        }
+        let commitment = note.commitment()?;
+        if !seen_commitments.insert(commitment.0.clone()) {
+            return Err(ProtocolError::Crypto(
+                "multi-note funding inputs must be unique".into(),
+            ));
+        }
+        nullifiers.push(nullifier_from_note_secret(&commitment, &note.blinding)?);
+        commitments.push(commitment);
+    }
+    let funding_note_commitment = funding_input_set_commitment(&commitments)?;
+    if funding_note_commitment != payload.order.funding_note_ref {
+        return Err(ProtocolError::Crypto(
+            "funding input commitment does not match authorization payload".into(),
+        ));
+    }
+    let funding_nullifier_commitment = funding_nullifier_set_commitment(&nullifiers)?;
+    if funding_nullifier_commitment != payload.order.funding_nullifier {
+        return Err(ProtocolError::Crypto(
+            "funding nullifier commitment does not match authorization payload".into(),
+        ));
+    }
+
+    let public_key = felt_from_hex_str(&first_spend_authority)?;
     let signature_r = felt_from_hex_str(&payload.funding_authorization.signature_r)?;
     let signature_s = felt_from_hex_str(&payload.funding_authorization.signature_s)?;
     let message = felt_from_hex_str(&expected_order_commitment.0)?;
@@ -567,23 +600,6 @@ fn validate_private_order_spend_authorization(
         ));
     }
 
-    if *funding_note_commitment != payload.order.funding_note_ref {
-        return Err(ProtocolError::Crypto(
-            "funding note commitment does not match authorization payload".into(),
-        ));
-    }
-    validate_note_nullifier(&payload.funding_note, &payload.order.funding_nullifier)?;
-    Ok(())
-}
-
-fn validate_note_nullifier(note: &Note, nullifier: &crate::Nullifier) -> Result<(), ProtocolError> {
-    let note_commitment = note.commitment()?;
-    let expected = nullifier_from_note_secret(&note_commitment, &note.blinding)?;
-    if expected != *nullifier {
-        return Err(ProtocolError::Crypto(
-            "funding nullifier does not match note commitment and note secret".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -713,6 +729,7 @@ pub fn build_heartbeat_cover_orders(
             payload: PrivateOrderPayload {
                 order,
                 funding_note,
+                funding_notes: Vec::new(),
                 funding_authorization,
             },
         });
@@ -810,16 +827,13 @@ pub fn build_output_note(
             "output_index": output_index,
         }),
     )?;
-    let metadata_commitment = tagged_field_hex(
-        "zylith/output-metadata",
-        &serde_json::json!({
-            "batch_id": batch_id,
-            "order_commitment": order_commitment.0,
-            "funding_note_ref": order.funding_note_ref.0,
-            "pair_id": order.pair_id.0,
-            "recipient_spend_authority": order.recipient_spend_authority,
-            "withdraw_authority": withdraw_authority,
-        }),
+    let metadata_commitment = output_note_metadata_commitment(
+        batch_id,
+        order_commitment,
+        &order.funding_note_ref,
+        &order.pair_id,
+        &order.recipient_spend_authority,
+        &withdraw_authority,
     )?;
 
     Ok(Note {
@@ -832,6 +846,27 @@ pub fn build_output_note(
         nonce: output_index as u64,
         metadata_commitment,
     })
+}
+
+pub fn output_note_metadata_commitment(
+    batch_id: &str,
+    order_commitment: &OrderCommitment,
+    funding_note_ref: &NoteCommitment,
+    pair_id: &PairId,
+    recipient_spend_authority: &str,
+    withdraw_authority: &str,
+) -> Result<String, ProtocolError> {
+    tagged_field_hex(
+        "zylith/output-metadata",
+        &serde_json::json!({
+            "batch_id": batch_id,
+            "order_commitment": order_commitment.0,
+            "funding_note_ref": funding_note_ref.0,
+            "pair_id": pair_id.0,
+            "recipient_spend_authority": recipient_spend_authority,
+            "withdraw_authority": withdraw_authority,
+        }),
+    )
 }
 
 pub fn derive_order_cancellation_secret(
@@ -1081,6 +1116,56 @@ pub fn build_settlement_output_withdrawal_submission_plan(
     })
 }
 
+pub fn build_renewal_parent_cancel_submission_plan(
+    request: RenewalParentCancelPlanRequest,
+) -> Result<RenewalParentCancelSubmissionPlan, ProtocolError> {
+    let chain_id = normalize_felt_hex(&request.chain_id)?;
+    let auction_verifier_address = normalize_felt_hex(&request.auction_verifier_address)?;
+    let cancel_authority = normalize_felt_hex(&request.parent_cancel_authority)?;
+    let renewal_cancel_auth_key = normalize_felt_hex(&request.renewal_cancel_auth_key)?;
+    let cancel_marker =
+        renewal_parent_cancel_marker(&request.parent_secret_commitment, &cancel_authority)?;
+
+    let mut entries = BTreeMap::<Vec<bool>, Felt>::new();
+    for entry in &request.prior_renewal_entries {
+        insert_renewal_sparse_entry(&mut entries, entry)?;
+    }
+    let witness = renewal_sparse_witness_for_entry(&entries, &cancel_marker)?;
+
+    let message = renewal_parent_cancel_marker_message_hash(
+        &chain_id,
+        &auction_verifier_address,
+        &cancel_marker,
+    )?;
+    let private_key = felt_from_hex_str(&renewal_cancel_auth_key)?;
+    let message = felt_from_hex_str(&message)?;
+    let k = rfc6979_generate_k(&message, &private_key, None);
+    let signature = sign(&private_key, &message, &k).map_err(|err| {
+        ProtocolError::Crypto(format!("renewal parent cancellation signing failed: {err}"))
+    })?;
+
+    let encoded_args = RenewalParentCancelCallArguments {
+        cancel_marker,
+        cancel_authority,
+        sparse_key_low: witness.key_low,
+        sparse_key_high: witness.key_high,
+        merkle_path: witness.merkle_path,
+        merkle_directions: witness.merkle_directions,
+        signature_r: felt_hex(&signature.r),
+        signature_s: felt_hex(&signature.s),
+    };
+    let calldata = flatten_renewal_parent_cancel_call_arguments(&encoded_args);
+
+    Ok(RenewalParentCancelSubmissionPlan {
+        starknet_call: StarknetCall {
+            contract_address: auction_verifier_address,
+            entrypoint: "cancel_renewal_parent_marker".into(),
+            calldata,
+        },
+        encoded_args,
+    })
+}
+
 pub fn withdrawal_message_hash(
     note_commitment: &str,
     recipient: &str,
@@ -1098,6 +1183,21 @@ pub fn withdrawal_message_hash(
             shielded_asset_adapter_address,
             note_commitment,
             recipient,
+        ],
+    ))
+}
+
+pub fn renewal_parent_cancel_marker_message_hash(
+    chain_id: &str,
+    auction_verifier_address: &str,
+    cancel_marker: &str,
+) -> Result<String, ProtocolError> {
+    Ok(poseidon_chain_hex(
+        felt_from_hex_str(RENEWAL_PARENT_CANCEL_DOMAIN_HEX)?,
+        &[
+            felt_from_hex_str(chain_id)?,
+            felt_from_hex_str(auction_verifier_address)?,
+            felt_from_hex_str(cancel_marker)?,
         ],
     ))
 }
@@ -2087,9 +2187,22 @@ fn nullifier_key_low_high(nullifier: &str) -> Result<(u128, u128), ProtocolError
 }
 
 fn nullifier_key_bits(nullifier: &str) -> Result<Vec<bool>, ProtocolError> {
-    let (low, _high) = nullifier_key_low_high(nullifier)?;
-    let mut bits = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH);
-    for index in 0..NULLIFIER_KEY_LOW_BITS {
+    sparse_key_bits(nullifier, NULLIFIER_KEY_LOW_BITS)
+}
+
+fn renewal_key_bits(entry: &str) -> Result<Vec<bool>, ProtocolError> {
+    sparse_key_bits(entry, RENEWAL_SPARSE_TREE_DEPTH)
+}
+
+fn sparse_key_bits(entry: &str, bit_count: usize) -> Result<Vec<bool>, ProtocolError> {
+    if bit_count > 128 {
+        return Err(ProtocolError::Crypto(
+            "sparse key bit count exceeds low-limb width".into(),
+        ));
+    }
+    let (low, _high) = nullifier_key_low_high(entry)?;
+    let mut bits = Vec::with_capacity(bit_count);
+    for index in 0..bit_count {
         bits.push(((low >> index) & 1) == 1);
     }
     Ok(bits)
@@ -2245,15 +2358,17 @@ fn renewal_sparse_node(left: Felt, right: Felt) -> Result<Felt, ProtocolError> {
     if right == Felt::ZERO {
         return Ok(left);
     }
-    Ok(poseidon_hash(node_domain, poseidon_hash(left, right)))
+    let mut state = [node_domain, left, right];
+    poseidon_permute_comp(&mut state);
+    Ok(state[0])
 }
 
 fn renewal_sparse_levels(
     entries: &BTreeMap<Vec<bool>, Felt>,
 ) -> Result<Vec<BTreeMap<Vec<bool>, Felt>>, ProtocolError> {
-    let mut levels = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH + 1);
+    let mut levels = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH + 1);
     levels.push(entries.clone());
-    for _ in 0..NULLIFIER_SPARSE_TREE_DEPTH {
+    for _ in 0..RENEWAL_SPARSE_TREE_DEPTH {
         let current = levels
             .last()
             .expect("sparse tree always has a current level");
@@ -2302,7 +2417,7 @@ fn insert_renewal_sparse_entry(
             "renewal sparse entry cannot be zero".into(),
         ));
     }
-    let key = nullifier_key_bits(&normalized)?;
+    let key = renewal_key_bits(&normalized)?;
     if entries.contains_key(&key) {
         return Err(ProtocolError::Crypto("duplicate sparse renewal key".into()));
     }
@@ -2316,7 +2431,7 @@ fn renewal_sparse_witness_for_entry(
     entry: &str,
 ) -> Result<NullifierSparseUpdateWitness, ProtocolError> {
     let normalized = normalize_felt_hex(entry)?;
-    let key = nullifier_key_bits(&normalized)?;
+    let key = renewal_key_bits(&normalized)?;
     if entries.contains_key(&key) {
         return Err(ProtocolError::Crypto(
             "renewal sparse entry already exists".into(),
@@ -2327,9 +2442,9 @@ fn renewal_sparse_witness_for_entry(
         (Vec::new(), Vec::new())
     } else {
         let levels = renewal_sparse_levels(entries)?;
-        let mut merkle_path = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH);
-        let mut merkle_directions = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH);
-        for level in 0..NULLIFIER_SPARSE_TREE_DEPTH {
+        let mut merkle_path = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH);
+        let mut merkle_directions = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH);
+        for level in 0..RENEWAL_SPARSE_TREE_DEPTH {
             let mut sibling_key = key[level..].to_vec();
             sibling_key[0] = !sibling_key[0];
             let sibling = levels[level]
@@ -2898,7 +3013,42 @@ pub fn build_stwo_serialized_input(
         )));
     }
     for entry in &witness.matched_order_witnesses {
-        validate_note_nullifier(&entry.funding_note, &entry.funding_nullifier)?;
+        let funding_notes = entry.effective_funding_notes();
+        if funding_notes.is_empty() || funding_notes.len() > MAX_ORDER_FUNDING_INPUTS {
+            return Err(ProtocolError::Crypto(
+                "matched order funding input count is invalid".into(),
+            ));
+        }
+        let mut commitments = Vec::with_capacity(funding_notes.len());
+        let mut nullifiers = Vec::with_capacity(funding_notes.len());
+        let first_spend_authority = funding_notes[0].spend_authority.clone();
+        let first_owner_public_key = funding_notes[0].owner_public_key.clone();
+        for note in funding_notes {
+            if note.spend_authority != first_spend_authority {
+                return Err(ProtocolError::Crypto(
+                    "matched order funding inputs must share spend authority".into(),
+                ));
+            }
+            if note.owner_public_key != first_owner_public_key {
+                return Err(ProtocolError::Crypto(
+                    "matched order funding inputs must share note owner".into(),
+                ));
+            }
+            let commitment = note.commitment()?;
+            let nullifier = nullifier_from_note_secret(&commitment, &note.blinding)?;
+            commitments.push(commitment);
+            nullifiers.push(nullifier);
+        }
+        if funding_input_set_commitment(&commitments)? != entry.funding_note_ref {
+            return Err(ProtocolError::Crypto(
+                "matched order funding input set commitment mismatch".into(),
+            ));
+        }
+        if funding_nullifier_set_commitment(&nullifiers)? != entry.funding_nullifier {
+            return Err(ProtocolError::Crypto(
+                "matched order funding nullifier set commitment mismatch".into(),
+            ));
+        }
     }
     let note_membership_witnesses = note_membership_witnesses_for_serialization(witness)?;
     let consumed_nullifier_root = settlement_consumed_nullifier_root(&witness.consumed_inputs)?;
@@ -3040,6 +3190,49 @@ pub fn build_stwo_serialized_input(
             })
         })
         .collect::<Vec<_>>();
+    let mut matched_funding_input_counts =
+        Vec::with_capacity(witness.matched_order_witnesses.len());
+    let mut matched_funding_note_commitments = Vec::new();
+    let mut matched_funding_note_asset_ids = Vec::new();
+    let mut matched_funding_input_amounts = Vec::new();
+    let mut matched_funding_input_owner_keys = Vec::new();
+    let mut matched_funding_note_spend_authorities = Vec::new();
+    let mut matched_funding_note_withdraw_authorities = Vec::new();
+    let mut matched_funding_note_blindings = Vec::new();
+    let mut matched_funding_note_nonces = Vec::new();
+    let mut matched_funding_note_metadata_commitments = Vec::new();
+    let mut matched_funding_note_amounts =
+        Vec::with_capacity(witness.matched_order_witnesses.len());
+    let mut matched_funding_note_owner_keys =
+        Vec::with_capacity(witness.matched_order_witnesses.len());
+    for entry in &witness.matched_order_witnesses {
+        let funding_notes = entry.effective_funding_notes();
+        if funding_notes.is_empty() || funding_notes.len() > MAX_ORDER_FUNDING_INPUTS {
+            return Err(ProtocolError::Crypto(
+                "matched order funding input count is invalid".into(),
+            ));
+        }
+        matched_funding_input_counts.push(encode_usize(funding_notes.len()));
+        let mut total_amount = 0u128;
+        for note in &funding_notes {
+            total_amount = total_amount.checked_add(note.amount).ok_or_else(|| {
+                ProtocolError::Crypto("matched order funding amount overflow".into())
+            })?;
+            matched_funding_note_commitments.push(note.commitment()?.0);
+            matched_funding_note_asset_ids.push(encode_asset_id(&note.asset_id.0));
+            matched_funding_input_amounts.push(encode_u128(note.amount));
+            matched_funding_input_owner_keys.push(encode_owner_public_key(&note.owner_public_key));
+            matched_funding_note_spend_authorities.push(normalize_felt_hex(&note.spend_authority)?);
+            matched_funding_note_withdraw_authorities
+                .push(normalize_felt_hex(&note.withdraw_authority)?);
+            matched_funding_note_blindings.push(note.blinding.clone());
+            matched_funding_note_nonces.push(encode_u64(note.nonce));
+            matched_funding_note_metadata_commitments.push(note.metadata_commitment.clone());
+        }
+        matched_funding_note_amounts.push(encode_u128(total_amount));
+        matched_funding_note_owner_keys
+            .push(encode_owner_public_key(&funding_notes[0].owner_public_key));
+    }
     let mut payload = vec![
         encode_u64(SETTLEMENT_STATEMENT_TYPE_TAG),
         domain_felt_hex("zylith/note"),
@@ -3220,83 +3413,18 @@ pub fn build_stwo_serialized_input(
             .map(|entry| entry.funding_note_ref.0.clone())
             .collect::<Vec<_>>(),
     );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| {
-                entry
-                    .funding_note
-                    .commitment()
-                    .map(|commitment| commitment.0)
-            })
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| encode_asset_id(&entry.funding_note.asset_id.0))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| encode_u128(entry.funding_note.amount))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| encode_owner_public_key(&entry.funding_note.owner_public_key))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| normalize_felt_hex(&entry.funding_note.spend_authority))
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| normalize_felt_hex(&entry.funding_note.withdraw_authority))
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| entry.funding_note.blinding.clone())
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| encode_u64(entry.funding_note.nonce))
-            .collect::<Vec<_>>(),
-    );
-    push_span(
-        &mut payload,
-        &witness
-            .matched_order_witnesses
-            .iter()
-            .map(|entry| entry.funding_note.metadata_commitment.clone())
-            .collect::<Vec<_>>(),
-    );
+    push_span(&mut payload, &matched_funding_input_counts);
+    push_span(&mut payload, &matched_funding_note_commitments);
+    push_span(&mut payload, &matched_funding_note_asset_ids);
+    push_span(&mut payload, &matched_funding_input_amounts);
+    push_span(&mut payload, &matched_funding_input_owner_keys);
+    push_span(&mut payload, &matched_funding_note_spend_authorities);
+    push_span(&mut payload, &matched_funding_note_withdraw_authorities);
+    push_span(&mut payload, &matched_funding_note_blindings);
+    push_span(&mut payload, &matched_funding_note_nonces);
+    push_span(&mut payload, &matched_funding_note_metadata_commitments);
+    push_span(&mut payload, &matched_funding_note_amounts);
+    push_span(&mut payload, &matched_funding_note_owner_keys);
     push_span(
         &mut payload,
         &witness
@@ -3987,14 +4115,43 @@ fn auction_proof_vectors(
                 "auction order witness commitment does not match order preimage".into(),
             ));
         }
-        let funding_note_commitment = entry.funding_note.commitment()?;
-        if funding_note_commitment != entry.order.funding_note_ref {
+        let funding_notes = entry.effective_funding_notes();
+        if funding_notes.is_empty() || funding_notes.len() > MAX_ORDER_FUNDING_INPUTS {
             return Err(ProtocolError::Crypto(
-                "auction order funding note does not match funding_note_ref".into(),
+                "auction order funding input count is invalid".into(),
             ));
         }
-        validate_note_nullifier(&entry.funding_note, &entry.order.funding_nullifier)?;
-        let public_key = felt_from_hex_str(&entry.funding_note.spend_authority)?;
+        let first_spend_authority = funding_notes[0].spend_authority.clone();
+        let first_owner_public_key = funding_notes[0].owner_public_key.clone();
+        let mut funding_note_commitments = Vec::with_capacity(funding_notes.len());
+        let mut funding_nullifiers = Vec::with_capacity(funding_notes.len());
+        for note in funding_notes {
+            if note.spend_authority != first_spend_authority {
+                return Err(ProtocolError::Crypto(
+                    "auction order funding inputs must share spend authority".into(),
+                ));
+            }
+            if note.owner_public_key != first_owner_public_key {
+                return Err(ProtocolError::Crypto(
+                    "auction order funding inputs must share note owner".into(),
+                ));
+            }
+            let commitment = note.commitment()?;
+            funding_nullifiers.push(nullifier_from_note_secret(&commitment, &note.blinding)?);
+            funding_note_commitments.push(commitment);
+        }
+        if funding_input_set_commitment(&funding_note_commitments)? != entry.order.funding_note_ref
+        {
+            return Err(ProtocolError::Crypto(
+                "auction order funding input set does not match funding_note_ref".into(),
+            ));
+        }
+        if funding_nullifier_set_commitment(&funding_nullifiers)? != entry.order.funding_nullifier {
+            return Err(ProtocolError::Crypto(
+                "auction order funding nullifier set does not match funding_nullifier".into(),
+            ));
+        }
+        let public_key = felt_from_hex_str(&first_spend_authority)?;
         let signature_r = felt_from_hex_str(&entry.funding_authorization.signature_r)?;
         let signature_s = felt_from_hex_str(&entry.funding_authorization.signature_s)?;
         let message = felt_from_hex_str(&entry.order_commitment.0)?;
@@ -4080,6 +4237,44 @@ fn auction_proof_vectors(
             Ok(encode_u128(filled_amount))
         })
         .collect::<Result<Vec<_>, ProtocolError>>()?;
+    let mut funding_input_counts = Vec::with_capacity(all_orders.len());
+    let mut funding_note_commitments = Vec::new();
+    let mut funding_note_asset_ids = Vec::new();
+    let mut funding_input_amounts = Vec::new();
+    let mut funding_input_owner_keys = Vec::new();
+    let mut funding_note_spend_authorities = Vec::new();
+    let mut funding_note_withdraw_authorities = Vec::new();
+    let mut funding_note_blindings = Vec::new();
+    let mut funding_note_nonces = Vec::new();
+    let mut funding_note_metadata_commitments = Vec::new();
+    let mut funding_note_amounts = Vec::with_capacity(all_orders.len());
+    let mut funding_note_owner_keys = Vec::with_capacity(all_orders.len());
+    for entry in all_orders {
+        let funding_notes = entry.effective_funding_notes();
+        if funding_notes.is_empty() || funding_notes.len() > MAX_ORDER_FUNDING_INPUTS {
+            return Err(ProtocolError::Crypto(
+                "auction order funding input count is invalid".into(),
+            ));
+        }
+        funding_input_counts.push(encode_usize(funding_notes.len()));
+        let mut total_amount = 0u128;
+        for note in &funding_notes {
+            total_amount = total_amount.checked_add(note.amount).ok_or_else(|| {
+                ProtocolError::Crypto("auction order funding amount overflow".into())
+            })?;
+            funding_note_commitments.push(note.commitment()?.0);
+            funding_note_asset_ids.push(encode_asset_id(&note.asset_id.0));
+            funding_input_amounts.push(encode_u128(note.amount));
+            funding_input_owner_keys.push(encode_owner_public_key(&note.owner_public_key));
+            funding_note_spend_authorities.push(normalize_felt_hex(&note.spend_authority)?);
+            funding_note_withdraw_authorities.push(normalize_felt_hex(&note.withdraw_authority)?);
+            funding_note_blindings.push(note.blinding.clone());
+            funding_note_nonces.push(encode_u64(note.nonce));
+            funding_note_metadata_commitments.push(note.metadata_commitment.clone());
+        }
+        funding_note_amounts.push(encode_u128(total_amount));
+        funding_note_owner_keys.push(encode_owner_public_key(&funding_notes[0].owner_public_key));
+    }
 
     Ok(AuctionProofVectors {
         settlement_payload: settlement_payload.to_vec(),
@@ -4157,47 +4352,18 @@ fn auction_proof_vectors(
             .iter()
             .map(|entry| entry.order.funding_note_ref.0.clone())
             .collect(),
-        funding_note_commitments: all_orders
-            .iter()
-            .map(|entry| {
-                entry
-                    .funding_note
-                    .commitment()
-                    .map(|commitment| commitment.0)
-            })
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-        funding_note_asset_ids: all_orders
-            .iter()
-            .map(|entry| encode_asset_id(&entry.funding_note.asset_id.0))
-            .collect(),
-        funding_note_amounts: all_orders
-            .iter()
-            .map(|entry| encode_u128(entry.funding_note.amount))
-            .collect(),
-        funding_note_owner_keys: all_orders
-            .iter()
-            .map(|entry| encode_owner_public_key(&entry.funding_note.owner_public_key))
-            .collect(),
-        funding_note_spend_authorities: all_orders
-            .iter()
-            .map(|entry| normalize_felt_hex(&entry.funding_note.spend_authority))
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-        funding_note_withdraw_authorities: all_orders
-            .iter()
-            .map(|entry| normalize_felt_hex(&entry.funding_note.withdraw_authority))
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-        funding_note_blindings: all_orders
-            .iter()
-            .map(|entry| entry.funding_note.blinding.clone())
-            .collect(),
-        funding_note_nonces: all_orders
-            .iter()
-            .map(|entry| encode_u64(entry.funding_note.nonce))
-            .collect(),
-        funding_note_metadata_commitments: all_orders
-            .iter()
-            .map(|entry| entry.funding_note.metadata_commitment.clone())
-            .collect(),
+        funding_input_counts,
+        funding_note_commitments,
+        funding_note_asset_ids,
+        funding_input_amounts,
+        funding_input_owner_keys,
+        funding_note_spend_authorities,
+        funding_note_withdraw_authorities,
+        funding_note_blindings,
+        funding_note_nonces,
+        funding_note_metadata_commitments,
+        funding_note_amounts,
+        funding_note_owner_keys,
         funding_authorization_rs: all_orders
             .iter()
             .map(|entry| normalize_felt_hex(&entry.funding_authorization.signature_r))
@@ -4267,15 +4433,18 @@ struct AuctionProofVectors {
     parent_authorization_secrets: Vec<String>,
     auditor_flags: Vec<String>,
     funding_note_refs: Vec<String>,
+    funding_input_counts: Vec<String>,
     funding_note_commitments: Vec<String>,
     funding_note_asset_ids: Vec<String>,
-    funding_note_amounts: Vec<String>,
-    funding_note_owner_keys: Vec<String>,
+    funding_input_amounts: Vec<String>,
+    funding_input_owner_keys: Vec<String>,
     funding_note_spend_authorities: Vec<String>,
     funding_note_withdraw_authorities: Vec<String>,
     funding_note_blindings: Vec<String>,
     funding_note_nonces: Vec<String>,
     funding_note_metadata_commitments: Vec<String>,
+    funding_note_amounts: Vec<String>,
+    funding_note_owner_keys: Vec<String>,
     funding_authorization_rs: Vec<String>,
     funding_authorization_ss: Vec<String>,
     funding_nullifiers: Vec<String>,
@@ -4358,15 +4527,18 @@ fn push_admission_order_vectors(payload: &mut Vec<String>, vectors: &AuctionProo
     push_span(payload, &vectors.parent_authorization_secrets);
     push_span(payload, &vectors.auditor_flags);
     push_span(payload, &vectors.funding_note_refs);
+    push_span(payload, &vectors.funding_input_counts);
     push_span(payload, &vectors.funding_note_commitments);
     push_span(payload, &vectors.funding_note_asset_ids);
-    push_span(payload, &vectors.funding_note_amounts);
-    push_span(payload, &vectors.funding_note_owner_keys);
+    push_span(payload, &vectors.funding_input_amounts);
+    push_span(payload, &vectors.funding_input_owner_keys);
     push_span(payload, &vectors.funding_note_spend_authorities);
     push_span(payload, &vectors.funding_note_withdraw_authorities);
     push_span(payload, &vectors.funding_note_blindings);
     push_span(payload, &vectors.funding_note_nonces);
     push_span(payload, &vectors.funding_note_metadata_commitments);
+    push_span(payload, &vectors.funding_note_amounts);
+    push_span(payload, &vectors.funding_note_owner_keys);
     push_span(payload, &vectors.funding_authorization_rs);
     push_span(payload, &vectors.funding_authorization_ss);
     push_span(payload, &vectors.funding_nullifiers);
@@ -4806,6 +4978,22 @@ fn flatten_settlement_output_withdrawal_call_arguments(
     calldata
 }
 
+fn flatten_renewal_parent_cancel_call_arguments(
+    args: &RenewalParentCancelCallArguments,
+) -> Vec<String> {
+    let mut calldata = vec![
+        args.cancel_marker.clone(),
+        args.cancel_authority.clone(),
+        args.sparse_key_low.clone(),
+        args.sparse_key_high.clone(),
+    ];
+    push_span(&mut calldata, &args.merkle_path);
+    push_span(&mut calldata, &args.merkle_directions);
+    calldata.push(args.signature_r.clone());
+    calldata.push(args.signature_s.clone());
+    calldata
+}
+
 fn push_span(calldata: &mut Vec<String>, values: &[String]) {
     calldata.push(encode_usize(values.len()));
     calldata.extend(values.iter().cloned());
@@ -4839,7 +5027,7 @@ mod tests {
         SettlementOutputWithdrawalMessage, SettlementOutputWithdrawalPlanRequest,
         auction_admission_root, build_admission_serialized_input,
         build_auction_result_serialized_input, build_deposit_note, build_deposit_submission_plan,
-        build_order_submission, build_output_note,
+        build_order_submission, build_output_note, build_renewal_parent_cancel_submission_plan,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
         build_settlement_witness, build_stwo_serialized_input, build_withdrawal_submission_plan,
         create_order_ingress_receipt, create_recovery_artifact, decrypt_note_for_owner,
@@ -4859,8 +5047,8 @@ mod tests {
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
         withdrawal_message_hash,
     };
-    use crate::AuctionPrivacyGateWitness;
     use crate::types::{output_bundle_bucket_size, output_recovery_bundle_root};
+    use crate::{AuctionPrivacyGateWitness, RenewalParentCancelPlanRequest};
 
     fn with_deposit_prior_note_root(mut transcript: SettlementTranscript) -> SettlementTranscript {
         if !transcript.consumed_inputs.is_empty() {
@@ -4999,8 +5187,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment,
                 funding_note,
+                funding_notes: vec![],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
                 funding_nullifier,
+                funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
@@ -5291,6 +5481,16 @@ mod tests {
             &order.recipient_withdraw_authority,
         )
         .expect("output note");
+        let expected_metadata = super::output_note_metadata_commitment(
+            "batch-1",
+            &order.commitment().expect("commitment"),
+            &order.funding_note_ref,
+            &order.pair_id,
+            &order.recipient_spend_authority,
+            &order.recipient_withdraw_authority,
+        )
+        .expect("metadata commitment");
+        assert_eq!(note.metadata_commitment, expected_metadata);
         let blob = encrypt_note_for_owner("batch-1", 0, &note, &order.recipient_owner_public_key)
             .expect("encrypted note");
 
@@ -5821,8 +6021,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-2".into()),
                 funding_note,
+                funding_notes: vec![],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
                 funding_nullifier,
+                funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
                 side: OrderSide::Sell,
                 order_type: crate::OrderType::LimitBatch,
@@ -5918,8 +6120,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-3".into()),
                 funding_note,
+                funding_notes: vec![],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
                 funding_nullifier,
+                funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
@@ -5953,6 +6157,181 @@ mod tests {
         assert_eq!(serialized[16], "0x141");
         assert_eq!(serialized[17], "0x1");
         assert!(!serialized.is_empty());
+    }
+
+    #[test]
+    fn stwo_serialized_input_binds_multiple_funding_inputs() {
+        let funding_note_a = sample_note("USDC", 80_000, 54);
+        let funding_note_b = sample_note("USDC", 120_000, 55);
+        let output_note = sample_note("STRK", 997, 56);
+        let residual_note = sample_note("USDC", 55_000, 57);
+        let funding_commitment_a = funding_note_a
+            .commitment()
+            .expect("funding note commitment a");
+        let funding_commitment_b = funding_note_b
+            .commitment()
+            .expect("funding note commitment b");
+        let funding_nullifier_a = sample_nullifier(&funding_note_a);
+        let funding_nullifier_b = sample_nullifier(&funding_note_b);
+        let funding_note_ref = crate::funding_input_set_commitment(&[
+            funding_commitment_a.clone(),
+            funding_commitment_b.clone(),
+        ])
+        .expect("funding input set");
+        let funding_nullifier = crate::funding_nullifier_set_commitment(&[
+            funding_nullifier_a.clone(),
+            funding_nullifier_b.clone(),
+        ])
+        .expect("funding nullifier set");
+        let order_commitment = crate::OrderCommitment("order-multi-input".into());
+        let transcript = with_proof_bound_output_recovery(
+            with_deposit_prior_note_root(SettlementTranscript {
+                batch_id: crate::BatchId("batch-multi-input".into()),
+                pair_id: PairId("STRK/USDC".into()),
+                batch_epoch: 12,
+                order_commitment_root: "0x111".into(),
+                encrypted_order_set_commitment: "0x222".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
+                clearing_price: 145,
+                price_base_scale: 1,
+                matched_orders: vec![crate::MatchedOrder {
+                    order_commitment: order_commitment.clone(),
+                    filled_amount: 1000,
+                }],
+                consumed_inputs: vec![
+                    ConsumedInput {
+                        note_commitment: funding_commitment_a.clone(),
+                        nullifier: funding_nullifier_a.clone(),
+                    },
+                    ConsumedInput {
+                        note_commitment: funding_commitment_b.clone(),
+                        nullifier: funding_nullifier_b.clone(),
+                    },
+                ],
+                renewal_child_uses: vec![],
+                fees: vec![],
+                output_notes: vec![
+                    OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 997,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    },
+                    OutputNoteRecord {
+                        note_commitment: residual_note
+                            .commitment()
+                            .expect("residual note commitment"),
+                        asset_id: AssetId("USDC".into()),
+                        amount: 55_000,
+                        withdraw_authority: residual_note.withdraw_authority.clone(),
+                    },
+                ],
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments: vec![],
+                output_ciphertext_bundle_ref: "bundle-multi-input".into(),
+            }),
+            vec![output_note.clone(), residual_note.clone()],
+        );
+        let witness = build_settlement_witness(
+            &transcript,
+            PairId("STRK/USDC".into()),
+            "0x999",
+            AssetId("STRK".into()),
+            AssetId("USDC".into()),
+            vec![MatchedOrderWitness {
+                order_commitment,
+                funding_note: funding_note_a.clone(),
+                funding_notes: vec![funding_note_a, funding_note_b],
+                funding_note_ref: funding_note_ref.clone(),
+                funding_nullifier: funding_nullifier.clone(),
+                funding_nullifiers: vec![funding_nullifier_a, funding_nullifier_b],
+                funding_authorization: sample_authorization_unchecked(),
+                side: OrderSide::Buy,
+                order_type: crate::OrderType::LimitBatch,
+                maker_curve: None,
+                limit_price: 145,
+                order_amount: 1000,
+                min_fill: 1000,
+                time_in_force: crate::TimeInForce::CurrentBatchOnly,
+                expiry_epoch: 12,
+                order_nonce: 21,
+                parent_order_commitment: "0x0".into(),
+                parent_child_index: 0,
+                parent_secret_commitment: "0x0".into(),
+                parent_cancel_authority: "0x0".into(),
+                parent_authorization_secret: "0x0".into(),
+                auditor_view_allowed: false,
+                recipient_owner_public_key: "ab".repeat(32),
+                recipient_spend_authority: sample_spend_authority(),
+                recipient_withdraw_authority: output_note.withdraw_authority.clone(),
+                recipient_residual_withdraw_authority: residual_note.withdraw_authority.clone(),
+                filled_amount: 1000,
+                output_note,
+                residual_note: Some(residual_note),
+            }],
+        )
+        .expect("multi-input witness");
+
+        let serialized = build_stwo_serialized_input(&witness).expect("serialized input");
+        let mut index = 1 + 31;
+        let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
+        let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
+        let _matched_sides = read_serialized_span(&serialized, &mut index);
+        let _matched_order_types = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_curve_commitments = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_curve_point_counts = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_curve_prices = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_curve_base_amounts = read_serialized_span(&serialized, &mut index);
+        let _matched_limit_prices = read_serialized_span(&serialized, &mut index);
+        let _matched_order_amounts = read_serialized_span(&serialized, &mut index);
+        let _matched_min_fills = read_serialized_span(&serialized, &mut index);
+        let _matched_time_in_force = read_serialized_span(&serialized, &mut index);
+        let _matched_expiry_epochs = read_serialized_span(&serialized, &mut index);
+        let _matched_order_nonces = read_serialized_span(&serialized, &mut index);
+        let _matched_parent_order_commitments = read_serialized_span(&serialized, &mut index);
+        let _matched_parent_child_indexes = read_serialized_span(&serialized, &mut index);
+        let _matched_parent_secret_commitments = read_serialized_span(&serialized, &mut index);
+        let _matched_parent_cancel_authorities = read_serialized_span(&serialized, &mut index);
+        let _matched_parent_authorization_secrets = read_serialized_span(&serialized, &mut index);
+        let _matched_auditor_flags = read_serialized_span(&serialized, &mut index);
+        let matched_funding_note_refs = read_serialized_span(&serialized, &mut index);
+        let matched_funding_input_counts = read_serialized_span(&serialized, &mut index);
+        let matched_funding_note_commitments = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_asset_ids = read_serialized_span(&serialized, &mut index);
+        let matched_funding_input_amounts = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_input_owner_keys = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_spend_authorities = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_withdraw_authorities =
+            read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_blindings = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_nonces = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_metadata_commitments =
+            read_serialized_span(&serialized, &mut index);
+        let matched_funding_note_amounts = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_owner_keys = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_authorization_rs = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_authorization_ss = read_serialized_span(&serialized, &mut index);
+        let matched_funding_nullifiers = read_serialized_span(&serialized, &mut index);
+
+        assert_eq!(matched_funding_note_refs, vec![funding_note_ref.0]);
+        assert_eq!(matched_funding_input_counts, vec!["0x2".to_string()]);
+        assert_eq!(
+            matched_funding_note_commitments,
+            vec![funding_commitment_a.0, funding_commitment_b.0]
+        );
+        assert_eq!(
+            matched_funding_input_amounts,
+            vec!["0x13880".to_string(), "0x1d4c0".to_string()]
+        );
+        assert_eq!(matched_funding_note_amounts, vec!["0x30d40".to_string()]);
+        assert_eq!(matched_funding_nullifiers, vec![funding_nullifier.0]);
+        assert_eq!(witness.consumed_inputs.len(), 2);
     }
 
     #[test]
@@ -6062,8 +6441,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-missing-membership".into()),
                 funding_note,
+                funding_notes: vec![],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
                 funding_nullifier,
+                funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
@@ -6317,8 +6698,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-asset-owner".into()),
                 funding_note,
+                funding_notes: vec![],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
                 funding_nullifier,
+                funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
@@ -6375,10 +6758,11 @@ mod tests {
         let matched_parent_authorization_secrets = read_serialized_span(&serialized, &mut index);
         let matched_auditor_flags = read_serialized_span(&serialized, &mut index);
         let matched_funding_note_refs = read_serialized_span(&serialized, &mut index);
+        let matched_funding_input_counts = read_serialized_span(&serialized, &mut index);
         let _matched_funding_note_commitments = read_serialized_span(&serialized, &mut index);
         let matched_funding_note_asset_ids = read_serialized_span(&serialized, &mut index);
-        let _matched_funding_note_amounts = read_serialized_span(&serialized, &mut index);
-        let matched_funding_note_owner_keys = read_serialized_span(&serialized, &mut index);
+        let _matched_funding_input_amounts = read_serialized_span(&serialized, &mut index);
+        let matched_funding_input_owner_keys = read_serialized_span(&serialized, &mut index);
         let matched_funding_note_spend_authorities = read_serialized_span(&serialized, &mut index);
         let _matched_funding_note_withdraw_authorities =
             read_serialized_span(&serialized, &mut index);
@@ -6386,6 +6770,8 @@ mod tests {
         let _matched_funding_note_nonces = read_serialized_span(&serialized, &mut index);
         let _matched_funding_note_metadata_commitments =
             read_serialized_span(&serialized, &mut index);
+        let _matched_funding_note_amounts = read_serialized_span(&serialized, &mut index);
+        let matched_funding_note_owner_keys = read_serialized_span(&serialized, &mut index);
         let matched_funding_authorization_rs = read_serialized_span(&serialized, &mut index);
         let matched_funding_authorization_ss = read_serialized_span(&serialized, &mut index);
         let _matched_funding_nullifiers = read_serialized_span(&serialized, &mut index);
@@ -6469,6 +6855,7 @@ mod tests {
         );
         assert_eq!(matched_auditor_flags, vec!["0x1".to_string()]);
         assert_eq!(matched_funding_note_refs, vec![funding_note_commitment]);
+        assert_eq!(matched_funding_input_counts, vec!["0x1".to_string()]);
         assert_eq!(note_membership_kinds, vec!["0x0".to_string()]);
         assert_eq!(note_membership_batch_roots.len(), 1);
         assert_eq!(note_membership_path_counts, vec!["0x0".to_string()]);
@@ -6478,6 +6865,7 @@ mod tests {
         assert_eq!(matched_funding_note_asset_ids, vec![quote_asset.clone()]);
         assert_eq!(matched_output_note_asset_ids, vec![base_asset.clone()]);
         assert_eq!(output_note_asset_ids, vec![base_asset.clone()]);
+        assert_eq!(matched_funding_input_owner_keys, vec![owner_key.clone()]);
         assert_eq!(matched_funding_note_owner_keys, vec![owner_key.clone()]);
         assert_eq!(
             matched_funding_note_spend_authorities,
@@ -6586,8 +6974,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: order_commitment.clone(),
                 funding_note: private_order.funding_note.clone(),
+                funding_notes: vec![],
                 funding_note_ref: funding_note_commitment.clone(),
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
+                funding_nullifiers: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
@@ -6629,6 +7019,7 @@ mod tests {
                 order_commitment: order_commitment.clone(),
                 order: private_order.order.clone(),
                 funding_note: private_order.funding_note.clone(),
+                funding_notes: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
             }],
         )
@@ -6660,15 +7051,18 @@ mod tests {
         let parent_authorization_secrets = read_serialized_span(&serialized, &mut index);
         let auditor_flags = read_serialized_span(&serialized, &mut index);
         let funding_note_refs = read_serialized_span(&serialized, &mut index);
+        let funding_input_counts = read_serialized_span(&serialized, &mut index);
         let funding_note_commitments = read_serialized_span(&serialized, &mut index);
         let funding_note_asset_ids = read_serialized_span(&serialized, &mut index);
-        let funding_note_amounts = read_serialized_span(&serialized, &mut index);
-        let funding_note_owner_keys = read_serialized_span(&serialized, &mut index);
+        let funding_input_amounts = read_serialized_span(&serialized, &mut index);
+        let funding_input_owner_keys = read_serialized_span(&serialized, &mut index);
         let funding_note_spend_authorities = read_serialized_span(&serialized, &mut index);
         let funding_note_withdraw_authorities = read_serialized_span(&serialized, &mut index);
         let funding_note_blindings = read_serialized_span(&serialized, &mut index);
         let funding_note_nonces = read_serialized_span(&serialized, &mut index);
         let funding_note_metadata_commitments = read_serialized_span(&serialized, &mut index);
+        let funding_note_amounts = read_serialized_span(&serialized, &mut index);
+        let funding_note_owner_keys = read_serialized_span(&serialized, &mut index);
         let funding_authorization_rs = read_serialized_span(&serialized, &mut index);
         let funding_authorization_ss = read_serialized_span(&serialized, &mut index);
         let funding_nullifiers = read_serialized_span(&serialized, &mut index);
@@ -6697,10 +7091,16 @@ mod tests {
         assert_eq!(parent_authorization_secrets, vec!["0x0".to_string()]);
         assert_eq!(auditor_flags, vec!["0x0".to_string()]);
         assert_eq!(funding_note_refs, vec![funding_note_commitment.0.clone()]);
+        assert_eq!(funding_input_counts, vec!["0x1".to_string()]);
         assert_eq!(funding_note_commitments, vec![funding_note_commitment.0]);
         assert_eq!(
             funding_note_asset_ids,
             vec![encode_starknet_felt("asset-id", "USDC")]
+        );
+        assert_eq!(funding_input_amounts, vec!["0x30d40".to_string()]);
+        assert_eq!(
+            funding_input_owner_keys,
+            vec![encode_starknet_felt("owner-public-key", &"ab".repeat(32))]
         );
         assert_eq!(funding_note_amounts, vec!["0x30d40".to_string()]);
         assert_eq!(
@@ -6802,8 +7202,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: order_commitment.clone(),
                 funding_note: private_order.funding_note.clone(),
+                funding_notes: vec![],
                 funding_note_ref: funding_note_commitment,
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
+                funding_nullifiers: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
@@ -6853,6 +7255,7 @@ mod tests {
             order_commitment,
             order: private_order.order,
             funding_note: private_order.funding_note,
+            funding_notes: vec![],
             funding_authorization: private_order.funding_authorization,
         }];
         let admission_root = auction_admission_root(&witness, &orders).expect("admission root");
@@ -7045,8 +7448,10 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: order_commitment.clone(),
                 funding_note: private_order.funding_note.clone(),
+                funding_notes: vec![],
                 funding_note_ref: funding_note_commitment,
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
+                funding_nullifiers: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
@@ -7088,6 +7493,7 @@ mod tests {
                 order_commitment,
                 order: private_order.order,
                 funding_note: private_order.funding_note,
+                funding_notes: vec![],
                 funding_authorization: private_order.funding_authorization,
             }],
         )
@@ -7134,6 +7540,7 @@ mod tests {
         PrivateOrderPayload {
             funding_authorization: sample_authorization_for_order(&order),
             funding_note,
+            funding_notes: Vec::new(),
             order,
         }
     }
@@ -7185,6 +7592,87 @@ mod tests {
     fn sample_nullifier(note: &Note) -> Nullifier {
         nullifier_from_note_secret(&note.commitment().expect("note commitment"), &note.blinding)
             .expect("sample nullifier")
+    }
+
+    #[test]
+    fn renewal_parent_cancel_submission_plan_builds_signed_contract_call() {
+        let order_cancel_key_hex = "44".repeat(32);
+        let parent_authorization_secret = "0x12345";
+        let parent_secret_commitment =
+            crate::renewal_parent_secret_commitment(parent_authorization_secret)
+                .expect("parent secret commitment");
+        let parent_cancel_authority =
+            crate::renewal_cancel_authority_from_raw_key_hex(&order_cancel_key_hex)
+                .expect("cancel authority");
+        let renewal_cancel_auth_key =
+            crate::renewal_cancel_auth_key_felt_from_raw_key_hex(&order_cancel_key_hex);
+
+        let plan = build_renewal_parent_cancel_submission_plan(RenewalParentCancelPlanRequest {
+            chain_id: "0x534e5f5345504f4c4941".into(),
+            auction_verifier_address: "0x1234".into(),
+            parent_secret_commitment,
+            parent_cancel_authority: parent_cancel_authority.clone(),
+            renewal_cancel_auth_key,
+            prior_renewal_entries: vec![],
+        })
+        .expect("renewal parent cancel plan");
+
+        assert_eq!(plan.starknet_call.contract_address, "0x1234");
+        assert_eq!(
+            plan.starknet_call.entrypoint,
+            "cancel_renewal_parent_marker"
+        );
+        assert_eq!(
+            plan.starknet_call.calldata[0],
+            plan.encoded_args.cancel_marker
+        );
+        assert_eq!(plan.starknet_call.calldata[1], parent_cancel_authority);
+        assert_eq!(
+            plan.starknet_call.calldata[2],
+            plan.encoded_args.sparse_key_low
+        );
+        assert_eq!(
+            plan.starknet_call.calldata[3],
+            plan.encoded_args.sparse_key_high
+        );
+        assert_eq!(plan.starknet_call.calldata[4], "0x0");
+        assert_eq!(plan.starknet_call.calldata[5], "0x0");
+        assert_ne!(plan.encoded_args.signature_r, "0x0");
+        assert_ne!(plan.encoded_args.signature_s, "0x0");
+    }
+
+    #[test]
+    fn renewal_parent_cancel_submission_plan_uses_128_bit_non_empty_witnesses() {
+        let order_cancel_key_hex = "45".repeat(32);
+        let parent_secret_commitment =
+            crate::renewal_parent_secret_commitment("0x98765").expect("parent secret commitment");
+        let parent_cancel_authority =
+            crate::renewal_cancel_authority_from_raw_key_hex(&order_cancel_key_hex)
+                .expect("cancel authority");
+        let prior_entry =
+            renewal_child_nullifier("0xabc", 1, "0xdef").expect("prior renewal child nullifier");
+
+        let plan = build_renewal_parent_cancel_submission_plan(RenewalParentCancelPlanRequest {
+            chain_id: "0x534e5f5345504f4c4941".into(),
+            auction_verifier_address: "0x1234".into(),
+            parent_secret_commitment,
+            parent_cancel_authority,
+            renewal_cancel_auth_key: crate::renewal_cancel_auth_key_felt_from_raw_key_hex(
+                &order_cancel_key_hex,
+            ),
+            prior_renewal_entries: vec![prior_entry],
+        })
+        .expect("renewal parent cancel plan");
+
+        assert_eq!(
+            plan.encoded_args.merkle_path.len(),
+            super::RENEWAL_SPARSE_TREE_DEPTH
+        );
+        assert_eq!(
+            plan.encoded_args.merkle_directions.len(),
+            super::RENEWAL_SPARSE_TREE_DEPTH,
+        );
+        assert_eq!(plan.starknet_call.calldata[4], "0x80");
     }
 
     #[test]

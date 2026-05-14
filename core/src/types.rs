@@ -21,15 +21,18 @@ pub const OUTPUT_NOTE_PLAINTEXT_PADDED_LEN: usize = 4096;
 pub const OUTPUT_NOTE_CIPHERTEXT_LEN: usize = OUTPUT_NOTE_PLAINTEXT_PADDED_LEN + 16;
 pub const OUTPUT_RECOVERY_FIELD_COUNT: usize = 21;
 pub const OUTPUT_RECOVERY_PROOF_SLOTS: usize = 4;
+pub const MAX_ORDER_FUNDING_INPUTS: usize = 4;
 const OUTPUT_RECOVERY_BUNDLE_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f62756e646c655f7631";
 const OUTPUT_RECOVERY_RECORD_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f7265635f7631";
+const FUNDING_INPUT_SET_DOMAIN_HEX: &str = "0x7a796c6974685f66756e64696e675f7365745f7631";
+const FUNDING_NULLIFIER_SET_DOMAIN_HEX: &str = "0x7a796c6974685f66756e64696e675f6e756c6c5f7631";
 const RENEWAL_CHILD_NULLIFIER_DOMAIN_HEX: &str =
     "0x362b534b676bb36e394d08e276c8e64e65e3733e5d517a7eb6f438eafe54b61";
 const RENEWAL_PARENT_SECRET_DOMAIN_HEX: &str =
     "0x7d7cdc3705c6b67855258ca803ee7b93dd4092346289da942f337b30d857667";
 const RENEWAL_PARENT_DOMAIN_HEX: &str =
     "0x3c16da1b34d6fcc6f6ea27674de3b6cead275b20c1dfafa4abb43515a8974b4";
-const RENEWAL_PARENT_CANCEL_DOMAIN_HEX: &str =
+pub const RENEWAL_PARENT_CANCEL_DOMAIN_HEX: &str =
     "0x26f84b60309c08d4030876815edb467f89f78e5a5f62823af4521f1be502ca3";
 
 mod serde_u128_decimal {
@@ -327,6 +330,58 @@ pub fn nullifier_from_note_secret(
         domain_felt("zylith/nullifier"),
         &[note_commitment, note_secret],
     )))
+}
+
+pub fn funding_input_set_commitment(
+    commitments: &[NoteCommitment],
+) -> Result<NoteCommitment, ProtocolError> {
+    if commitments.is_empty() {
+        return Err(ProtocolError::InvalidOrder(
+            "funding input set cannot be empty".into(),
+        ));
+    }
+    if commitments.len() > MAX_ORDER_FUNDING_INPUTS {
+        return Err(ProtocolError::InvalidOrder(format!(
+            "funding input count {} exceeds maximum {}",
+            commitments.len(),
+            MAX_ORDER_FUNDING_INPUTS
+        )));
+    }
+    if commitments.len() == 1 {
+        return Ok(commitments[0].clone());
+    }
+    let mut state = felt_from_hex_str(FUNDING_INPUT_SET_DOMAIN_HEX)?;
+    for commitment in commitments {
+        state = poseidon_hash(state, felt_from_hex_str(&commitment.0)?);
+    }
+    state = poseidon_hash(state, field_from_u64(commitments.len() as u64));
+    Ok(NoteCommitment(crate::hash::felt_hex(&state)))
+}
+
+pub fn funding_nullifier_set_commitment(
+    nullifiers: &[Nullifier],
+) -> Result<Nullifier, ProtocolError> {
+    if nullifiers.is_empty() {
+        return Err(ProtocolError::InvalidOrder(
+            "funding nullifier set cannot be empty".into(),
+        ));
+    }
+    if nullifiers.len() > MAX_ORDER_FUNDING_INPUTS {
+        return Err(ProtocolError::InvalidOrder(format!(
+            "funding nullifier count {} exceeds maximum {}",
+            nullifiers.len(),
+            MAX_ORDER_FUNDING_INPUTS
+        )));
+    }
+    if nullifiers.len() == 1 {
+        return Ok(nullifiers[0].clone());
+    }
+    let mut state = felt_from_hex_str(FUNDING_NULLIFIER_SET_DOMAIN_HEX)?;
+    for nullifier in nullifiers {
+        state = poseidon_hash(state, felt_from_hex_str(&nullifier.0)?);
+    }
+    state = poseidon_hash(state, field_from_u64(nullifiers.len() as u64));
+    Ok(Nullifier(crate::hash::felt_hex(&state)))
 }
 
 pub fn renewal_parent_secret_commitment(
@@ -629,7 +684,19 @@ impl OrderIntent {
 pub struct PrivateOrderPayload {
     pub order: OrderIntent,
     pub funding_note: Note,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub funding_notes: Vec<Note>,
     pub funding_authorization: SpendAuthorization,
+}
+
+impl PrivateOrderPayload {
+    pub fn effective_funding_notes(&self) -> Vec<&Note> {
+        if self.funding_notes.is_empty() {
+            vec![&self.funding_note]
+        } else {
+            self.funding_notes.iter().collect()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -873,8 +940,12 @@ pub struct OrderExecutionReport {
 pub struct MatchedOrderWitness {
     pub order_commitment: OrderCommitment,
     pub funding_note: Note,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub funding_notes: Vec<Note>,
     pub funding_note_ref: NoteCommitment,
     pub funding_nullifier: Nullifier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub funding_nullifiers: Vec<Nullifier>,
     pub funding_authorization: SpendAuthorization,
     pub side: OrderSide,
     pub order_type: OrderType,
@@ -910,12 +981,42 @@ pub struct MatchedOrderWitness {
     pub residual_note: Option<Note>,
 }
 
+impl MatchedOrderWitness {
+    pub fn effective_funding_notes(&self) -> Vec<&Note> {
+        if self.funding_notes.is_empty() {
+            vec![&self.funding_note]
+        } else {
+            self.funding_notes.iter().collect()
+        }
+    }
+
+    pub fn effective_funding_nullifiers(&self) -> Vec<&Nullifier> {
+        if self.funding_nullifiers.is_empty() {
+            vec![&self.funding_nullifier]
+        } else {
+            self.funding_nullifiers.iter().collect()
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuctionOrderWitness {
     pub order_commitment: OrderCommitment,
     pub order: OrderIntent,
     pub funding_note: Note,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub funding_notes: Vec<Note>,
     pub funding_authorization: SpendAuthorization,
+}
+
+impl AuctionOrderWitness {
+    pub fn effective_funding_notes(&self) -> Vec<&Note> {
+        if self.funding_notes.is_empty() {
+            vec![&self.funding_note]
+        } else {
+            self.funding_notes.iter().collect()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1385,6 +1486,8 @@ pub struct PublishedBatchArtifacts {
     pub settlement_witness: SettlementWitness,
     #[serde(default)]
     pub published_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub order_execution_reports: Vec<OrderExecutionReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1396,6 +1499,10 @@ pub struct PublicSettlementTranscript {
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub batch_epoch: u64,
+    #[serde(default)]
+    pub published_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at_unix_ms: Option<u64>,
     pub order_commitment_root: String,
     pub encrypted_order_set_commitment: String,
     pub transcript_commitment: String,
@@ -1450,6 +1557,8 @@ pub struct PublishedBatchArtifactSummary {
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub batch_epoch: u64,
+    #[serde(default)]
+    pub published_at_unix_ms: u64,
     pub transcript_commitment: String,
     pub output_bundle_ref: String,
     pub output_note_root: String,
@@ -1642,8 +1751,14 @@ pub struct OnchainSubmissionRecord {
     pub revert_reason: Option<String>,
     pub block_number: Option<u64>,
     pub block_hash: Option<String>,
+    pub block_timestamp_unix_ms: Option<u64>,
     pub submission_mode: String,
     pub settlement_contract_address: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementTimestampUpdate {
+    pub settled_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1651,6 +1766,35 @@ pub struct StarknetCall {
     pub contract_address: String,
     pub entrypoint: String,
     pub calldata: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewalParentCancelPlanRequest {
+    pub chain_id: String,
+    pub auction_verifier_address: String,
+    pub parent_secret_commitment: String,
+    pub parent_cancel_authority: String,
+    pub renewal_cancel_auth_key: String,
+    #[serde(default)]
+    pub prior_renewal_entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewalParentCancelCallArguments {
+    pub cancel_marker: String,
+    pub cancel_authority: String,
+    pub sparse_key_low: String,
+    pub sparse_key_high: String,
+    pub merkle_path: Vec<String>,
+    pub merkle_directions: Vec<String>,
+    pub signature_r: String,
+    pub signature_s: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewalParentCancelSubmissionPlan {
+    pub starknet_call: StarknetCall,
+    pub encoded_args: RenewalParentCancelCallArguments,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2151,6 +2295,12 @@ pub struct FundingRailCapabilities {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarknetPrivacyFundingRail {
     pub privacy_pool: String,
+    #[serde(default)]
+    pub bridge_adapter: Option<String>,
+    #[serde(default)]
+    pub deposit_router: Option<String>,
+    #[serde(default)]
+    pub shielded_asset_adapter: Option<String>,
     pub discovery_url: String,
     pub proving_url: String,
     pub paymaster_address: Option<String>,
@@ -2460,6 +2610,14 @@ impl ProductConfig {
         order: &OrderIntent,
         funding_note: &Note,
     ) -> Result<(), ProtocolError> {
+        self.validate_order_funding_notes(order, &[funding_note.clone()])
+    }
+
+    pub fn validate_order_funding_notes(
+        &self,
+        order: &OrderIntent,
+        funding_notes: &[Note],
+    ) -> Result<(), ProtocolError> {
         let pair = self
             .enabled_pair(&order.pair_id)
             .ok_or_else(|| ProtocolError::UnsupportedPair(order.pair_id.0.clone()))?;
@@ -2534,11 +2692,57 @@ impl ProductConfig {
         }
 
         let expected_funding_asset = pair.funding_asset_for_side(&order.side);
-        if funding_note.asset_id != *expected_funding_asset {
+        if funding_notes.is_empty() {
+            return Err(ProtocolError::InvalidOrder(
+                "order requires at least one funding note".into(),
+            ));
+        }
+        if funding_notes.len() > MAX_ORDER_FUNDING_INPUTS {
             return Err(ProtocolError::InvalidOrder(format!(
-                "funding note asset {} does not match expected {}",
-                funding_note.asset_id.0, expected_funding_asset.0
+                "order uses {} funding notes, maximum is {}",
+                funding_notes.len(),
+                MAX_ORDER_FUNDING_INPUTS
             )));
+        }
+        let first_spend_authority = &funding_notes[0].spend_authority;
+        let first_owner_public_key = &funding_notes[0].owner_public_key;
+        let mut total_funding = 0u128;
+        let mut commitments = Vec::with_capacity(funding_notes.len());
+        let mut nullifiers = Vec::with_capacity(funding_notes.len());
+        let mut seen_commitments = BTreeSet::new();
+        for funding_note in funding_notes {
+            if funding_note.asset_id != *expected_funding_asset {
+                return Err(ProtocolError::InvalidOrder(format!(
+                    "funding note asset {} does not match expected {}",
+                    funding_note.asset_id.0, expected_funding_asset.0
+                )));
+            }
+            if &funding_note.spend_authority != first_spend_authority {
+                return Err(ProtocolError::InvalidOrder(
+                    "multi-note funding requires a common spend authority".into(),
+                ));
+            }
+            if &funding_note.owner_public_key != first_owner_public_key {
+                return Err(ProtocolError::InvalidOrder(
+                    "multi-note funding requires a common note owner".into(),
+                ));
+            }
+            total_funding = total_funding
+                .checked_add(funding_note.amount)
+                .ok_or_else(|| {
+                    ProtocolError::InvalidOrder("funding note total overflows u128".into())
+                })?;
+            let commitment = funding_note.commitment()?;
+            if !seen_commitments.insert(commitment.0.clone()) {
+                return Err(ProtocolError::InvalidOrder(
+                    "funding notes must be unique".into(),
+                ));
+            }
+            nullifiers.push(nullifier_from_note_secret(
+                &commitment,
+                &funding_note.blinding,
+            )?);
+            commitments.push(commitment);
         }
 
         let minimum_funding = match order.side {
@@ -2567,16 +2771,21 @@ impl ProductConfig {
             OrderSide::Sell if matches!(order.order_type, OrderType::MakerCurve) => order.amount,
             OrderSide::Sell => order.min_fill,
         };
-        if funding_note.amount < minimum_funding {
+        if total_funding < minimum_funding {
             return Err(ProtocolError::InvalidOrder(format!(
-                "funding note amount {} is below minimum required {}",
-                funding_note.amount, minimum_funding
+                "funding note total {} is below minimum required {}",
+                total_funding, minimum_funding
             )));
         }
 
-        if funding_note.commitment()? != order.funding_note_ref {
+        if funding_input_set_commitment(&commitments)? != order.funding_note_ref {
             return Err(ProtocolError::InvalidOrder(
-                "funding note commitment mismatch".into(),
+                "funding note set commitment mismatch".into(),
+            ));
+        }
+        if funding_nullifier_set_commitment(&nullifiers)? != order.funding_nullifier {
+            return Err(ProtocolError::InvalidOrder(
+                "funding nullifier set commitment mismatch".into(),
             ));
         }
 
@@ -2666,7 +2875,8 @@ mod tests {
         Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIntent, OrderShareBundle, OrderSide,
         OrderSubmission, OutputCiphertextBundle, OutputNoteRecord, PairId, ProductConfig,
         SettlementTranscript, StarknetPrivacyFundingRail, TRANSCRIPT_SHAPE_POLICY_VERSION,
-        renewal_parent_commitment, renewal_parent_secret_commitment,
+        funding_input_set_commitment, funding_nullifier_set_commitment, renewal_parent_commitment,
+        renewal_parent_secret_commitment,
     };
 
     use crate::EncryptedBlob;
@@ -2674,6 +2884,11 @@ mod tests {
         RecoverySeed, derive_user_keys, nullifier_from_note_secret,
         spend_authority_from_raw_key_hex,
     };
+
+    fn test_note_nullifier(note: &Note) -> Nullifier {
+        let commitment = note.commitment().expect("test note commitment");
+        nullifier_from_note_secret(&commitment, &note.blinding).expect("test note nullifier")
+    }
 
     #[test]
     fn note_commitments_are_deterministic() {
@@ -2748,7 +2963,7 @@ mod tests {
             parent_cancel_authority: "0x0".into(),
             parent_authorization_secret: "0x0".into(),
             funding_note_ref: funding_note.commitment().expect("funding note commitment"),
-            funding_nullifier: Nullifier("0x333".into()),
+            funding_nullifier: test_note_nullifier(&funding_note),
             recipient_owner_public_key: "ab".repeat(32),
             recipient_spend_authority: "0x333".into(),
             recipient_withdraw_authority: "0x444".into(),
@@ -2791,7 +3006,7 @@ mod tests {
             parent_cancel_authority: "0x0".into(),
             parent_authorization_secret: "0x0".into(),
             funding_note_ref: funding_note.commitment().expect("funding note commitment"),
-            funding_nullifier: Nullifier("0x333".into()),
+            funding_nullifier: test_note_nullifier(&funding_note),
             recipient_owner_public_key: "ab".repeat(32),
             recipient_spend_authority: "0x333".into(),
             recipient_withdraw_authority: "0x444".into(),
@@ -2922,6 +3137,9 @@ mod tests {
             primary: FundingRailKind::StarknetPrivacy,
             starknet_privacy: Some(StarknetPrivacyFundingRail {
                 privacy_pool: String::new(),
+                bridge_adapter: None,
+                deposit_router: None,
+                shielded_asset_adapter: None,
                 discovery_url: "https://discovery.example".into(),
                 proving_url: "https://prover.example".into(),
                 paymaster_address: None,
@@ -2994,7 +3212,7 @@ mod tests {
             parent_cancel_authority: "0x0".into(),
             parent_authorization_secret: "0x0".into(),
             funding_note_ref: funding_note.commitment().expect("funding note commitment"),
-            funding_nullifier: Nullifier("0x333".into()),
+            funding_nullifier: test_note_nullifier(&funding_note),
             recipient_owner_public_key: "ab".repeat(32),
             recipient_spend_authority: "0x333".into(),
             recipient_withdraw_authority: "0x444".into(),
@@ -3007,6 +3225,61 @@ mod tests {
                 .validate_order_funding(&order, &funding_note)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn product_config_rejects_duplicate_funding_inputs() {
+        let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
+        let funding_note = Note {
+            asset_id: AssetId("USDC".into()),
+            amount: 1_000,
+            owner_public_key: "ab".repeat(32),
+            spend_authority: "0x333".into(),
+            withdraw_authority: "0x333".into(),
+            blinding: "0x111".into(),
+            nonce: 7,
+            metadata_commitment: "0x222".into(),
+        };
+        let duplicated_notes = vec![funding_note.clone(), funding_note.clone()];
+        let commitments = duplicated_notes
+            .iter()
+            .map(|note| note.commitment().expect("funding note commitment"))
+            .collect::<Vec<_>>();
+        let nullifiers = duplicated_notes
+            .iter()
+            .map(test_note_nullifier)
+            .collect::<Vec<_>>();
+        let order = OrderIntent {
+            pair_id: PairId("STRK/USDC".into()),
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            side: OrderSide::Buy,
+            order_type: crate::OrderType::LimitBatch,
+            maker_curve: None,
+            limit_price: 145,
+            amount: 1,
+            min_fill: 1,
+            time_in_force: crate::TimeInForce::CurrentBatchOnly,
+            expiry_epoch: 42,
+            order_nonce: 9,
+            parent_order_commitment: "0x0".into(),
+            parent_child_index: 0,
+            parent_secret_commitment: "0x0".into(),
+            parent_cancel_authority: "0x0".into(),
+            parent_authorization_secret: "0x0".into(),
+            funding_note_ref: funding_input_set_commitment(&commitments).expect("funding ref"),
+            funding_nullifier: funding_nullifier_set_commitment(&nullifiers)
+                .expect("funding nullifier"),
+            recipient_owner_public_key: "ab".repeat(32),
+            recipient_spend_authority: "0x333".into(),
+            recipient_withdraw_authority: "0x444".into(),
+            recipient_residual_withdraw_authority: "0x445".into(),
+            auditor_view_allowed: false,
+        };
+
+        let error = product
+            .validate_order_funding_notes(&order, &duplicated_notes)
+            .expect_err("duplicate funding inputs must fail");
+        assert!(error.to_string().contains("unique"));
     }
 
     #[test]
@@ -3040,7 +3313,7 @@ mod tests {
             parent_cancel_authority: "0x0".into(),
             parent_authorization_secret: "0x0".into(),
             funding_note_ref: funding_note.commitment().expect("funding note commitment"),
-            funding_nullifier: Nullifier("0x333".into()),
+            funding_nullifier: test_note_nullifier(&funding_note),
             recipient_owner_public_key: "ab".repeat(32),
             recipient_spend_authority: "0x333".into(),
             recipient_withdraw_authority: "0x444".into(),
@@ -3105,7 +3378,7 @@ mod tests {
             parent_cancel_authority: "0x0".into(),
             parent_authorization_secret: "0x0".into(),
             funding_note_ref: funding_note.commitment().expect("funding note commitment"),
-            funding_nullifier: Nullifier("0x333".into()),
+            funding_nullifier: test_note_nullifier(&funding_note),
             recipient_owner_public_key: "ab".repeat(32),
             recipient_spend_authority: "0x333".into(),
             recipient_withdraw_authority: "0x444".into(),
