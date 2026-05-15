@@ -121,11 +121,10 @@ const NATIVE_PROOF_AGGREGATOR_URL_ENV: &str = "ZYLITH_NATIVE_PROOF_AGGREGATOR_UR
 const NATIVE_PROOF_SMOKE_ZERO_ROOTS_ENV: &str = "ZYLITH_NATIVE_PROOF_SMOKE_ZERO_ROOTS";
 const AUCTION_PROVER_KEYS_PATH_ENV: &str = "ZYLITH_AUCTION_PROVER_KEYS_PATH";
 const AUCTION_PROVER_ALLOW_KEYGEN_ENV: &str = "ZYLITH_AUCTION_PROVER_ALLOW_KEYGEN";
-const DEFAULT_PRODUCT_PAIR_IDS: &str = "STRK/ETH,STRK/USDC,STRK/strkBTC";
-const DEFAULT_PROTOCOL_FEE_BPS: u128 = 30;
-const DEFAULT_PROTOCOL_FEE_RECIPIENT: &str = "zylith-protocol-fees";
-const PROTOCOL_FEE_BPS_ENV: &str = "ZYLITH_PROTOCOL_FEE_BPS";
-const PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_FEE_RECIPIENT";
+const DEFAULT_PRODUCT_PAIR_IDS: &str =
+    "STRK/USDC,ETH/USDC,strkBTC/USDC,STRK/ETH,STRK/strkBTC,WBTC/strkBTC,USDC/USDT";
+const DEFAULT_PROTOCOL_FEE_RECIPIENT: &str = "zylith-protocol-treasury";
+const PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_TREASURY_RECIPIENT";
 const PROOF_JOBS_DIR: &str = "proof_jobs";
 const SETTLEMENT_PLANS_DIR: &str = "settlement_plans";
 const SETTLEMENT_WITNESSES_DIR: &str = "settlement_witnesses";
@@ -214,7 +213,6 @@ struct AppState {
     max_order_amount: u128,
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
-    protocol_fee_bps: u128,
     protocol_fee_recipient: String,
     settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
@@ -307,7 +305,6 @@ struct AppConfig {
     max_order_amount: u128,
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
-    protocol_fee_bps: u128,
     protocol_fee_recipient: String,
     settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
@@ -694,7 +691,6 @@ fn build_app() -> Result<Router, String> {
             MAX_MAKER_CURVE_QUOTE_NOTIONAL_ENV,
             0_u128,
         ),
-        protocol_fee_bps: env_parse_or_default(PROTOCOL_FEE_BPS_ENV, DEFAULT_PROTOCOL_FEE_BPS),
         protocol_fee_recipient: env::var(PROTOCOL_FEE_RECIPIENT_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -894,7 +890,6 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_order_amount,
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
-        protocol_fee_bps,
         protocol_fee_recipient,
         settlement_submission_jitter_ms,
         private_payload_retention_ms,
@@ -907,9 +902,6 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         native_prover_request_timeout_seconds,
     } = config;
 
-    if protocol_fee_bps > 10_000 {
-        return Err("protocol fee bps must be <= 10000".into());
-    }
     if protocol_fee_recipient.trim().is_empty() {
         return Err("protocol fee recipient must not be empty".into());
     }
@@ -999,7 +991,6 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_order_amount,
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
-        protocol_fee_bps,
         protocol_fee_recipient,
         settlement_submission_jitter_ms,
         private_payload_retention_ms,
@@ -1111,7 +1102,6 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "max_order_amount": state.max_order_amount.to_string(),
         "max_maker_curve_base_amount": state.max_maker_curve_base_amount.to_string(),
         "max_maker_curve_quote_notional": state.max_maker_curve_quote_notional.to_string(),
-        "protocol_fee_bps": state.protocol_fee_bps.to_string(),
         "protocol_fee_recipient": &state.protocol_fee_recipient,
         "settlement_submission_jitter_ms": state.settlement_submission_jitter_ms,
         "native_prover_attempts": state.native_prover_attempts,
@@ -2790,7 +2780,6 @@ async fn prepare_private_auction_batch_inner(
             note_root_transitions: &note_root_transitions,
             prior_settlement_witnesses: &historical_witnesses,
             privacy_gate: Default::default(),
-            protocol_fee_bps: state.protocol_fee_bps,
             protocol_fee_recipient: &state.protocol_fee_recipient,
         },
     )?;
@@ -2897,7 +2886,6 @@ async fn prepare_private_auction_batch_inner(
                 note_root_transitions: &note_root_transitions,
                 prior_settlement_witnesses: &historical_witnesses,
                 privacy_gate: privacy_gate_witness.clone(),
-                protocol_fee_bps: state.protocol_fee_bps,
                 protocol_fee_recipient: &state.protocol_fee_recipient,
             },
         )?
@@ -3120,7 +3108,13 @@ async fn fetch_current_settlement_roots(state: &AppState) -> Result<SettlementRo
     let result = provider
         .call(call, BlockId::Tag(BlockTag::Latest))
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|error| {
+            eprintln!(
+                "fetch_current_settlement_roots failed auction_verifier={} rpc={} error={error:?}",
+                state.auction_verifier_address, executor.rpc_url
+            );
+            StatusCode::BAD_GATEWAY
+        })?;
     if result.len() != 4 {
         return Err(StatusCode::BAD_GATEWAY);
     }
@@ -3294,6 +3288,9 @@ fn root_history_batch_to_witness(
         new_renewal_root: batch.new_renewal_root,
         clearing_price: 0,
         price_base_scale: 1,
+        taker_fee_bps: 0,
+        maker_fee_bps: 0,
+        protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
         base_asset_id: AssetId("ROOT_HISTORY".into()),
         quote_asset_id: AssetId("ROOT_HISTORY".into()),
         matched_orders: Vec::new(),
@@ -5265,7 +5262,6 @@ struct SettlementBuildContext<'a> {
     note_root_transitions: &'a [NoteRootTransitionRecord],
     prior_settlement_witnesses: &'a [SettlementWitness],
     privacy_gate: AuctionPrivacyGateWitness,
-    protocol_fee_bps: u128,
     protocol_fee_recipient: &'a str,
 }
 
@@ -5283,7 +5279,6 @@ fn build_settlement_artifacts(
         note_root_transitions,
         prior_settlement_witnesses,
         privacy_gate,
-        protocol_fee_bps,
         protocol_fee_recipient,
     } = context;
     eprintln!(
@@ -5428,8 +5423,9 @@ fn build_settlement_artifacts(
                 .map_err(|_| StatusCode::CONFLICT)?,
             ),
         };
+        let fee_bps = u128::from(pair.fee_bps_for_order_type(&fill.order.order_type));
         let fee_amount = gross_amount
-            .checked_mul(protocol_fee_bps)
+            .checked_mul(fee_bps)
             .ok_or(StatusCode::CONFLICT)?
             / 10_000;
         let net_amount = gross_amount
@@ -5761,6 +5757,9 @@ fn build_settlement_artifacts(
         new_renewal_root: new_renewal_root.clone(),
         clearing_price,
         price_base_scale: pair.price_base_scale,
+        taker_fee_bps: pair.taker_fee_bps,
+        maker_fee_bps: pair.maker_fee_bps,
+        protocol_fee_recipient: protocol_fee_recipient.into(),
         matched_orders,
         consumed_inputs,
         renewal_child_uses: renewal_child_uses.clone(),
@@ -5788,6 +5787,9 @@ fn build_settlement_artifacts(
         new_renewal_root: transcript.new_renewal_root.clone(),
         clearing_price,
         price_base_scale: pair.price_base_scale,
+        taker_fee_bps: pair.taker_fee_bps,
+        maker_fee_bps: pair.maker_fee_bps,
+        protocol_fee_recipient: protocol_fee_recipient.into(),
         base_asset_id: base_asset,
         quote_asset_id: quote_asset,
         matched_orders: transcript.matched_orders.clone(),
@@ -7361,8 +7363,8 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PROTOCOL_FEE_BPS, DEFAULT_PROTOCOL_FEE_RECIPIENT, DecryptedOrderRecord,
-        NativeBlockId, NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
+        DEFAULT_PROTOCOL_FEE_RECIPIENT, DecryptedOrderRecord, NativeBlockId,
+        NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
         NativeTransactionMode, SettlementBuildContext, SettlementRoots, artifact_id_for,
         build_batch_liquidity_report, build_native_proof_program_calldata,
         build_settlement_artifacts, compute_candidate_clearing_price, decode_bhttp_response,
@@ -7789,7 +7791,6 @@ mod tests {
                 note_root_transitions: &[],
                 prior_settlement_witnesses: &[],
                 privacy_gate: Default::default(),
-                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
             },
         )
@@ -7909,7 +7910,6 @@ mod tests {
                 note_root_transitions: &[],
                 prior_settlement_witnesses: &[],
                 privacy_gate: Default::default(),
-                protocol_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
             },
         )
@@ -8280,6 +8280,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 1,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
             base_asset_id: AssetId("STRK".into()),
             quote_asset_id: AssetId("USDC".into()),
             matched_orders: vec![],

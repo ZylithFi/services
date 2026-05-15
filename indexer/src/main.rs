@@ -23,8 +23,8 @@ use zylith_core::{
     MultiPairArtifactBundleList, MultiPairArtifactBundleSummary, NoteCommitment,
     OutputCiphertextBundle, PublicSettlementTranscript, PublishedBatchArtifactList,
     PublishedBatchArtifactSummary, PublishedBatchArtifacts, RootOnlySettlementCommitments,
-    SettlementRootHistoryArchive, SettlementRootHistoryBatch, SettlementTranscript,
-    WithdrawalAmountBucketPolicy, WithdrawalRecord, WithdrawalRecordList,
+    SettlementRootHistoryArchive, SettlementRootHistoryBatch, SettlementTimestampUpdate,
+    SettlementTranscript, WithdrawalAmountBucketPolicy, WithdrawalRecord, WithdrawalRecordList,
     artifact_bundle_padded_count, artifact_epoch_bucket_end, artifact_epoch_bucket_start,
     count_bucket_label, extract_bearer_token, root_only_settlement_commitments,
     settlement_transcript_commitment, transcript_shape_metadata,
@@ -207,6 +207,10 @@ fn build_app_with_state(state: AppState) -> Router {
             post(publish_batch_artifacts),
         )
         .route(
+            "/api/internal/batches/{batch_id}/settled-at",
+            post(mark_published_batch_settled),
+        )
+        .route(
             "/api/withdrawals/range/{start}/{end}",
             get(list_confirmed_withdrawals_range),
         )
@@ -299,8 +303,24 @@ fn load_shielded_asset_adapter_address() -> String {
     }
 
     load_deployment_manifest()
-        .map(|manifest| manifest.contracts.shielded_asset_adapter)
+        .map(|manifest| selected_shielded_asset_adapter_address(&manifest))
         .unwrap_or_else(|| DEFAULT_SHIELDED_ASSET_ADAPTER_ADDRESS.into())
+}
+
+fn selected_shielded_asset_adapter_address(manifest: &DeploymentManifest) -> String {
+    manifest
+        .funding
+        .starknet_privacy
+        .as_ref()
+        .and_then(|config| nonempty_string(config.shielded_asset_adapter.as_deref()))
+        .unwrap_or_else(|| manifest.contracts.shielded_asset_adapter.clone())
+}
+
+fn nonempty_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn load_u64_env(name: &str, default_value: u64, minimum_value: u64) -> u64 {
@@ -411,6 +431,7 @@ fn published_batch_artifact_summary(
         batch_id: published.transcript.batch_id.clone(),
         pair_id: published.transcript.pair_id.clone(),
         batch_epoch: published.transcript.batch_epoch,
+        published_at_unix_ms: published.published_at_unix_ms,
         transcript_commitment: published.settlement_witness.transcript_commitment.clone(),
         output_bundle_ref: published.transcript.output_ciphertext_bundle_ref.clone(),
         output_note_root: roots.output_note_root,
@@ -857,11 +878,16 @@ fn public_settlement_transcript(
         batch_id: published.transcript.batch_id.clone(),
         pair_id: published.transcript.pair_id.clone(),
         batch_epoch: published.transcript.batch_epoch,
+        published_at_unix_ms: published.published_at_unix_ms,
+        settled_at_unix_ms: published.settled_at_unix_ms,
         order_commitment_root: published.transcript.order_commitment_root.clone(),
         encrypted_order_set_commitment: published.transcript.encrypted_order_set_commitment.clone(),
         transcript_commitment,
         clearing_price: published.transcript.clearing_price,
         price_base_scale: published.transcript.price_base_scale,
+        taker_fee_bps: published.transcript.taker_fee_bps,
+        maker_fee_bps: published.transcript.maker_fee_bps,
+        protocol_fee_recipient: published.transcript.protocol_fee_recipient.clone(),
         output_bundle_ref: published.transcript.output_ciphertext_bundle_ref.clone(),
         prior_note_root: roots.prior_note_root,
         prior_nullifier_root: roots.prior_nullifier_root,
@@ -911,6 +937,29 @@ async fn publish_batch_artifacts(
     }
 
     Ok(Json(request))
+}
+
+async fn mark_published_batch_settled(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<String>,
+    Json(request): Json<SettlementTimestampUpdate>,
+) -> Result<Json<PublishedBatchArtifacts>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    if request.settled_at_unix_ms == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut artifacts = state.published_batch_artifacts.write().await;
+    let published = artifacts.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    published.settled_at_unix_ms = Some(request.settled_at_unix_ms);
+    let response = published.clone();
+
+    if let Some(path) = state.artifact_archive_path.as_deref() {
+        persist_published_batch_artifacts_store(path, &artifacts)?;
+    }
+
+    Ok(Json(response))
 }
 
 async fn get_confirmed_withdrawal(
@@ -1211,6 +1260,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-fees".into(),
                 matched_orders: vec![],
                 consumed_inputs: consumed_inputs.clone(),
                 renewal_child_uses: vec![],
@@ -1238,6 +1290,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-fees".into(),
                 base_asset_id: AssetId("STRK".into()),
                 quote_asset_id: AssetId("USDC".into()),
                 matched_orders: vec![],
@@ -1259,6 +1314,7 @@ mod tests {
                 output_ciphertext_bundle_ref: output_bundle_ref,
             },
             published_at_unix_ms: now_unix_ms(),
+            settled_at_unix_ms: None,
             order_execution_reports: vec![],
             transcript_shape: None,
         }
@@ -1336,6 +1392,21 @@ mod tests {
             artifact_epoch_bucket_size: 8,
         });
 
+        let settled_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/internal/batches/{batch_id}/settled-at"))
+                    .method(Method::POST)
+                    .header("authorization", format!("Bearer {TEST_INTERNAL_TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"settled_at_unix_ms":1778661520000}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(settled_response.status(), StatusCode::OK);
+
         let public_response = app
             .clone()
             .oneshot(
@@ -1353,6 +1424,7 @@ mod tests {
             .expect("body");
         let public_json = serde_json::from_slice::<serde_json::Value>(&public_body).expect("json");
         assert_eq!(public_json["batch_id"], batch_id);
+        assert_eq!(public_json["settled_at_unix_ms"], 1_778_661_520_000_u64);
         assert!(public_json["transcript_shape"].is_object());
         assert!(public_json.get("matched_orders").is_none());
         assert!(public_json.get("consumed_inputs").is_none());

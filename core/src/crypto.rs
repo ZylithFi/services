@@ -1815,6 +1815,12 @@ pub fn settlement_transcript_commitment(
     );
     state = poseidon_hash(state, Felt::from(transcript.clearing_price));
     state = poseidon_hash(state, Felt::from(transcript.price_base_scale));
+    state = poseidon_hash(state, Felt::from(transcript.taker_fee_bps));
+    state = poseidon_hash(state, Felt::from(transcript.maker_fee_bps));
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&encode_fee_recipient(&transcript.protocol_fee_recipient))?,
+    );
     state = poseidon_hash(
         state,
         felt_from_hex_str(&encode_output_bundle_ref(
@@ -1845,6 +1851,13 @@ pub fn settlement_transcript_commitment(
 pub fn root_only_settlement_commitments(
     transcript: &SettlementTranscript,
 ) -> Result<RootOnlySettlementCommitments, ProtocolError> {
+    for fee in &transcript.fees {
+        if fee.recipient != transcript.protocol_fee_recipient {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "fee recipient does not match settlement protocol fee recipient".into(),
+            ));
+        }
+    }
     let prior_note_root = normalize_felt_hex(&transcript.prior_note_root)?;
     let prior_nullifier_root = normalize_felt_hex(&transcript.prior_nullifier_root)?;
     let prior_renewal_root = normalize_felt_hex(&transcript.prior_renewal_root)?;
@@ -2750,6 +2763,9 @@ pub fn build_settlement_submission_plan(
         proof_artifact_commitment: normalized_proof_artifact_commitment.clone(),
         clearing_price: encode_u128(transcript.clearing_price),
         price_base_scale: encode_u128(transcript.price_base_scale),
+        taker_fee_bps: encode_u64(u64::from(transcript.taker_fee_bps)),
+        maker_fee_bps: encode_u64(u64::from(transcript.maker_fee_bps)),
+        protocol_fee_recipient: encode_fee_recipient(&transcript.protocol_fee_recipient),
         output_bundle_ref: encode_output_bundle_ref(&transcript.output_ciphertext_bundle_ref)?,
         prior_note_root: roots.prior_note_root,
         prior_nullifier_root: roots.prior_nullifier_root,
@@ -2764,6 +2780,16 @@ pub fn build_settlement_submission_plan(
         new_nullifier_root: roots.new_nullifier_root,
         new_renewal_root: roots.new_renewal_root,
         new_fee_root: roots.new_fee_root,
+        fee_asset_ids: transcript
+            .fees
+            .iter()
+            .map(|fee| encode_asset_id(&fee.asset_id.0))
+            .collect(),
+        fee_amounts: transcript
+            .fees
+            .iter()
+            .map(|fee| encode_u128(fee.amount))
+            .collect(),
     };
 
     let calldata = flatten_settlement_call_arguments(&encoded_args);
@@ -2968,6 +2994,9 @@ pub fn build_settlement_witness(
         new_renewal_root: normalize_felt_hex(&transcript.new_renewal_root)?,
         clearing_price: transcript.clearing_price,
         price_base_scale: transcript.price_base_scale,
+        taker_fee_bps: transcript.taker_fee_bps,
+        maker_fee_bps: transcript.maker_fee_bps,
+        protocol_fee_recipient: transcript.protocol_fee_recipient.clone(),
         base_asset_id,
         quote_asset_id,
         matched_orders: transcript.matched_orders.clone(),
@@ -3251,6 +3280,9 @@ pub fn build_stwo_serialized_input(
         encode_asset_id(&witness.quote_asset_id.0),
         encode_u128(witness.clearing_price),
         encode_u128(witness.price_base_scale),
+        encode_u64(u64::from(witness.taker_fee_bps)),
+        encode_u64(u64::from(witness.maker_fee_bps)),
+        encode_fee_recipient(&witness.protocol_fee_recipient),
         encode_u64(witness.matched_orders.len() as u64),
         encode_output_bundle_ref(&witness.output_ciphertext_bundle_ref)?,
         normalize_felt_hex(&witness.prior_note_root)?,
@@ -4645,6 +4677,10 @@ fn encode_asset_id(asset_id: &str) -> String {
     encode_starknet_felt("asset-id", asset_id)
 }
 
+fn encode_fee_recipient(recipient: &str) -> String {
+    encode_starknet_felt("fee-recipient", recipient)
+}
+
 fn normalize_batch_order_commitment_root(root: &str) -> Result<String, ProtocolError> {
     normalize_felt_hex(root)
 }
@@ -4943,6 +4979,9 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
     ];
     calldata.push(args.clearing_price.clone());
     calldata.push(args.price_base_scale.clone());
+    calldata.push(args.taker_fee_bps.clone());
+    calldata.push(args.maker_fee_bps.clone());
+    calldata.push(args.protocol_fee_recipient.clone());
     calldata.push(args.output_bundle_ref.clone());
     calldata.push(args.prior_note_root.clone());
     calldata.push(args.prior_nullifier_root.clone());
@@ -4957,6 +4996,8 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
     calldata.push(args.new_nullifier_root.clone());
     calldata.push(args.new_renewal_root.clone());
     calldata.push(args.new_fee_root.clone());
+    push_span(&mut calldata, &args.fee_asset_ids);
+    push_span(&mut calldata, &args.fee_amounts);
     calldata
 }
 
@@ -5155,6 +5196,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 321,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 111,
@@ -5778,6 +5822,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 145,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "fee-recipient".into(),
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-1".into()),
                 filled_amount: 500,
@@ -5821,7 +5868,10 @@ mod tests {
         assert_eq!(plan.proof_artifact_commitment, proof_commitment);
         assert_ne!(plan.encoded_args.consumed_note_root, "0x0");
         assert_ne!(plan.encoded_args.output_note_root, "0x0");
-        assert_eq!(plan.settlement_call.calldata.len(), 21);
+        assert_eq!(
+            plan.settlement_call.calldata.len(),
+            26 + transcript.fees.len() * 2
+        );
     }
 
     #[test]
@@ -5840,6 +5890,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 145,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "zylith-protocol-fee".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -5886,6 +5939,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 300,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "zylith-protocol-fee".into(),
             matched_orders: vec![
                 crate::MatchedOrder {
                     order_commitment: crate::OrderCommitment(
@@ -5953,7 +6009,10 @@ mod tests {
             settlement_transcript_commitment(&transcript).expect("transcript commitment");
         let plan = build_settlement_submission_plan(&transcript, "0x123", "0x456").expect("plan");
         assert_eq!(commitment, plan.encoded_args.transcript_commitment);
-        assert_eq!(plan.settlement_call.calldata.len(), 21);
+        assert_eq!(
+            plan.settlement_call.calldata.len(),
+            26 + transcript.fees.len() * 2
+        );
     }
 
     #[test]
@@ -5990,6 +6049,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 200,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "zylith-protocol-treasury".into(),
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-2".into()),
                 filled_amount: 700,
@@ -6083,6 +6145,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 321,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "recipient-3".into(),
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: crate::OrderCommitment("order-3".into()),
                     filled_amount: 111,
@@ -6199,6 +6264,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "recipient-asset-owner".into(),
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 1000,
@@ -6279,7 +6347,7 @@ mod tests {
         .expect("multi-input witness");
 
         let serialized = build_stwo_serialized_input(&witness).expect("serialized input");
-        let mut index = 1 + 31;
+        let mut index = 1 + 34;
         let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
         let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_sides = read_serialized_span(&serialized, &mut index);
@@ -6351,6 +6419,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 321,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "zylith-protocol-treasury".into(),
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-mismatched-witness".into()),
                 filled_amount: 111,
@@ -6404,6 +6475,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 321,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "zylith-protocol-treasury".into(),
             matched_orders: vec![crate::MatchedOrder {
                 order_commitment: crate::OrderCommitment("order-missing-membership".into()),
                 filled_amount: 111,
@@ -6661,6 +6735,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 321,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "recipient-asset-owner".into(),
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: crate::OrderCommitment("order-asset-owner".into()),
                     filled_amount: 111,
@@ -6735,7 +6812,7 @@ mod tests {
         let owner_key = encode_starknet_felt("owner-public-key", &owner_public_key);
 
         let mut index = 1;
-        index += 31;
+        index += 34;
 
         let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
         let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
@@ -6938,6 +7015,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 1000,
@@ -6950,7 +7030,7 @@ mod tests {
                 fees: vec![FeeEntry {
                     asset_id: AssetId("STRK".into()),
                     amount: 3,
-                    recipient: "zylith-protocol-fees".into(),
+                    recipient: "zylith-protocol-treasury".into(),
                 }],
                 output_notes: vec![OutputNoteRecord {
                     note_commitment: output_note.commitment().expect("output note commitment"),
@@ -7166,6 +7246,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 1000,
@@ -7178,7 +7261,7 @@ mod tests {
                 fees: vec![FeeEntry {
                     asset_id: AssetId("STRK".into()),
                     amount: 3,
-                    recipient: "zylith-protocol-fees".into(),
+                    recipient: "zylith-protocol-treasury".into(),
                 }],
                 output_notes: vec![OutputNoteRecord {
                     note_commitment: output_note.commitment().expect("output note commitment"),
@@ -7304,6 +7387,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 0,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 matched_orders: vec![],
                 consumed_inputs: vec![],
                 renewal_child_uses: vec![],
@@ -7336,7 +7422,7 @@ mod tests {
         assert_eq!(settlement_payload[0], "0x1");
         assert_eq!(settlement_payload[15], "0x0");
         assert_eq!(settlement_payload[16], "0x1");
-        assert_eq!(settlement_payload[17], "0x0");
+        assert_eq!(settlement_payload[20], "0x0");
 
         let mut admission_vector_count = 0;
         while index < serialized.len() {
@@ -7363,6 +7449,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 0,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "zylith-protocol-treasury".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -7412,6 +7501,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 matched_orders: vec![crate::MatchedOrder {
                     order_commitment: order_commitment.clone(),
                     filled_amount: 1000,
@@ -7424,7 +7516,7 @@ mod tests {
                 fees: vec![FeeEntry {
                     asset_id: AssetId("STRK".into()),
                     amount: 3,
-                    recipient: "zylith-protocol-fees".into(),
+                    recipient: "zylith-protocol-treasury".into(),
                 }],
                 output_notes: vec![OutputNoteRecord {
                     note_commitment: output_note.commitment().expect("output note commitment"),

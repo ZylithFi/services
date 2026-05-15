@@ -20,7 +20,7 @@ use zylith_core::{
     CoordinatorStatus, OrderCancellationAccepted, OrderCancellationRequest, OrderShareBundle,
     OrderSubmission, OrderSubmissionAccepted, PairId, ProductConfig, PublicBatchSummary,
     PublicSettlementTranscript, PublishedBatchArtifacts, RecoveryArtifact, RecoveryArtifactList,
-    RecoveryArtifactUpload, SubmittedOrderRecord, count_bucket_label,
+    RecoveryArtifactUpload, SettlementTimestampUpdate, SubmittedOrderRecord, count_bucket_label,
     derive_order_cancellation_tag, extract_bearer_token,
     hash::{ordered_felt_list_commitment, tagged_field_hex},
     heartbeat_cover_order_commitments, heartbeat_cover_order_count,
@@ -33,7 +33,8 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_BATCH_STORE_PATH: &str = "coordinator/batches.dev.json";
 const DEFAULT_RECOVERY_STORE_PATH: &str = "coordinator/recovery_artifacts.dev.json";
 const DEFAULT_ARTIFACT_STORE_PATH: &str = "coordinator/published_batch_artifacts.dev.json";
-const DEFAULT_PAIR_IDS: &str = "STRK/ETH,STRK/USDC,STRK/strkBTC";
+const DEFAULT_PAIR_IDS: &str =
+    "STRK/USDC,ETH/USDC,strkBTC/USDC,STRK/ETH,STRK/strkBTC,WBTC/strkBTC,USDC/USDT";
 const PRODUCT_PAIRS_ENV: &str = "ZYLITH_PRODUCT_PAIRS";
 const COORDINATOR_PAIR_IDS_ENV: &str = "ZYLITH_COORDINATOR_PAIRS";
 const BATCH_WINDOW_MS_ENV: &str = "ZYLITH_BATCH_WINDOW_MS";
@@ -437,6 +438,10 @@ fn build_app_with_config(
             post(publish_batch_artifacts),
         )
         .route(
+            "/api/internal/batches/{batch_id}/settled-at",
+            post(mark_published_batch_settled),
+        )
+        .route(
             "/api/internal/batches/{batch_id}/witness",
             get(get_published_witness),
         )
@@ -690,11 +695,16 @@ fn public_settlement_transcript(
         batch_id: published.transcript.batch_id.clone(),
         pair_id: published.transcript.pair_id.clone(),
         batch_epoch: published.transcript.batch_epoch,
+        published_at_unix_ms: published.published_at_unix_ms,
+        settled_at_unix_ms: published.settled_at_unix_ms,
         order_commitment_root: published.transcript.order_commitment_root.clone(),
         encrypted_order_set_commitment: published.transcript.encrypted_order_set_commitment.clone(),
         transcript_commitment,
         clearing_price: published.transcript.clearing_price,
         price_base_scale: published.transcript.price_base_scale,
+        taker_fee_bps: published.transcript.taker_fee_bps,
+        maker_fee_bps: published.transcript.maker_fee_bps,
+        protocol_fee_recipient: published.transcript.protocol_fee_recipient.clone(),
         output_bundle_ref: published.transcript.output_ciphertext_bundle_ref.clone(),
         prior_note_root: roots.prior_note_root,
         prior_nullifier_root: roots.prior_nullifier_root,
@@ -755,6 +765,39 @@ async fn publish_batch_artifacts(
     }
 
     Ok(Json(request))
+}
+
+async fn mark_published_batch_settled(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(batch_id): Path<String>,
+    Json(request): Json<SettlementTimestampUpdate>,
+) -> Result<Json<PublishedBatchArtifacts>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    if request.settled_at_unix_ms == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut artifacts = state.published_batch_artifacts.write().await;
+    let published = artifacts.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    published.settled_at_unix_ms = Some(request.settled_at_unix_ms);
+    let response = published.clone();
+
+    if let Some(path) = state.published_batch_artifacts_store_path.as_deref() {
+        persist_published_batch_artifacts_store(path, &artifacts)?;
+    }
+
+    {
+        let mut batches = state.batches.write().await;
+        if let Some(record) = batches.get_mut(&batch_id) {
+            record.batch.status = BatchStatus::Settled;
+            if let Some(path) = state.batch_store_path.as_deref() {
+                persist_batch_store(path, &batches)?;
+            }
+        }
+    }
+
+    Ok(Json(response))
 }
 
 async fn list_recovery_artifacts(
@@ -1881,7 +1924,13 @@ mod tests {
             .expect("body")
             .to_bytes();
         let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
-        assert_eq!(json["pair_id"], "STRK/ETH");
+        let pair_id = json["pair_id"].as_str().expect("pair id");
+        assert!(
+            ProductConfig::default()
+                .enabled_pair(&PairId(pair_id.to_owned()))
+                .is_some(),
+            "current batch pair must be enabled by default product config"
+        );
     }
 
     #[tokio::test]
@@ -2498,6 +2547,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 matched_orders: vec![],
                 consumed_inputs: vec![],
                 renewal_child_uses: vec![],
@@ -2525,6 +2577,9 @@ mod tests {
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 base_asset_id: zylith_core::AssetId("STRK".into()),
                 quote_asset_id: zylith_core::AssetId("USDC".into()),
                 matched_orders: vec![],
@@ -2546,6 +2601,7 @@ mod tests {
                 output_ciphertext_bundle_ref: output_bundle_ref.clone(),
             },
             published_at_unix_ms: now_unix_ms(),
+            settled_at_unix_ms: None,
             order_execution_reports: vec![],
             transcript_shape: None,
         };
@@ -2569,6 +2625,22 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
+        let settled_response = app
+            .clone()
+            .oneshot(
+                auth_request(
+                    Request::builder()
+                        .uri(format!("/api/internal/batches/{batch_id}/settled-at"))
+                        .method(Method::POST),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"settled_at_unix_ms":1778661520000}"#))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(settled_response.status(), StatusCode::OK);
+
         let transcript_response = app
             .clone()
             .oneshot(
@@ -2589,6 +2661,7 @@ mod tests {
             .to_bytes();
         let public_json = serde_json::from_slice::<serde_json::Value>(&public_body).expect("json");
         assert_eq!(public_json["batch_id"], batch_id);
+        assert_eq!(public_json["settled_at_unix_ms"], 1_778_661_520_000_u64);
         assert_eq!(public_json["output_bundle_ref"], output_bundle_ref);
         assert!(public_json["transcript_shape"].is_object());
         assert!(public_json.get("matched_orders").is_none());

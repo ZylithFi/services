@@ -22,6 +22,7 @@ pub const OUTPUT_NOTE_CIPHERTEXT_LEN: usize = OUTPUT_NOTE_PLAINTEXT_PADDED_LEN +
 pub const OUTPUT_RECOVERY_FIELD_COUNT: usize = 21;
 pub const OUTPUT_RECOVERY_PROOF_SLOTS: usize = 4;
 pub const MAX_ORDER_FUNDING_INPUTS: usize = 4;
+pub const MAX_MAKER_CURVE_POINTS: usize = 8;
 const OUTPUT_RECOVERY_BUNDLE_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f62756e646c655f7631";
 const OUTPUT_RECOVERY_RECORD_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f7265635f7631";
 const FUNDING_INPUT_SET_DOMAIN_HEX: &str = "0x7a796c6974685f66756e64696e675f7365745f7631";
@@ -225,6 +226,13 @@ impl HiddenMakerCurve {
             return Err(ProtocolError::InvalidOrder(
                 "maker curve must contain at least one point".into(),
             ));
+        }
+        if self.points.len() > MAX_MAKER_CURVE_POINTS {
+            return Err(ProtocolError::InvalidOrder(format!(
+                "maker curve uses {} points, maximum is {}",
+                self.points.len(),
+                MAX_MAKER_CURVE_POINTS
+            )));
         }
 
         let mut previous_price = None;
@@ -1250,6 +1258,12 @@ pub struct SettlementTranscript {
     pub clearing_price: u128,
     #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
     pub price_base_scale: u128,
+    #[serde(default = "default_speculative_taker_fee_bps")]
+    pub taker_fee_bps: u16,
+    #[serde(default)]
+    pub maker_fee_bps: u16,
+    #[serde(default = "default_protocol_fee_recipient")]
+    pub protocol_fee_recipient: String,
     pub matched_orders: Vec<MatchedOrder>,
     pub consumed_inputs: Vec<ConsumedInput>,
     #[serde(default)]
@@ -1510,6 +1524,12 @@ pub struct PublicSettlementTranscript {
     pub clearing_price: u128,
     #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
     pub price_base_scale: u128,
+    #[serde(default = "default_speculative_taker_fee_bps")]
+    pub taker_fee_bps: u16,
+    #[serde(default)]
+    pub maker_fee_bps: u16,
+    #[serde(default = "default_protocol_fee_recipient")]
+    pub protocol_fee_recipient: String,
     pub output_bundle_ref: String,
     pub prior_note_root: String,
     pub prior_nullifier_root: String,
@@ -1972,7 +1992,7 @@ pub struct WithdrawalAmountBucketPolicy {
 impl Default for WithdrawalAmountBucketPolicy {
     fn default() -> Self {
         let mut asset_buckets = BTreeMap::new();
-        for asset in ["STRK", "ETH", "USDC", "strkBTC"] {
+        for asset in ["STRK", "ETH", "USDC", "strkBTC", "WBTC", "USDT"] {
             asset_buckets.insert(asset.into(), default_withdrawal_amount_buckets());
         }
         Self {
@@ -2130,6 +2150,9 @@ pub struct SettlementCallArguments {
     pub proof_artifact_commitment: String,
     pub clearing_price: String,
     pub price_base_scale: String,
+    pub taker_fee_bps: String,
+    pub maker_fee_bps: String,
+    pub protocol_fee_recipient: String,
     pub output_bundle_ref: String,
     pub prior_note_root: String,
     pub prior_nullifier_root: String,
@@ -2144,6 +2167,10 @@ pub struct SettlementCallArguments {
     pub new_nullifier_root: String,
     pub new_renewal_root: String,
     pub new_fee_root: String,
+    #[serde(default)]
+    pub fee_asset_ids: Vec<String>,
+    #[serde(default)]
+    pub fee_amounts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2176,6 +2203,12 @@ pub struct SettlementWitness {
     pub clearing_price: u128,
     #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
     pub price_base_scale: u128,
+    #[serde(default = "default_speculative_taker_fee_bps")]
+    pub taker_fee_bps: u16,
+    #[serde(default)]
+    pub maker_fee_bps: u16,
+    #[serde(default = "default_protocol_fee_recipient")]
+    pub protocol_fee_recipient: String,
     pub base_asset_id: AssetId,
     pub quote_asset_id: AssetId,
     pub matched_orders: Vec<MatchedOrder>,
@@ -2298,8 +2331,6 @@ pub struct StarknetPrivacyFundingRail {
     #[serde(default)]
     pub bridge_adapter: Option<String>,
     #[serde(default)]
-    pub deposit_router: Option<String>,
-    #[serde(default)]
     pub shielded_asset_adapter: Option<String>,
     pub discovery_url: String,
     pub proving_url: String,
@@ -2396,6 +2427,10 @@ pub struct ProductPairConfig {
     pub price_base_scale: u128,
     #[serde(default = "default_heartbeat_cover_price", with = "serde_u128_decimal")]
     pub heartbeat_cover_price: u128,
+    #[serde(default = "default_speculative_taker_fee_bps")]
+    pub taker_fee_bps: u16,
+    #[serde(default)]
+    pub maker_fee_bps: u16,
     pub enabled: bool,
 }
 
@@ -2413,10 +2448,38 @@ impl ProductPairConfig {
             OrderSide::Sell => &self.quote_asset_id,
         }
     }
+
+    pub fn fee_bps_for_order_type(&self, order_type: &OrderType) -> u16 {
+        match order_type {
+            OrderType::HeartbeatCover => 0,
+            OrderType::MakerCurve => self.maker_fee_bps,
+            OrderType::LimitBatch => self.taker_fee_bps,
+        }
+    }
 }
 
 fn default_heartbeat_cover_price() -> u128 {
     1
+}
+
+fn default_speculative_taker_fee_bps() -> u16 {
+    4
+}
+
+fn default_protocol_fee_recipient() -> String {
+    "zylith-protocol-treasury".into()
+}
+
+pub fn default_pair_fee_bps(pair_id: &PairId) -> (u16, u16) {
+    if is_conversion_pair(pair_id) {
+        (2, 0)
+    } else {
+        (4, 0)
+    }
+}
+
+pub fn is_conversion_pair(pair_id: &PairId) -> bool {
+    matches!(pair_id.0.as_str(), "WBTC/strkBTC" | "USDC/USDT")
 }
 
 fn default_price_base_scale() -> u128 {
@@ -2429,8 +2492,8 @@ fn default_asset_decimals() -> u8 {
 
 pub fn known_asset_decimals(asset_id: &AssetId) -> u8 {
     match asset_id.0.as_str() {
-        "USDC" => 6,
-        "strkBTC" => 8,
+        "USDC" | "USDT" => 6,
+        "strkBTC" | "WBTC" => 8,
         "STRK" | "ETH" => 18,
         _ => default_asset_decimals(),
     }
@@ -2485,7 +2548,7 @@ impl Default for ProductConfig {
 impl ProductConfig {
     pub fn default_v1() -> Self {
         let mut assets = BTreeMap::new();
-        for asset_id in ["STRK", "ETH", "USDC", "strkBTC"] {
+        for asset_id in ["STRK", "ETH", "USDC", "strkBTC", "WBTC", "USDT"] {
             assets.insert(
                 asset_id.to_owned(),
                 ProductAssetConfig {
@@ -2499,19 +2562,27 @@ impl ProductConfig {
 
         let mut pairs = BTreeMap::new();
         for (pair_id, base_asset_id, quote_asset_id) in [
-            ("STRK/ETH", "STRK", "ETH"),
             ("STRK/USDC", "STRK", "USDC"),
+            ("ETH/USDC", "ETH", "USDC"),
+            ("strkBTC/USDC", "strkBTC", "USDC"),
+            ("STRK/ETH", "STRK", "ETH"),
             ("STRK/strkBTC", "STRK", "strkBTC"),
+            ("WBTC/strkBTC", "WBTC", "strkBTC"),
+            ("USDC/USDT", "USDC", "USDT"),
         ] {
+            let pair_id_value = PairId(pair_id.to_owned());
+            let (taker_fee_bps, maker_fee_bps) = default_pair_fee_bps(&pair_id_value);
             pairs.insert(
                 pair_id.to_owned(),
                 ProductPairConfig {
-                    pair_id: PairId(pair_id.to_owned()),
+                    pair_id: pair_id_value,
                     base_asset_id: AssetId(base_asset_id.to_owned()),
                     quote_asset_id: AssetId(quote_asset_id.to_owned()),
                     min_order_amount: 1,
                     price_base_scale: asset_amount_scale(&AssetId(base_asset_id.to_owned())),
                     heartbeat_cover_price: default_heartbeat_cover_price(),
+                    taker_fee_bps,
+                    maker_fee_bps,
                     enabled: true,
                 },
             );
@@ -2808,6 +2879,7 @@ impl ProductConfig {
         let base_asset_id = AssetId(base.to_owned());
         let quote_asset_id = AssetId(quote.to_owned());
         let price_base_scale = asset_amount_scale(&base_asset_id);
+        let (taker_fee_bps, maker_fee_bps) = default_pair_fee_bps(&pair_id);
 
         Ok(ProductPairConfig {
             pair_id,
@@ -2816,6 +2888,8 @@ impl ProductConfig {
             min_order_amount: 1,
             price_base_scale,
             heartbeat_cover_price: default_heartbeat_cover_price(),
+            taker_fee_bps,
+            maker_fee_bps,
             enabled,
         })
     }
@@ -2871,11 +2945,12 @@ mod tests {
     use super::{
         AssetId, BatchId, BatchLiquidityReport, BatchStatus, BatchSummary, ClaimWindowPolicy,
         DeploymentManifest, DepositIntent, FeeEntry, FundingRailConfig, FundingRailKind,
-        HiddenMakerCurve, MakerCurvePoint, NOTE_RECOGNITION_ALGORITHM, Note, NoteCommitment,
-        Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIntent, OrderShareBundle, OrderSide,
-        OrderSubmission, OutputCiphertextBundle, OutputNoteRecord, PairId, ProductConfig,
-        SettlementTranscript, StarknetPrivacyFundingRail, TRANSCRIPT_SHAPE_POLICY_VERSION,
-        funding_input_set_commitment, funding_nullifier_set_commitment, renewal_parent_commitment,
+        HiddenMakerCurve, MAX_MAKER_CURVE_POINTS, MakerCurvePoint, NOTE_RECOGNITION_ALGORITHM,
+        Note, NoteCommitment, Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIntent, OrderShareBundle,
+        OrderSide, OrderSubmission, OutputCiphertextBundle, OutputNoteRecord, PairId,
+        ProductConfig, SettlementTranscript, StarknetPrivacyFundingRail,
+        TRANSCRIPT_SHAPE_POLICY_VERSION, funding_input_set_commitment,
+        funding_nullifier_set_commitment, renewal_parent_commitment,
         renewal_parent_secret_commitment,
     };
 
@@ -2931,6 +3006,20 @@ mod tests {
 
         assert_eq!(nullifier, expected);
         assert_ne!(nullifier.0, commitment.0);
+    }
+
+    #[test]
+    fn maker_curve_rejects_too_many_points() {
+        let curve = HiddenMakerCurve {
+            points: (0..=MAX_MAKER_CURVE_POINTS)
+                .map(|index| MakerCurvePoint {
+                    price: 100 + index as u128,
+                    base_amount: 10,
+                })
+                .collect(),
+        };
+
+        assert!(curve.validate().is_err());
     }
 
     #[test]
@@ -3138,7 +3227,6 @@ mod tests {
             starknet_privacy: Some(StarknetPrivacyFundingRail {
                 privacy_pool: String::new(),
                 bridge_adapter: None,
-                deposit_router: None,
                 shielded_asset_adapter: None,
                 discovery_url: "https://discovery.example".into(),
                 proving_url: "https://prover.example".into(),
@@ -3531,6 +3619,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 100,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "0x123".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -3592,6 +3683,9 @@ mod tests {
             new_renewal_root: "0x0".into(),
             clearing_price: 100,
             price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: "zylith-protocol-treasury".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
