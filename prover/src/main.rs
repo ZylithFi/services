@@ -4957,7 +4957,7 @@ fn apply_cross_order_output_netting(
         let output_index = netted_records.len();
         let mut note = group.template.clone();
         note.amount = group.amount;
-        note.nonce = output_index as u64;
+        note.nonce = (output_index as u64).saturating_add(1);
         let note_commitment = note
             .commitment()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -7932,6 +7932,14 @@ mod tests {
             .expect("netted sell output");
         assert_eq!(buy_output.amount, 20);
         assert_eq!(sell_output.amount, 200);
+        assert!(
+            artifacts
+                .settlement_witness
+                .output_note_preimages
+                .iter()
+                .all(|note| note.nonce > 0),
+            "netted output notes must keep proof-valid non-zero nonces",
+        );
         assert_eq!(
             artifacts.settlement_witness.matched_order_witnesses[0]
                 .output_note
