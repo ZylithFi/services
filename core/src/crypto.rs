@@ -76,6 +76,7 @@ const NULLIFIER_KEY_HIGH_BITS: usize = 124;
 const NULLIFIER_KEY_HIGH_BOUND: u128 = 1_u128 << NULLIFIER_KEY_HIGH_BITS;
 pub const RENEWAL_SPARSE_TREE_DEPTH: usize = 128;
 const SETTLEMENT_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f736574746c655f7631";
+const RENEWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f72656e65775f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
 const ADMISSION_ROOT_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f726f6f745f7631";
@@ -2842,6 +2843,68 @@ pub fn settlement_proof_message_hash_from_statement(
     Ok(crate::hash::poseidon_hash_hex(&fields))
 }
 
+pub fn native_renewal_message_hash(
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+    prior_renewal_root: &str,
+    renewal_child_root: &str,
+    new_renewal_root: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(RENEWAL_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(&normalize_felt_hex(auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(transcript_commitment)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(prior_renewal_root)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(renewal_child_root)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(new_renewal_root)?)?,
+    );
+    Ok(felt_hex(&state))
+}
+
+pub fn renewal_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+    prior_renewal_root: &str,
+    renewal_child_root: &str,
+    new_renewal_root: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash = native_renewal_message_hash(
+        auction_verifier_address,
+        transcript_commitment,
+        prior_renewal_root,
+        renewal_child_root,
+        new_renewal_root,
+    )?;
+    renewal_proof_message_hash_from_statement(proof_program_address, &statement_message_hash)
+}
+
+pub fn renewal_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    let fields = [
+        felt_from_hex_str(proof_program_address)?,
+        Felt::ZERO,
+        Felt::from(2_u64),
+        felt_from_hex_str(RENEWAL_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(statement_message_hash)?,
+    ];
+    Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
 pub fn native_auction_result_message_hash(
     auction_verifier_address: &str,
     batch_id: &str,
@@ -4035,6 +4098,15 @@ pub fn build_stwo_serialized_input(
             .map(|commitment| normalize_felt_hex(commitment))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
+    let claimed_new_renewal_root = {
+        let normalized_new_root = normalize_felt_hex(&witness.new_renewal_root)?;
+        if witness.renewal_child_uses.is_empty() && normalized_new_root == "0x0" {
+            normalize_felt_hex(&witness.prior_renewal_root)?
+        } else {
+            normalized_new_root
+        }
+    };
+    payload.push(claimed_new_renewal_root);
     let mut serialized = vec![encode_usize(payload.len())];
     serialized.extend(payload);
     Ok(serialized)
@@ -7734,7 +7806,7 @@ mod tests {
     }
 
     #[test]
-    fn renewal_parent_cancel_submission_plan_uses_128_bit_non_empty_witnesses() {
+    fn renewal_parent_cancel_submission_plan_uses_sparse_non_empty_witnesses() {
         let order_cancel_key_hex = "45".repeat(32);
         let parent_secret_commitment =
             crate::renewal_parent_secret_commitment("0x98765").expect("parent secret commitment");
@@ -7779,6 +7851,42 @@ mod tests {
             hash,
             "0x4a97eeca5c02b9944edc993761b04c20a788f02b380419d29f8a337d92ef2ac"
         );
+    }
+
+    #[test]
+    fn renewal_proof_message_hash_binds_statement_roots() {
+        let proof_program = "0x0123";
+        let verifier = "0x030f8072f3c6a9261704b056875cc0983335f7e95540026bfd359c9ee5c1041d";
+        let transcript = "0x34f779a519b7c0ffb1db2f00d7683befa23663c929cbce579c87d4fb0dbb89b";
+        let prior_renewal_root = "0x45";
+        let renewal_child_root = "0x67";
+        let new_renewal_root = "0x89";
+
+        let statement = crate::native_renewal_message_hash(
+            verifier,
+            transcript,
+            prior_renewal_root,
+            renewal_child_root,
+            new_renewal_root,
+        )
+        .expect("native renewal statement message hash");
+        let direct = crate::renewal_proof_message_hash_from_statement(proof_program, &statement)
+            .expect("renewal proof message hash");
+        let composed = crate::renewal_proof_message_hash_for_program(
+            proof_program,
+            verifier,
+            transcript,
+            prior_renewal_root,
+            renewal_child_root,
+            new_renewal_root,
+        )
+        .expect("renewal proof message hash for program");
+        let settlement =
+            crate::settlement_proof_message_hash_for_program(proof_program, verifier, transcript)
+                .expect("settlement proof message hash");
+
+        assert_eq!(direct, composed);
+        assert_ne!(direct, settlement);
     }
 
     fn private_execution_keys() -> Vec<PrivateExecutionKeyPrivateConfig> {

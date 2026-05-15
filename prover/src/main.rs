@@ -65,7 +65,8 @@ use zylith_core::{
     nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
     private_execution_key_registry_fingerprint, private_order_payload_commitment,
     proof_artifact_commitment, quote_amount_for_base_amount,
-    renewal_sparse_witnesses_for_child_uses, sanitize_order_submission_for_coordinator,
+    renewal_proof_message_hash_for_program, renewal_sparse_witnesses_for_child_uses,
+    root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
     settlement_note_root_after_deposit_chain, settlement_proof_message_hash_for_program,
     settlement_state_transition_root, settlement_transcript_commitment,
     validate_order_ingress_receipt_for_manifest_with_secrets,
@@ -514,7 +515,7 @@ struct NativeProofAggregationRecord {
 struct NativeAggregationPreparedMember {
     witness: SettlementWitness,
     settlement_plan: SettlementSubmissionPlan,
-    proof_message_hash: String,
+    proof_message_hashes: Vec<String>,
 }
 
 fn redact_native_execution_request(
@@ -1694,7 +1695,7 @@ async fn run_provider_proof_aggregation(
     validate_aggregate_root_chain(&prepared_members).map_err(|_| StatusCode::CONFLICT)?;
     let expected_messages = prepared_members
         .iter()
-        .map(|member| member.proof_message_hash.clone())
+        .flat_map(|member| member.proof_message_hashes.iter().cloned())
         .collect::<Vec<_>>();
     validate_native_proof_facts_messages(&provider_response.proof_facts, &expected_messages)
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -1735,7 +1736,7 @@ async fn run_true_native_proof_aggregation(
     validate_aggregate_root_chain(&members).map_err(|_| StatusCode::CONFLICT)?;
     let expected_messages = members
         .iter()
-        .map(|member| member.proof_message_hash.clone())
+        .flat_map(|member| member.proof_message_hashes.iter().cloned())
         .collect::<Vec<_>>();
     let aggregate_call = build_native_aggregate_proof_program_call(state, &members)?;
     let executor = state
@@ -1809,10 +1810,21 @@ async fn prepare_native_aggregation_members(
         let statement_message =
             native_settlement_message_hash(&state.auction_verifier_address, &transcript_commitment)
                 .map_err(|_| StatusCode::BAD_GATEWAY)?;
-        let proof_message = settlement_proof_message_hash_for_program(
+        let roots =
+            root_only_settlement_commitments(&transcript).map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let settlement_proof_message = settlement_proof_message_hash_for_program(
             &state.native_proof_program_address,
             &state.auction_verifier_address,
             &transcript_commitment,
+        )
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let renewal_proof_message = renewal_proof_message_hash_for_program(
+            &state.native_proof_program_address,
+            &state.auction_verifier_address,
+            &transcript_commitment,
+            &roots.prior_renewal_root,
+            &roots.renewal_child_root,
+            &roots.new_renewal_root,
         )
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
         let settlement_plan = build_settlement_submission_plan(
@@ -1824,7 +1836,7 @@ async fn prepare_native_aggregation_members(
         members.push(NativeAggregationPreparedMember {
             witness,
             settlement_plan,
-            proof_message_hash: proof_message,
+            proof_message_hashes: vec![settlement_proof_message, renewal_proof_message],
         });
     }
     Ok(members)
@@ -4050,10 +4062,20 @@ async fn execute_native_transaction_prover(
     let native_proof_reference =
         native_settlement_message_hash(&state.auction_verifier_address, &transcript_commitment)
             .map_err(|error| error.to_string())?;
-    let expected_proof_message_hash = settlement_proof_message_hash_for_program(
+    let roots = root_only_settlement_commitments(transcript).map_err(|error| error.to_string())?;
+    let expected_settlement_proof_message_hash = settlement_proof_message_hash_for_program(
         &state.native_proof_program_address,
         &state.auction_verifier_address,
         &transcript_commitment,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_renewal_proof_message_hash = renewal_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &transcript_commitment,
+        &roots.prior_renewal_root,
+        &roots.renewal_child_root,
+        &roots.new_renewal_root,
     )
     .map_err(|error| error.to_string())?;
     let paths = proof_execution_paths(state.data_dir.as_ref(), batch_id);
@@ -4135,7 +4157,13 @@ async fn execute_native_transaction_prover(
     })?;
     let result =
         final_result.ok_or_else(|| "native transaction prover returned no result".to_string())?;
-    validate_native_proof_facts(&result.proof_facts, &expected_proof_message_hash)?;
+    validate_native_proof_facts_messages(
+        &result.proof_facts,
+        &[
+            expected_settlement_proof_message_hash,
+            expected_renewal_proof_message_hash,
+        ],
+    )?;
 
     fs::write(&paths.proof_path, result.proof.trim())
         .map_err(|error| format!("failed to persist native proof: {error}"))?;
