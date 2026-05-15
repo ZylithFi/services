@@ -70,12 +70,13 @@ const NULLIFIER_SPARSE_LEAF_DOMAIN_HEX: &str =
     "0x03fd7c748b95292c230aa528dc391912cd4557ad3e157e94ab06b22af433f967";
 const NULLIFIER_SPARSE_NODE_DOMAIN_HEX: &str =
     "0x02de7e98b8f1ba580329d7cfcf51a36f6eb4f8611cae6f82b34e116bb9c2588c";
-pub const NULLIFIER_SPARSE_TREE_DEPTH: usize = 64;
+pub const NULLIFIER_SPARSE_TREE_DEPTH: usize = 128;
 const NULLIFIER_KEY_LOW_BITS: usize = NULLIFIER_SPARSE_TREE_DEPTH;
 const NULLIFIER_KEY_HIGH_BITS: usize = 124;
 const NULLIFIER_KEY_HIGH_BOUND: u128 = 1_u128 << NULLIFIER_KEY_HIGH_BITS;
 pub const RENEWAL_SPARSE_TREE_DEPTH: usize = 128;
 const SETTLEMENT_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f736574746c655f7631";
+const NULLIFIER_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6e756c6c5f7631";
 const RENEWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f72656e65775f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
@@ -2843,6 +2844,68 @@ pub fn settlement_proof_message_hash_from_statement(
     Ok(crate::hash::poseidon_hash_hex(&fields))
 }
 
+pub fn native_nullifier_message_hash(
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+    prior_nullifier_root: &str,
+    consumed_nullifier_root: &str,
+    new_nullifier_root: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(NULLIFIER_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(&normalize_felt_hex(auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(transcript_commitment)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(prior_nullifier_root)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(consumed_nullifier_root)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(new_nullifier_root)?)?,
+    );
+    Ok(felt_hex(&state))
+}
+
+pub fn nullifier_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+    prior_nullifier_root: &str,
+    consumed_nullifier_root: &str,
+    new_nullifier_root: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash = native_nullifier_message_hash(
+        auction_verifier_address,
+        transcript_commitment,
+        prior_nullifier_root,
+        consumed_nullifier_root,
+        new_nullifier_root,
+    )?;
+    nullifier_proof_message_hash_from_statement(proof_program_address, &statement_message_hash)
+}
+
+pub fn nullifier_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    let fields = [
+        felt_from_hex_str(proof_program_address)?,
+        Felt::ZERO,
+        Felt::from(2_u64),
+        felt_from_hex_str(NULLIFIER_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(statement_message_hash)?,
+    ];
+    Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
 pub fn native_renewal_message_hash(
     auction_verifier_address: &str,
     transcript_commitment: &str,
@@ -4098,6 +4161,15 @@ pub fn build_stwo_serialized_input(
             .map(|commitment| normalize_felt_hex(commitment))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
+    let claimed_new_nullifier_root = {
+        let normalized_new_root = normalize_felt_hex(&witness.new_nullifier_root)?;
+        if witness.consumed_inputs.is_empty() && normalized_new_root == "0x0" {
+            normalize_felt_hex(&witness.prior_nullifier_root)?
+        } else {
+            normalized_new_root
+        }
+    };
+    payload.push(claimed_new_nullifier_root);
     let claimed_new_renewal_root = {
         let normalized_new_root = normalize_felt_hex(&witness.new_renewal_root)?;
         if witness.renewal_child_uses.is_empty() && normalized_new_root == "0x0" {
@@ -7881,6 +7953,42 @@ mod tests {
             new_renewal_root,
         )
         .expect("renewal proof message hash for program");
+        let settlement =
+            crate::settlement_proof_message_hash_for_program(proof_program, verifier, transcript)
+                .expect("settlement proof message hash");
+
+        assert_eq!(direct, composed);
+        assert_ne!(direct, settlement);
+    }
+
+    #[test]
+    fn nullifier_proof_message_hash_binds_statement_roots() {
+        let proof_program = "0x0123";
+        let verifier = "0x030f8072f3c6a9261704b056875cc0983335f7e95540026bfd359c9ee5c1041d";
+        let transcript = "0x34f779a519b7c0ffb1db2f00d7683befa23663c929cbce579c87d4fb0dbb89b";
+        let prior_nullifier_root = "0x45";
+        let consumed_nullifier_root = "0x67";
+        let new_nullifier_root = "0x89";
+
+        let statement = crate::native_nullifier_message_hash(
+            verifier,
+            transcript,
+            prior_nullifier_root,
+            consumed_nullifier_root,
+            new_nullifier_root,
+        )
+        .expect("native nullifier statement message hash");
+        let direct = crate::nullifier_proof_message_hash_from_statement(proof_program, &statement)
+            .expect("nullifier proof message hash");
+        let composed = crate::nullifier_proof_message_hash_for_program(
+            proof_program,
+            verifier,
+            transcript,
+            prior_nullifier_root,
+            consumed_nullifier_root,
+            new_nullifier_root,
+        )
+        .expect("nullifier proof message hash for program");
         let settlement =
             crate::settlement_proof_message_hash_for_program(proof_program, verifier, transcript)
                 .expect("settlement proof message hash");

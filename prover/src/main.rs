@@ -62,6 +62,7 @@ use zylith_core::{
     deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
     extract_bearer_token, format_bearer_token, funding_input_set_commitment,
     funding_nullifier_set_commitment, native_settlement_message_hash, nullifier_from_note_secret,
+    nullifier_proof_message_hash_for_program,
     nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
     private_execution_key_registry_fingerprint, private_order_payload_commitment,
     proof_artifact_commitment, quote_amount_for_base_amount,
@@ -1818,6 +1819,15 @@ async fn prepare_native_aggregation_members(
             &transcript_commitment,
         )
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let nullifier_proof_message = nullifier_proof_message_hash_for_program(
+            &state.native_proof_program_address,
+            &state.auction_verifier_address,
+            &transcript_commitment,
+            &roots.prior_nullifier_root,
+            &roots.consumed_nullifier_root,
+            &roots.new_nullifier_root,
+        )
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
         let renewal_proof_message = renewal_proof_message_hash_for_program(
             &state.native_proof_program_address,
             &state.auction_verifier_address,
@@ -1836,7 +1846,11 @@ async fn prepare_native_aggregation_members(
         members.push(NativeAggregationPreparedMember {
             witness,
             settlement_plan,
-            proof_message_hashes: vec![settlement_proof_message, renewal_proof_message],
+            proof_message_hashes: vec![
+                settlement_proof_message,
+                nullifier_proof_message,
+                renewal_proof_message,
+            ],
         });
     }
     Ok(members)
@@ -4069,6 +4083,15 @@ async fn execute_native_transaction_prover(
         &transcript_commitment,
     )
     .map_err(|error| error.to_string())?;
+    let expected_nullifier_proof_message_hash = nullifier_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &transcript_commitment,
+        &roots.prior_nullifier_root,
+        &roots.consumed_nullifier_root,
+        &roots.new_nullifier_root,
+    )
+    .map_err(|error| error.to_string())?;
     let expected_renewal_proof_message_hash = renewal_proof_message_hash_for_program(
         &state.native_proof_program_address,
         &state.auction_verifier_address,
@@ -4161,6 +4184,7 @@ async fn execute_native_transaction_prover(
         &result.proof_facts,
         &[
             expected_settlement_proof_message_hash,
+            expected_nullifier_proof_message_hash,
             expected_renewal_proof_message_hash,
         ],
     )?;
