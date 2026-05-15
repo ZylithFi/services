@@ -1756,6 +1756,18 @@ pub struct ProofArtifactRecord {
     pub native_proof_file_path: Option<String>,
     pub native_proof_facts_file_path: Option<String>,
     pub native_execution_request_path: Option<String>,
+    #[serde(default)]
+    pub native_nullifier_proof_file_path: Option<String>,
+    #[serde(default)]
+    pub native_nullifier_proof_facts_file_path: Option<String>,
+    #[serde(default)]
+    pub native_nullifier_execution_request_path: Option<String>,
+    #[serde(default)]
+    pub native_renewal_proof_file_path: Option<String>,
+    #[serde(default)]
+    pub native_renewal_proof_facts_file_path: Option<String>,
+    #[serde(default)]
+    pub native_renewal_execution_request_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -431,6 +431,17 @@ struct NativeProverResult {
     l2_to_l1_messages: Vec<NativeMessageToL1>,
 }
 
+#[derive(Clone, Debug)]
+struct NativeStatementProofArtifact {
+    proof_path: String,
+    proof_facts_path: String,
+    execution_request_path: String,
+    stdout_path: String,
+    stderr_path: String,
+    proof_sha256: String,
+    proof_facts_sha256: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct NativeMessageToL1 {
     from_address: String,
@@ -4052,6 +4063,12 @@ async fn execute_stwo_prover(
         native_proof_file_path: None,
         native_proof_facts_file_path: None,
         native_execution_request_path: None,
+        native_nullifier_proof_file_path: None,
+        native_nullifier_proof_facts_file_path: None,
+        native_nullifier_execution_request_path: None,
+        native_renewal_proof_file_path: None,
+        native_renewal_proof_facts_file_path: None,
+        native_renewal_execution_request_path: None,
     })
 }
 
@@ -4101,9 +4118,6 @@ async fn execute_native_transaction_prover(
         &roots.new_renewal_root,
     )
     .map_err(|error| error.to_string())?;
-    let paths = proof_execution_paths(state.data_dir.as_ref(), batch_id);
-    delete_execution_outputs_if_exist(state.data_dir.as_ref(), batch_id)
-        .map_err(status_to_error)?;
 
     let _settlement_plan = build_settlement_submission_plan(
         transcript,
@@ -4118,20 +4132,97 @@ async fn execute_native_transaction_prover(
         .map_err(|error| {
             format!("failed to serialize settlement witness for native proof: {error}")
         })?;
+    let settlement_statement = execute_native_statement_prover(
+        state,
+        &tx_prover_url,
+        &executor,
+        batch_id,
+        batch_id,
+        &state.native_proof_entrypoint,
+        &serialized_native_witness,
+        &[expected_settlement_proof_message_hash],
+    )
+    .await?;
+    let nullifier_stage_key = format!("{batch_id}-nullifier");
+    let nullifier_statement = execute_native_statement_prover(
+        state,
+        &tx_prover_url,
+        &executor,
+        batch_id,
+        &nullifier_stage_key,
+        "compile_nullifier_proof",
+        &serialized_native_witness,
+        &[expected_nullifier_proof_message_hash],
+    )
+    .await?;
+    let renewal_stage_key = format!("{batch_id}-renewal");
+    let renewal_statement = execute_native_statement_prover(
+        state,
+        &tx_prover_url,
+        &executor,
+        batch_id,
+        &renewal_stage_key,
+        "compile_renewal_proof",
+        &serialized_native_witness,
+        &[expected_renewal_proof_message_hash],
+    )
+    .await?;
+
+    let artifact_id = artifact_id_for(batch_id, &transcript_commitment);
+
+    Ok(ProofArtifactRecord {
+        artifact_id,
+        batch_id: transcript.batch_id.clone(),
+        proof_system: "starknet-snip36".into(),
+        proof_format: "virtual-tx-proof".into(),
+        prover_backend: prover_backend_label(true),
+        created_at_unix_ms: now_unix_ms(),
+        proof_artifact_commitment: native_proof_reference,
+        proof_path: settlement_statement.proof_path.clone(),
+        public_inputs_path: settlement_statement.proof_facts_path.clone(),
+        prover_stdout_path: settlement_statement.stdout_path.clone(),
+        prover_stderr_path: settlement_statement.stderr_path.clone(),
+        proof_sha256: settlement_statement.proof_sha256.clone(),
+        public_inputs_sha256: settlement_statement.proof_facts_sha256.clone(),
+        native_proof_file_path: Some(settlement_statement.proof_path),
+        native_proof_facts_file_path: Some(settlement_statement.proof_facts_path),
+        native_execution_request_path: Some(settlement_statement.execution_request_path),
+        native_nullifier_proof_file_path: Some(nullifier_statement.proof_path),
+        native_nullifier_proof_facts_file_path: Some(nullifier_statement.proof_facts_path),
+        native_nullifier_execution_request_path: Some(nullifier_statement.execution_request_path),
+        native_renewal_proof_file_path: Some(renewal_statement.proof_path),
+        native_renewal_proof_facts_file_path: Some(renewal_statement.proof_facts_path),
+        native_renewal_execution_request_path: Some(renewal_statement.execution_request_path),
+    })
+}
+
+async fn execute_native_statement_prover(
+    state: &AppState,
+    tx_prover_url: &str,
+    executor: &StarknetExecutorConfig,
+    batch_id: &str,
+    stage_key: &str,
+    entrypoint: &str,
+    serialized_native_witness: &[String],
+    expected_message_hashes: &[String],
+) -> Result<NativeStatementProofArtifact, String> {
+    delete_execution_outputs_if_exist(state.data_dir.as_ref(), stage_key)
+        .map_err(status_to_error)?;
+    let paths = proof_execution_paths(state.data_dir.as_ref(), stage_key);
     let proof_program_calldata = build_native_proof_program_calldata(
         &state.auction_verifier_address,
-        &serialized_native_witness,
+        serialized_native_witness,
     )?;
     let proof_compilation_call = StarknetCall {
         contract_address: normalize_nonzero_felt(
             &state.native_proof_program_address,
             "native_proof_program_address",
         )?,
-        entrypoint: state.native_proof_entrypoint.clone(),
+        entrypoint: entrypoint.into(),
         calldata: proof_program_calldata,
     };
     let execution_request = build_native_execution_request(
-        &executor,
+        executor,
         &proof_compilation_call,
         NativeTransactionMode::ProofOnly,
     )
@@ -4155,7 +4246,7 @@ async fn execute_native_transaction_prover(
     let mut final_result = None;
     let mut last_error = None;
     for attempt in 1..=state.native_prover_attempts {
-        match request_native_proof(state, &tx_prover_url, &rpc_request).await {
+        match request_native_proof(state, tx_prover_url, &rpc_request).await {
             Ok((result, response_value)) => {
                 final_result = Some(result);
                 final_response_value = Some(response_value);
@@ -4163,7 +4254,7 @@ async fn execute_native_transaction_prover(
             }
             Err(error) if attempt < state.native_prover_attempts => {
                 eprintln!(
-                    "native transaction prover attempt {attempt}/{attempts} failed for batch {batch_id}: {error}",
+                    "native {entrypoint} prover attempt {attempt}/{attempts} failed for batch {batch_id}: {error}",
                     attempts = state.native_prover_attempts
                 );
                 last_error = Some(error);
@@ -4176,21 +4267,14 @@ async fn execute_native_transaction_prover(
         }
     }
     let response_value = final_response_value.ok_or_else(|| {
-        last_error.unwrap_or_else(|| "native transaction prover returned no result".into())
+        last_error.unwrap_or_else(|| format!("native {entrypoint} prover returned no result"))
     })?;
     let result =
-        final_result.ok_or_else(|| "native transaction prover returned no result".to_string())?;
-    validate_native_proof_facts_messages(
-        &result.proof_facts,
-        &[
-            expected_settlement_proof_message_hash,
-            expected_nullifier_proof_message_hash,
-            expected_renewal_proof_message_hash,
-        ],
-    )?;
+        final_result.ok_or_else(|| format!("native {entrypoint} prover returned no result"))?;
+    validate_native_proof_facts_messages(&result.proof_facts, expected_message_hashes)?;
 
     fs::write(&paths.proof_path, result.proof.trim())
-        .map_err(|error| format!("failed to persist native proof: {error}"))?;
+        .map_err(|error| format!("failed to persist native {entrypoint} proof: {error}"))?;
     persist_json_file(&paths.public_inputs_path, &result.proof_facts).map_err(status_to_error)?;
     persist_json_file(
         &paths.stdout_path,
@@ -4201,31 +4285,18 @@ async fn execute_native_transaction_prover(
     )
     .map_err(status_to_error)?;
     fs::write(&paths.stderr_path, "")
-        .map_err(|error| format!("failed to persist native prover stderr log: {error}"))?;
+        .map_err(|error| format!("failed to persist native {entrypoint} stderr log: {error}"))?;
 
     let proof_sha256 = sha256_file_hex(&paths.proof_path)?;
     let proof_facts_sha256 = sha256_file_hex(&paths.public_inputs_path)?;
-    let artifact_id = artifact_id_for(batch_id, &transcript_commitment);
-
-    Ok(ProofArtifactRecord {
-        artifact_id,
-        batch_id: transcript.batch_id.clone(),
-        proof_system: "starknet-snip36".into(),
-        proof_format: "virtual-tx-proof".into(),
-        prover_backend: prover_backend_label(true),
-        created_at_unix_ms: now_unix_ms(),
-        proof_artifact_commitment: native_proof_reference,
+    Ok(NativeStatementProofArtifact {
         proof_path: paths.proof_path.display().to_string(),
-        public_inputs_path: paths.public_inputs_path.display().to_string(),
-        prover_stdout_path: paths.stdout_path.display().to_string(),
-        prover_stderr_path: paths.stderr_path.display().to_string(),
+        proof_facts_path: paths.public_inputs_path.display().to_string(),
+        execution_request_path: paths.native_execution_request_path.display().to_string(),
+        stdout_path: paths.stdout_path.display().to_string(),
+        stderr_path: paths.stderr_path.display().to_string(),
         proof_sha256,
-        public_inputs_sha256: proof_facts_sha256,
-        native_proof_file_path: Some(paths.proof_path.display().to_string()),
-        native_proof_facts_file_path: Some(paths.public_inputs_path.display().to_string()),
-        native_execution_request_path: Some(
-            paths.native_execution_request_path.display().to_string(),
-        ),
+        proof_facts_sha256,
     })
 }
 
@@ -6713,14 +6784,82 @@ async fn submit_native_plan_onchain(
         .native_proof_facts_file_path
         .as_ref()
         .ok_or_else(|| "native proof facts path missing".to_string())?;
+    let nullifier_proof_path = proof_artifact
+        .native_nullifier_proof_file_path
+        .as_ref()
+        .ok_or_else(|| "native nullifier proof path missing".to_string())?;
+    let nullifier_proof_facts_path = proof_artifact
+        .native_nullifier_proof_facts_file_path
+        .as_ref()
+        .ok_or_else(|| "native nullifier proof facts path missing".to_string())?;
+    let renewal_proof_path = proof_artifact
+        .native_renewal_proof_file_path
+        .as_ref()
+        .ok_or_else(|| "native renewal proof path missing".to_string())?;
+    let renewal_proof_facts_path = proof_artifact
+        .native_renewal_proof_facts_file_path
+        .as_ref()
+        .ok_or_else(|| "native renewal proof facts path missing".to_string())?;
 
-    let proof = fs::read_to_string(proof_path)
-        .map_err(|error| format!("failed to read native proof {proof_path}: {error}"))?;
-    let proof_facts: Vec<String> =
-        serde_json::from_str(&fs::read_to_string(proof_facts_path).map_err(|error| {
-            format!("failed to read native proof facts {proof_facts_path}: {error}")
-        })?)
-        .map_err(|error| format!("failed to parse native proof facts: {error}"))?;
+    let (nullifier_proof, nullifier_proof_facts) = read_native_proof_bundle(
+        nullifier_proof_path,
+        nullifier_proof_facts_path,
+        "nullifier",
+    )?;
+    let (renewal_proof, renewal_proof_facts) =
+        read_native_proof_bundle(renewal_proof_path, renewal_proof_facts_path, "renewal")?;
+    let (proof, proof_facts) =
+        read_native_proof_bundle(proof_path, proof_facts_path, "settlement")?;
+
+    let provider = JsonRpcClient::new(HttpTransport::new(
+        Url::parse(&executor.rpc_url)
+            .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?,
+    ));
+    let verifier_address = settlement_plan.settlement_call.contract_address.clone();
+    let args = &settlement_plan.encoded_args;
+    let nullifier_record_call = StarknetCall {
+        contract_address: verifier_address.clone(),
+        entrypoint: "record_nullifier_roots_with_proof_facts".into(),
+        calldata: vec![
+            args.batch_id.clone(),
+            args.transcript_commitment.clone(),
+            args.prior_nullifier_root.clone(),
+            args.consumed_nullifier_root.clone(),
+            args.new_nullifier_root.clone(),
+        ],
+    };
+    let nullifier_tx_hash = submit_native_invoke_with_typed_sdk_retry(
+        state,
+        &executor,
+        &nullifier_record_call,
+        nullifier_proof,
+        &nullifier_proof_facts,
+    )
+    .await
+    .map_err(|error| format!("failed to record native nullifier proof: {error}"))?;
+    ensure_native_statement_record_accepted(&provider, &nullifier_tx_hash, "nullifier").await?;
+
+    let renewal_record_call = StarknetCall {
+        contract_address: verifier_address.clone(),
+        entrypoint: "record_renewal_roots_with_proof_facts".into(),
+        calldata: vec![
+            args.batch_id.clone(),
+            args.transcript_commitment.clone(),
+            args.prior_renewal_root.clone(),
+            args.renewal_child_root.clone(),
+            args.new_renewal_root.clone(),
+        ],
+    };
+    let renewal_tx_hash = submit_native_invoke_with_typed_sdk_retry(
+        state,
+        &executor,
+        &renewal_record_call,
+        renewal_proof,
+        &renewal_proof_facts,
+    )
+    .await
+    .map_err(|error| format!("failed to record native renewal proof: {error}"))?;
+    ensure_native_statement_record_accepted(&provider, &renewal_tx_hash, "renewal").await?;
 
     let tx_hash = submit_native_invoke_with_typed_sdk_retry(
         state,
@@ -6734,10 +6873,6 @@ async fn submit_native_plan_onchain(
     let batch_id = settlement_plan.batch_id.clone();
     let submission_id = format!("{}:{}", batch_id.0, tx_hash);
 
-    let provider = JsonRpcClient::new(HttpTransport::new(
-        Url::parse(&executor.rpc_url)
-            .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?,
-    ));
     let mut submission = OnchainSubmissionRecord {
         submission_id,
         batch_id,
@@ -6766,6 +6901,42 @@ async fn submit_native_plan_onchain(
     }
 
     Ok(submission)
+}
+
+fn read_native_proof_bundle(
+    proof_path: &str,
+    proof_facts_path: &str,
+    label: &str,
+) -> Result<(String, Vec<String>), String> {
+    let proof = fs::read_to_string(proof_path)
+        .map_err(|error| format!("failed to read native {label} proof {proof_path}: {error}"))?;
+    let proof_facts: Vec<String> =
+        serde_json::from_str(&fs::read_to_string(proof_facts_path).map_err(|error| {
+            format!("failed to read native {label} proof facts {proof_facts_path}: {error}")
+        })?)
+        .map_err(|error| format!("failed to parse native {label} proof facts: {error}"))?;
+    Ok((proof, proof_facts))
+}
+
+async fn ensure_native_statement_record_accepted(
+    provider: &JsonRpcClient<HttpTransport>,
+    tx_hash: &str,
+    label: &str,
+) -> Result<(), String> {
+    let receipt = wait_for_accepted_receipt(
+        provider,
+        parse_felt(tx_hash, &format!("{label} proof transaction hash"))?,
+    )
+    .await
+    .ok_or_else(|| {
+        format!("{label} proof transaction {tx_hash} was not accepted before settlement")
+    })?;
+    match receipt.receipt.execution_result() {
+        ExecutionResult::Succeeded => Ok(()),
+        ExecutionResult::Reverted { reason } => Err(format!(
+            "{label} proof transaction {tx_hash} reverted onchain: {reason}"
+        )),
+    }
 }
 
 async fn submit_native_invoke_with_typed_sdk_retry(
