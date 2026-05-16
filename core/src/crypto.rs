@@ -22,6 +22,7 @@ use crate::{
     ApprovalCallArguments, AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput,
     DecryptedOrderShare, DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
     EncryptedRecoveryPayload, FundingRailKind, MatchedOrderWitness, Note, NoteCommitment,
+    NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan, NoteConsolidationWitness,
     NoteMembershipKind, NoteMembershipWitness, Nullifier, NullifierHistoryBatch,
     NullifierSparseUpdateWitness, OrderCommitment, OrderIngressReceipt, OrderIntent, OrderShare,
     OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputNoteMerkleProof,
@@ -53,6 +54,7 @@ const NATIVE_SETTLEMENT_MESSAGE_DOMAIN_HEX: &str =
     "0x0326c16c927e3e9e1e2cb23ce296a3e7f3d21e798e34d6cac00f9b1241fdfc3a";
 const PUBLIC_SETTLEMENT_DOMAIN_HEX: &str =
     "0x0283f626418aa97a073f64500f7e35dd8bf7c01ff8611917c3c38e5be92eb205";
+const PUBLIC_NOTE_CONSOLIDATION_DOMAIN_HEX: &str = "0x7a796c6974685f6e6f74655f636f6e736f6c5f7631";
 const ROOT_ONLY_STATE_TRANSITION_DOMAIN_HEX: &str =
     "0x01f14f0555b0b80fd6af9553623a021c472d8c930dfcb5b204b35b26f0d2b1b2";
 const OUTPUT_NOTE_LEAF_DOMAIN_HEX: &str =
@@ -80,6 +82,7 @@ const NULLIFIER_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6e756c6c5f7631
 const RENEWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f72656e65775f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
+const NOTE_CONSOLIDATION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f636f6e736f6c5f7631";
 const ADMISSION_ROOT_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f726f6f745f7631";
 const ADMISSION_LEAF_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f6c6561665f7631";
 const PRIVATE_ORDER_SHARE_ALGORITHM_V1: &str = "ecdh-p256+hkdf-sha256+aes-256-gcm/private-order-v1";
@@ -88,6 +91,7 @@ const OUTPUT_NOTE_HKDF_SALT: &[u8] = b"zylith/output-note-key-separation-v2";
 const RECOVERY_ARTIFACT_ALGORITHM_V2: &str = "aes-256-gcm/recovery-v2";
 const WALLET_HKDF_SALT: &[u8] = b"zylith/wallet-key-separation-v2";
 const ORDER_INGRESS_RECEIPT_VERSION: u32 = 1;
+const STATEMENT_TYPE_NOTE_CONSOLIDATION_HEX: &str = "0x5";
 
 fn aes_nonce_from_slice(bytes: &[u8]) -> Result<Nonce<U12>, ProtocolError> {
     let nonce: [u8; 12] = bytes
@@ -1932,6 +1936,249 @@ pub fn root_only_settlement_commitments(
     })
 }
 
+#[derive(Clone, Debug)]
+struct NoteConsolidationRootFields {
+    consumed_inputs: Vec<ConsumedInput>,
+    consumed_note_root: String,
+    consumed_nullifier_root: String,
+    output_note_root: String,
+    new_note_root: String,
+    new_nullifier_root: String,
+}
+
+fn note_consolidation_root_fields(
+    witness: &NoteConsolidationWitness,
+) -> Result<NoteConsolidationRootFields, ProtocolError> {
+    if witness.input_notes.is_empty() {
+        return Err(ProtocolError::Crypto(
+            "note consolidation must consume at least one input note".into(),
+        ));
+    }
+    if witness.output_notes.is_empty() {
+        return Err(ProtocolError::Crypto(
+            "note consolidation must create at least one output note".into(),
+        ));
+    }
+    if witness.output_notes.len() != witness.output_note_preimages.len() {
+        return Err(ProtocolError::Crypto(
+            "note consolidation output preimage count does not match output records".into(),
+        ));
+    }
+
+    let input_asset = witness.input_notes[0].asset_id.clone();
+    let input_spend_authority = normalize_felt_hex(&witness.input_notes[0].spend_authority)?;
+    let mut input_total = 0_u128;
+    let mut consumed_inputs = Vec::with_capacity(witness.input_notes.len());
+    for note in &witness.input_notes {
+        if note.asset_id != input_asset {
+            return Err(ProtocolError::Crypto(
+                "note consolidation inputs must share asset_id".into(),
+            ));
+        }
+        if normalize_felt_hex(&note.spend_authority)? != input_spend_authority {
+            return Err(ProtocolError::Crypto(
+                "note consolidation inputs must share spend authority".into(),
+            ));
+        }
+        if note.amount == 0 {
+            return Err(ProtocolError::Crypto(
+                "note consolidation input amount must be non-zero".into(),
+            ));
+        }
+        input_total = input_total.checked_add(note.amount).ok_or_else(|| {
+            ProtocolError::Crypto("note consolidation input total overflows u128".into())
+        })?;
+        let commitment = note.commitment()?;
+        let nullifier = nullifier_from_note_secret(&commitment, &note.blinding)?;
+        consumed_inputs.push(ConsumedInput {
+            note_commitment: commitment,
+            nullifier,
+        });
+    }
+
+    let mut output_total = 0_u128;
+    for (record, note) in witness
+        .output_notes
+        .iter()
+        .zip(witness.output_note_preimages.iter())
+    {
+        if record.asset_id != input_asset || note.asset_id != input_asset {
+            return Err(ProtocolError::Crypto(
+                "note consolidation outputs must share the input asset_id".into(),
+            ));
+        }
+        if record.amount == 0 || note.amount == 0 {
+            return Err(ProtocolError::Crypto(
+                "note consolidation output amount must be non-zero".into(),
+            ));
+        }
+        if note.commitment()? != record.note_commitment {
+            return Err(ProtocolError::Crypto(
+                "note consolidation output note preimage does not match output commitment".into(),
+            ));
+        }
+        if note.amount != record.amount
+            || normalize_felt_hex(&note.withdraw_authority)?
+                != normalize_felt_hex(&record.withdraw_authority)?
+        {
+            return Err(ProtocolError::Crypto(
+                "note consolidation output preimage does not match output record".into(),
+            ));
+        }
+        output_total = output_total.checked_add(record.amount).ok_or_else(|| {
+            ProtocolError::Crypto("note consolidation output total overflows u128".into())
+        })?;
+    }
+    if input_total != output_total {
+        return Err(ProtocolError::Crypto(
+            "note consolidation input and output totals must match".into(),
+        ));
+    }
+
+    let prior_note_root = normalize_felt_hex(&witness.prior_note_root)?;
+    let consumed_note_root = settlement_root(
+        "zylith/root/consumed-notes-v1",
+        consumed_inputs
+            .iter()
+            .map(|input| Ok(vec![normalize_felt_hex(&input.note_commitment.0)?])),
+    )?;
+    let consumed_nullifier_root = settlement_consumed_nullifier_root(&consumed_inputs)?;
+    let output_note_root =
+        output_note_merkle_root(&witness.output_notes, &witness.output_ciphertext_bundle_ref)?;
+    let new_note_root = settlement_state_transition_root(&prior_note_root, &output_note_root)?;
+    let new_nullifier_root = normalize_felt_hex(&witness.new_nullifier_root)?;
+    if new_nullifier_root == "0x0" {
+        return Err(ProtocolError::Crypto(
+            "note consolidation missing sparse new_nullifier_root".into(),
+        ));
+    }
+
+    Ok(NoteConsolidationRootFields {
+        consumed_inputs,
+        consumed_note_root,
+        consumed_nullifier_root,
+        output_note_root,
+        new_note_root,
+        new_nullifier_root,
+    })
+}
+
+pub fn note_consolidation_commitment(
+    witness: &NoteConsolidationWitness,
+) -> Result<String, ProtocolError> {
+    let roots = note_consolidation_root_fields(witness)?;
+    note_consolidation_commitment_from_roots(
+        &witness.consolidation_id,
+        &witness.output_ciphertext_bundle_ref,
+        &witness.prior_note_root,
+        &witness.prior_nullifier_root,
+        &roots.consumed_note_root,
+        &roots.consumed_nullifier_root,
+        &roots.output_note_root,
+        &roots.new_note_root,
+        &roots.new_nullifier_root,
+    )
+}
+
+pub fn note_consolidation_commitment_from_roots(
+    consolidation_id: &BatchId,
+    output_ciphertext_bundle_ref: &str,
+    prior_note_root: &str,
+    prior_nullifier_root: &str,
+    consumed_note_root: &str,
+    consumed_nullifier_root: &str,
+    output_note_root: &str,
+    new_note_root: &str,
+    new_nullifier_root: &str,
+) -> Result<String, ProtocolError> {
+    let consolidation_id = felt_from_hex_str(&normalize_felt_hex(&encode_starknet_felt(
+        "note-consolidation-id",
+        &consolidation_id.0,
+    ))?)?;
+    let mut state = poseidon_hash(
+        felt_from_hex_str(PUBLIC_NOTE_CONSOLIDATION_DOMAIN_HEX)?,
+        consolidation_id,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&encode_output_bundle_ref(output_ciphertext_bundle_ref)?)?,
+    );
+    for root in [
+        prior_note_root,
+        prior_nullifier_root,
+        consumed_note_root,
+        consumed_nullifier_root,
+        output_note_root,
+        new_note_root,
+        new_nullifier_root,
+    ] {
+        state = poseidon_hash(state, felt_from_hex_str(&normalize_felt_hex(root)?)?);
+    }
+    Ok(felt_hex(&state))
+}
+
+pub fn sign_note_consolidation_authorization(
+    spend_auth_key_felt: &str,
+    consolidation_commitment: &str,
+) -> Result<crate::SpendAuthorization, ProtocolError> {
+    let private_key = felt_from_hex_str(spend_auth_key_felt)?;
+    let message = felt_from_hex_str(&normalize_felt_hex(consolidation_commitment)?)?;
+    let k = rfc6979_generate_k(&message, &private_key, None);
+    let signature = sign(&private_key, &message, &k).map_err(|err| {
+        ProtocolError::Crypto(format!(
+            "note consolidation authorization signing failed: {err}"
+        ))
+    })?;
+    Ok(crate::SpendAuthorization {
+        signature_r: felt_hex(&signature.r),
+        signature_s: felt_hex(&signature.s),
+    })
+}
+
+pub fn build_note_consolidation_submission_plan(
+    witness: &NoteConsolidationWitness,
+    verifier_address: &str,
+    proof_artifact_commitment: &str,
+) -> Result<NoteConsolidationSubmissionPlan, ProtocolError> {
+    let normalized_verifier_address = normalize_felt_hex(verifier_address)?;
+    if normalize_felt_hex(&witness.auction_verifier_address)? != normalized_verifier_address {
+        return Err(ProtocolError::Crypto(
+            "note consolidation verifier address does not match witness".into(),
+        ));
+    }
+    let roots = note_consolidation_root_fields(witness)?;
+    let consolidation_commitment = note_consolidation_commitment(witness)?;
+    let normalized_proof_artifact_commitment = normalize_felt_hex(proof_artifact_commitment)?;
+    let encoded_args = NoteConsolidationCallArguments {
+        consolidation_id: encode_starknet_felt(
+            "note-consolidation-id",
+            &witness.consolidation_id.0,
+        ),
+        proof_artifact_commitment: normalized_proof_artifact_commitment.clone(),
+        output_bundle_ref: encode_output_bundle_ref(&witness.output_ciphertext_bundle_ref)?,
+        prior_note_root: normalize_felt_hex(&witness.prior_note_root)?,
+        prior_nullifier_root: normalize_felt_hex(&witness.prior_nullifier_root)?,
+        consumed_note_root: roots.consumed_note_root,
+        consumed_nullifier_root: roots.consumed_nullifier_root,
+        output_note_root: roots.output_note_root,
+        new_note_root: roots.new_note_root,
+        new_nullifier_root: roots.new_nullifier_root,
+    };
+    let calldata = flatten_note_consolidation_call_arguments(&encoded_args);
+
+    Ok(NoteConsolidationSubmissionPlan {
+        consolidation_id: witness.consolidation_id.clone(),
+        consolidation_commitment,
+        proof_artifact_commitment: normalized_proof_artifact_commitment,
+        consolidation_call: StarknetCall {
+            contract_address: normalized_verifier_address,
+            entrypoint: "submit_note_consolidation_with_proof_facts".into(),
+            calldata,
+        },
+        encoded_args,
+    })
+}
+
 fn settlement_consumed_nullifier_root(
     consumed_inputs: &[ConsumedInput],
 ) -> Result<String, ProtocolError> {
@@ -2963,6 +3210,48 @@ pub fn renewal_proof_message_hash_from_statement(
         Felt::ZERO,
         Felt::from(2_u64),
         felt_from_hex_str(RENEWAL_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(statement_message_hash)?,
+    ];
+    Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
+pub fn native_note_consolidation_message_hash(
+    auction_verifier_address: &str,
+    consolidation_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(NOTE_CONSOLIDATION_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(&normalize_felt_hex(auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(consolidation_commitment)?)?,
+    );
+    Ok(felt_hex(&state))
+}
+
+pub fn note_consolidation_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    consolidation_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash =
+        native_note_consolidation_message_hash(auction_verifier_address, consolidation_commitment)?;
+    note_consolidation_proof_message_hash_from_statement(
+        proof_program_address,
+        &statement_message_hash,
+    )
+}
+
+pub fn note_consolidation_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    let fields = [
+        felt_from_hex_str(proof_program_address)?,
+        Felt::ZERO,
+        Felt::from(2_u64),
+        felt_from_hex_str(NOTE_CONSOLIDATION_PROOF_MESSAGE_DOMAIN_HEX)?,
         felt_from_hex_str(statement_message_hash)?,
     ];
     Ok(crate::hash::poseidon_hash_hex(&fields))
@@ -4184,26 +4473,450 @@ pub fn build_stwo_serialized_input(
     Ok(serialized)
 }
 
-fn validate_output_recovery_witness(witness: &SettlementWitness) -> Result<(), ProtocolError> {
-    if witness.output_notes.len() != witness.output_note_preimages.len() {
+fn note_consolidation_membership_witnesses_for_serialization(
+    witness: &NoteConsolidationWitness,
+    consumed_inputs: &[ConsumedInput],
+) -> Result<Vec<NoteMembershipWitness>, ProtocolError> {
+    if witness.note_membership_witnesses.is_empty() {
+        let consumed_note_commitments = consumed_inputs
+            .iter()
+            .map(|input| normalize_felt_hex(&input.note_commitment.0))
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
+        let deposit_chain_root =
+            settlement_note_root_after_deposit_chain(&consumed_note_commitments)?;
+        if normalize_felt_hex(&witness.prior_note_root)? == deposit_chain_root {
+            return deposit_chain_membership_witnesses(&consumed_note_commitments);
+        }
+        return Err(ProtocolError::Crypto(
+            "note consolidation missing consumed-note membership witnesses for prior_note_root"
+                .into(),
+        ));
+    }
+    if witness.note_membership_witnesses.len() != consumed_inputs.len() {
+        return Err(ProtocolError::Crypto(
+            "note consolidation membership witness count does not match input count".into(),
+        ));
+    }
+    for membership in &witness.note_membership_witnesses {
+        if membership.merkle_path.len() != membership.merkle_directions.len() {
+            return Err(ProtocolError::Crypto(
+                "note consolidation membership merkle path/direction length mismatch".into(),
+            ));
+        }
+    }
+    Ok(witness.note_membership_witnesses.clone())
+}
+
+fn note_consolidation_nullifier_witnesses_for_serialization(
+    witness: &NoteConsolidationWitness,
+    consumed_inputs: &[ConsumedInput],
+) -> Result<Vec<NullifierSparseUpdateWitness>, ProtocolError> {
+    let current_nullifiers = consumed_inputs
+        .iter()
+        .map(|input| input.nullifier.clone())
+        .collect::<Vec<_>>();
+    let mut history_nullifiers = Vec::new();
+    for batch in &witness.nullifier_history {
+        if batch.repeat_count == 0 {
+            return Err(ProtocolError::Crypto(
+                "nullifier history repeat_count must be non-zero".into(),
+            ));
+        }
+        if !batch.nullifiers.is_empty() && batch.repeat_count != 1 {
+            return Err(ProtocolError::Crypto(
+                "non-empty nullifier history batches cannot be repeated".into(),
+            ));
+        }
+        history_nullifiers.extend(batch.nullifiers.iter().cloned());
+    }
+    if !history_nullifiers.is_empty() || witness.nullifier_sparse_witnesses.is_empty() {
+        let (computed_prior_root, computed_new_root, generated_witnesses) =
+            nullifier_sparse_update_witnesses_for_nullifiers(
+                &history_nullifiers,
+                &current_nullifiers,
+            )?;
+        if computed_prior_root != normalize_felt_hex(&witness.prior_nullifier_root)? {
+            return Err(ProtocolError::Crypto(
+                "note consolidation nullifier history does not reconstruct prior_nullifier_root"
+                    .into(),
+            ));
+        }
+        if computed_new_root != normalize_felt_hex(&witness.new_nullifier_root)? {
+            return Err(ProtocolError::Crypto(
+                "note consolidation sparse nullifier witness does not reconstruct new_nullifier_root"
+                    .into(),
+            ));
+        }
+        return Ok(generated_witnesses);
+    }
+    if witness.nullifier_sparse_witnesses.len() != consumed_inputs.len() {
+        return Err(ProtocolError::Crypto(
+            "note consolidation sparse nullifier witness count does not match input count".into(),
+        ));
+    }
+    Ok(witness.nullifier_sparse_witnesses.clone())
+}
+
+pub fn build_note_consolidation_serialized_input(
+    witness: &NoteConsolidationWitness,
+) -> Result<Vec<String>, ProtocolError> {
+    let roots = note_consolidation_root_fields(witness)?;
+    let consolidation_commitment = note_consolidation_commitment(witness)?;
+    let note_membership_witnesses =
+        note_consolidation_membership_witnesses_for_serialization(witness, &roots.consumed_inputs)?;
+    let nullifier_sparse_witnesses =
+        note_consolidation_nullifier_witnesses_for_serialization(witness, &roots.consumed_inputs)?;
+    validate_output_recovery_bundle_for_outputs(
+        &witness.consolidation_id,
+        &witness.output_notes,
+        &witness.output_note_preimages,
+        &witness.output_recovery_records,
+        &witness.output_recovery_dummy_commitments,
+        &witness.output_ciphertext_bundle_ref,
+    )?;
+
+    let mut payload = vec![
+        normalize_felt_hex(STATEMENT_TYPE_NOTE_CONSOLIDATION_HEX)?,
+        domain_felt_hex("zylith/note"),
+        domain_felt_hex("zylith/nullifier"),
+        normalize_felt_hex(PUBLIC_NOTE_CONSOLIDATION_DOMAIN_HEX)?,
+        encode_starknet_felt("note-consolidation-id", &witness.consolidation_id.0),
+        normalize_felt_hex(&consolidation_commitment)?,
+        encode_output_bundle_ref(&witness.output_ciphertext_bundle_ref)?,
+        normalize_felt_hex(&witness.prior_note_root)?,
+        normalize_felt_hex(&witness.prior_nullifier_root)?,
+        domain_felt_hex("zylith/root/consumed-notes-v1"),
+        domain_felt_hex("zylith/root/consumed-nullifiers-v1"),
+        domain_felt_hex("zylith/root/output-notes-v1"),
+        normalize_felt_hex(ROOT_ONLY_STATE_TRANSITION_DOMAIN_HEX)?,
+        normalize_felt_hex(NULLIFIER_SPARSE_LEAF_DOMAIN_HEX)?,
+        normalize_felt_hex(NULLIFIER_SPARSE_NODE_DOMAIN_HEX)?,
+    ];
+
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| note.commitment().map(|commitment| commitment.0))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| encode_asset_id(&note.asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| encode_u128(note.amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| encode_owner_public_key(&note.owner_public_key))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| normalize_felt_hex(&note.spend_authority))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| normalize_felt_hex(&note.withdraw_authority))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| normalize_felt_hex(&note.blinding))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| encode_u64(note.nonce))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .input_notes
+            .iter()
+            .map(|note| normalize_felt_hex(&note.metadata_commitment))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &roots
+            .consumed_inputs
+            .iter()
+            .map(|input| input.nullifier.0.clone())
+            .collect::<Vec<_>>(),
+    );
+    payload.push(normalize_felt_hex(
+        &witness.spend_authorization.signature_r,
+    )?);
+    payload.push(normalize_felt_hex(
+        &witness.spend_authorization.signature_s,
+    )?);
+
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .map(|membership| match &membership.kind {
+                NoteMembershipKind::Deposit => "0x0".to_string(),
+                NoteMembershipKind::SettlementOutput => "0x1".to_string(),
+            })
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .map(|membership| normalize_felt_hex(&membership.prefix_root))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .map(|membership| normalize_felt_hex(&membership.batch_root))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .map(|membership| encode_usize(membership.merkle_path.len()))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .flat_map(|membership| membership.merkle_path.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .flat_map(|membership| membership.merkle_directions.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .map(|membership| encode_usize(membership.suffix_batch_roots.len()))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .flat_map(|membership| membership.suffix_batch_roots.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+
+    push_span(
+        &mut payload,
+        &nullifier_sparse_witnesses
+            .iter()
+            .map(|update| normalize_felt_hex(&update.key_low))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &nullifier_sparse_witnesses
+            .iter()
+            .map(|update| normalize_felt_hex(&update.key_high))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &nullifier_sparse_witnesses
+            .iter()
+            .map(|update| encode_usize(update.merkle_path.len()))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &nullifier_sparse_witnesses
+            .iter()
+            .flat_map(|update| update.merkle_path.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &nullifier_sparse_witnesses
+            .iter()
+            .flat_map(|update| update.merkle_directions.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+
+    push_span(
+        &mut payload,
+        &witness
+            .output_notes
+            .iter()
+            .map(|output| output.note_commitment.0.clone())
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_notes
+            .iter()
+            .map(|output| encode_asset_id(&output.asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_notes
+            .iter()
+            .map(|output| encode_u128(output.amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_notes
+            .iter()
+            .map(|output| normalize_felt_hex(&output.withdraw_authority))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_note_preimages
+            .iter()
+            .map(|note| encode_owner_public_key(&note.owner_public_key))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_note_preimages
+            .iter()
+            .map(|note| normalize_felt_hex(&note.spend_authority))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_note_preimages
+            .iter()
+            .map(|note| normalize_felt_hex(&note.blinding))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_note_preimages
+            .iter()
+            .map(|note| encode_u64(note.nonce))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_note_preimages
+            .iter()
+            .map(|note| normalize_felt_hex(&note.metadata_commitment))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_recovery_records
+            .iter()
+            .map(|record| normalize_felt_hex(&record.key_tag))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_recovery_records
+            .iter()
+            .map(|record| normalize_felt_hex(&record.auth_tag))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_recovery_records
+            .iter()
+            .flat_map(|record| record.ciphertext_fields.iter())
+            .map(|field| normalize_felt_hex(field))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .output_recovery_dummy_commitments
+            .iter()
+            .map(|commitment| normalize_felt_hex(commitment))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    payload.push(roots.new_nullifier_root);
+    let mut serialized = vec![encode_usize(payload.len())];
+    serialized.extend(payload);
+    Ok(serialized)
+}
+
+fn validate_output_recovery_bundle_for_outputs(
+    context_id: &BatchId,
+    output_notes: &[OutputNoteRecord],
+    output_note_preimages: &[Note],
+    output_recovery_records: &[OutputRecoveryRecord],
+    output_recovery_dummy_commitments: &[String],
+    output_ciphertext_bundle_ref: &str,
+) -> Result<(), ProtocolError> {
+    if output_notes.len() != output_note_preimages.len() {
         return Err(ProtocolError::Crypto(
             "output recovery preimage count does not match output notes".into(),
         ));
     }
-    if witness.output_notes.len() != witness.output_recovery_records.len() {
+    if output_notes.len() != output_recovery_records.len() {
         return Err(ProtocolError::Crypto(
             "output recovery record count does not match output notes".into(),
         ));
     }
 
-    let mut recovery_commitments = Vec::with_capacity(
-        witness.output_recovery_records.len() + witness.output_recovery_dummy_commitments.len(),
-    );
-    for (output_index, ((output_note, note), record)) in witness
-        .output_notes
+    let mut recovery_commitments =
+        Vec::with_capacity(output_recovery_records.len() + output_recovery_dummy_commitments.len());
+    for (output_index, ((output_note, note), record)) in output_notes
         .iter()
-        .zip(witness.output_note_preimages.iter())
-        .zip(witness.output_recovery_records.iter())
+        .zip(output_note_preimages.iter())
+        .zip(output_recovery_records.iter())
         .enumerate()
     {
         if note.commitment()? != output_note.note_commitment {
@@ -4220,14 +4933,9 @@ fn validate_output_recovery_witness(witness: &SettlementWitness) -> Result<(), P
                 "output recovery note preimage does not match output record".into(),
             ));
         }
-        let proof = output_note_merkle_proof(&witness.output_notes, &output_note.note_commitment)?;
-        let expected = encrypt_output_recovery_record(
-            &witness.batch_id.0,
-            output_index,
-            note,
-            output_note,
-            &proof,
-        )?;
+        let proof = output_note_merkle_proof(output_notes, &output_note.note_commitment)?;
+        let expected =
+            encrypt_output_recovery_record(&context_id.0, output_index, note, output_note, &proof)?;
         if expected != *record {
             return Err(ProtocolError::Crypto(
                 "output recovery record is not bound to output note preimage/proof".into(),
@@ -4235,7 +4943,7 @@ fn validate_output_recovery_witness(witness: &SettlementWitness) -> Result<(), P
         }
         recovery_commitments.push(normalize_felt_hex(&record.commitment)?);
     }
-    for commitment in &witness.output_recovery_dummy_commitments {
+    for commitment in output_recovery_dummy_commitments {
         let normalized = normalize_felt_hex(commitment)?;
         if felt_from_hex_str(&normalized)? == Felt::ZERO {
             return Err(ProtocolError::Crypto(
@@ -4246,9 +4954,7 @@ fn validate_output_recovery_witness(witness: &SettlementWitness) -> Result<(), P
     }
     let expected_bundle_root = output_recovery_bundle_root(&recovery_commitments)?;
     if felt_from_hex_str(&expected_bundle_root)?
-        != felt_from_hex_str(&encode_output_bundle_ref(
-            &witness.output_ciphertext_bundle_ref,
-        )?)?
+        != felt_from_hex_str(&encode_output_bundle_ref(output_ciphertext_bundle_ref)?)?
     {
         return Err(ProtocolError::Crypto(
             "output recovery bundle root does not match settlement output bundle ref".into(),
@@ -4256,6 +4962,17 @@ fn validate_output_recovery_witness(witness: &SettlementWitness) -> Result<(), P
     }
 
     Ok(())
+}
+
+fn validate_output_recovery_witness(witness: &SettlementWitness) -> Result<(), ProtocolError> {
+    validate_output_recovery_bundle_for_outputs(
+        &witness.batch_id,
+        &witness.output_notes,
+        &witness.output_note_preimages,
+        &witness.output_recovery_records,
+        &witness.output_recovery_dummy_commitments,
+        &witness.output_ciphertext_bundle_ref,
+    )
 }
 
 fn auction_proof_vectors(
@@ -5145,6 +5862,21 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
     calldata
 }
 
+fn flatten_note_consolidation_call_arguments(args: &NoteConsolidationCallArguments) -> Vec<String> {
+    vec![
+        args.consolidation_id.clone(),
+        args.proof_artifact_commitment.clone(),
+        args.output_bundle_ref.clone(),
+        args.prior_note_root.clone(),
+        args.prior_nullifier_root.clone(),
+        args.consumed_note_root.clone(),
+        args.consumed_nullifier_root.clone(),
+        args.output_note_root.clone(),
+        args.new_note_root.clone(),
+        args.new_nullifier_root.clone(),
+    ]
+}
+
 fn flatten_settlement_output_withdrawal_call_arguments(
     args: &SettlementOutputWithdrawalCallArguments,
 ) -> Vec<String> {
@@ -5212,6 +5944,7 @@ mod tests {
         SettlementOutputWithdrawalMessage, SettlementOutputWithdrawalPlanRequest,
         auction_admission_root, build_admission_serialized_input,
         build_auction_result_serialized_input, build_deposit_note, build_deposit_submission_plan,
+        build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
         build_order_submission, build_output_note, build_renewal_parent_cancel_submission_plan,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
         build_settlement_witness, build_stwo_serialized_input, build_withdrawal_submission_plan,
@@ -5219,14 +5952,15 @@ mod tests {
         decrypt_order_bundle, decrypt_order_share, decrypt_output_recovery_record,
         decrypt_recovery_artifact_payload, derive_account_id, derive_order_cancellation_secret,
         derive_order_cancellation_tag, derive_user_keys, encrypt_note_for_owner,
-        encrypt_output_recovery_record, note_recognition_public_key_from_raw_key_hex,
+        encrypt_output_recovery_record, native_note_consolidation_message_hash,
+        note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
         output_note_merkle_proof, output_note_merkle_root,
         private_execution_key_registry_fingerprint, proof_artifact_commitment,
         reconstruct_order_from_shares, renewal_child_nullifier, root_only_settlement_commitments,
         sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
         settlement_nullifier_root_after_history, settlement_output_withdrawal_message_hash,
-        settlement_transcript_commitment, sign_order_authorization,
-        validate_order_ingress_receipt_for_manifest,
+        settlement_transcript_commitment, sign_note_consolidation_authorization,
+        sign_order_authorization, validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
@@ -5408,8 +6142,8 @@ mod tests {
     }
     use crate::{
         AssetId, AuctionOrderWitness, BatchId, ConsumedInput, DepositIntent, FeeEntry,
-        MatchedOrderWitness, Note, NoteCommitment, Nullifier, NullifierHistoryBatch,
-        OrderCommitment, OrderIntent, OrderSide, OutputNoteRecord, PairId,
+        MatchedOrderWitness, Note, NoteCommitment, NoteConsolidationWitness, Nullifier,
+        NullifierHistoryBatch, OrderCommitment, OrderIntent, OrderSide, OutputNoteRecord, PairId,
         PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
         PrivateExecutionKeyRegistry, PrivateOrderPayload, ProtocolError, RecoveryArtifactKind,
         RecoverySeed, SettlementTranscript, SettlementWitness,
@@ -6833,6 +7567,157 @@ mod tests {
         assert_eq!(
             settlement_nullifier_root_after_history(&compressed).expect("compressed"),
             settlement_nullifier_root_after_history(&expanded).expect("expanded"),
+        );
+    }
+
+    fn sample_note_consolidation_witness() -> NoteConsolidationWitness {
+        let input_a = sample_note("STRK", 40, 501);
+        let input_b = sample_note("STRK", 85, 502);
+        let output_note = sample_note("STRK", 125, 601);
+        let consolidation_id = BatchId("consolidation-test-1".into());
+        let input_commitments = vec![
+            input_a.commitment().expect("input a commitment").0,
+            input_b.commitment().expect("input b commitment").0,
+        ];
+        let prior_note_root =
+            settlement_note_root_after_deposit_chain(&input_commitments).expect("prior note root");
+        let input_nullifiers = vec![sample_nullifier(&input_a), sample_nullifier(&input_b)];
+        let (prior_nullifier_root, new_nullifier_root, nullifier_sparse_witnesses) =
+            super::nullifier_sparse_update_witnesses_for_nullifiers(&[], &input_nullifiers)
+                .expect("nullifier sparse witnesses");
+        let output_record = OutputNoteRecord {
+            note_commitment: output_note.commitment().expect("output commitment"),
+            asset_id: output_note.asset_id.clone(),
+            amount: output_note.amount,
+            withdraw_authority: output_note.withdraw_authority.clone(),
+        };
+        let output_notes = vec![output_record];
+        let proof = output_note_merkle_proof(&output_notes, &output_notes[0].note_commitment)
+            .expect("output merkle proof");
+        let recovery_record = encrypt_output_recovery_record(
+            &consolidation_id.0,
+            0,
+            &output_note,
+            &output_notes[0],
+            &proof,
+        )
+        .expect("output recovery record");
+        let mut recovery_commitments = vec![recovery_record.commitment.clone()];
+        let dummy_bundle = crate::OutputCiphertextBundle::from_ciphertexts(
+            consolidation_id.clone(),
+            "test-da",
+            vec![],
+        )
+        .expect("dummy output bundle");
+        let recovery_dummy_commitments = dummy_bundle
+            .ciphertexts
+            .iter()
+            .take(output_bundle_bucket_size(output_notes.len()).saturating_sub(output_notes.len()))
+            .map(|ciphertext| {
+                ciphertext
+                    .recovery
+                    .as_ref()
+                    .expect("dummy recovery")
+                    .commitment
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        recovery_commitments.extend(recovery_dummy_commitments.iter().cloned());
+        let output_ciphertext_bundle_ref =
+            output_recovery_bundle_root(&recovery_commitments).expect("output bundle ref");
+
+        let mut witness = NoteConsolidationWitness {
+            consolidation_id,
+            auction_verifier_address: "0x1234".into(),
+            prior_note_root,
+            prior_nullifier_root,
+            input_notes: vec![input_a, input_b],
+            spend_authorization: sample_authorization_unchecked(),
+            note_membership_witnesses: vec![],
+            nullifier_history: vec![],
+            nullifier_sparse_witnesses,
+            output_notes,
+            output_note_preimages: vec![output_note],
+            output_recovery_records: vec![recovery_record],
+            output_recovery_dummy_commitments: recovery_dummy_commitments,
+            output_ciphertext_bundle_ref,
+            new_nullifier_root,
+        };
+        let consolidation_commitment =
+            note_consolidation_commitment(&witness).expect("consolidation commitment");
+        witness.spend_authorization = sign_note_consolidation_authorization(
+            &sample_spend_auth_key(),
+            &consolidation_commitment,
+        )
+        .expect("consolidation authorization");
+        witness
+    }
+
+    #[test]
+    fn note_consolidation_serialization_and_submission_plan_bind_roots() {
+        let witness = sample_note_consolidation_witness();
+        let serialized =
+            build_note_consolidation_serialized_input(&witness).expect("serialized consolidation");
+        assert!(serialized.len() > 1);
+        let payload_len =
+            usize::from_str_radix(serialized[0].trim_start_matches("0x"), 16).expect("payload len");
+        assert_eq!(payload_len, serialized.len() - 1);
+
+        let consolidation_commitment =
+            note_consolidation_commitment(&witness).expect("consolidation commitment");
+        let statement_message =
+            native_note_consolidation_message_hash("0x1234", &consolidation_commitment)
+                .expect("statement message");
+        let plan = build_note_consolidation_submission_plan(&witness, "0x1234", &statement_message)
+            .expect("submission plan");
+        assert_eq!(plan.consolidation_commitment, consolidation_commitment);
+        assert_eq!(
+            plan.consolidation_call.entrypoint,
+            "submit_note_consolidation_with_proof_facts"
+        );
+        assert_eq!(plan.consolidation_call.calldata.len(), 10);
+        assert_eq!(
+            plan.encoded_args.proof_artifact_commitment,
+            statement_message
+        );
+        assert_ne!(plan.encoded_args.consumed_note_root, "0x0");
+        assert_ne!(plan.encoded_args.consumed_nullifier_root, "0x0");
+        assert_ne!(plan.encoded_args.output_note_root, "0x0");
+        assert_ne!(plan.encoded_args.new_note_root, witness.prior_note_root);
+        assert_eq!(
+            plan.encoded_args.new_nullifier_root,
+            witness.new_nullifier_root
+        );
+    }
+
+    #[test]
+    fn note_consolidation_rejects_value_creation() {
+        let mut witness = sample_note_consolidation_witness();
+        witness.output_notes[0].amount += 1;
+        witness.output_note_preimages[0].amount += 1;
+        witness.output_notes[0].note_commitment = witness.output_note_preimages[0]
+            .commitment()
+            .expect("updated output commitment");
+        let error =
+            build_note_consolidation_serialized_input(&witness).expect_err("inflation rejected");
+        assert!(
+            matches!(error, ProtocolError::Crypto(message) if message.contains("totals must match"))
+        );
+    }
+
+    #[test]
+    fn note_consolidation_submission_plan_rejects_wrong_verifier() {
+        let witness = sample_note_consolidation_witness();
+        let consolidation_commitment =
+            note_consolidation_commitment(&witness).expect("consolidation commitment");
+        let statement_message =
+            native_note_consolidation_message_hash("0x1234", &consolidation_commitment)
+                .expect("statement message");
+        let error =
+            build_note_consolidation_submission_plan(&witness, "0x5678", &statement_message)
+                .expect_err("wrong verifier rejected");
+        assert!(
+            matches!(error, ProtocolError::Crypto(message) if message.contains("verifier address"))
         );
     }
 

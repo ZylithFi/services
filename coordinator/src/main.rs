@@ -57,6 +57,7 @@ const DEFAULT_COORDINATOR_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE: u64 = 120;
 const DEFAULT_COORDINATOR_MAX_ORDERS_PER_BATCH: u64 = 32;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = 1;
+const ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_EPOCHS";
 const PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS";
 
 #[derive(Clone)]
@@ -290,7 +291,8 @@ fn build_app() -> Result<Router, String> {
             "zylith-coordinator",
             HEARTBEAT_COVER_SECRET_ENV,
         )?,
-        public_artifact_delay_epochs: env_u64_or_default(
+        public_artifact_delay_epochs: env_u64_alias_or_default(
+            ARTIFACT_DELAY_EPOCHS_ENV,
             PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
             DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
         )?,
@@ -660,6 +662,9 @@ fn is_public_artifact_visible(
     delay_epochs: u64,
     batch_window_ms: u64,
 ) -> bool {
+    if published.settled_at_unix_ms.is_none() {
+        return false;
+    }
     if delay_epochs == 0 {
         return true;
     }
@@ -1265,6 +1270,17 @@ fn env_u64_or_default(env_name: &str, default: u64) -> Result<u64, String> {
         })
         .transpose()
         .map(|value| value.unwrap_or(default))
+}
+
+fn env_u64_alias_or_default(primary: &str, fallback: &str, default: u64) -> Result<u64, String> {
+    if env::var(primary)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+    {
+        return env_u64_or_default(primary, default);
+    }
+    env_u64_or_default(fallback, default)
 }
 
 fn load_receipt_secret_keyring() -> Vec<String> {

@@ -1579,6 +1579,8 @@ pub struct PublishedBatchArtifactSummary {
     pub batch_epoch: u64,
     #[serde(default)]
     pub published_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at_unix_ms: Option<u64>,
     pub transcript_commitment: String,
     pub output_bundle_ref: String,
     pub output_note_root: String,
@@ -1909,6 +1911,29 @@ pub struct SettlementOutputWithdrawalSubmissionPlan {
     pub note_commitment: NoteCommitment,
     pub starknet_call: StarknetCall,
     pub encoded_args: SettlementOutputWithdrawalCallArguments,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteConsolidationCallArguments {
+    pub consolidation_id: String,
+    pub proof_artifact_commitment: String,
+    pub output_bundle_ref: String,
+    pub prior_note_root: String,
+    pub prior_nullifier_root: String,
+    pub consumed_note_root: String,
+    pub consumed_nullifier_root: String,
+    pub output_note_root: String,
+    pub new_note_root: String,
+    pub new_nullifier_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteConsolidationSubmissionPlan {
+    pub consolidation_id: BatchId,
+    pub consolidation_commitment: String,
+    pub proof_artifact_commitment: String,
+    pub consolidation_call: StarknetCall,
+    pub encoded_args: NoteConsolidationCallArguments,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2251,6 +2276,29 @@ pub struct SettlementWitness {
     #[serde(default)]
     pub output_recovery_dummy_commitments: Vec<String>,
     pub output_ciphertext_bundle_ref: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteConsolidationWitness {
+    pub consolidation_id: BatchId,
+    pub auction_verifier_address: String,
+    pub prior_note_root: String,
+    pub prior_nullifier_root: String,
+    pub input_notes: Vec<Note>,
+    pub spend_authorization: SpendAuthorization,
+    #[serde(default)]
+    pub note_membership_witnesses: Vec<NoteMembershipWitness>,
+    #[serde(default)]
+    pub nullifier_history: Vec<NullifierHistoryBatch>,
+    #[serde(default)]
+    pub nullifier_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
+    pub output_notes: Vec<OutputNoteRecord>,
+    pub output_note_preimages: Vec<Note>,
+    pub output_recovery_records: Vec<OutputRecoveryRecord>,
+    #[serde(default)]
+    pub output_recovery_dummy_commitments: Vec<String>,
+    pub output_ciphertext_bundle_ref: String,
+    pub new_nullifier_root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2931,6 +2979,14 @@ pub struct DeploymentProofConfig {
     pub proof_program_hash: String,
     #[serde(default)]
     pub proof_account_address: String,
+    #[serde(default)]
+    pub settlement_statement_program_address: String,
+    #[serde(default)]
+    pub nullifier_statement_program_address: String,
+    #[serde(default)]
+    pub renewal_statement_program_address: String,
+    #[serde(default)]
+    pub note_consolidation_statement_program_address: String,
     #[serde(default)]
     pub settlement_account_address: String,
     #[serde(default)]

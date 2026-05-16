@@ -46,15 +46,16 @@ use zylith_core::hash::{encode_starknet_felt, normalize_felt_hex, ordered_felt_l
 use zylith_core::{
     AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchOrderSet, BatchSummary,
     CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord, DepositRecordList,
-    FeeEntry, MatchedOrder, MatchedOrderWitness, Note, NoteMembershipKind, NoteMembershipWitness,
-    OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport, OrderIngressReceipt,
-    OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle,
-    OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
-    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
-    ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublishedBatchArtifacts,
-    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTimestampUpdate,
-    SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
-    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
+    FeeEntry, MatchedOrder, MatchedOrderWitness, Note, NoteConsolidationWitness,
+    NoteMembershipKind, NoteMembershipWitness, OnchainSubmissionRecord, OrderCommitment,
+    OrderExecutionReport, OrderIngressReceipt, OrderIntent, OrderShareBundle, OrderSide,
+    OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord,
+    PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
+    PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig, ProofArtifactRecord,
+    ProofJobStatus, PublishedBatchArtifacts, SettlementRootHistoryArchive,
+    SettlementSubmissionPlan, SettlementTimestampUpdate, SettlementTranscript, SettlementWitness,
+    StarknetCall, TimeInForce, TrustedOrderIngressRequest, TrustedOrderIngressResponse,
+    admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
     build_admission_serialized_input, build_auction_result_serialized_input,
     build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
@@ -70,7 +71,7 @@ use zylith_core::{
     root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
     settlement_note_root_after_deposit_chain, settlement_proof_message_hash_for_program,
     settlement_state_transition_root, settlement_transcript_commitment,
-    validate_order_ingress_receipt_for_manifest_with_secrets,
+    validate_order_ingress_receipt_for_manifest_with_secrets, verify_output_note_membership,
 };
 
 const DEFAULT_COORDINATOR_URL: &str = "http://127.0.0.1:3000";
@@ -136,6 +137,9 @@ const PROOF_OUTPUTS_DIR: &str = "proof_outputs";
 const PUBLIC_INPUTS_DIR: &str = "public_inputs";
 const PROVER_LOGS_DIR: &str = "prover_logs";
 const PRIVATE_ORDER_PAYLOADS_DIR: &str = "private_order_payloads";
+const NOTE_ROOT_TRANSITION_DEPOSIT_KIND: u64 = 0;
+const NOTE_ROOT_TRANSITION_SETTLEMENT_KIND: u64 = 1;
+const NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND: u64 = 2;
 const ORDER_INGRESS_RECEIPT_SECRET_ENV: &str = "ZYLITH_TRUSTED_INGRESS_RECEIPT_SECRET";
 const ORDER_INGRESS_RECEIPT_PREVIOUS_SECRETS_ENV: &str =
     "ZYLITH_TRUSTED_INGRESS_RECEIPT_PREVIOUS_SECRETS";
@@ -2183,6 +2187,11 @@ async fn refresh_onchain_submission(
     }
 
     sync_job_with_onchain_submission(&state, &batch_id, &refreshed_record).await?;
+    if let Err(error) =
+        publish_settlement_timestamp_to_artifact_stores(&state, &batch_id, &refreshed_record).await
+    {
+        eprintln!("failed to publish settlement timestamp for batch {batch_id}: {error}");
+    }
 
     Ok(Json(refreshed_record))
 }
@@ -2771,8 +2780,15 @@ async fn prepare_private_auction_batch_inner(
         let merged_witnesses = merged.into_values().collect::<Vec<_>>();
         let confirmed_witnesses =
             filter_root_history_witnesses_for_current_roots(state, merged_witnesses, &prior_roots)?;
-        validate_batch_nullifier_freshness(batch_id, &records, confirmed_witnesses.iter())
-            .map_err(|_| StatusCode::CONFLICT)?;
+        validate_batch_nullifier_freshness(batch_id, &records, confirmed_witnesses.iter()).map_err(
+            |error| {
+                eprintln!(
+                    "prepare_private_auction_batch batch_id={} stage=confirmed_root_history failed=nullifier_freshness error={}",
+                    batch_id, error
+                );
+                StatusCode::CONFLICT
+            },
+        )?;
         confirmed_witnesses
     };
     eprintln!(
@@ -2816,6 +2832,7 @@ async fn prepare_private_auction_batch_inner(
             deposit_records: &deposit_records,
             note_root_transitions: &note_root_transitions,
             prior_settlement_witnesses: &historical_witnesses,
+            prior_note_consolidation_witnesses: &[],
             privacy_gate: Default::default(),
             protocol_fee_recipient: &state.protocol_fee_recipient,
         },
@@ -2922,6 +2939,7 @@ async fn prepare_private_auction_batch_inner(
                 deposit_records: &deposit_records,
                 note_root_transitions: &note_root_transitions,
                 prior_settlement_witnesses: &historical_witnesses,
+                prior_note_consolidation_witnesses: &[],
                 privacy_gate: privacy_gate_witness.clone(),
                 protocol_fee_recipient: &state.protocol_fee_recipient,
             },
@@ -3061,17 +3079,22 @@ fn validate_batch_nullifier_freshness<'a>(
     records: &[DecryptedOrderRecord],
     historical_witnesses: impl IntoIterator<Item = &'a SettlementWitness>,
 ) -> Result<(), String> {
-    let mut current_nullifiers = BTreeSet::new();
+    let mut current_nullifiers = BTreeMap::new();
     for record in records {
         for note in &record.funding_notes {
             let commitment = note
                 .commitment()
                 .map_err(|error| format!("invalid funding note: {error}"))?;
+            let commitment_hex = normalize_felt_hex(&commitment.0)
+                .map_err(|error| format!("invalid funding note commitment: {error}"))?;
             let nullifier = nullifier_from_note_secret(&commitment, &note.blinding)
                 .map_err(|error| format!("invalid funding nullifier: {error}"))?;
             let nullifier = normalize_felt_hex(&nullifier.0)
                 .map_err(|error| format!("invalid funding nullifier: {error}"))?;
-            if !current_nullifiers.insert(nullifier) {
+            if current_nullifiers
+                .insert(nullifier, commitment_hex)
+                .is_some()
+            {
                 return Err("duplicate funding nullifier in current batch".into());
             }
         }
@@ -3084,10 +3107,10 @@ fn validate_batch_nullifier_freshness<'a>(
         for input in &witness.consumed_inputs {
             let historical_nullifier = normalize_felt_hex(&input.nullifier.0)
                 .map_err(|error| format!("invalid historical nullifier: {error}"))?;
-            if current_nullifiers.contains(&historical_nullifier) {
+            if let Some(current_commitment) = current_nullifiers.get(&historical_nullifier) {
                 return Err(format!(
-                    "funding nullifier was already reserved by batch {}",
-                    witness.batch_id.0
+                    "funding nullifier for note {} was already reserved by batch {}",
+                    current_commitment, witness.batch_id.0
                 ));
             }
         }
@@ -5015,6 +5038,7 @@ struct OutputNettingKey {
     owner_public_key: String,
     spend_authority: String,
     withdraw_authority: String,
+    metadata_commitment: String,
 }
 
 struct OutputNettingGroup {
@@ -5044,6 +5068,8 @@ fn add_output_to_netting_group(
         spend_authority: normalize_felt_hex(&note.spend_authority)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         withdraw_authority: normalize_felt_hex(&note.withdraw_authority)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        metadata_commitment: normalize_felt_hex(&note.metadata_commitment)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     };
     let entry = groups.entry(key).or_insert_with(|| OutputNettingGroup {
@@ -5233,10 +5259,53 @@ fn try_deposit_membership_candidate(
     Ok(None)
 }
 
-fn derive_deposit_note_membership_witnesses_from_note_root_transitions(
+fn settlement_output_membership_proof(
+    note_commitment: &str,
+    batch_root: &str,
+    prior_settlement_witnesses: &[SettlementWitness],
+    prior_note_consolidation_witnesses: &[NoteConsolidationWitness],
+) -> Result<Option<(Vec<String>, Vec<String>)>, StatusCode> {
+    let note_commitment =
+        normalize_felt_hex(note_commitment).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let batch_root =
+        normalize_felt_hex(batch_root).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for witness in prior_settlement_witnesses {
+        let Some(output_note) = witness.output_notes.iter().find(|output| {
+            normalize_felt_hex(&output.note_commitment.0)
+                .map(|commitment| commitment == note_commitment)
+                .unwrap_or(false)
+        }) else {
+            continue;
+        };
+        let proof = output_note_merkle_proof(&witness.output_notes, &output_note.note_commitment)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if verify_output_note_membership(output_note, &proof, &batch_root).is_ok() {
+            return Ok(Some((proof.merkle_path, proof.merkle_directions)));
+        }
+    }
+    for witness in prior_note_consolidation_witnesses {
+        let Some(output_note) = witness.output_notes.iter().find(|output| {
+            normalize_felt_hex(&output.note_commitment.0)
+                .map(|commitment| commitment == note_commitment)
+                .unwrap_or(false)
+        }) else {
+            continue;
+        };
+        let proof = output_note_merkle_proof(&witness.output_notes, &output_note.note_commitment)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if verify_output_note_membership(output_note, &proof, &batch_root).is_ok() {
+            return Ok(Some((proof.merkle_path, proof.merkle_directions)));
+        }
+    }
+    Ok(None)
+}
+
+fn derive_note_membership_witnesses_from_note_root_transitions(
     prior_note_root: &str,
     consumed_commitments: &[String],
     transitions: &[NoteRootTransitionRecord],
+    prior_settlement_witnesses: &[SettlementWitness],
+    prior_note_consolidation_witnesses: &[NoteConsolidationWitness],
 ) -> Result<Option<Vec<NoteMembershipWitness>>, StatusCode> {
     let target_root =
         normalize_felt_hex(prior_note_root).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -5278,25 +5347,67 @@ fn derive_deposit_note_membership_witnesses_from_note_root_transitions(
 
     let mut witnesses_by_commitment = BTreeMap::<String, NoteMembershipWitness>::new();
     for (index, transition) in active_transitions.iter().enumerate() {
-        if transition.kind != 0 {
+        if transition.kind == NOTE_ROOT_TRANSITION_DEPOSIT_KIND {
+            let key = normalize_felt_hex(&transition.key)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !consumed_set.contains(&key) {
+                continue;
+            }
+            if witnesses_by_commitment
+                .insert(
+                    key,
+                    NoteMembershipWitness {
+                        kind: NoteMembershipKind::Deposit,
+                        prefix_root: prefixes[index].clone(),
+                        batch_root: batch_roots[index].clone(),
+                        merkle_path: Vec::new(),
+                        merkle_directions: Vec::new(),
+                        suffix_batch_roots: batch_roots[index + 1..].to_vec(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(StatusCode::CONFLICT);
+            }
             continue;
         }
-        let key =
-            normalize_felt_hex(&transition.key).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if !consumed_set.contains(&key) {
-            continue;
+
+        if transition.kind != NOTE_ROOT_TRANSITION_SETTLEMENT_KIND
+            && transition.kind != NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND
+        {
+            return Err(StatusCode::CONFLICT);
         }
-        witnesses_by_commitment.insert(
-            key,
-            NoteMembershipWitness {
-                kind: NoteMembershipKind::Deposit,
-                prefix_root: prefixes[index].clone(),
-                batch_root: batch_roots[index].clone(),
-                merkle_path: Vec::new(),
-                merkle_directions: Vec::new(),
-                suffix_batch_roots: batch_roots[index + 1..].to_vec(),
-            },
-        );
+
+        for commitment in &consumed_set {
+            if witnesses_by_commitment.contains_key(commitment) {
+                continue;
+            }
+            let Some((merkle_path, merkle_directions)) = settlement_output_membership_proof(
+                commitment,
+                &batch_roots[index],
+                prior_settlement_witnesses,
+                prior_note_consolidation_witnesses,
+            )?
+            else {
+                continue;
+            };
+            if witnesses_by_commitment
+                .insert(
+                    commitment.clone(),
+                    NoteMembershipWitness {
+                        kind: NoteMembershipKind::SettlementOutput,
+                        prefix_root: prefixes[index].clone(),
+                        batch_root: batch_roots[index].clone(),
+                        merkle_path,
+                        merkle_directions,
+                        suffix_batch_roots: batch_roots[index + 1..].to_vec(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
     }
 
     let mut witnesses = Vec::with_capacity(consumed_commitments.len());
@@ -5309,12 +5420,14 @@ fn derive_deposit_note_membership_witnesses_from_note_root_transitions(
     Ok(Some(witnesses))
 }
 
-fn derive_deposit_note_membership_witnesses(
+fn derive_note_membership_witnesses(
     prior_note_root: &str,
     consumed_inputs: &[ConsumedInput],
     matched_order_witnesses: &[MatchedOrderWitness],
     deposit_records: &[DepositRecord],
     note_root_transitions: &[NoteRootTransitionRecord],
+    prior_settlement_witnesses: &[SettlementWitness],
+    prior_note_consolidation_witnesses: &[NoteConsolidationWitness],
 ) -> Result<Vec<NoteMembershipWitness>, StatusCode> {
     if consumed_inputs.is_empty() {
         return Ok(Vec::new());
@@ -5325,10 +5438,12 @@ fn derive_deposit_note_membership_witnesses(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if let Some(witnesses) = derive_deposit_note_membership_witnesses_from_note_root_transitions(
+    if let Some(witnesses) = derive_note_membership_witnesses_from_note_root_transitions(
         prior_note_root,
         &consumed_commitments,
         note_root_transitions,
+        prior_settlement_witnesses,
+        prior_note_consolidation_witnesses,
     )? {
         return Ok(witnesses);
     }
@@ -5384,6 +5499,7 @@ struct SettlementBuildContext<'a> {
     deposit_records: &'a [DepositRecord],
     note_root_transitions: &'a [NoteRootTransitionRecord],
     prior_settlement_witnesses: &'a [SettlementWitness],
+    prior_note_consolidation_witnesses: &'a [NoteConsolidationWitness],
     privacy_gate: AuctionPrivacyGateWitness,
     protocol_fee_recipient: &'a str,
 }
@@ -5401,6 +5517,7 @@ fn build_settlement_artifacts(
         deposit_records,
         note_root_transitions,
         prior_settlement_witnesses,
+        prior_note_consolidation_witnesses,
         privacy_gate,
         protocol_fee_recipient,
     } = context;
@@ -5554,6 +5671,13 @@ fn build_settlement_artifacts(
         let net_amount = gross_amount
             .checked_sub(fee_amount)
             .ok_or(StatusCode::CONFLICT)?;
+        if gross_amount == 0 || net_amount == 0 {
+            eprintln!(
+                "build_settlement_artifacts batch_id={batch_id} stage=build_fills failed=dust_output order={} asset={} gross={} net={}",
+                fill.order_commitment.0, asset_id.0, gross_amount, net_amount
+            );
+            return Err(StatusCode::CONFLICT);
+        }
         if fee_amount > 0 {
             let accrued_fee = fee_accumulator.entry(asset_id.0.clone()).or_default();
             *accrued_fee = accrued_fee
@@ -5840,12 +5964,14 @@ fn build_settlement_artifacts(
         deposit_records.len(),
         note_root_transitions.len()
     );
-    let note_membership_witnesses = derive_deposit_note_membership_witnesses(
+    let note_membership_witnesses = derive_note_membership_witnesses(
         &prior_note_root,
         &consumed_inputs,
         &matched_order_witnesses,
         deposit_records,
         note_root_transitions,
+        prior_settlement_witnesses,
+        prior_note_consolidation_witnesses,
     )
     .inspect_err(|status| {
         eprintln!(
@@ -7586,15 +7712,17 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PROTOCOL_FEE_RECIPIENT, DecryptedOrderRecord, NativeBlockId,
-        NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
-        NativeTransactionMode, SettlementBuildContext, SettlementRoots, artifact_id_for,
+        DEFAULT_PROTOCOL_FEE_RECIPIENT, DecryptedOrderRecord,
+        NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND, NativeBlockId, NativeExecutionRequestRecord,
+        NativeProverParams, NativeProverRpcRequest, NativeTransactionMode,
+        NoteRootTransitionRecord, SettlementBuildContext, SettlementRoots, artifact_id_for,
         build_batch_liquidity_report, build_native_proof_program_calldata,
         build_settlement_artifacts, compute_candidate_clearing_price, decode_bhttp_response,
-        deterministic_settlement_submission_jitter_ms, eligible_order_count,
-        encode_bhttp_json_post, matched_maker_participant_count, matched_participant_count,
-        max_maker_fill_share_bps, max_single_order_fill_share_bps, max_single_owner_fill_share_bps,
-        native_execution_context_block_id, native_fee_estimate_requires_proof_facts,
+        derive_note_membership_witnesses, deterministic_settlement_submission_jitter_ms,
+        eligible_order_count, encode_bhttp_json_post, matched_maker_participant_count,
+        matched_participant_count, max_maker_fill_share_bps, max_single_order_fill_share_bps,
+        max_single_owner_fill_share_bps, native_execution_context_block_id,
+        native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
         redact_native_execution_request, redact_native_prover_request,
@@ -7603,10 +7731,13 @@ mod tests {
     };
     use zylith_core::{
         AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, MatchedOrder, Note,
-        NoteCommitment, Nullifier, NullifierHistoryBatch, OrderIntent, OrderSide, OrderType,
-        PairId, ProductConfig, SettlementWitness, SpendAuthorization, TimeInForce,
-        hash::ordered_felt_list_commitment, note_recognition_public_key_from_raw_key_hex,
-        nullifier_from_note_secret, settlement_nullifier_root_after_history,
+        NoteCommitment, NoteConsolidationWitness, NoteMembershipKind, Nullifier,
+        NullifierHistoryBatch, OrderIntent, OrderSide, OrderType, OutputNoteRecord, PairId,
+        ProductConfig, SettlementTranscript, SettlementWitness, SpendAuthorization, TimeInForce,
+        deposit_note_root, hash::ordered_felt_list_commitment,
+        note_recognition_public_key_from_raw_key_hex, nullifier_from_note_secret,
+        root_only_settlement_commitments, settlement_nullifier_root_after_history,
+        settlement_state_transition_root,
     };
 
     #[test]
@@ -7626,6 +7757,254 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn note_membership_derivation_supports_prior_settlement_outputs() {
+        let initial_deposit_commitment = "0x101".to_string();
+        let later_deposit_commitment = "0x202".to_string();
+        let initial_deposit_root =
+            deposit_note_root(&initial_deposit_commitment).expect("initial deposit root");
+        let root_after_initial_deposit =
+            settlement_state_transition_root("0x0", &initial_deposit_root)
+                .expect("initial note root");
+
+        let output_a = OutputNoteRecord {
+            note_commitment: NoteCommitment("0x303".into()),
+            asset_id: AssetId("STRK".into()),
+            amount: 10,
+            withdraw_authority: "0x404".into(),
+        };
+        let output_b = OutputNoteRecord {
+            note_commitment: NoteCommitment("0x505".into()),
+            asset_id: AssetId("ETH".into()),
+            amount: 2,
+            withdraw_authority: "0x606".into(),
+        };
+        let prior_transcript = SettlementTranscript {
+            batch_id: BatchId("batch-strk-eth-7".into()),
+            pair_id: PairId("STRK/ETH".into()),
+            batch_epoch: 7,
+            order_commitment_root: "0x111".into(),
+            encrypted_order_set_commitment: "0x222".into(),
+            prior_note_root: root_after_initial_deposit.clone(),
+            prior_nullifier_root: "0x0".into(),
+            prior_renewal_root: "0x0".into(),
+            prior_fee_root: "0x0".into(),
+            new_nullifier_root: "0x0".into(),
+            new_renewal_root: "0x0".into(),
+            clearing_price: 1,
+            price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            matched_orders: Vec::new(),
+            consumed_inputs: Vec::new(),
+            renewal_child_uses: Vec::new(),
+            fees: Vec::new(),
+            output_notes: vec![output_a.clone(), output_b.clone()],
+            output_note_preimages: Vec::new(),
+            output_recovery_records: Vec::new(),
+            output_recovery_dummy_commitments: Vec::new(),
+            output_ciphertext_bundle_ref: "0x777".into(),
+        };
+        let prior_roots =
+            root_only_settlement_commitments(&prior_transcript).expect("prior settlement roots");
+        let later_deposit_root =
+            deposit_note_root(&later_deposit_commitment).expect("later deposit root");
+        let target_note_root =
+            settlement_state_transition_root(&prior_roots.new_note_root, &later_deposit_root)
+                .expect("target note root");
+        let transitions = vec![
+            NoteRootTransitionRecord {
+                kind: 0,
+                key: initial_deposit_commitment,
+                batch_root: initial_deposit_root,
+                new_root: root_after_initial_deposit.clone(),
+            },
+            NoteRootTransitionRecord {
+                kind: 1,
+                key: "0x7".into(),
+                batch_root: prior_roots.output_note_root.clone(),
+                new_root: prior_roots.new_note_root.clone(),
+            },
+            NoteRootTransitionRecord {
+                kind: 0,
+                key: later_deposit_commitment.clone(),
+                batch_root: later_deposit_root,
+                new_root: target_note_root.clone(),
+            },
+        ];
+        let prior_witness = SettlementWitness {
+            batch_id: BatchId("batch-strk-eth-7".into()),
+            pair_id: PairId("STRK/ETH".into()),
+            batch_epoch: 7,
+            order_commitment_root: "0x0".into(),
+            encrypted_order_set_commitment: "0x0".into(),
+            transcript_commitment: "0x0".into(),
+            auction_verifier_address: "0x0".into(),
+            prior_note_root: root_after_initial_deposit,
+            prior_nullifier_root: "0x0".into(),
+            prior_renewal_root: "0x0".into(),
+            prior_fee_root: "0x0".into(),
+            new_nullifier_root: "0x0".into(),
+            new_renewal_root: "0x0".into(),
+            clearing_price: 0,
+            price_base_scale: 1,
+            taker_fee_bps: 0,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            base_asset_id: AssetId("STRK".into()),
+            quote_asset_id: AssetId("ETH".into()),
+            matched_orders: Vec::new(),
+            matched_order_witnesses: Vec::new(),
+            consumed_inputs: Vec::new(),
+            note_membership_witnesses: Vec::new(),
+            nullifier_history: Vec::new(),
+            nullifier_sparse_witnesses: Vec::new(),
+            renewal_history: Vec::new(),
+            renewal_child_sparse_witnesses: Vec::new(),
+            renewal_cancel_sparse_witnesses: Vec::new(),
+            privacy_gate: Default::default(),
+            renewal_child_uses: Vec::new(),
+            fees: Vec::new(),
+            output_notes: vec![output_a, output_b.clone()],
+            output_note_preimages: Vec::new(),
+            output_recovery_records: Vec::new(),
+            output_recovery_dummy_commitments: Vec::new(),
+            output_ciphertext_bundle_ref: "root-history".into(),
+        };
+        let consumed_inputs = vec![
+            ConsumedInput {
+                note_commitment: output_b.note_commitment,
+                nullifier: Nullifier("0x900".into()),
+            },
+            ConsumedInput {
+                note_commitment: NoteCommitment(later_deposit_commitment),
+                nullifier: Nullifier("0x901".into()),
+            },
+        ];
+
+        let witnesses = derive_note_membership_witnesses(
+            &target_note_root,
+            &consumed_inputs,
+            &[],
+            &[],
+            &transitions,
+            &[prior_witness],
+            &[],
+        )
+        .expect("note membership witnesses");
+
+        assert_eq!(witnesses.len(), 2);
+        assert_eq!(witnesses[0].kind, NoteMembershipKind::SettlementOutput);
+        assert_eq!(witnesses[0].batch_root, prior_roots.output_note_root);
+        assert_eq!(witnesses[0].merkle_path.len(), 1);
+        assert_eq!(witnesses[0].suffix_batch_roots.len(), 1);
+        assert_eq!(witnesses[1].kind, NoteMembershipKind::Deposit);
+        assert!(witnesses[1].merkle_path.is_empty());
+        assert!(witnesses[1].suffix_batch_roots.is_empty());
+    }
+
+    #[test]
+    fn note_membership_derivation_supports_prior_consolidation_outputs() {
+        let deposit_commitment = "0x101".to_string();
+        let deposit_root = deposit_note_root(&deposit_commitment).expect("deposit root");
+        let root_after_deposit =
+            settlement_state_transition_root("0x0", &deposit_root).expect("deposit note root");
+        let consolidated_output = OutputNoteRecord {
+            note_commitment: NoteCommitment("0x303".into()),
+            asset_id: AssetId("STRK".into()),
+            amount: 10,
+            withdraw_authority: "0x404".into(),
+        };
+        let fake_transcript = SettlementTranscript {
+            batch_id: BatchId("consolidation-1".into()),
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 1,
+            order_commitment_root: "0x0".into(),
+            encrypted_order_set_commitment: "0x0".into(),
+            prior_note_root: root_after_deposit.clone(),
+            prior_nullifier_root: "0x0".into(),
+            prior_renewal_root: "0x0".into(),
+            prior_fee_root: "0x0".into(),
+            new_nullifier_root: "0x0".into(),
+            new_renewal_root: "0x0".into(),
+            clearing_price: 0,
+            price_base_scale: 1,
+            taker_fee_bps: 0,
+            maker_fee_bps: 0,
+            protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            matched_orders: Vec::new(),
+            consumed_inputs: Vec::new(),
+            renewal_child_uses: Vec::new(),
+            fees: Vec::new(),
+            output_notes: vec![consolidated_output.clone()],
+            output_note_preimages: Vec::new(),
+            output_recovery_records: Vec::new(),
+            output_recovery_dummy_commitments: Vec::new(),
+            output_ciphertext_bundle_ref: "0x777".into(),
+        };
+        let consolidation_roots =
+            root_only_settlement_commitments(&fake_transcript).expect("consolidation roots");
+        let target_note_root = consolidation_roots.new_note_root.clone();
+        let transitions = vec![
+            NoteRootTransitionRecord {
+                kind: 0,
+                key: deposit_commitment,
+                batch_root: deposit_root,
+                new_root: root_after_deposit.clone(),
+            },
+            NoteRootTransitionRecord {
+                kind: NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND,
+                key: "0x1".into(),
+                batch_root: consolidation_roots.output_note_root.clone(),
+                new_root: target_note_root.clone(),
+            },
+        ];
+        let consolidation_witness = NoteConsolidationWitness {
+            consolidation_id: BatchId("consolidation-1".into()),
+            auction_verifier_address: "0x0".into(),
+            prior_note_root: root_after_deposit,
+            prior_nullifier_root: "0x0".into(),
+            input_notes: Vec::new(),
+            spend_authorization: SpendAuthorization {
+                signature_r: "0x0".into(),
+                signature_s: "0x0".into(),
+            },
+            note_membership_witnesses: Vec::new(),
+            nullifier_history: Vec::new(),
+            nullifier_sparse_witnesses: Vec::new(),
+            output_notes: vec![consolidated_output.clone()],
+            output_note_preimages: Vec::new(),
+            output_recovery_records: Vec::new(),
+            output_recovery_dummy_commitments: Vec::new(),
+            output_ciphertext_bundle_ref: "0x777".into(),
+            new_nullifier_root: "0x0".into(),
+        };
+        let consumed_inputs = vec![ConsumedInput {
+            note_commitment: consolidated_output.note_commitment,
+            nullifier: Nullifier("0x900".into()),
+        }];
+
+        let witnesses = derive_note_membership_witnesses(
+            &target_note_root,
+            &consumed_inputs,
+            &[],
+            &[],
+            &transitions,
+            &[],
+            &[consolidation_witness],
+        )
+        .expect("note membership witnesses");
+
+        assert_eq!(witnesses.len(), 1);
+        assert_eq!(witnesses[0].kind, NoteMembershipKind::SettlementOutput);
+        assert_eq!(
+            witnesses[0].batch_root,
+            consolidation_roots.output_note_root
+        );
+        assert!(witnesses[0].suffix_batch_roots.is_empty());
     }
 
     #[test]
@@ -8013,6 +8392,7 @@ mod tests {
                 deposit_records: &[],
                 note_root_transitions: &[],
                 prior_settlement_witnesses: &[],
+                prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
             },
@@ -8033,7 +8413,7 @@ mod tests {
     }
 
     #[test]
-    fn settlement_artifacts_net_outputs_across_orders_for_same_recipient() {
+    fn settlement_artifacts_preserve_per_order_output_metadata_for_same_recipient() {
         let mut product_config = ProductConfig::default_v1();
         let pair_id = PairId("STRK/USDC".into());
         product_config
@@ -8132,6 +8512,7 @@ mod tests {
                 deposit_records: &[],
                 note_root_transitions: &[],
                 prior_settlement_witnesses: &[],
+                prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
             },
@@ -8139,22 +8520,24 @@ mod tests {
         .expect("netted artifacts");
 
         assert_eq!(artifacts.transcript.matched_orders.len(), 4);
-        assert_eq!(artifacts.transcript.output_notes.len(), 2);
+        assert_eq!(artifacts.transcript.output_notes.len(), 4);
         assert_eq!(artifacts.output_bundle.ciphertext_count_bucket, "0-4");
-        let buy_output = artifacts
+        let buy_outputs = artifacts
             .transcript
             .output_notes
             .iter()
-            .find(|note| note.asset_id.0 == "STRK")
-            .expect("netted buy output");
-        let sell_output = artifacts
+            .filter(|note| note.asset_id.0 == "STRK")
+            .collect::<Vec<_>>();
+        let sell_outputs = artifacts
             .transcript
             .output_notes
             .iter()
-            .find(|note| note.asset_id.0 == "USDC")
-            .expect("netted sell output");
-        assert_eq!(buy_output.amount, 20);
-        assert_eq!(sell_output.amount, 200);
+            .filter(|note| note.asset_id.0 == "USDC")
+            .collect::<Vec<_>>();
+        assert_eq!(buy_outputs.len(), 2);
+        assert_eq!(sell_outputs.len(), 2);
+        assert!(buy_outputs.iter().all(|note| note.amount == 10));
+        assert!(sell_outputs.iter().all(|note| note.amount == 100));
         assert!(
             artifacts
                 .settlement_witness
@@ -8163,15 +8546,23 @@ mod tests {
                 .all(|note| note.nonce > 0),
             "netted output notes must keep proof-valid non-zero nonces",
         );
-        assert_eq!(
-            artifacts.settlement_witness.matched_order_witnesses[0]
-                .output_note
-                .commitment()
-                .expect("buy output commitment"),
+        let first_buy_commitment = artifacts.settlement_witness.matched_order_witnesses[0]
+            .output_note
+            .commitment()
+            .expect("buy output commitment");
+        assert!(
+            artifacts
+                .transcript
+                .output_notes
+                .iter()
+                .any(|note| note.note_commitment == first_buy_commitment)
+        );
+        assert_ne!(
+            first_buy_commitment,
             artifacts.settlement_witness.matched_order_witnesses[1]
                 .output_note
                 .commitment()
-                .expect("buy output commitment"),
+                .expect("second buy output commitment"),
         );
     }
 
@@ -8606,6 +8997,76 @@ mod tests {
                 signature_s: "0x2".into(),
             },
         }
+    }
+
+    #[test]
+    fn settlement_artifacts_reject_dust_matched_outputs_before_proving() {
+        let product_config = ProductConfig::default_v1();
+        let pair_id = PairId("STRK/USDC".into());
+        let pair = product_config
+            .enabled_pair(&pair_id)
+            .expect("enabled pair")
+            .clone();
+        let records = vec![
+            valid_test_record(
+                0,
+                OrderSide::Buy,
+                300,
+                10,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                1,
+            ),
+            valid_test_record(
+                1,
+                OrderSide::Sell,
+                300,
+                10,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                10,
+            ),
+        ];
+        let order_commitments = records
+            .iter()
+            .map(|record| record.order_commitment.0.clone())
+            .collect::<Vec<_>>();
+        let batch = BatchSummary {
+            batch_id: BatchId("batch-strk-usdc-1".into()),
+            pair_id,
+            epoch_id: 1,
+            close_time_unix_ms: 0,
+            status: BatchStatus::Closed,
+            order_count: records.len() as u64,
+            order_commitment_root: ordered_felt_list_commitment(
+                "zylith/batch-order-root",
+                &order_commitments,
+            )
+            .expect("order root"),
+            encrypted_order_set_commitment: "0x222".into(),
+        };
+
+        let result = build_settlement_artifacts(
+            &batch.batch_id.0,
+            &batch,
+            &pair,
+            &records,
+            SettlementBuildContext {
+                product_config: &product_config,
+                prior_roots: &SettlementRoots::zero(),
+                deposit_records: &[],
+                note_root_transitions: &[],
+                prior_settlement_witnesses: &[],
+                prior_note_consolidation_witnesses: &[],
+                privacy_gate: Default::default(),
+                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "dust-sized matched outputs must not reach the Cairo statement",
+        );
     }
 
     fn valid_test_record(

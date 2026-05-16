@@ -41,6 +41,8 @@ const DEFAULT_ARTIFACT_ARCHIVE_PATH: &str = "indexer/published_batch_artifacts.d
 const DEFAULT_BATCH_WINDOW_MS: u64 = 30_000;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = 1;
 const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
+const ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_EPOCHS";
+const PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS";
 const INDEXER_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_INDEXER_ALLOWED_ORIGINS";
 
 #[derive(Clone)]
@@ -119,8 +121,9 @@ async fn main() -> Result<(), String> {
             CONTROL_PLANE_TOKEN_ENV,
         )?)),
         batch_window_ms: load_u64_env("ZYLITH_BATCH_WINDOW_MS", DEFAULT_BATCH_WINDOW_MS, 1_000),
-        public_artifact_delay_epochs: load_u64_env(
-            "ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS",
+        public_artifact_delay_epochs: load_u64_alias_env(
+            ARTIFACT_DELAY_EPOCHS_ENV,
+            PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
             DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
             0,
         ),
@@ -331,6 +334,22 @@ fn load_u64_env(name: &str, default_value: u64, minimum_value: u64) -> u64 {
         .unwrap_or(default_value)
 }
 
+fn load_u64_alias_env(
+    primary: &str,
+    fallback: &str,
+    default_value: u64,
+    minimum_value: u64,
+) -> u64 {
+    if env::var(primary)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+    {
+        return load_u64_env(primary, default_value, minimum_value);
+    }
+    load_u64_env(fallback, default_value, minimum_value)
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -432,6 +451,7 @@ fn published_batch_artifact_summary(
         pair_id: published.transcript.pair_id.clone(),
         batch_epoch: published.transcript.batch_epoch,
         published_at_unix_ms: published.published_at_unix_ms,
+        settled_at_unix_ms: published.settled_at_unix_ms,
         transcript_commitment: published.settlement_witness.transcript_commitment.clone(),
         output_bundle_ref: published.transcript.output_ciphertext_bundle_ref.clone(),
         output_note_root: roots.output_note_root,
@@ -476,6 +496,9 @@ fn is_public_artifact_visible(
     delay_epochs: u64,
     batch_window_ms: u64,
 ) -> bool {
+    if published.settled_at_unix_ms.is_none() {
+        return false;
+    }
     if delay_epochs == 0 {
         return true;
     }
@@ -784,8 +807,17 @@ async fn list_internal_root_history_by_epoch_range(
             published.transcript.batch_epoch >= start_epoch
                 && published.transcript.batch_epoch <= end_epoch
         })
-        .map(root_history_batch)
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(|published| match root_history_batch(published) {
+            Ok(batch) => Some(batch),
+            Err(status) => {
+                eprintln!(
+                    "skipping invalid root-history artifact batch_id={} status={status}",
+                    published.transcript.batch_id.0
+                );
+                None
+            }
+        })
+        .collect::<Vec<_>>();
     batches.sort_by(|left, right| {
         left.batch_epoch
             .cmp(&right.batch_epoch)
@@ -1538,6 +1570,23 @@ mod tests {
             public_artifact_delay_epochs: 1,
             artifact_epoch_bucket_size: 8,
         });
+
+        for batch_id in ["batch-strk-usdc-10", "batch-strk-eth-10"] {
+            let settled_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/internal/batches/{batch_id}/settled-at"))
+                        .method(Method::POST)
+                        .header("authorization", format!("Bearer {TEST_INTERNAL_TOKEN}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"settled_at_unix_ms":1778661520000}"#))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(settled_response.status(), StatusCode::OK);
+        }
 
         let exact_response = app
             .clone()
