@@ -5691,7 +5691,10 @@ fn build_settlement_artifacts(
                 .map_err(|_| StatusCode::CONFLICT)?,
             ),
         };
-        let fee_bps = u128::from(pair.fee_bps_for_order_type(&fill.order.order_type));
+        let fee_bps = u128::from(
+            pair.fee_bps_for_order(&fill.order)
+                .map_err(|_| StatusCode::CONFLICT)?,
+        );
         let fee_amount = gross_amount
             .checked_mul(fee_bps)
             .ok_or(StatusCode::CONFLICT)?

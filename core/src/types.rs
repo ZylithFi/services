@@ -22,7 +22,12 @@ pub const OUTPUT_NOTE_CIPHERTEXT_LEN: usize = OUTPUT_NOTE_PLAINTEXT_PADDED_LEN +
 pub const OUTPUT_RECOVERY_FIELD_COUNT: usize = 21;
 pub const OUTPUT_RECOVERY_PROOF_SLOTS: usize = 4;
 pub const MAX_ORDER_FUNDING_INPUTS: usize = 4;
+pub const MIN_MAKER_CURVE_POINTS: usize = 3;
 pub const MAX_MAKER_CURVE_POINTS: usize = 8;
+pub const MAKER_CURVE_MIN_SPREAD_BPS_STABLE_CONVERSION: u128 = 5;
+pub const MAKER_CURVE_MIN_SPREAD_BPS_CONVERSION: u128 = 10;
+pub const MAKER_CURVE_MIN_SPREAD_BPS_SPECULATIVE: u128 = 20;
+const BPS_DENOMINATOR: u128 = 10_000;
 const OUTPUT_RECOVERY_BUNDLE_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f62756e646c655f7631";
 const OUTPUT_RECOVERY_RECORD_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f7265635f7631";
 const FUNDING_INPUT_SET_DOMAIN_HEX: &str = "0x7a796c6974685f66756e64696e675f7365745f7631";
@@ -222,10 +227,10 @@ impl HiddenMakerCurve {
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.points.is_empty() {
-            return Err(ProtocolError::InvalidOrder(
-                "maker curve must contain at least one point".into(),
-            ));
+        if self.points.len() < MIN_MAKER_CURVE_POINTS {
+            return Err(ProtocolError::InvalidOrder(format!(
+                "maker curve must contain at least {MIN_MAKER_CURVE_POINTS} points"
+            )));
         }
         if self.points.len() > MAX_MAKER_CURVE_POINTS {
             return Err(ProtocolError::InvalidOrder(format!(
@@ -685,6 +690,11 @@ impl OrderIntent {
             ));
         }
         Ok(())
+    }
+
+    pub fn is_renewal_backed_child(&self) -> Result<bool, ProtocolError> {
+        self.validate_parent_link()?;
+        Ok(felt_from_hex_str(&self.parent_order_commitment)? != field_from_u64(0))
     }
 }
 
@@ -2509,12 +2519,13 @@ impl ProductPairConfig {
         }
     }
 
-    pub fn fee_bps_for_order_type(&self, order_type: &OrderType) -> u16 {
-        match order_type {
+    pub fn fee_bps_for_order(&self, order: &OrderIntent) -> Result<u16, ProtocolError> {
+        Ok(match order.order_type {
             OrderType::HeartbeatCover => 0,
-            OrderType::MakerCurve => self.maker_fee_bps,
+            OrderType::MakerCurve if order.is_renewal_backed_child()? => self.maker_fee_bps,
+            OrderType::MakerCurve => self.taker_fee_bps,
             OrderType::LimitBatch => self.taker_fee_bps,
-        }
+        })
     }
 }
 
@@ -2540,6 +2551,63 @@ pub fn default_pair_fee_bps(pair_id: &PairId) -> (u16, u16) {
 
 pub fn is_conversion_pair(pair_id: &PairId) -> bool {
     matches!(pair_id.0.as_str(), "WBTC/strkBTC" | "USDC/USDT")
+}
+
+pub fn maker_curve_min_spread_bps(pair_id: &PairId) -> u128 {
+    match pair_id.0.as_str() {
+        "USDC/USDT" => MAKER_CURVE_MIN_SPREAD_BPS_STABLE_CONVERSION,
+        _ if is_conversion_pair(pair_id) => MAKER_CURVE_MIN_SPREAD_BPS_CONVERSION,
+        _ => MAKER_CURVE_MIN_SPREAD_BPS_SPECULATIVE,
+    }
+}
+
+pub fn maker_curve_min_band_base_amount(pair_id: &PairId) -> u128 {
+    match pair_id.0.as_str() {
+        "ETH/USDC" => 1_000_000_000_000_000,
+        "strkBTC/USDC" | "WBTC/strkBTC" => 100_000,
+        "USDC/USDT" => 1_000_000,
+        "STRK/USDC" | "STRK/ETH" | "STRK/strkBTC" => 1_000_000_000_000_000_000,
+        _ => 1,
+    }
+}
+
+fn validate_maker_curve_pair_shape(
+    pair_id: &PairId,
+    curve: &HiddenMakerCurve,
+) -> Result<(), ProtocolError> {
+    let min_band_amount = maker_curve_min_band_base_amount(pair_id);
+    for point in &curve.points {
+        if point.base_amount < min_band_amount {
+            return Err(ProtocolError::InvalidOrder(format!(
+                "maker curve band depth {} is below pair minimum {}",
+                point.base_amount, min_band_amount
+            )));
+        }
+    }
+
+    let first_price = curve
+        .points
+        .first()
+        .map(|point| point.price)
+        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve missing first price".into()))?;
+    let last_price = curve
+        .points
+        .last()
+        .map(|point| point.price)
+        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve missing last price".into()))?;
+    let min_spread_bps = maker_curve_min_spread_bps(pair_id);
+    let actual = last_price
+        .checked_mul(BPS_DENOMINATOR)
+        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve spread overflows u128".into()))?;
+    let required = first_price
+        .checked_mul(BPS_DENOMINATOR + min_spread_bps)
+        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve spread overflows u128".into()))?;
+    if actual < required {
+        return Err(ProtocolError::InvalidOrder(format!(
+            "maker curve outer bands must span at least {min_spread_bps} bps"
+        )));
+    }
+    Ok(())
 }
 
 fn default_price_base_scale() -> u128 {
@@ -2753,6 +2821,8 @@ impl ProductConfig {
             .enabled_pair(&order.pair_id)
             .ok_or_else(|| ProtocolError::UnsupportedPair(order.pair_id.0.clone()))?;
 
+        order.validate_parent_link()?;
+
         if order.amount == 0 {
             return Err(ProtocolError::InvalidOrder(
                 "order amount must be positive".into(),
@@ -2776,6 +2846,7 @@ impl ProductConfig {
             }
             (OrderType::MakerCurve, Some(curve)) => {
                 curve.validate()?;
+                validate_maker_curve_pair_shape(&order.pair_id, curve)?;
                 let curve_base_amount = curve.total_base_amount()?;
                 if order.amount != curve_base_amount {
                     return Err(ProtocolError::InvalidOrder(
@@ -3496,8 +3567,8 @@ mod tests {
     fn product_config_enforces_maker_curve_envelope_price() {
         let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
         let funding_note = Note {
-            asset_id: AssetId("USDC".into()),
-            amount: 2_000,
+            asset_id: AssetId("STRK".into()),
+            amount: 3_000_000_000_000_000_000,
             owner_public_key: "ab".repeat(32),
             spend_authority: "0x333".into(),
             withdraw_authority: "0x333".into(),
@@ -3508,23 +3579,27 @@ mod tests {
         let mut order = OrderIntent {
             pair_id: PairId("STRK/USDC".into()),
             batch_id: BatchId("batch-strk-usdc-42".into()),
-            side: OrderSide::Buy,
+            side: OrderSide::Sell,
             order_type: crate::OrderType::MakerCurve,
             maker_curve: Some(HiddenMakerCurve {
                 points: vec![
                     MakerCurvePoint {
-                        price: 10,
-                        base_amount: 50,
+                        price: 1_000_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
                     },
                     MakerCurvePoint {
-                        price: 12,
-                        base_amount: 50,
+                        price: 1_001_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
+                    },
+                    MakerCurvePoint {
+                        price: 1_002_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
                     },
                 ],
             }),
-            limit_price: 11,
-            amount: 100,
-            min_fill: 50,
+            limit_price: 1_001_000_000_000_000_000,
+            amount: 3_000_000_000_000_000_000,
+            min_fill: 1_000_000_000_000_000_000,
             time_in_force: crate::TimeInForce::CurrentBatchOnly,
             expiry_epoch: 42,
             order_nonce: 9,
@@ -3547,12 +3622,186 @@ mod tests {
             .expect_err("mismatched maker curve envelope must fail");
         assert!(error.to_string().contains("curve envelope price"));
 
-        order.limit_price = 12;
+        order.limit_price = 1_000_000_000_000_000_000;
         assert!(
             product
                 .validate_order_funding(&order, &funding_note)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn product_config_enforces_maker_curve_band_count_depth_and_spread() {
+        let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
+        let funding_note = Note {
+            asset_id: AssetId("STRK".into()),
+            amount: 3_000_000_000_000_000_000,
+            owner_public_key: "ab".repeat(32),
+            spend_authority: "0x333".into(),
+            withdraw_authority: "0x333".into(),
+            blinding: "0x111".into(),
+            nonce: 7,
+            metadata_commitment: "0x222".into(),
+        };
+        let mut order = OrderIntent {
+            pair_id: PairId("STRK/USDC".into()),
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            side: OrderSide::Sell,
+            order_type: crate::OrderType::MakerCurve,
+            maker_curve: Some(HiddenMakerCurve {
+                points: vec![
+                    MakerCurvePoint {
+                        price: 1_000_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
+                    },
+                    MakerCurvePoint {
+                        price: 1_001_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
+                    },
+                ],
+            }),
+            limit_price: 1_000_000_000_000_000_000,
+            amount: 2_000_000_000_000_000_000,
+            min_fill: 1_000_000_000_000_000_000,
+            time_in_force: crate::TimeInForce::CurrentBatchOnly,
+            expiry_epoch: 42,
+            order_nonce: 9,
+            parent_order_commitment: "0x0".into(),
+            parent_child_index: 0,
+            parent_secret_commitment: "0x0".into(),
+            parent_cancel_authority: "0x0".into(),
+            parent_authorization_secret: "0x0".into(),
+            funding_note_ref: funding_note.commitment().expect("funding note commitment"),
+            funding_nullifier: test_note_nullifier(&funding_note),
+            recipient_owner_public_key: "ab".repeat(32),
+            recipient_spend_authority: "0x333".into(),
+            recipient_withdraw_authority: "0x444".into(),
+            recipient_residual_withdraw_authority: "0x445".into(),
+            auditor_view_allowed: false,
+        };
+
+        let error = product
+            .validate_order_funding(&order, &funding_note)
+            .expect_err("two-band maker curve must fail");
+        assert!(error.to_string().contains("at least 3"));
+
+        order.maker_curve = Some(HiddenMakerCurve {
+            points: vec![
+                MakerCurvePoint {
+                    price: 1_000_000_000_000_000_000,
+                    base_amount: 1_000_000_000_000_000_000,
+                },
+                MakerCurvePoint {
+                    price: 1_001_000_000_000_000_000,
+                    base_amount: 999_999_999_999_999_999,
+                },
+                MakerCurvePoint {
+                    price: 1_002_000_000_000_000_000,
+                    base_amount: 1_000_000_000_000_000_000,
+                },
+            ],
+        });
+        order.amount = 2_999_999_999_999_999_999;
+        let error = product
+            .validate_order_funding(&order, &funding_note)
+            .expect_err("sub-minimum maker band must fail");
+        assert!(error.to_string().contains("below pair minimum"));
+
+        order.maker_curve = Some(HiddenMakerCurve {
+            points: vec![
+                MakerCurvePoint {
+                    price: 1_000_000_000_000_000_000,
+                    base_amount: 1_000_000_000_000_000_000,
+                },
+                MakerCurvePoint {
+                    price: 1_001_000_000_000_000_000,
+                    base_amount: 1_000_000_000_000_000_000,
+                },
+                MakerCurvePoint {
+                    price: 1_001_999_999_999_999_999,
+                    base_amount: 1_000_000_000_000_000_000,
+                },
+            ],
+        });
+        order.amount = 3_000_000_000_000_000_000;
+        let error = product
+            .validate_order_funding(&order, &funding_note)
+            .expect_err("under-spread maker curve must fail");
+        assert!(error.to_string().contains("at least 20 bps"));
+    }
+
+    #[test]
+    fn maker_fee_requires_renewal_backed_child_order() {
+        let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
+        let pair = product
+            .enabled_pair(&PairId("STRK/USDC".into()))
+            .expect("pair");
+        let funding_note = Note {
+            asset_id: AssetId("STRK".into()),
+            amount: 3_000_000_000_000_000_000,
+            owner_public_key: "ab".repeat(32),
+            spend_authority: "0x333".into(),
+            withdraw_authority: "0x333".into(),
+            blinding: "0x111".into(),
+            nonce: 7,
+            metadata_commitment: "0x222".into(),
+        };
+        let mut order = OrderIntent {
+            pair_id: PairId("STRK/USDC".into()),
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            side: OrderSide::Sell,
+            order_type: crate::OrderType::MakerCurve,
+            maker_curve: Some(HiddenMakerCurve {
+                points: vec![
+                    MakerCurvePoint {
+                        price: 1_000_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
+                    },
+                    MakerCurvePoint {
+                        price: 1_001_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
+                    },
+                    MakerCurvePoint {
+                        price: 1_002_000_000_000_000_000,
+                        base_amount: 1_000_000_000_000_000_000,
+                    },
+                ],
+            }),
+            limit_price: 1_000_000_000_000_000_000,
+            amount: 3_000_000_000_000_000_000,
+            min_fill: 1_000_000_000_000_000_000,
+            time_in_force: crate::TimeInForce::CurrentBatchOnly,
+            expiry_epoch: 42,
+            order_nonce: 9,
+            parent_order_commitment: "0x0".into(),
+            parent_child_index: 0,
+            parent_secret_commitment: "0x0".into(),
+            parent_cancel_authority: "0x0".into(),
+            parent_authorization_secret: "0x0".into(),
+            funding_note_ref: funding_note.commitment().expect("funding note commitment"),
+            funding_nullifier: test_note_nullifier(&funding_note),
+            recipient_owner_public_key: "ab".repeat(32),
+            recipient_spend_authority: "0x333".into(),
+            recipient_withdraw_authority: "0x444".into(),
+            recipient_residual_withdraw_authority: "0x445".into(),
+            auditor_view_allowed: false,
+        };
+
+        assert_eq!(pair.fee_bps_for_order(&order).expect("fee bps"), 4);
+
+        order.parent_authorization_secret = "0x7777".into();
+        order.parent_secret_commitment =
+            renewal_parent_secret_commitment(&order.parent_authorization_secret)
+                .expect("parent secret commitment");
+        order.parent_cancel_authority = "0x8888".into();
+        order.parent_order_commitment = renewal_parent_commitment(
+            &order.parent_secret_commitment,
+            &order.parent_cancel_authority,
+        )
+        .expect("parent commitment");
+        order.parent_child_index = 1;
+
+        assert_eq!(pair.fee_bps_for_order(&order).expect("fee bps"), 0);
     }
 
     #[test]
