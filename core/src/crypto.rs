@@ -1892,7 +1892,7 @@ pub fn root_only_settlement_commitments(
         transcript.fees.iter().map(|fee| {
             Ok(vec![
                 encode_starknet_felt("asset-id", &fee.asset_id.0),
-                encode_starknet_felt("fee-recipient", &fee.recipient),
+                encode_fee_recipient(&fee.recipient),
                 encode_u128(fee.amount),
             ])
         }),
@@ -5546,6 +5546,11 @@ fn encode_asset_id(asset_id: &str) -> String {
 }
 
 fn encode_fee_recipient(recipient: &str) -> String {
+    if recipient.trim_start().starts_with("0x")
+        && let Ok(normalized) = normalize_felt_hex(recipient)
+    {
+        return normalized;
+    }
     encode_starknet_felt("fee-recipient", recipient)
 }
 
@@ -8505,6 +8510,20 @@ mod tests {
 
         assert_ne!(roots_a.output_note_root, "0x0");
         assert_ne!(roots_a.output_note_root, roots_b.output_note_root);
+    }
+
+    #[test]
+    fn starknet_fee_recipient_addresses_are_not_domain_hashed() {
+        let recipient = "0x07e53a0f246423910af93ce1dbb2c0ba4cc032b5fb6f0170e6a4a72704e915f6";
+
+        assert_eq!(
+            super::encode_fee_recipient(recipient),
+            super::normalize_felt_hex(recipient).expect("normalized recipient felt")
+        );
+        assert_ne!(
+            super::encode_fee_recipient(recipient),
+            super::encode_starknet_felt("fee-recipient", recipient)
+        );
     }
 
     #[test]

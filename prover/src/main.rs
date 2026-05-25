@@ -127,7 +127,8 @@ const AUCTION_PROVER_ALLOW_KEYGEN_ENV: &str = "ZYLITH_AUCTION_PROVER_ALLOW_KEYGE
 const DEFAULT_PRODUCT_PAIR_IDS: &str =
     "STRK/USDC,ETH/USDC,strkBTC/USDC,STRK/ETH,STRK/strkBTC,WBTC/strkBTC,USDC/USDT";
 const DEFAULT_PROTOCOL_FEE_RECIPIENT: &str = "zylith-protocol-treasury";
-const PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_TREASURY_RECIPIENT";
+const PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_FEE_RECIPIENT";
+const LEGACY_PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_TREASURY_RECIPIENT";
 const PROOF_JOBS_DIR: &str = "proof_jobs";
 const SETTLEMENT_PLANS_DIR: &str = "settlement_plans";
 const SETTLEMENT_WITNESSES_DIR: &str = "settlement_witnesses";
@@ -579,6 +580,20 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("prover service failed: {error}"))
 }
 
+fn protocol_fee_recipient_from_values(canonical: Option<String>, legacy: Option<String>) -> String {
+    canonical
+        .or(legacy)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_PROTOCOL_FEE_RECIPIENT.into())
+}
+
+fn protocol_fee_recipient_from_env() -> String {
+    protocol_fee_recipient_from_values(
+        env::var(PROTOCOL_FEE_RECIPIENT_ENV).ok(),
+        env::var(LEGACY_PROTOCOL_FEE_RECIPIENT_ENV).ok(),
+    )
+}
+
 fn build_app() -> Result<Router, String> {
     let deployment_manifest = load_deployment_manifest();
     let coordinator_url =
@@ -708,10 +723,7 @@ fn build_app() -> Result<Router, String> {
             MAX_MAKER_CURVE_QUOTE_NOTIONAL_ENV,
             0_u128,
         ),
-        protocol_fee_recipient: env::var(PROTOCOL_FEE_RECIPIENT_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_PROTOCOL_FEE_RECIPIENT.into()),
+        protocol_fee_recipient: protocol_fee_recipient_from_env(),
         settlement_submission_jitter_ms: env_parse_or_default(
             SETTLEMENT_SUBMISSION_JITTER_MS_ENV,
             DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS,
@@ -7741,9 +7753,9 @@ mod tests {
         native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
-        redact_native_execution_request, redact_native_prover_request,
-        resolve_batch_registrar_private_key, same_starknet_address, storage_key,
-        validate_batch_nullifier_freshness,
+        protocol_fee_recipient_from_values, redact_native_execution_request,
+        redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
+        storage_key, validate_batch_nullifier_freshness,
     };
     use zylith_core::{
         AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, MatchedOrder, Note,
@@ -7763,6 +7775,29 @@ mod tests {
             "batch_2f_strk_20_usdc_3a_1"
         );
         assert_eq!(storage_key("batch-strk-usdc-1"), "batch-strk-usdc-1");
+    }
+
+    #[test]
+    fn protocol_fee_recipient_prefers_canonical_env_value() {
+        assert_eq!(
+            protocol_fee_recipient_from_values(
+                Some("0xabc".into()),
+                Some("legacy-recipient".into())
+            ),
+            "0xabc"
+        );
+    }
+
+    #[test]
+    fn protocol_fee_recipient_keeps_legacy_env_fallback() {
+        assert_eq!(
+            protocol_fee_recipient_from_values(None, Some("legacy-recipient".into())),
+            "legacy-recipient"
+        );
+        assert_eq!(
+            protocol_fee_recipient_from_values(Some("   ".into()), None),
+            DEFAULT_PROTOCOL_FEE_RECIPIENT
+        );
     }
 
     #[test]
