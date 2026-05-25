@@ -2741,7 +2741,7 @@ impl ProductConfig {
         order: &OrderIntent,
         funding_note: &Note,
     ) -> Result<(), ProtocolError> {
-        self.validate_order_funding_notes(order, &[funding_note.clone()])
+        self.validate_order_funding_notes(order, std::slice::from_ref(funding_note))
     }
 
     pub fn validate_order_funding_notes(

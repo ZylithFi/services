@@ -4155,40 +4155,40 @@ async fn execute_native_transaction_prover(
         .map_err(|error| {
             format!("failed to serialize settlement witness for native proof: {error}")
         })?;
-    let settlement_statement = execute_native_statement_prover(
+    let settlement_statement = execute_native_statement_prover(NativeStatementProverRequest {
         state,
-        &tx_prover_url,
-        &executor,
+        tx_prover_url: &tx_prover_url,
+        executor: &executor,
         batch_id,
-        batch_id,
-        &state.native_proof_entrypoint,
-        &serialized_native_witness,
-        &[expected_settlement_proof_message_hash],
-    )
+        stage_key: batch_id,
+        entrypoint: &state.native_proof_entrypoint,
+        serialized_native_witness: &serialized_native_witness,
+        expected_message_hashes: &[expected_settlement_proof_message_hash],
+    })
     .await?;
     let nullifier_stage_key = format!("{batch_id}-nullifier");
-    let nullifier_statement = execute_native_statement_prover(
+    let nullifier_statement = execute_native_statement_prover(NativeStatementProverRequest {
         state,
-        &tx_prover_url,
-        &executor,
+        tx_prover_url: &tx_prover_url,
+        executor: &executor,
         batch_id,
-        &nullifier_stage_key,
-        "compile_nullifier_proof",
-        &serialized_native_witness,
-        &[expected_nullifier_proof_message_hash],
-    )
+        stage_key: &nullifier_stage_key,
+        entrypoint: "compile_nullifier_proof",
+        serialized_native_witness: &serialized_native_witness,
+        expected_message_hashes: &[expected_nullifier_proof_message_hash],
+    })
     .await?;
     let renewal_stage_key = format!("{batch_id}-renewal");
-    let renewal_statement = execute_native_statement_prover(
+    let renewal_statement = execute_native_statement_prover(NativeStatementProverRequest {
         state,
-        &tx_prover_url,
-        &executor,
+        tx_prover_url: &tx_prover_url,
+        executor: &executor,
         batch_id,
-        &renewal_stage_key,
-        "compile_renewal_proof",
-        &serialized_native_witness,
-        &[expected_renewal_proof_message_hash],
-    )
+        stage_key: &renewal_stage_key,
+        entrypoint: "compile_renewal_proof",
+        serialized_native_witness: &serialized_native_witness,
+        expected_message_hashes: &[expected_renewal_proof_message_hash],
+    })
     .await?;
 
     let artifact_id = artifact_id_for(batch_id, &transcript_commitment);
@@ -4219,16 +4219,30 @@ async fn execute_native_transaction_prover(
     })
 }
 
+struct NativeStatementProverRequest<'a> {
+    state: &'a AppState,
+    tx_prover_url: &'a str,
+    executor: &'a StarknetExecutorConfig,
+    batch_id: &'a str,
+    stage_key: &'a str,
+    entrypoint: &'a str,
+    serialized_native_witness: &'a [String],
+    expected_message_hashes: &'a [String],
+}
+
 async fn execute_native_statement_prover(
-    state: &AppState,
-    tx_prover_url: &str,
-    executor: &StarknetExecutorConfig,
-    batch_id: &str,
-    stage_key: &str,
-    entrypoint: &str,
-    serialized_native_witness: &[String],
-    expected_message_hashes: &[String],
+    request: NativeStatementProverRequest<'_>,
 ) -> Result<NativeStatementProofArtifact, String> {
+    let NativeStatementProverRequest {
+        state,
+        tx_prover_url,
+        executor,
+        batch_id,
+        stage_key,
+        entrypoint,
+        serialized_native_witness,
+        expected_message_hashes,
+    } = request;
     delete_execution_outputs_if_exist(state.data_dir.as_ref(), stage_key)
         .map_err(status_to_error)?;
     let paths = proof_execution_paths(state.data_dir.as_ref(), stage_key);
@@ -5259,12 +5273,14 @@ fn try_deposit_membership_candidate(
     Ok(None)
 }
 
+type MerklePathProof = (Vec<String>, Vec<String>);
+
 fn settlement_output_membership_proof(
     note_commitment: &str,
     batch_root: &str,
     prior_settlement_witnesses: &[SettlementWitness],
     prior_note_consolidation_witnesses: &[NoteConsolidationWitness],
-) -> Result<Option<(Vec<String>, Vec<String>)>, StatusCode> {
+) -> Result<Option<MerklePathProof>, StatusCode> {
     let note_commitment =
         normalize_felt_hex(note_commitment).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let batch_root =

@@ -2067,33 +2067,38 @@ pub fn note_consolidation_commitment(
     witness: &NoteConsolidationWitness,
 ) -> Result<String, ProtocolError> {
     let roots = note_consolidation_root_fields(witness)?;
-    note_consolidation_commitment_from_roots(
-        &witness.consolidation_id,
-        &witness.output_ciphertext_bundle_ref,
-        &witness.prior_note_root,
-        &witness.prior_nullifier_root,
-        &roots.consumed_note_root,
-        &roots.consumed_nullifier_root,
-        &roots.output_note_root,
-        &roots.new_note_root,
-        &roots.new_nullifier_root,
-    )
+    note_consolidation_commitment_from_roots(NoteConsolidationCommitmentRoots {
+        consolidation_id: &witness.consolidation_id,
+        output_ciphertext_bundle_ref: &witness.output_ciphertext_bundle_ref,
+        prior_note_root: &witness.prior_note_root,
+        prior_nullifier_root: &witness.prior_nullifier_root,
+        consumed_note_root: &roots.consumed_note_root,
+        consumed_nullifier_root: &roots.consumed_nullifier_root,
+        output_note_root: &roots.output_note_root,
+        new_note_root: &roots.new_note_root,
+        new_nullifier_root: &roots.new_nullifier_root,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NoteConsolidationCommitmentRoots<'a> {
+    pub consolidation_id: &'a BatchId,
+    pub output_ciphertext_bundle_ref: &'a str,
+    pub prior_note_root: &'a str,
+    pub prior_nullifier_root: &'a str,
+    pub consumed_note_root: &'a str,
+    pub consumed_nullifier_root: &'a str,
+    pub output_note_root: &'a str,
+    pub new_note_root: &'a str,
+    pub new_nullifier_root: &'a str,
 }
 
 pub fn note_consolidation_commitment_from_roots(
-    consolidation_id: &BatchId,
-    output_ciphertext_bundle_ref: &str,
-    prior_note_root: &str,
-    prior_nullifier_root: &str,
-    consumed_note_root: &str,
-    consumed_nullifier_root: &str,
-    output_note_root: &str,
-    new_note_root: &str,
-    new_nullifier_root: &str,
+    roots: NoteConsolidationCommitmentRoots<'_>,
 ) -> Result<String, ProtocolError> {
     let consolidation_id = felt_from_hex_str(&normalize_felt_hex(&encode_starknet_felt(
         "note-consolidation-id",
-        &consolidation_id.0,
+        &roots.consolidation_id.0,
     ))?)?;
     let mut state = poseidon_hash(
         felt_from_hex_str(PUBLIC_NOTE_CONSOLIDATION_DOMAIN_HEX)?,
@@ -2101,16 +2106,18 @@ pub fn note_consolidation_commitment_from_roots(
     );
     state = poseidon_hash(
         state,
-        felt_from_hex_str(&encode_output_bundle_ref(output_ciphertext_bundle_ref)?)?,
+        felt_from_hex_str(&encode_output_bundle_ref(
+            roots.output_ciphertext_bundle_ref,
+        )?)?,
     );
     for root in [
-        prior_note_root,
-        prior_nullifier_root,
-        consumed_note_root,
-        consumed_nullifier_root,
-        output_note_root,
-        new_note_root,
-        new_nullifier_root,
+        roots.prior_note_root,
+        roots.prior_nullifier_root,
+        roots.consumed_note_root,
+        roots.consumed_nullifier_root,
+        roots.output_note_root,
+        roots.new_note_root,
+        roots.new_nullifier_root,
     ] {
         state = poseidon_hash(state, felt_from_hex_str(&normalize_felt_hex(root)?)?);
     }

@@ -10,9 +10,10 @@ pub use auth::{
     extract_bearer_token, format_bearer_token,
 };
 pub use crypto::{
-    HeartbeatCoverOrder, SettlementOutputWithdrawalMessage, SettlementOutputWithdrawalPlanRequest,
-    admission_proof_message_hash_for_program, admission_proof_message_hash_from_statement,
-    auction_admission_root, auction_result_proof_message_hash_for_program,
+    HeartbeatCoverOrder, NoteConsolidationCommitmentRoots, SettlementOutputWithdrawalMessage,
+    SettlementOutputWithdrawalPlanRequest, admission_proof_message_hash_for_program,
+    admission_proof_message_hash_from_statement, auction_admission_root,
+    auction_result_proof_message_hash_for_program,
     auction_result_proof_message_hash_from_statement, build_admission_serialized_input,
     build_auction_result_serialized_input, build_deposit_note, build_deposit_submission_plan,
     build_heartbeat_cover_orders, build_note_consolidation_serialized_input,
