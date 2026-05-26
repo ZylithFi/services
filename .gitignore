@@ -4,6 +4,8 @@
 /client/node_modules
 /client/dist
 /client/*.tsbuildinfo
+/client/scripts/browser-qa.mjs
+/client/test-artifacts/
 /client/vite.config.js
 /client/vite.config.d.ts
 /client/starknet-9.4.2.tgz

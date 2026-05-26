@@ -23,15 +23,20 @@ checkCsv("ZYLITH_COORDINATOR_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_PROVER_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_INDEXER_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_ORIGINS");
+checkCsv("ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS");
 
 checkPositiveInt("ZYLITH_COORDINATOR_MAX_BODY_BYTES", 1, 1_000_000);
 checkPositiveInt("ZYLITH_PROVER_MAX_BODY_BYTES", 1, 1_000_000);
 checkPositiveInt("ZYLITH_PAYMASTER_MAX_BODY_BYTES", 1, 1_000_000);
+checkPositiveInt("ZYLITH_RENEWAL_RELAY_MAX_BODY_BYTES", 1, 128_000_000);
 checkPositiveInt("ZYLITH_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE", 1, 600);
 checkPositiveInt("ZYLITH_PROVER_PRIVATE_INGRESS_RATE_LIMIT_PER_MINUTE", 1, 600);
 checkPositiveInt("ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE", 1, 120);
+checkPositiveInt("ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE", 1, 600);
 checkPositiveInt("ZYLITH_PROVER_MAX_STORED_PRIVATE_PAYLOADS", 1, 250_000);
 checkPositiveInt("ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS", 60_000, 86_400_000);
+checkPositiveInt("ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS", 86_400_000, 31_536_000_000);
+checkPositiveInt("ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS", 86_400, 100_000);
 checkPositiveInt("ZYLITH_COORDINATOR_MAX_ORDERS_PER_BATCH", 1, 10_000);
 checkExactInt("ZYLITH_BATCH_WINDOW_MS", 90_000);
 checkPositiveInt("ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS", 1, 100);
@@ -71,6 +76,14 @@ checkCsv("ZYLITH_PAYMASTER_ALLOWED_CONTRACTS");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS");
 checkCsv("ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS");
 checkCsv("ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS");
+
+checkRequired("ZYLITH_RENEWAL_RELAY_STRICT");
+expectValue("ZYLITH_RENEWAL_RELAY_STRICT", "true", "renewal relay strict mode must be enabled in production");
+checkRequired("ZYLITH_RENEWAL_RELAY_STORE_PATH");
+checkSecret("ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN", 32);
+checkSecret("ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN", 32);
+checkRequired("ZYLITH_RENEWAL_RELAY_COORDINATOR_URL");
+checkRequired("ZYLITH_RENEWAL_RELAY_PROVER_URL");
 
 checkRecommended("ZYLITH_ALERT_WEBHOOK_URL", "monitoring alerts have no destination");
 checkRecommended("ZYLITH_MONITORING_ENV", "monitoring environment label is unset");
@@ -205,6 +218,10 @@ function checkDistinctRoles(names) {
 
 function expectNot(name, forbidden, message) {
   if (value(name)?.toLowerCase() === forbidden) failures.push(`${name}: ${message}`);
+}
+
+function expectValue(name, expected, message) {
+  if (value(name)?.toLowerCase() !== expected) failures.push(`${name}: ${message}`);
 }
 
 function value(name) {
