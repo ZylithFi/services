@@ -41,12 +41,13 @@ use crate::{
         tagged_sha256_bytes, tagged_sha256_hex,
     },
     types::{
-        MAX_ORDER_FUNDING_INPUTS, NOTE_RECOGNITION_ALGORITHM, OUTPUT_NOTE_PLAINTEXT_PADDED_LEN,
-        OUTPUT_RECOVERY_FIELD_COUNT, OUTPUT_RECOVERY_PROOF_SLOTS, RENEWAL_PARENT_CANCEL_DOMAIN_HEX,
-        funding_input_set_commitment, funding_nullifier_set_commitment, nullifier_from_note_secret,
-        output_recovery_bundle_root, output_recovery_record_commitment, renewal_child_nullifier,
-        renewal_parent_cancel_marker, spend_auth_key_felt_from_raw_key_hex,
-        spend_authority_from_raw_key_hex, withdraw_authority_from_raw_key_hex,
+        MAX_ORDER_FUNDING_INPUTS, MakerBandAttribution, NOTE_RECOGNITION_ALGORITHM,
+        OUTPUT_NOTE_PLAINTEXT_PADDED_LEN, OUTPUT_RECOVERY_FIELD_COUNT, OUTPUT_RECOVERY_PROOF_SLOTS,
+        RENEWAL_PARENT_CANCEL_DOMAIN_HEX, funding_input_set_commitment,
+        funding_nullifier_set_commitment, nullifier_from_note_secret, output_recovery_bundle_root,
+        output_recovery_record_commitment, renewal_child_nullifier, renewal_parent_cancel_marker,
+        spend_auth_key_felt_from_raw_key_hex, spend_authority_from_raw_key_hex,
+        withdraw_authority_from_raw_key_hex,
     },
 };
 
@@ -825,6 +826,30 @@ pub fn build_output_note(
     amount: u128,
     withdraw_authority: &str,
 ) -> Result<Note, ProtocolError> {
+    build_output_note_with_attribution(
+        batch_id,
+        output_index,
+        order_commitment,
+        order,
+        asset_id,
+        amount,
+        withdraw_authority,
+        None,
+    )
+}
+
+/// Mirrors `build_output_note` and adds only the proof-bound maker attribution commitment.
+#[allow(clippy::too_many_arguments)]
+pub fn build_output_note_with_attribution(
+    batch_id: &str,
+    output_index: usize,
+    order_commitment: &OrderCommitment,
+    order: &OrderIntent,
+    asset_id: AssetId,
+    amount: u128,
+    withdraw_authority: &str,
+    maker_attribution: Option<&MakerBandAttribution>,
+) -> Result<Note, ProtocolError> {
     let withdraw_authority = normalize_felt_hex(withdraw_authority)?;
     let blinding = tagged_field_hex(
         "zylith/output-blinding",
@@ -834,6 +859,10 @@ pub fn build_output_note(
             "output_index": output_index,
         }),
     )?;
+    let attribution_commitment = match maker_attribution {
+        Some(attribution) => maker_band_attribution_commitment(attribution)?,
+        None => "0x0".into(),
+    };
     let metadata_commitment = output_note_metadata_commitment(
         batch_id,
         order_commitment,
@@ -841,6 +870,7 @@ pub fn build_output_note(
         &order.pair_id,
         &order.recipient_spend_authority,
         &withdraw_authority,
+        &attribution_commitment,
     )?;
 
     Ok(Note {
@@ -862,18 +892,54 @@ pub fn output_note_metadata_commitment(
     pair_id: &PairId,
     recipient_spend_authority: &str,
     withdraw_authority: &str,
+    attribution_commitment: &str,
 ) -> Result<String, ProtocolError> {
-    tagged_field_hex(
-        "zylith/output-metadata",
-        &serde_json::json!({
-            "batch_id": batch_id,
-            "order_commitment": order_commitment.0,
-            "funding_note_ref": funding_note_ref.0,
-            "pair_id": pair_id.0,
-            "recipient_spend_authority": recipient_spend_authority,
-            "withdraw_authority": withdraw_authority,
-        }),
+    poseidon_chain_hex_from_hexes(
+        &domain_felt_hex("zylith/output-metadata-v2"),
+        &[
+            &encode_starknet_felt("batch-id", batch_id),
+            &normalize_felt_hex(&order_commitment.0)?,
+            &normalize_felt_hex(&funding_note_ref.0)?,
+            &encode_starknet_felt("pair-id", &pair_id.0),
+            &normalize_felt_hex(recipient_spend_authority)?,
+            &normalize_felt_hex(withdraw_authority)?,
+            &normalize_felt_hex(attribution_commitment)?,
+        ],
     )
+}
+
+pub fn maker_band_attribution_commitment(
+    attribution: &MakerBandAttribution,
+) -> Result<String, ProtocolError> {
+    if attribution.version != 1 {
+        return Err(ProtocolError::Crypto(
+            "unsupported maker band attribution version".into(),
+        ));
+    }
+    if attribution.bands.is_empty() {
+        return Err(ProtocolError::Crypto(
+            "maker band attribution must include at least one band".into(),
+        ));
+    }
+    let mut fields = Vec::with_capacity(7 + attribution.bands.len() * 4);
+    fields.push(normalize_felt_hex(&attribution.order_commitment.0)?);
+    fields.push(normalize_felt_hex(&attribution.funding_note_ref.0)?);
+    fields.push(encode_starknet_felt("pair-id", &attribution.pair_id.0));
+    fields.push(match attribution.side {
+        OrderSide::Buy => "0x0".into(),
+        OrderSide::Sell => "0x1".into(),
+    });
+    fields.push(encode_u128(attribution.clearing_price));
+    fields.push(encode_u128(attribution.filled_base_amount));
+    fields.push(encode_u64(attribution.bands.len() as u64));
+    for band in &attribution.bands {
+        fields.push(encode_u64(band.band_index));
+        fields.push(encode_u128(band.band_price));
+        fields.push(encode_u128(band.band_base_amount));
+        fields.push(encode_u128(band.filled_base_amount));
+    }
+    let refs = fields.iter().map(String::as_str).collect::<Vec<_>>();
+    poseidon_chain_hex_from_hexes(&domain_felt_hex("zylith/maker-band-attribution-v1"), &refs)
 }
 
 pub fn derive_order_cancellation_secret(
@@ -1270,6 +1336,26 @@ pub fn encrypt_output_note_for_owner(
     output_proof: &OutputNoteMerkleProof,
     recipient_owner_public_key: &str,
 ) -> Result<EncryptedBlob, ProtocolError> {
+    encrypt_output_note_for_owner_with_attribution(
+        batch_id,
+        output_index,
+        note,
+        output_note,
+        output_proof,
+        recipient_owner_public_key,
+        None,
+    )
+}
+
+pub fn encrypt_output_note_for_owner_with_attribution(
+    batch_id: &str,
+    output_index: usize,
+    note: &Note,
+    output_note: &OutputNoteRecord,
+    output_proof: &OutputNoteMerkleProof,
+    recipient_owner_public_key: &str,
+    maker_attribution: Option<MakerBandAttribution>,
+) -> Result<EncryptedBlob, ProtocolError> {
     let recipient_public_key = parse_note_recognition_public_key(recipient_owner_public_key)?;
     let ephemeral_secret = SecretKey::random(&mut OsRng);
     let ephemeral_public_key = hex::encode(
@@ -1309,6 +1395,7 @@ pub fn encrypt_output_note_for_owner(
         note: note.clone(),
         output_note: output_note.clone(),
         output_proof: output_proof.clone(),
+        maker_attribution,
     })?;
     let ciphertext = cipher
         .encrypt(
@@ -1401,8 +1488,33 @@ pub fn decrypt_output_note_for_owner(
     {
         return Ok(None);
     }
+    validate_output_note_payload_attribution(&payload)?;
 
     Ok(Some(payload))
+}
+
+fn validate_output_note_payload_attribution(
+    payload: &OwnedOutputNotePayload,
+) -> Result<(), ProtocolError> {
+    let Some(attribution) = payload.maker_attribution.as_ref() else {
+        return Ok(());
+    };
+    let attribution_commitment = maker_band_attribution_commitment(attribution)?;
+    let expected_metadata = output_note_metadata_commitment(
+        &payload.batch_id.0,
+        &attribution.order_commitment,
+        &attribution.funding_note_ref,
+        &attribution.pair_id,
+        &payload.note.spend_authority,
+        &payload.note.withdraw_authority,
+        &attribution_commitment,
+    )?;
+    if normalize_felt_hex(&payload.note.metadata_commitment)? != expected_metadata {
+        return Err(ProtocolError::Crypto(
+            "maker band attribution does not match output note metadata".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn encrypt_output_recovery_record(
@@ -1605,6 +1717,7 @@ fn output_recovery_payload_from_plaintext(
         note,
         output_note,
         output_proof,
+        maker_attribution: None,
     }))
 }
 
@@ -3658,6 +3771,83 @@ pub fn build_stwo_serialized_input(
             })
         })
         .collect::<Vec<_>>();
+    let maker_band_attribution_counts = witness
+        .matched_order_witnesses
+        .iter()
+        .map(|entry| {
+            encode_u64(
+                entry
+                    .maker_band_attribution
+                    .as_ref()
+                    .map(|attribution| attribution.bands.len())
+                    .unwrap_or(0) as u64,
+            )
+        })
+        .collect::<Vec<_>>();
+    let maker_band_attribution_indexes = witness
+        .matched_order_witnesses
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .maker_band_attribution
+                .as_ref()
+                .into_iter()
+                .flat_map(|attribution| {
+                    attribution
+                        .bands
+                        .iter()
+                        .map(|band| encode_u64(band.band_index))
+                })
+        })
+        .collect::<Vec<_>>();
+    let maker_band_attribution_prices = witness
+        .matched_order_witnesses
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .maker_band_attribution
+                .as_ref()
+                .into_iter()
+                .flat_map(|attribution| {
+                    attribution
+                        .bands
+                        .iter()
+                        .map(|band| encode_u128(band.band_price))
+                })
+        })
+        .collect::<Vec<_>>();
+    let maker_band_attribution_base_amounts = witness
+        .matched_order_witnesses
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .maker_band_attribution
+                .as_ref()
+                .into_iter()
+                .flat_map(|attribution| {
+                    attribution
+                        .bands
+                        .iter()
+                        .map(|band| encode_u128(band.band_base_amount))
+                })
+        })
+        .collect::<Vec<_>>();
+    let maker_band_attribution_filled_amounts = witness
+        .matched_order_witnesses
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .maker_band_attribution
+                .as_ref()
+                .into_iter()
+                .flat_map(|attribution| {
+                    attribution
+                        .bands
+                        .iter()
+                        .map(|band| encode_u128(band.filled_base_amount))
+                })
+        })
+        .collect::<Vec<_>>();
     let mut matched_funding_input_counts =
         Vec::with_capacity(witness.matched_order_witnesses.len());
     let mut matched_funding_note_commitments = Vec::new();
@@ -3708,6 +3898,8 @@ pub fn build_stwo_serialized_input(
         domain_felt_hex("zylith/nullifier"),
         domain_felt_hex("zylith/order"),
         domain_felt_hex("zylith/maker-curve"),
+        domain_felt_hex("zylith/output-metadata-v2"),
+        domain_felt_hex("zylith/maker-band-attribution-v1"),
         PUBLIC_SETTLEMENT_DOMAIN_HEX.into(),
         encode_starknet_felt("batch-id", &witness.batch_id.0),
         encode_starknet_felt("pair-id", &witness.pair_id.0),
@@ -3784,6 +3976,11 @@ pub fn build_stwo_serialized_input(
     push_span(&mut payload, &maker_curve_point_counts);
     push_span(&mut payload, &maker_curve_prices);
     push_span(&mut payload, &maker_curve_base_amounts);
+    push_span(&mut payload, &maker_band_attribution_counts);
+    push_span(&mut payload, &maker_band_attribution_indexes);
+    push_span(&mut payload, &maker_band_attribution_prices);
+    push_span(&mut payload, &maker_band_attribution_base_amounts);
+    push_span(&mut payload, &maker_band_attribution_filled_amounts);
     push_span(
         &mut payload,
         &witness
@@ -6003,13 +6200,15 @@ mod tests {
         auction_admission_root, build_admission_serialized_input,
         build_auction_result_serialized_input, build_deposit_note, build_deposit_submission_plan,
         build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
-        build_order_submission, build_output_note, build_renewal_parent_cancel_submission_plan,
+        build_order_submission, build_output_note, build_output_note_with_attribution,
+        build_renewal_parent_cancel_submission_plan,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
         build_settlement_witness, build_stwo_serialized_input, build_withdrawal_submission_plan,
         create_order_ingress_receipt, create_recovery_artifact, decrypt_note_for_owner,
-        decrypt_order_bundle, decrypt_order_share, decrypt_output_recovery_record,
-        decrypt_recovery_artifact_payload, derive_account_id, derive_order_cancellation_secret,
-        derive_order_cancellation_tag, derive_user_keys, encrypt_note_for_owner,
+        decrypt_order_bundle, decrypt_order_share, decrypt_output_note_for_owner,
+        decrypt_output_recovery_record, decrypt_recovery_artifact_payload, derive_account_id,
+        derive_order_cancellation_secret, derive_order_cancellation_tag, derive_user_keys,
+        encrypt_note_for_owner, encrypt_output_note_for_owner_with_attribution,
         encrypt_output_recovery_record, native_note_consolidation_message_hash,
         note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
         output_note_merkle_proof, output_note_merkle_root,
@@ -6024,7 +6223,10 @@ mod tests {
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
         withdrawal_message_hash,
     };
-    use crate::types::{output_bundle_bucket_size, output_recovery_bundle_root};
+    use crate::types::{
+        HiddenMakerCurve, MakerBandAttribution, MakerBandFillAttribution, MakerCurvePoint,
+        OutputNoteMerkleProof, output_bundle_bucket_size, output_recovery_bundle_root,
+    };
     use crate::{AuctionPrivacyGateWitness, RelayMode, RenewalParentCancelPlanRequest};
 
     fn with_deposit_prior_note_root(mut transcript: SettlementTranscript) -> SettlementTranscript {
@@ -6178,6 +6380,7 @@ mod tests {
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
                 maker_curve: None,
+                maker_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -6471,6 +6674,7 @@ mod tests {
             &order.pair_id,
             &order.recipient_spend_authority,
             &order.recipient_withdraw_authority,
+            "0x0",
         )
         .expect("metadata commitment");
         assert_eq!(note.metadata_commitment, expected_metadata);
@@ -6500,6 +6704,106 @@ mod tests {
                 .expect("public key id decrypt")
                 .is_none(),
             "public envelope key_id must not be sufficient to decrypt output notes"
+        );
+    }
+
+    #[test]
+    fn output_note_roundtrip_recovers_encrypted_maker_band_attribution() {
+        let seed = RecoverySeed([7_u8; 32]);
+        let keys = derive_user_keys(&seed);
+        let note_recognition_key = hex::encode(keys.note_recognition_key);
+        let owner_public_key = note_recognition_public_key_from_raw_key_hex(&note_recognition_key)
+            .expect("owner public key");
+        let payload = sample_private_order();
+        let mut order = payload.order;
+        order.order_type = crate::OrderType::MakerCurve;
+        order.maker_curve = Some(HiddenMakerCurve {
+            points: vec![
+                MakerCurvePoint {
+                    price: 410,
+                    base_amount: 750,
+                },
+                MakerCurvePoint {
+                    price: 420,
+                    base_amount: 250,
+                },
+                MakerCurvePoint {
+                    price: 430,
+                    base_amount: 250,
+                },
+            ],
+        });
+        order.recipient_owner_public_key = owner_public_key.clone();
+        let order_commitment = order.commitment().expect("commitment");
+        let attribution = MakerBandAttribution {
+            version: 1,
+            pair_id: order.pair_id.clone(),
+            order_commitment: order_commitment.clone(),
+            funding_note_ref: order.funding_note_ref.clone(),
+            side: order.side.clone(),
+            clearing_price: 400,
+            filled_base_amount: 500,
+            bands: vec![MakerBandFillAttribution {
+                band_index: 0,
+                band_price: 410,
+                band_base_amount: 750,
+                filled_base_amount: 500,
+            }],
+        };
+        let note = build_output_note_with_attribution(
+            "batch-attribution",
+            0,
+            &order_commitment,
+            &order,
+            AssetId("STRK".into()),
+            500,
+            &order.recipient_withdraw_authority,
+            Some(&attribution),
+        )
+        .expect("output note");
+        let output_note = OutputNoteRecord {
+            note_commitment: note.commitment().expect("note commitment"),
+            asset_id: note.asset_id.clone(),
+            amount: note.amount,
+            withdraw_authority: note.withdraw_authority.clone(),
+        };
+        let proof = OutputNoteMerkleProof {
+            merkle_path: vec![],
+            merkle_directions: vec![],
+        };
+        let blob = encrypt_output_note_for_owner_with_attribution(
+            "batch-attribution",
+            0,
+            &note,
+            &output_note,
+            &proof,
+            &order.recipient_owner_public_key,
+            Some(attribution.clone()),
+        )
+        .expect("encrypted output note");
+        let decrypted = decrypt_output_note_for_owner(&note_recognition_key, &blob)
+            .expect("decrypt")
+            .expect("matching owner");
+
+        assert_eq!(decrypted.note, note);
+        assert_eq!(decrypted.output_note, output_note);
+        assert_eq!(decrypted.maker_attribution, Some(attribution));
+
+        let mut wrong_attribution = decrypted.maker_attribution.clone().expect("attribution");
+        wrong_attribution.bands[0].filled_base_amount = 499;
+        let wrong_blob = encrypt_output_note_for_owner_with_attribution(
+            "batch-attribution",
+            0,
+            &note,
+            &decrypted.output_note,
+            &decrypted.output_proof,
+            &order.recipient_owner_public_key,
+            Some(wrong_attribution),
+        )
+        .expect("wrong encrypted output note");
+        assert!(
+            decrypt_output_note_for_owner(&note_recognition_key, &wrong_blob).is_err(),
+            "decrypted maker attribution must match the proof-bound note metadata"
         );
     }
 
@@ -7039,6 +7343,7 @@ mod tests {
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
                 maker_curve: None,
+                maker_band_attribution: None,
                 limit_price: 180,
                 order_amount: 700,
                 min_fill: 100,
@@ -7144,6 +7449,7 @@ mod tests {
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
                 maker_curve: None,
+                maker_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -7170,8 +7476,8 @@ mod tests {
 
         assert_eq!(serialized[0], format!("0x{:x}", serialized.len() - 1));
         assert_eq!(serialized[1], "0x1");
-        assert_eq!(serialized[16], "0x141");
-        assert_eq!(serialized[17], "0x1");
+        assert_eq!(serialized[18], "0x141");
+        assert_eq!(serialized[19], "0x1");
         assert!(!serialized.is_empty());
     }
 
@@ -7277,6 +7583,7 @@ mod tests {
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
                 maker_curve: None,
+                maker_band_attribution: None,
                 limit_price: 145,
                 order_amount: 1000,
                 min_fill: 1000,
@@ -7301,7 +7608,7 @@ mod tests {
         .expect("multi-input witness");
 
         let serialized = build_stwo_serialized_input(&witness).expect("serialized input");
-        let mut index = 1 + 36;
+        let mut index = 1 + 38;
         let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
         let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_sides = read_serialized_span(&serialized, &mut index);
@@ -7311,6 +7618,13 @@ mod tests {
         let _matched_maker_curve_point_counts = read_serialized_span(&serialized, &mut index);
         let _matched_maker_curve_prices = read_serialized_span(&serialized, &mut index);
         let _matched_maker_curve_base_amounts = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_band_attribution_counts = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_band_attribution_indexes = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_band_attribution_prices = read_serialized_span(&serialized, &mut index);
+        let _matched_maker_band_attribution_base_amounts =
+            read_serialized_span(&serialized, &mut index);
+        let _matched_maker_band_attribution_filled_amounts =
+            read_serialized_span(&serialized, &mut index);
         let _matched_limit_prices = read_serialized_span(&serialized, &mut index);
         let _matched_order_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_min_fills = read_serialized_span(&serialized, &mut index);
@@ -7483,6 +7797,7 @@ mod tests {
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
                 maker_curve: None,
+                maker_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -7897,6 +8212,7 @@ mod tests {
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
                 maker_curve: None,
+                maker_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -7926,7 +8242,7 @@ mod tests {
         let owner_key = encode_starknet_felt("owner-public-key", &owner_public_key);
 
         let mut index = 1;
-        index += 36;
+        index += 38;
 
         let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
         let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
@@ -7937,6 +8253,13 @@ mod tests {
         let matched_maker_curve_point_counts = read_serialized_span(&serialized, &mut index);
         let matched_maker_curve_prices = read_serialized_span(&serialized, &mut index);
         let matched_maker_curve_base_amounts = read_serialized_span(&serialized, &mut index);
+        let matched_maker_band_attribution_counts = read_serialized_span(&serialized, &mut index);
+        let matched_maker_band_attribution_indexes = read_serialized_span(&serialized, &mut index);
+        let matched_maker_band_attribution_prices = read_serialized_span(&serialized, &mut index);
+        let matched_maker_band_attribution_base_amounts =
+            read_serialized_span(&serialized, &mut index);
+        let matched_maker_band_attribution_filled_amounts =
+            read_serialized_span(&serialized, &mut index);
         let _matched_limit_prices = read_serialized_span(&serialized, &mut index);
         let _matched_order_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_min_fills = read_serialized_span(&serialized, &mut index);
@@ -8027,14 +8350,22 @@ mod tests {
         let _output_note_amounts = read_serialized_span(&serialized, &mut index);
         let _output_note_withdraw_authorities = read_serialized_span(&serialized, &mut index);
 
-        assert_eq!(serialized[14], base_asset);
-        assert_eq!(serialized[15], quote_asset);
+        assert_eq!(serialized[16], base_asset);
+        assert_eq!(serialized[17], quote_asset);
         assert_eq!(matched_order_types, vec!["0x0".to_string()]);
         assert_eq!(matched_relay_modes, vec!["0x0".to_string()]);
         assert_eq!(matched_maker_curve_commitments, vec!["0x0".to_string()]);
         assert_eq!(matched_maker_curve_point_counts, vec!["0x0".to_string()]);
         assert!(matched_maker_curve_prices.is_empty());
         assert!(matched_maker_curve_base_amounts.is_empty());
+        assert_eq!(
+            matched_maker_band_attribution_counts,
+            vec!["0x0".to_string()]
+        );
+        assert!(matched_maker_band_attribution_indexes.is_empty());
+        assert!(matched_maker_band_attribution_prices.is_empty());
+        assert!(matched_maker_band_attribution_base_amounts.is_empty());
+        assert!(matched_maker_band_attribution_filled_amounts.is_empty());
         assert_eq!(matched_time_in_force, vec!["0x0".to_string()]);
         assert_eq!(matched_expiry_epochs, vec!["0x16".to_string()]);
         assert_eq!(matched_order_nonces, vec!["0x21".to_string()]);
@@ -8181,6 +8512,7 @@ mod tests {
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
                 maker_curve: private_order.order.maker_curve.clone(),
+                maker_band_attribution: None,
                 limit_price: private_order.order.limit_price,
                 order_amount: private_order.order.amount,
                 min_fill: private_order.order.min_fill,
@@ -8417,6 +8749,7 @@ mod tests {
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
                 maker_curve: private_order.order.maker_curve.clone(),
+                maker_band_attribution: None,
                 limit_price: private_order.order.limit_price,
                 order_amount: private_order.order.amount,
                 min_fill: private_order.order.min_fill,
@@ -8546,10 +8879,10 @@ mod tests {
         index += 1;
         let settlement_payload = read_serialized_span(&serialized, &mut index);
         assert_eq!(settlement_payload[0], "0x1");
-        assert_eq!(settlement_payload[15], "0x0");
-        assert_eq!(settlement_payload[16], "0x1");
-        assert_eq!(settlement_payload[19], "0x0");
-        assert_eq!(settlement_payload[22], "0x0");
+        assert_eq!(settlement_payload[17], "0x0");
+        assert_eq!(settlement_payload[18], "0x1");
+        assert_eq!(settlement_payload[21], "0x0");
+        assert_eq!(settlement_payload[24], "0x0");
 
         let mut admission_vector_count = 0;
         while index < serialized.len() {
@@ -8694,6 +9027,7 @@ mod tests {
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
                 maker_curve: private_order.order.maker_curve.clone(),
+                maker_band_attribution: None,
                 limit_price: private_order.order.limit_price,
                 order_amount: private_order.order.amount,
                 min_fill: private_order.order.min_fill,

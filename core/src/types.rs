@@ -207,6 +207,31 @@ pub struct MakerCurvePoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerBandFillAttribution {
+    pub band_index: u64,
+    #[serde(with = "serde_u128_decimal")]
+    pub band_price: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub band_base_amount: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub filled_base_amount: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerBandAttribution {
+    pub version: u32,
+    pub pair_id: PairId,
+    pub order_commitment: OrderCommitment,
+    pub funding_note_ref: NoteCommitment,
+    pub side: OrderSide,
+    #[serde(with = "serde_u128_decimal")]
+    pub clearing_price: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub filled_base_amount: u128,
+    pub bands: Vec<MakerBandFillAttribution>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HiddenMakerCurve {
     pub points: Vec<MakerCurvePoint>,
 }
@@ -1004,6 +1029,8 @@ pub struct MatchedOrderWitness {
     pub relay_mode: RelayMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maker_curve: Option<HiddenMakerCurve>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_band_attribution: Option<MakerBandAttribution>,
     #[serde(with = "serde_u128_decimal")]
     pub limit_price: u128,
     #[serde(with = "serde_u128_decimal")]
@@ -1109,6 +1136,8 @@ pub struct OwnedOutputNotePayload {
     pub note: Note,
     pub output_note: OutputNoteRecord,
     pub output_proof: OutputNoteMerkleProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_attribution: Option<MakerBandAttribution>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

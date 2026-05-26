@@ -46,21 +46,21 @@ use zylith_core::hash::{encode_starknet_felt, normalize_felt_hex, ordered_felt_l
 use zylith_core::{
     AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchOrderSet, BatchSummary,
     CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord, DepositRecordList,
-    FeeEntry, MatchedOrder, MatchedOrderWitness, Note, NoteConsolidationWitness,
-    NoteMembershipKind, NoteMembershipWitness, OnchainSubmissionRecord, OrderCommitment,
-    OrderExecutionReport, OrderIngressReceipt, OrderIntent, OrderShareBundle, OrderSide,
-    OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord,
-    PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
-    PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig, ProofArtifactRecord,
-    ProofJobStatus, PublishedBatchArtifacts, SettlementRootHistoryArchive,
-    SettlementSubmissionPlan, SettlementTimestampUpdate, SettlementTranscript, SettlementWitness,
-    StarknetCall, TimeInForce, TrustedOrderIngressRequest, TrustedOrderIngressResponse,
-    admission_proof_message_hash_for_program, auction_admission_root,
+    FeeEntry, MakerBandAttribution, MakerBandFillAttribution, MatchedOrder, MatchedOrderWitness,
+    Note, NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness,
+    OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport, OrderIngressReceipt,
+    OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle,
+    OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
+    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
+    ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublishedBatchArtifacts,
+    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTimestampUpdate,
+    SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
+    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
     build_admission_serialized_input, build_auction_result_serialized_input,
-    build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
-    create_order_ingress_receipt, decrypt_order_bundle,
-    deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
+    build_heartbeat_cover_orders, build_output_note, build_output_note_with_attribution,
+    build_settlement_submission_plan, create_order_ingress_receipt, decrypt_order_bundle,
+    deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner_with_attribution,
     extract_bearer_token, format_bearer_token, funding_input_set_commitment,
     funding_nullifier_set_commitment, native_settlement_message_hash, nullifier_from_note_secret,
     nullifier_proof_message_hash_for_program,
@@ -5092,6 +5092,7 @@ struct OutputNettingGroup {
     template: Note,
     amount: u128,
     old_commitments: Vec<String>,
+    maker_attribution: Option<MakerBandAttribution>,
 }
 
 struct OutputNettingResult {
@@ -5104,6 +5105,7 @@ struct OutputNettingResult {
 fn add_output_to_netting_group(
     groups: &mut BTreeMap<OutputNettingKey, OutputNettingGroup>,
     note: &Note,
+    maker_attribution: Option<&MakerBandAttribution>,
 ) -> Result<(), StatusCode> {
     let old_commitment = note
         .commitment()
@@ -5123,7 +5125,11 @@ fn add_output_to_netting_group(
         template: note.clone(),
         amount: 0,
         old_commitments: Vec::new(),
+        maker_attribution: maker_attribution.cloned(),
     });
+    if entry.maker_attribution != maker_attribution.cloned() {
+        return Err(StatusCode::CONFLICT);
+    }
     entry.amount = entry
         .amount
         .checked_add(note.amount)
@@ -5140,13 +5146,18 @@ fn apply_cross_order_output_netting(
 ) -> Result<OutputNettingResult, StatusCode> {
     let mut groups = BTreeMap::<OutputNettingKey, OutputNettingGroup>::new();
     for witness in matched_order_witnesses.iter() {
-        add_output_to_netting_group(&mut groups, &witness.output_note)?;
+        add_output_to_netting_group(
+            &mut groups,
+            &witness.output_note,
+            witness.maker_band_attribution.as_ref(),
+        )?;
         if let Some(residual_note) = witness.residual_note.as_ref() {
-            add_output_to_netting_group(&mut groups, residual_note)?;
+            add_output_to_netting_group(&mut groups, residual_note, None)?;
         }
     }
 
     let mut replacements = BTreeMap::<String, Note>::new();
+    let mut attribution_by_commitment = BTreeMap::<String, Option<MakerBandAttribution>>::new();
     let mut netted_records = Vec::with_capacity(groups.len());
     let mut netted_notes = Vec::with_capacity(groups.len());
     for (_key, group) in groups.into_iter() {
@@ -5160,6 +5171,7 @@ fn apply_cross_order_output_netting(
         for old_commitment in group.old_commitments {
             replacements.insert(old_commitment, note.clone());
         }
+        attribution_by_commitment.insert(note_commitment.0.clone(), group.maker_attribution);
         netted_notes.push(note.clone());
         netted_records.push(OutputNoteRecord {
             note_commitment,
@@ -5224,13 +5236,17 @@ fn apply_cross_order_output_netting(
         let output_proof = output_note_merkle_proof(output_notes, &output_note.note_commitment)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         ciphertexts.push(
-            encrypt_output_note_for_owner(
+            encrypt_output_note_for_owner_with_attribution(
                 batch_id,
                 output_index,
                 note,
                 output_note,
                 &output_proof,
                 &note.owner_public_key,
+                attribution_by_commitment
+                    .get(&output_note.note_commitment.0)
+                    .cloned()
+                    .flatten(),
             )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         );
@@ -5761,7 +5777,9 @@ fn build_settlement_artifacts(
 
         let note_asset_id = asset_id.clone();
         let output_index = output_notes.len();
-        let note = build_output_note(
+        let maker_band_attribution = maker_band_attribution_for_fill(fill, clearing_price)
+            .map_err(|_| StatusCode::CONFLICT)?;
+        let note = build_output_note_with_attribution(
             batch_id,
             output_index,
             &fill.order_commitment,
@@ -5769,6 +5787,7 @@ fn build_settlement_artifacts(
             note_asset_id.clone(),
             net_amount,
             &fill.order.recipient_withdraw_authority,
+            maker_band_attribution.as_ref(),
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let note_commitment = note
@@ -5849,6 +5868,7 @@ fn build_settlement_artifacts(
             order_type: fill.order.order_type.clone(),
             relay_mode: fill.order.relay_mode.clone(),
             maker_curve: fill.order.maker_curve.clone(),
+            maker_band_attribution,
             limit_price: fill.order.limit_price,
             order_amount: fill.order.amount,
             min_fill: fill.order.min_fill,
@@ -6174,6 +6194,58 @@ fn residual_for_fill(
                 .ok_or(StatusCode::CONFLICT)?,
         )),
     }
+}
+
+fn maker_band_attribution_for_fill(
+    fill: &OrderFillPlan,
+    clearing_price: u128,
+) -> Result<Option<MakerBandAttribution>, String> {
+    if !matches!(fill.order.order_type, OrderType::MakerCurve) {
+        return Ok(None);
+    }
+    let curve = fill
+        .order
+        .maker_curve
+        .as_ref()
+        .ok_or_else(|| "maker curve order missing curve points".to_string())?;
+    let mut remaining = fill.filled_amount;
+    let mut bands = Vec::new();
+    for (index, point) in curve.points.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+        let eligible = match fill.order.side {
+            OrderSide::Buy => point.price >= clearing_price,
+            OrderSide::Sell => point.price <= clearing_price,
+        };
+        if !eligible {
+            continue;
+        }
+        let consumed = remaining.min(point.base_amount);
+        if consumed == 0 {
+            continue;
+        }
+        bands.push(MakerBandFillAttribution {
+            band_index: index as u64,
+            band_price: point.price,
+            band_base_amount: point.base_amount,
+            filled_base_amount: consumed,
+        });
+        remaining = remaining.saturating_sub(consumed);
+    }
+    if remaining != 0 || bands.is_empty() {
+        return Err("maker curve fill exceeds eligible attributed bands".into());
+    }
+    Ok(Some(MakerBandAttribution {
+        version: 1,
+        pair_id: fill.order.pair_id.clone(),
+        order_commitment: fill.order_commitment.clone(),
+        funding_note_ref: fill.order.funding_note_ref.clone(),
+        side: fill.order.side.clone(),
+        clearing_price,
+        filled_base_amount: fill.filled_amount,
+        bands,
+    }))
 }
 
 fn funding_note_total(notes: &[Note]) -> Option<u128> {
@@ -8658,6 +8730,20 @@ mod tests {
         assert_eq!(
             artifacts.settlement_witness.matched_order_witnesses[1].relay_mode,
             RelayMode::ZylithRelay
+        );
+        let attribution = artifacts.settlement_witness.matched_order_witnesses[1]
+            .maker_band_attribution
+            .as_ref()
+            .expect("maker band attribution");
+        assert_eq!(attribution.clearing_price, 100);
+        assert_eq!(attribution.filled_base_amount, 2 * base_unit);
+        assert_eq!(
+            attribution
+                .bands
+                .iter()
+                .map(|band| (band.band_index, band.filled_base_amount))
+                .collect::<Vec<_>>(),
+            vec![(0, base_unit), (1, base_unit)]
         );
         assert_eq!(artifacts.transcript.fees.len(), 2);
         assert_eq!(artifacts.transcript.fees[0].asset_id.0, "STRK");
