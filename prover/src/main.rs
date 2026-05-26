@@ -46,21 +46,22 @@ use zylith_core::hash::{encode_starknet_felt, normalize_felt_hex, ordered_felt_l
 use zylith_core::{
     AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchOrderSet, BatchSummary,
     CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord, DepositRecordList,
-    FeeEntry, MakerBandAttribution, MakerBandFillAttribution, MatchedOrder, MatchedOrderWitness,
-    Note, NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness,
-    OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport, OrderIngressReceipt,
-    OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle,
-    OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
-    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
-    ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublishedBatchArtifacts,
-    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTimestampUpdate,
-    SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
-    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
+    FeeEntry, MakerAttributionBundle, MakerAttributionPlaintext, MakerBandAttribution,
+    MakerBandFillAttribution, MatchedOrder, MatchedOrderWitness, Note, NoteConsolidationWitness,
+    NoteMembershipKind, NoteMembershipWitness, OnchainSubmissionRecord, OrderCommitment,
+    OrderExecutionReport, OrderIngressReceipt, OrderIntent, OrderShareBundle, OrderSide,
+    OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord,
+    PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
+    PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig, ProofArtifactRecord,
+    ProofJobStatus, PublishedBatchArtifacts, SettlementRootHistoryArchive,
+    SettlementSubmissionPlan, SettlementTimestampUpdate, SettlementTranscript, SettlementWitness,
+    StarknetCall, TimeInForce, TrustedOrderIngressRequest, TrustedOrderIngressResponse,
+    admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
     build_admission_serialized_input, build_auction_result_serialized_input,
-    build_heartbeat_cover_orders, build_output_note, build_output_note_with_attribution,
-    build_settlement_submission_plan, create_order_ingress_receipt, decrypt_order_bundle,
-    deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner_with_attribution,
+    build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
+    create_maker_attribution_artifact, create_order_ingress_receipt, decrypt_order_bundle,
+    deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
     extract_bearer_token, format_bearer_token, funding_input_set_commitment,
     funding_nullifier_set_commitment, native_settlement_message_hash, nullifier_from_note_secret,
     nullifier_proof_message_hash_for_program,
@@ -147,6 +148,7 @@ const ORDER_INGRESS_RECEIPT_SECRET_ENV: &str = "ZYLITH_TRUSTED_INGRESS_RECEIPT_S
 const ORDER_INGRESS_RECEIPT_PREVIOUS_SECRETS_ENV: &str =
     "ZYLITH_TRUSTED_INGRESS_RECEIPT_PREVIOUS_SECRETS";
 const ORDER_INGRESS_ID_ENV: &str = "ZYLITH_TRUSTED_PROVER_INGRESS_ID";
+const ATTRIBUTION_SIGNING_PRIVATE_KEY_ENV: &str = "ZYLITH_ATTRIBUTION_SIGNING_PRIVATE_KEY";
 const HEARTBEAT_COVER_SECRET_ENV: &str = "ZYLITH_HEARTBEAT_COVER_SECRET";
 const HEARTBEAT_COVER_PRICES_ENV: &str = "ZYLITH_HEARTBEAT_COVER_PRICES";
 const MIN_BATCH_BASE_LIQUIDITY_ENV: &str = "ZYLITH_MIN_BATCH_BASE_LIQUIDITY";
@@ -210,6 +212,7 @@ struct AppState {
     order_ingress_id: String,
     order_ingress_receipt_secret: Option<Arc<String>>,
     order_ingress_receipt_secrets: Arc<Vec<String>>,
+    attribution_signing_private_key: Arc<String>,
     heartbeat_cover_secret: Arc<String>,
     min_batch_base_liquidity: u128,
     min_batch_participants: u64,
@@ -303,6 +306,7 @@ struct AppConfig {
     order_ingress_id: String,
     order_ingress_receipt_secret: Option<String>,
     order_ingress_receipt_secrets: Vec<String>,
+    attribution_signing_private_key: String,
     heartbeat_cover_secret: String,
     min_batch_base_liquidity: u128,
     min_batch_participants: u64,
@@ -362,6 +366,7 @@ struct ProofExecutionPaths {
 struct SettlementArtifacts {
     transcript: SettlementTranscript,
     output_bundle: OutputCiphertextBundle,
+    maker_attribution_bundle: Option<MakerAttributionBundle>,
     settlement_witness: SettlementWitness,
     order_execution_reports: Vec<OrderExecutionReport>,
 }
@@ -674,6 +679,8 @@ fn build_app() -> Result<Router, String> {
         .filter(|value| !value.is_empty());
     let order_ingress_receipt_secrets =
         load_receipt_secret_keyring(order_ingress_receipt_secret.as_ref());
+    let attribution_signing_private_key =
+        load_attribution_signing_private_key(order_ingress_receipt_secret.as_ref())?;
     let heartbeat_cover_secret =
         load_required_control_plane_token("zylith-prover", HEARTBEAT_COVER_SECRET_ENV)?;
     let product_config = load_product_config(deployment_manifest.as_ref())?;
@@ -716,6 +723,7 @@ fn build_app() -> Result<Router, String> {
         order_ingress_id,
         order_ingress_receipt_secret,
         order_ingress_receipt_secrets,
+        attribution_signing_private_key,
         heartbeat_cover_secret,
         min_batch_base_liquidity: env_parse_or_default(MIN_BATCH_BASE_LIQUIDITY_ENV, 0_u128),
         min_batch_participants: env_parse_or_default(MIN_BATCH_PARTICIPANTS_ENV, 0_u64),
@@ -821,6 +829,34 @@ fn load_receipt_secret_keyring(current_secret: Option<&String>) -> Vec<String> {
     keyring
 }
 
+fn load_attribution_signing_private_key(
+    current_receipt_secret: Option<&String>,
+) -> Result<String, String> {
+    if let Ok(value) = env::var(ATTRIBUTION_SIGNING_PRIVATE_KEY_ENV) {
+        let value = value.trim().to_owned();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    if let Ok(value) = env::var("ZYLITH_STARKNET_PRIVATE_KEY") {
+        let value = value.trim().to_owned();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    if let Some(secret) = current_receipt_secret
+        && !secret.trim().is_empty()
+    {
+        return Ok(encode_starknet_felt(
+            "maker-attribution-signing-key",
+            secret.trim(),
+        ));
+    }
+    Err(format!(
+        "zylith-prover requires {ATTRIBUTION_SIGNING_PRIVATE_KEY_ENV}, ZYLITH_STARKNET_PRIVATE_KEY, or {ORDER_INGRESS_RECEIPT_SECRET_ENV} for maker attribution receipts"
+    ))
+}
+
 fn load_required_control_plane_token(service_name: &str, env_name: &str) -> Result<String, String> {
     env::var(env_name)
         .map(|value| value.trim().to_owned())
@@ -919,6 +955,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         order_ingress_id,
         order_ingress_receipt_secret,
         order_ingress_receipt_secrets,
+        attribution_signing_private_key,
         heartbeat_cover_secret,
         min_batch_base_liquidity,
         min_batch_participants,
@@ -1024,6 +1061,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         order_ingress_id,
         order_ingress_receipt_secret: order_ingress_receipt_secret.map(Arc::new),
         order_ingress_receipt_secrets: Arc::new(order_ingress_receipt_secrets),
+        attribution_signing_private_key: Arc::new(attribution_signing_private_key),
         heartbeat_cover_secret: Arc::new(heartbeat_cover_secret),
         min_batch_base_liquidity,
         min_batch_participants,
@@ -2865,6 +2903,7 @@ async fn prepare_private_auction_batch_inner(
             privacy_gate: Default::default(),
             protocol_fee_recipient: &state.protocol_fee_recipient,
             relay_fee_recipient: &state.relay_fee_recipient,
+            attribution_signing_private_key: &state.attribution_signing_private_key,
         },
     )?;
     eprintln!(
@@ -2973,6 +3012,7 @@ async fn prepare_private_auction_batch_inner(
                 privacy_gate: privacy_gate_witness.clone(),
                 protocol_fee_recipient: &state.protocol_fee_recipient,
                 relay_fee_recipient: &state.relay_fee_recipient,
+                attribution_signing_private_key: &state.attribution_signing_private_key,
             },
         )?
     } else if !artifacts.transcript.matched_orders.is_empty() {
@@ -3648,6 +3688,7 @@ async fn publish_batch_artifacts_to_coordinator(
     let payload = PublishedBatchArtifacts {
         transcript: artifacts.transcript.clone(),
         output_bundle: artifacts.output_bundle.clone(),
+        maker_attribution_bundle: artifacts.maker_attribution_bundle.clone(),
         settlement_witness: artifacts.settlement_witness.clone(),
         published_at_unix_ms: now_unix_ms(),
         settled_at_unix_ms: None,
@@ -5092,7 +5133,6 @@ struct OutputNettingGroup {
     template: Note,
     amount: u128,
     old_commitments: Vec<String>,
-    maker_attribution: Option<MakerBandAttribution>,
 }
 
 struct OutputNettingResult {
@@ -5105,7 +5145,6 @@ struct OutputNettingResult {
 fn add_output_to_netting_group(
     groups: &mut BTreeMap<OutputNettingKey, OutputNettingGroup>,
     note: &Note,
-    maker_attribution: Option<&MakerBandAttribution>,
 ) -> Result<(), StatusCode> {
     let old_commitment = note
         .commitment()
@@ -5125,11 +5164,7 @@ fn add_output_to_netting_group(
         template: note.clone(),
         amount: 0,
         old_commitments: Vec::new(),
-        maker_attribution: maker_attribution.cloned(),
     });
-    if entry.maker_attribution != maker_attribution.cloned() {
-        return Err(StatusCode::CONFLICT);
-    }
     entry.amount = entry
         .amount
         .checked_add(note.amount)
@@ -5146,18 +5181,13 @@ fn apply_cross_order_output_netting(
 ) -> Result<OutputNettingResult, StatusCode> {
     let mut groups = BTreeMap::<OutputNettingKey, OutputNettingGroup>::new();
     for witness in matched_order_witnesses.iter() {
-        add_output_to_netting_group(
-            &mut groups,
-            &witness.output_note,
-            witness.maker_band_attribution.as_ref(),
-        )?;
+        add_output_to_netting_group(&mut groups, &witness.output_note)?;
         if let Some(residual_note) = witness.residual_note.as_ref() {
-            add_output_to_netting_group(&mut groups, residual_note, None)?;
+            add_output_to_netting_group(&mut groups, residual_note)?;
         }
     }
 
     let mut replacements = BTreeMap::<String, Note>::new();
-    let mut attribution_by_commitment = BTreeMap::<String, Option<MakerBandAttribution>>::new();
     let mut netted_records = Vec::with_capacity(groups.len());
     let mut netted_notes = Vec::with_capacity(groups.len());
     for (_key, group) in groups.into_iter() {
@@ -5171,7 +5201,6 @@ fn apply_cross_order_output_netting(
         for old_commitment in group.old_commitments {
             replacements.insert(old_commitment, note.clone());
         }
-        attribution_by_commitment.insert(note_commitment.0.clone(), group.maker_attribution);
         netted_notes.push(note.clone());
         netted_records.push(OutputNoteRecord {
             note_commitment,
@@ -5236,17 +5265,13 @@ fn apply_cross_order_output_netting(
         let output_proof = output_note_merkle_proof(output_notes, &output_note.note_commitment)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         ciphertexts.push(
-            encrypt_output_note_for_owner_with_attribution(
+            encrypt_output_note_for_owner(
                 batch_id,
                 output_index,
                 note,
                 output_note,
                 &output_proof,
                 &note.owner_public_key,
-                attribution_by_commitment
-                    .get(&output_note.note_commitment.0)
-                    .cloned()
-                    .flatten(),
             )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         );
@@ -5568,6 +5593,7 @@ struct SettlementBuildContext<'a> {
     privacy_gate: AuctionPrivacyGateWitness,
     protocol_fee_recipient: &'a str,
     relay_fee_recipient: &'a str,
+    attribution_signing_private_key: &'a str,
 }
 
 fn build_settlement_artifacts(
@@ -5587,6 +5613,7 @@ fn build_settlement_artifacts(
         privacy_gate,
         protocol_fee_recipient,
         relay_fee_recipient,
+        attribution_signing_private_key,
     } = context;
     eprintln!(
         "build_settlement_artifacts batch_id={} stage=validate_orders start records={}",
@@ -5779,7 +5806,7 @@ fn build_settlement_artifacts(
         let output_index = output_notes.len();
         let maker_band_attribution = maker_band_attribution_for_fill(fill, clearing_price)
             .map_err(|_| StatusCode::CONFLICT)?;
-        let note = build_output_note_with_attribution(
+        let note = build_output_note(
             batch_id,
             output_index,
             &fill.order_commitment,
@@ -5787,7 +5814,6 @@ fn build_settlement_artifacts(
             note_asset_id.clone(),
             net_amount,
             &fill.order.recipient_withdraw_authority,
-            maker_band_attribution.as_ref(),
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let note_commitment = note
@@ -5948,6 +5974,13 @@ fn build_settlement_artifacts(
         output_notes.len(),
         output_netting.recovery_records.len()
     );
+    let maker_attribution_bundle = build_maker_attribution_bundle(
+        batch_id,
+        &pair.pair_id,
+        batch.epoch_id,
+        &matched_order_witnesses,
+        attribution_signing_private_key,
+    )?;
     let renewal_child_uses = zylith_core::renewal_child_uses_from_matched_witnesses(
         &matched_order_witnesses,
     )
@@ -6164,6 +6197,7 @@ fn build_settlement_artifacts(
     Ok(SettlementArtifacts {
         transcript,
         output_bundle: output_netting.bundle,
+        maker_attribution_bundle,
         settlement_witness,
         order_execution_reports,
     })
@@ -6246,6 +6280,59 @@ fn maker_band_attribution_for_fill(
         filled_base_amount: fill.filled_amount,
         bands,
     }))
+}
+
+fn build_maker_attribution_bundle(
+    batch_id: &str,
+    pair_id: &PairId,
+    epoch_id: u64,
+    witnesses: &[MatchedOrderWitness],
+    attribution_signing_private_key: &str,
+) -> Result<Option<MakerAttributionBundle>, StatusCode> {
+    let mut artifacts = Vec::new();
+    for witness in witnesses {
+        let Some(attribution) = witness.maker_band_attribution.as_ref() else {
+            continue;
+        };
+        let curve = witness
+            .maker_curve
+            .as_ref()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        let output_note_commitment = witness
+            .output_note
+            .commitment()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let plaintext = MakerAttributionPlaintext {
+            version: 1,
+            batch_id: BatchId(batch_id.into()),
+            pair_id: pair_id.clone(),
+            epoch_id,
+            maker_public_key: witness.recipient_owner_public_key.clone(),
+            curve_commitment: curve
+                .commitment()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            output_note_commitment,
+            attribution: attribution.clone(),
+        };
+        artifacts.push(
+            create_maker_attribution_artifact(
+                &plaintext,
+                &witness.recipient_owner_public_key,
+                attribution_signing_private_key,
+                now_unix_ms(),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        );
+    }
+    if artifacts.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(MakerAttributionBundle {
+            version: 1,
+            batch_id: BatchId(batch_id.into()),
+            artifacts,
+        }))
+    }
 }
 
 fn funding_note_total(notes: &[Note]) -> Option<u128> {
@@ -8601,6 +8688,7 @@ mod tests {
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
                 relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                attribution_signing_private_key: "0x12345",
             },
         )
         .expect("no-cross artifacts");
@@ -8614,6 +8702,7 @@ mod tests {
         assert!(artifacts.transcript.consumed_inputs.is_empty());
         assert!(artifacts.transcript.output_notes.is_empty());
         assert!(artifacts.transcript.fees.is_empty());
+        assert!(artifacts.maker_attribution_bundle.is_none());
         assert_eq!(artifacts.output_bundle.padded_ciphertext_count, 4);
         assert_eq!(artifacts.output_bundle.ciphertext_count_bucket, "0-4");
     }
@@ -8720,6 +8809,7 @@ mod tests {
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
                 relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                attribution_signing_private_key: "0x12345",
             },
         )
         .expect("relay fee artifacts");
@@ -8745,6 +8835,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, base_unit), (1, base_unit)]
         );
+        let attribution_bundle = artifacts
+            .maker_attribution_bundle
+            .as_ref()
+            .expect("maker attribution bundle");
+        assert_eq!(attribution_bundle.artifacts.len(), 1);
+        let attribution_artifact = &attribution_bundle.artifacts[0];
+        assert_eq!(
+            attribution_artifact.order_commitment,
+            records[1].order_commitment
+        );
+        assert_eq!(
+            attribution_artifact.output_note_commitment,
+            artifacts.settlement_witness.matched_order_witnesses[1]
+                .output_note
+                .commitment()
+                .expect("output note commitment")
+        );
+        zylith_core::validate_maker_attribution_receipt(&attribution_artifact.receipt)
+            .expect("maker attribution receipt verifies");
         assert_eq!(artifacts.transcript.fees.len(), 2);
         assert_eq!(artifacts.transcript.fees[0].asset_id.0, "STRK");
         assert_eq!(
@@ -8864,6 +8973,7 @@ mod tests {
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
                 relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                attribution_signing_private_key: "0x12345",
             },
         )
         .expect("netted artifacts");
@@ -9413,6 +9523,7 @@ mod tests {
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
                 relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                attribution_signing_private_key: "0x12345",
             },
         );
 

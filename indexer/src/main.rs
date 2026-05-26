@@ -20,8 +20,8 @@ use zylith_core::{
     ARTIFACT_AGGREGATION_POLICY_VERSION, ArtifactAggregationPolicy, AssetId,
     CONTROL_PLANE_TOKEN_ENV, ClaimWindowPolicy, DeploymentManifest, DepositConfirmationList,
     DepositConfirmationRequest, DepositRecord, DepositRecordList, DepositSyncStatus,
-    MultiPairArtifactBundleList, MultiPairArtifactBundleSummary, NoteCommitment,
-    OutputCiphertextBundle, PublicSettlementTranscript, PublishedBatchArtifactList,
+    MakerAttributionArtifactList, MultiPairArtifactBundleList, MultiPairArtifactBundleSummary,
+    NoteCommitment, OutputCiphertextBundle, PublicSettlementTranscript, PublishedBatchArtifactList,
     PublishedBatchArtifactSummary, PublishedBatchArtifacts, RootOnlySettlementCommitments,
     SettlementRootHistoryArchive, SettlementRootHistoryBatch, SettlementTimestampUpdate,
     SettlementTranscript, WithdrawalAmountBucketPolicy, WithdrawalRecord, WithdrawalRecordList,
@@ -204,6 +204,14 @@ fn build_app_with_state(state: AppState) -> Router {
         .route(
             "/api/batches/{batch_id}/output-bundle",
             get(get_archived_output_bundle),
+        )
+        .route(
+            "/api/attribution/{batch_id}/{maker_public_key}",
+            get(get_archived_maker_attribution),
+        )
+        .route(
+            "/attribution/{batch_id}/{maker_public_key}",
+            get(get_archived_maker_attribution),
         )
         .route(
             "/api/internal/batches/{batch_id}/artifacts",
@@ -873,6 +881,43 @@ async fn get_archived_output_bundle(
     Ok(Json(published.output_bundle.clone()))
 }
 
+async fn get_archived_maker_attribution(
+    State(state): State<AppState>,
+    Path((batch_id, maker_public_key)): Path<(String, String)>,
+) -> Result<Json<MakerAttributionArtifactList>, StatusCode> {
+    let artifacts = state.published_batch_artifacts.read().await;
+    let published = artifacts.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    if !is_public_artifact_visible(
+        &artifacts,
+        published,
+        published.transcript.batch_epoch,
+        state.public_artifact_delay_epochs,
+        state.batch_window_ms,
+    ) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let matching = published
+        .maker_attribution_bundle
+        .as_ref()
+        .map(|bundle| {
+            bundle
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.maker_public_key == maker_public_key)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if matching.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(MakerAttributionArtifactList {
+        batch_id: zylith_core::BatchId(batch_id),
+        maker_public_key,
+        artifacts: matching,
+    }))
+}
+
 fn root_history_batch(
     published: &PublishedBatchArtifacts,
 ) -> Result<SettlementRootHistoryBatch, StatusCode> {
@@ -948,6 +993,15 @@ async fn publish_batch_artifacts(
 ) -> Result<Json<PublishedBatchArtifacts>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     if request.transcript.batch_id.0 != batch_id || request.output_bundle.batch_id.0 != batch_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Some(bundle) = request.maker_attribution_bundle.as_ref()
+        && (bundle.batch_id.0 != batch_id
+            || bundle
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.batch_id.0 != batch_id))
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     let expected_shape =
@@ -1310,6 +1364,7 @@ mod tests {
                 output_ciphertext_bundle_ref: output_bundle_ref.clone(),
             },
             output_bundle,
+            maker_attribution_bundle: None,
             settlement_witness: SettlementWitness {
                 batch_id: BatchId(batch_id.into()),
                 pair_id,

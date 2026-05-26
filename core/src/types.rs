@@ -232,6 +232,60 @@ pub struct MakerBandAttribution {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerAttributionPlaintext {
+    pub version: u32,
+    pub batch_id: BatchId,
+    pub pair_id: PairId,
+    pub epoch_id: u64,
+    pub maker_public_key: String,
+    pub curve_commitment: String,
+    pub output_note_commitment: NoteCommitment,
+    pub attribution: MakerBandAttribution,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerAttributionReceipt {
+    pub version: u32,
+    pub signer_public_key: String,
+    pub issued_at_unix_ms: u64,
+    pub payload_commitment: String,
+    pub signature_r: String,
+    pub signature_s: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedMakerAttributionArtifact {
+    pub version: u32,
+    pub batch_id: BatchId,
+    pub pair_id: PairId,
+    pub epoch_id: u64,
+    pub maker_public_key: String,
+    pub curve_commitment: String,
+    pub output_note_commitment: NoteCommitment,
+    pub order_commitment: OrderCommitment,
+    pub algorithm: String,
+    pub key_id: String,
+    pub ephemeral_public_key: String,
+    pub nonce: String,
+    pub ciphertext: String,
+    pub receipt: MakerAttributionReceipt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerAttributionBundle {
+    pub version: u32,
+    pub batch_id: BatchId,
+    pub artifacts: Vec<EncryptedMakerAttributionArtifact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerAttributionArtifactList {
+    pub batch_id: BatchId,
+    pub maker_public_key: String,
+    pub artifacts: Vec<EncryptedMakerAttributionArtifact>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HiddenMakerCurve {
     pub points: Vec<MakerCurvePoint>,
 }
@@ -1136,8 +1190,6 @@ pub struct OwnedOutputNotePayload {
     pub note: Note,
     pub output_note: OutputNoteRecord,
     pub output_proof: OutputNoteMerkleProof,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maker_attribution: Option<MakerBandAttribution>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1575,6 +1627,8 @@ fn validate_output_ciphertext_bundle_shape(
 pub struct PublishedBatchArtifacts {
     pub transcript: SettlementTranscript,
     pub output_bundle: OutputCiphertextBundle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_attribution_bundle: Option<MakerAttributionBundle>,
     pub settlement_witness: SettlementWitness,
     #[serde(default)]
     pub published_at_unix_ms: u64,
