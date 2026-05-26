@@ -3662,6 +3662,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "zylith-renewal-relayer"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower",
+ "tower-http",
+ "zylith-core",
+]
+
+[[package]]
 name = "zylith-wallet-wasm"
 version = "0.1.0"
 dependencies = [
