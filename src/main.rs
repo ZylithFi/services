@@ -1,11 +1,13 @@
 use axum::{
     Json, Router,
+    extract::DefaultBodyLimit,
     extract::{Path, State},
-    http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION},
     response::IntoResponse,
     routing::{get, post},
 };
 use reqwest::Client;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -17,16 +19,23 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{fs, net::TcpListener, sync::RwLock};
-use tower_http::cors::{Any, CorsLayer};
+use tokio::{
+    fs,
+    net::TcpListener,
+    sync::{Mutex, RwLock},
+};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{constant_time_eq, extract_bearer_token, format_bearer_token};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3400";
 const DEFAULT_STORE_PATH: &str = "renewal_relayer/relay_store.dev.json";
 const DEFAULT_TICK_MS: u64 = 5_000;
-const DEFAULT_MAX_PACKAGE_SLOTS: usize = 10_000;
+const DEFAULT_MAX_PACKAGE_SLOTS: usize = 100_000;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 8_000;
 const DEFAULT_MAX_ATTEMPTS: u32 = 16;
+const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_PACKAGE_RETENTION_MS: u64 = 120 * 24 * 60 * 60 * 1000;
+const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 120;
 const BIND_ADDR_ENV: &str = "ZYLITH_RENEWAL_RELAY_BIND_ADDR";
 const STORE_PATH_ENV: &str = "ZYLITH_RENEWAL_RELAY_STORE_PATH";
 const PACKAGE_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN";
@@ -38,6 +47,11 @@ const ENABLE_WORKER_ENV: &str = "ZYLITH_RENEWAL_RELAY_ENABLE_WORKER";
 const MAX_PACKAGE_SLOTS_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS";
 const RETRY_BACKOFF_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_RETRY_BACKOFF_MS";
 const MAX_ATTEMPTS_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_ATTEMPTS";
+const STRICT_MODE_ENV: &str = "ZYLITH_RENEWAL_RELAY_STRICT";
+const ALLOWED_ORIGINS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS";
+const MAX_BODY_BYTES_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_BODY_BYTES";
+const PACKAGE_RETENTION_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS";
+const RATE_LIMIT_PER_MINUTE_ENV: &str = "ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE";
 
 #[derive(Clone)]
 struct RelayConfig {
@@ -52,30 +66,75 @@ struct RelayConfig {
     max_package_slots: usize,
     retry_backoff_ms: u64,
     max_attempts: u32,
+    strict_mode: bool,
+    allowed_origins: Vec<HeaderValue>,
+    max_body_bytes: usize,
+    package_retention_ms: u64,
+    rate_limit_per_minute: u32,
 }
 
 impl RelayConfig {
     fn from_env() -> Result<Self, String> {
+        let strict_mode = env_bool(STRICT_MODE_ENV, false);
+        let package_registration_token = env::var(PACKAGE_TOKEN_ENV).ok().map(Arc::new);
+        let coordinator_control_token = env::var(COORDINATOR_CONTROL_TOKEN_ENV)
+            .or_else(|_| env::var(zylith_core::CONTROL_PLANE_TOKEN_ENV))
+            .ok()
+            .map(Arc::new);
+        let allowed_origins = parse_allowed_origins(ALLOWED_ORIGINS_ENV)?;
+        let store_path =
+            PathBuf::from(env::var(STORE_PATH_ENV).unwrap_or_else(|_| DEFAULT_STORE_PATH.into()));
+        if strict_mode {
+            if package_registration_token.is_none() {
+                return Err(format!(
+                    "{PACKAGE_TOKEN_ENV} is required when {STRICT_MODE_ENV}=true"
+                ));
+            }
+            if coordinator_control_token.is_none() {
+                return Err(format!(
+                    "{COORDINATOR_CONTROL_TOKEN_ENV} or {} is required when {STRICT_MODE_ENV}=true",
+                    zylith_core::CONTROL_PLANE_TOKEN_ENV,
+                ));
+            }
+            if allowed_origins.is_empty() {
+                return Err(format!(
+                    "{ALLOWED_ORIGINS_ENV} is required when {STRICT_MODE_ENV}=true"
+                ));
+            }
+            if store_path == PathBuf::from(DEFAULT_STORE_PATH) {
+                return Err(format!(
+                    "{STORE_PATH_ENV} must point at a production volume when {STRICT_MODE_ENV}=true"
+                ));
+            }
+            if !is_sqlite_store(&store_path) {
+                return Err(format!(
+                    "{STORE_PATH_ENV} must use a .sqlite or .db durable store when {STRICT_MODE_ENV}=true"
+                ));
+            }
+        }
         Ok(Self {
             bind_addr: env::var(BIND_ADDR_ENV)
                 .unwrap_or_else(|_| DEFAULT_BIND_ADDR.into())
                 .parse()
                 .map_err(|error| format!("invalid {BIND_ADDR_ENV}: {error}"))?,
-            store_path: PathBuf::from(
-                env::var(STORE_PATH_ENV).unwrap_or_else(|_| DEFAULT_STORE_PATH.into()),
-            ),
-            package_registration_token: env::var(PACKAGE_TOKEN_ENV).ok().map(Arc::new),
+            store_path,
+            package_registration_token,
             default_coordinator_url: env::var(COORDINATOR_URL_ENV).ok().map(normalize_url),
             default_prover_url: env::var(PROVER_URL_ENV).ok().map(normalize_url),
-            coordinator_control_token: env::var(COORDINATOR_CONTROL_TOKEN_ENV)
-                .or_else(|_| env::var(zylith_core::CONTROL_PLANE_TOKEN_ENV))
-                .ok()
-                .map(Arc::new),
+            coordinator_control_token,
             tick_interval_ms: env_u64(TICK_MS_ENV, DEFAULT_TICK_MS),
             enable_worker: env_bool(ENABLE_WORKER_ENV, true),
             max_package_slots: env_usize(MAX_PACKAGE_SLOTS_ENV, DEFAULT_MAX_PACKAGE_SLOTS),
             retry_backoff_ms: env_u64(RETRY_BACKOFF_MS_ENV, DEFAULT_RETRY_BACKOFF_MS),
             max_attempts: env_u32(MAX_ATTEMPTS_ENV, DEFAULT_MAX_ATTEMPTS),
+            strict_mode,
+            allowed_origins,
+            max_body_bytes: env_usize(MAX_BODY_BYTES_ENV, DEFAULT_MAX_BODY_BYTES),
+            package_retention_ms: env_u64(PACKAGE_RETENTION_MS_ENV, DEFAULT_PACKAGE_RETENTION_MS),
+            rate_limit_per_minute: env_u32(
+                RATE_LIMIT_PER_MINUTE_ENV,
+                DEFAULT_RATE_LIMIT_PER_MINUTE,
+            ),
         })
     }
 }
@@ -85,6 +144,14 @@ struct AppState {
     config: RelayConfig,
     store: Arc<RwLock<RelayStore>>,
     http: Client,
+    tick_lock: Arc<Mutex<()>>,
+    rate_limits: Arc<RwLock<BTreeMap<String, RateLimitBucket>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RateLimitBucket {
+    window_start_unix_ms: u64,
+    count: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -243,6 +310,8 @@ async fn main() {
         config,
         store: Arc::new(RwLock::new(store)),
         http: Client::new(),
+        tick_lock: Arc::new(Mutex::new(())),
+        rate_limits: Arc::new(RwLock::new(BTreeMap::new())),
     };
     if state.config.enable_worker {
         spawn_worker(state.clone());
@@ -258,8 +327,11 @@ async fn main() {
 }
 
 fn app(state: AppState) -> Router {
+    let cors = service_cors_layer(&state.config);
+    let max_body_bytes = state.config.max_body_bytes;
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/api/relay/packages", post(register_package))
         .route("/api/relay/packages/{package_id}", get(get_package_status))
         .route(
@@ -267,12 +339,8 @@ fn app(state: AppState) -> Router {
             get(get_package_results),
         )
         .route("/api/internal/relay/tick", post(trigger_tick))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers(Any),
-        )
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -282,7 +350,52 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "status": "ok",
         "packages": store.packages.len(),
         "worker_enabled": state.config.enable_worker,
+        "strict_mode": state.config.strict_mode,
+        "max_package_slots": state.config.max_package_slots,
     }))
+}
+
+async fn metrics(State(state): State<AppState>) -> String {
+    let store = state.store.read().await;
+    let mut total_slots = 0usize;
+    let mut submitted = 0usize;
+    let mut failed = 0usize;
+    for package in store.packages.values() {
+        total_slots += package.package.slot_count;
+        submitted += package
+            .results
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry.result.status,
+                    RelaySlotStatus::Submitted | RelaySlotStatus::AlreadySubmitted
+                )
+            })
+            .count();
+        failed += package
+            .results
+            .values()
+            .filter(|entry| matches!(entry.result.status, RelaySlotStatus::Failed))
+            .count();
+    }
+    format!(
+        "# HELP zylith_renewal_relay_packages Registered renewal packages.\n\
+         # TYPE zylith_renewal_relay_packages gauge\n\
+         zylith_renewal_relay_packages {}\n\
+         # HELP zylith_renewal_relay_slots Registered renewal slots.\n\
+         # TYPE zylith_renewal_relay_slots gauge\n\
+         zylith_renewal_relay_slots {}\n\
+         # HELP zylith_renewal_relay_submitted_slots Submitted renewal slots.\n\
+         # TYPE zylith_renewal_relay_submitted_slots gauge\n\
+         zylith_renewal_relay_submitted_slots {}\n\
+         # HELP zylith_renewal_relay_failed_slots Failed renewal slots.\n\
+         # TYPE zylith_renewal_relay_failed_slots gauge\n\
+         zylith_renewal_relay_failed_slots {}\n",
+        store.packages.len(),
+        total_slots,
+        submitted,
+        failed,
+    )
 }
 
 async fn register_package(
@@ -291,11 +404,22 @@ async fn register_package(
     Json(package): Json<OfflineRenewalPackage>,
 ) -> Result<Json<PackageStatus>, RelayApiError> {
     require_package_auth(&state, &headers)?;
+    enforce_rate_limit(&state, &headers).await?;
     validate_package(&package, state.config.max_package_slots)?;
     let now = now_unix_ms();
     let package_id = package.package_id.clone();
     let status = {
         let mut store = state.store.write().await;
+        prune_store_locked(&mut store, &state.config, now);
+        if let Some(existing) = store.packages.get(&package_id) {
+            if existing.package.package_commitment != package.package_commitment {
+                return Err(RelayApiError {
+                    status: StatusCode::CONFLICT,
+                    detail: "Renewal package ID is already registered with a different commitment"
+                        .into(),
+                });
+            }
+        }
         let entry = store
             .packages
             .entry(package_id.clone())
@@ -319,6 +443,7 @@ async fn get_package_status(
     Path(package_id): Path<String>,
 ) -> Result<Json<PackageStatus>, RelayApiError> {
     require_package_auth(&state, &headers)?;
+    enforce_rate_limit(&state, &headers).await?;
     let store = state.store.read().await;
     let package = store
         .packages
@@ -333,6 +458,7 @@ async fn get_package_results(
     Path(package_id): Path<String>,
 ) -> Result<Json<PackageResults>, RelayApiError> {
     require_package_auth(&state, &headers)?;
+    enforce_rate_limit(&state, &headers).await?;
     let store = state.store.read().await;
     let package = store
         .packages
@@ -381,8 +507,14 @@ fn spawn_worker(state: AppState) {
 }
 
 async fn process_due_slots_once(state: &AppState) -> Vec<OfflineRenewalRelayResult> {
+    let _guard = state.tick_lock.lock().await;
+    let persistent_lease = acquire_persistent_tick_lease(&state.config).await;
+    if matches!(persistent_lease, PersistentTickLease::Busy) {
+        return Vec::new();
+    }
     let snapshots = {
-        let store = state.store.read().await;
+        let mut store = state.store.write().await;
+        prune_store_locked(&mut store, &state.config, now_unix_ms());
         store
             .packages
             .values()
@@ -418,6 +550,9 @@ async fn process_due_slots_once(state: &AppState) -> Vec<OfflineRenewalRelayResu
     }
     if !emitted.is_empty() {
         let _ = persist_store(&state.config.store_path, &state.store).await;
+    }
+    if let PersistentTickLease::Acquired(owner) = persistent_lease {
+        release_persistent_tick_lease(&state.config.store_path, &owner).await;
     }
     emitted
 }
@@ -853,7 +988,61 @@ fn require_optional_bearer(expected: Option<&str>, headers: &HeaderMap) -> Resul
     Ok(())
 }
 
+async fn enforce_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), RelayApiError> {
+    let limit = state.config.rate_limit_per_minute;
+    if limit == 0 {
+        return Ok(());
+    }
+    let key = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer_token)
+        .map(|token| {
+            let mut hasher = Sha256::new();
+            hasher.update(token.as_bytes());
+            format!("{:x}", hasher.finalize())
+        })
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "anonymous".into());
+    let now = now_unix_ms();
+    let mut limits = state.rate_limits.write().await;
+    let bucket = limits.entry(key).or_default();
+    if now.saturating_sub(bucket.window_start_unix_ms) >= 60_000 {
+        bucket.window_start_unix_ms = now;
+        bucket.count = 0;
+    }
+    bucket.count = bucket.count.saturating_add(1);
+    if bucket.count > limit {
+        return Err(RelayApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            detail: "Renewal relay rate limit exceeded".into(),
+        });
+    }
+    limits.retain(|_, bucket| now.saturating_sub(bucket.window_start_unix_ms) < 120_000);
+    Ok(())
+}
+
+fn prune_store_locked(store: &mut RelayStore, config: &RelayConfig, now: u64) {
+    if config.package_retention_ms == 0 {
+        return;
+    }
+    store.packages.retain(|_, package| {
+        now.saturating_sub(package.updated_at_unix_ms) <= config.package_retention_ms
+    });
+}
+
 async fn load_store(path: &FsPath) -> Result<RelayStore, String> {
+    if is_sqlite_store(path) {
+        return load_sqlite_store(path).await;
+    }
     let bytes = match fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -869,6 +1058,11 @@ async fn persist_store(
     store: &Arc<RwLock<RelayStore>>,
 ) -> Result<(), RelayApiError> {
     let snapshot = store.read().await.clone();
+    if is_sqlite_store(path) {
+        return persist_sqlite_store(path, snapshot)
+            .await
+            .map_err(RelayApiError::internal);
+    }
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(RelayApiError::internal)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -883,6 +1077,309 @@ async fn persist_store(
         .await
         .map_err(RelayApiError::internal)?;
     Ok(())
+}
+
+fn is_sqlite_store(path: &FsPath) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "sqlite" | "sqlite3" | "db"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn load_sqlite_store(path: &FsPath) -> Result<RelayStore, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || load_sqlite_store_sync(&path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn load_sqlite_store_sync(path: &FsPath) -> Result<RelayStore, String> {
+    let connection = open_sqlite_store(path)?;
+    let mut store = RelayStore::default();
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT package_id, package_json, registered_at_unix_ms, updated_at_unix_ms \
+                 FROM relay_packages",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let package_id: String = row.get(0).map_err(|error| error.to_string())?;
+            let package_json: String = row.get(1).map_err(|error| error.to_string())?;
+            let package = serde_json::from_str::<OfflineRenewalPackage>(&package_json)
+                .map_err(|error| format!("invalid package JSON for {package_id}: {error}"))?;
+            let registered_at_unix_ms = row.get::<_, i64>(2).map_err(|error| error.to_string())?;
+            let updated_at_unix_ms = row.get::<_, i64>(3).map_err(|error| error.to_string())?;
+            store.packages.insert(
+                package_id,
+                StoredPackage {
+                    package,
+                    registered_at_unix_ms: registered_at_unix_ms.max(0) as u64,
+                    updated_at_unix_ms: updated_at_unix_ms.max(0) as u64,
+                    results: BTreeMap::new(),
+                },
+            );
+        }
+    }
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT package_id, slot_id, result_json, attempts, last_attempt_unix_ms \
+                 FROM relay_slot_results",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let package_id: String = row.get(0).map_err(|error| error.to_string())?;
+            let slot_id: String = row.get(1).map_err(|error| error.to_string())?;
+            let result_json: String = row.get(2).map_err(|error| error.to_string())?;
+            let result = serde_json::from_str::<OfflineRenewalRelayResult>(&result_json)
+                .map_err(|error| format!("invalid slot result JSON for {slot_id}: {error}"))?;
+            let attempts = row.get::<_, i64>(3).map_err(|error| error.to_string())?;
+            let last_attempt_unix_ms = row.get::<_, i64>(4).map_err(|error| error.to_string())?;
+            if let Some(package) = store.packages.get_mut(&package_id) {
+                package.results.insert(
+                    slot_id,
+                    StoredSlotResult {
+                        result,
+                        attempts: attempts.max(0) as u32,
+                        last_attempt_unix_ms: last_attempt_unix_ms.max(0) as u64,
+                    },
+                );
+            }
+        }
+    }
+    Ok(store)
+}
+
+async fn persist_sqlite_store(path: &FsPath, snapshot: RelayStore) -> Result<(), String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || persist_sqlite_store_sync(&path, snapshot))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), String> {
+    let mut connection = open_sqlite_store(path)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM relay_slot_results", [])
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM relay_packages", [])
+        .map_err(|error| error.to_string())?;
+    for (package_id, stored) in snapshot.packages {
+        let package_json =
+            serde_json::to_string(&stored.package).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO relay_packages \
+                 (package_id, package_commitment, pair, start_epoch, end_epoch, slot_count, \
+                  package_json, registered_at_unix_ms, updated_at_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    package_id.as_str(),
+                    stored.package.package_commitment.as_str(),
+                    stored.package.pair.as_str(),
+                    stored.package.start_epoch as i64,
+                    stored.package.end_epoch as i64,
+                    stored.package.slot_count as i64,
+                    package_json.as_str(),
+                    stored.registered_at_unix_ms as i64,
+                    stored.updated_at_unix_ms as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        for (slot_id, result) in stored.results {
+            let result_json =
+                serde_json::to_string(&result.result).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO relay_slot_results \
+                     (package_id, slot_id, result_json, attempts, last_attempt_unix_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        package_id.as_str(),
+                        slot_id.as_str(),
+                        result_json.as_str(),
+                        result.attempts as i64,
+                        result.last_attempt_unix_ms as i64,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn open_sqlite_store(path: &FsPath) -> Result<Connection, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    configure_sqlite_store(&connection)?;
+    Ok(connection)
+}
+
+fn configure_sqlite_store(connection: &Connection) -> Result<(), String> {
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| error.to_string())?;
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(|error| error.to_string())?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| error.to_string())?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS relay_packages (
+                package_id TEXT PRIMARY KEY,
+                package_commitment TEXT NOT NULL,
+                pair TEXT NOT NULL,
+                start_epoch INTEGER NOT NULL,
+                end_epoch INTEGER NOT NULL,
+                slot_count INTEGER NOT NULL,
+                package_json TEXT NOT NULL,
+                registered_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS relay_packages_pair_idx ON relay_packages(pair);
+            CREATE INDEX IF NOT EXISTS relay_packages_updated_idx ON relay_packages(updated_at_unix_ms);
+            CREATE TABLE IF NOT EXISTS relay_slot_results (
+                package_id TEXT NOT NULL,
+                slot_id TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                last_attempt_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (package_id, slot_id),
+                FOREIGN KEY(package_id) REFERENCES relay_packages(package_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS relay_slot_results_last_attempt_idx
+                ON relay_slot_results(last_attempt_unix_ms);
+            CREATE TABLE IF NOT EXISTS relay_locks (
+                name TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at_unix_ms INTEGER NOT NULL
+            );",
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+enum PersistentTickLease {
+    Disabled,
+    Busy,
+    Acquired(String),
+}
+
+async fn acquire_persistent_tick_lease(config: &RelayConfig) -> PersistentTickLease {
+    if !is_sqlite_store(&config.store_path) {
+        return PersistentTickLease::Disabled;
+    }
+    let path = config.store_path.clone();
+    let lease_ms = config
+        .tick_interval_ms
+        .saturating_mul(4)
+        .max(config.retry_backoff_ms)
+        .max(10_000);
+    tokio::task::spawn_blocking(move || acquire_persistent_tick_lease_sync(&path, lease_ms))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(PersistentTickLease::Busy)
+}
+
+fn acquire_persistent_tick_lease_sync(
+    path: &FsPath,
+    lease_ms: u64,
+) -> Result<PersistentTickLease, String> {
+    let owner = format!("pid:{}:{}", std::process::id(), now_unix_ms());
+    let now = now_unix_ms();
+    let expires_at = now.saturating_add(lease_ms) as i64;
+    let mut connection = open_sqlite_store(path)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let existing = transaction
+        .query_row(
+            "SELECT owner, expires_at_unix_ms FROM relay_locks WHERE name = 'worker_tick'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .ok();
+    if let Some((existing_owner, existing_expires_at)) = existing {
+        if existing_expires_at > now as i64 && existing_owner != owner {
+            return Ok(PersistentTickLease::Busy);
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO relay_locks (name, owner, expires_at_unix_ms)
+             VALUES ('worker_tick', ?1, ?2)
+             ON CONFLICT(name) DO UPDATE SET
+                owner = excluded.owner,
+                expires_at_unix_ms = excluded.expires_at_unix_ms",
+            params![owner, expires_at],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(PersistentTickLease::Acquired(owner))
+}
+
+async fn release_persistent_tick_lease(path: &FsPath, owner: &str) {
+    if !is_sqlite_store(path) {
+        return;
+    }
+    let path = path.to_path_buf();
+    let owner = owner.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let connection = open_sqlite_store(&path)?;
+        connection
+            .execute(
+                "DELETE FROM relay_locks WHERE name = 'worker_tick' AND owner = ?1",
+                params![owner],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok::<(), String>(())
+    })
+    .await;
+}
+
+fn service_cors_layer(config: &RelayConfig) -> CorsLayer {
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
+    if config.allowed_origins.is_empty() {
+        return layer.allow_origin(Any);
+    }
+    layer.allow_origin(AllowOrigin::list(config.allowed_origins.clone()))
+}
+
+fn parse_allowed_origins(env_name: &str) -> Result<Vec<HeaderValue>, String> {
+    let Some(value) = env::var(env_name).ok() else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(|origin| {
+            HeaderValue::from_str(origin)
+                .map_err(|error| format!("invalid {env_name} origin {origin}: {error}"))
+        })
+        .collect()
 }
 
 fn normalize_url(value: String) -> String {
@@ -1028,9 +1525,16 @@ mod tests {
                 max_package_slots: DEFAULT_MAX_PACKAGE_SLOTS,
                 retry_backoff_ms: 0,
                 max_attempts: DEFAULT_MAX_ATTEMPTS,
+                strict_mode: false,
+                allowed_origins: Vec::new(),
+                max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+                package_retention_ms: DEFAULT_PACKAGE_RETENTION_MS,
+                rate_limit_per_minute: 0,
             },
             store: Arc::new(RwLock::new(RelayStore::default())),
             http: Client::new(),
+            tick_lock: Arc::new(Mutex::new(())),
+            rate_limits: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -1081,12 +1585,13 @@ mod tests {
         let package = test_package(coordinator_url, prover_url);
         {
             let mut store = state.store.write().await;
+            let now = now_unix_ms();
             store.packages.insert(
                 package.package_id.clone(),
                 StoredPackage {
                     package,
-                    registered_at_unix_ms: 1,
-                    updated_at_unix_ms: 1,
+                    registered_at_unix_ms: now,
+                    updated_at_unix_ms: now,
                     results: BTreeMap::new(),
                 },
             );
@@ -1104,6 +1609,60 @@ mod tests {
         let _ = coordinator_shutdown.send(());
         let _ = prover_shutdown.send(());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_persists_packages_results_and_tick_lease() {
+        let path = temp_sqlite_store_path("sqlite");
+        let package = test_package("http://coordinator".into(), "http://prover".into());
+        let result = slot_result(&package.slots[0], RelaySlotStatus::Submitted, None);
+        let mut store = RelayStore::default();
+        store.packages.insert(
+            package.package_id.clone(),
+            StoredPackage {
+                package: package.clone(),
+                registered_at_unix_ms: 10,
+                updated_at_unix_ms: 20,
+                results: BTreeMap::from([(
+                    package.slots[0].slot_id.clone(),
+                    StoredSlotResult {
+                        result,
+                        attempts: 2,
+                        last_attempt_unix_ms: 30,
+                    },
+                )]),
+            },
+        );
+        persist_sqlite_store(&path, store).await.unwrap();
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        let loaded_package = loaded.packages.get(&package.package_id).unwrap();
+        assert_eq!(loaded_package.package.package_commitment, "0xabc");
+        assert_eq!(
+            loaded_package
+                .results
+                .get(&package.slots[0].slot_id)
+                .unwrap()
+                .attempts,
+            2,
+        );
+
+        let lease = acquire_persistent_tick_lease_sync(&path, 60_000).unwrap();
+        let owner = match lease {
+            PersistentTickLease::Acquired(owner) => owner,
+            PersistentTickLease::Busy | PersistentTickLease::Disabled => {
+                panic!("expected persistent tick lease")
+            }
+        };
+        assert!(matches!(
+            acquire_persistent_tick_lease_sync(&path, 60_000).unwrap(),
+            PersistentTickLease::Busy,
+        ));
+        release_persistent_tick_lease(&path, &owner).await;
+        assert!(matches!(
+            acquire_persistent_tick_lease_sync(&path, 60_000).unwrap(),
+            PersistentTickLease::Acquired(_),
+        ));
+        cleanup_sqlite_store(&path);
     }
 
     async fn spawn_mock_coordinator() -> (String, oneshot::Sender<()>) {
@@ -1169,5 +1728,20 @@ mod tests {
             now_unix_ms()
         ));
         path
+    }
+
+    fn temp_sqlite_store_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zylith-renewal-relayer-{name}-{}.sqlite",
+            now_unix_ms()
+        ));
+        path
+    }
+
+    fn cleanup_sqlite_store(path: &FsPath) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
     }
 }
