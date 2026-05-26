@@ -96,12 +96,30 @@ impl RelayConfig {
                     zylith_core::CONTROL_PLANE_TOKEN_ENV,
                 ));
             }
+            if env::var(COORDINATOR_URL_ENV)
+                .ok()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(format!(
+                    "{COORDINATOR_URL_ENV} is required when {STRICT_MODE_ENV}=true"
+                ));
+            }
+            if env::var(PROVER_URL_ENV)
+                .ok()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(format!(
+                    "{PROVER_URL_ENV} is required when {STRICT_MODE_ENV}=true"
+                ));
+            }
             if allowed_origins.is_empty() {
                 return Err(format!(
                     "{ALLOWED_ORIGINS_ENV} is required when {STRICT_MODE_ENV}=true"
                 ));
             }
-            if store_path == PathBuf::from(DEFAULT_STORE_PATH) {
+            if store_path == FsPath::new(DEFAULT_STORE_PATH) {
                 return Err(format!(
                     "{STORE_PATH_ENV} must point at a production volume when {STRICT_MODE_ENV}=true"
                 ));
@@ -331,6 +349,7 @@ fn app(state: AppState) -> Router {
     let max_body_bytes = state.config.max_body_bytes;
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
         .route("/api/relay/packages", post(register_package))
         .route("/api/relay/packages/{package_id}", get(get_package_status))
@@ -353,6 +372,38 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "strict_mode": state.config.strict_mode,
         "max_package_slots": state.config.max_package_slots,
     }))
+}
+
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    let store_ok = if is_sqlite_store(&state.config.store_path) {
+        open_sqlite_store(&state.config.store_path).is_ok()
+    } else {
+        !state.config.strict_mode
+    };
+    let ready = store_ok
+        && (!state.config.strict_mode
+            || (state.config.package_registration_token.is_some()
+                && state.config.coordinator_control_token.is_some()
+                && state.config.default_coordinator_url.is_some()
+                && state.config.default_prover_url.is_some()
+                && !state.config.allowed_origins.is_empty()
+                && is_sqlite_store(&state.config.store_path)));
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "store_ok": store_ok,
+            "strict_mode": state.config.strict_mode,
+            "worker_enabled": state.config.enable_worker,
+            "coordinator_pinned": state.config.default_coordinator_url.is_some(),
+            "prover_pinned": state.config.default_prover_url.is_some(),
+        })),
+    )
 }
 
 async fn metrics(State(state): State<AppState>) -> String {
@@ -405,20 +456,20 @@ async fn register_package(
 ) -> Result<Json<PackageStatus>, RelayApiError> {
     require_package_auth(&state, &headers)?;
     enforce_rate_limit(&state, &headers).await?;
-    validate_package(&package, state.config.max_package_slots)?;
+    validate_package(&package, &state.config)?;
     let now = now_unix_ms();
     let package_id = package.package_id.clone();
     let status = {
         let mut store = state.store.write().await;
         prune_store_locked(&mut store, &state.config, now);
-        if let Some(existing) = store.packages.get(&package_id) {
-            if existing.package.package_commitment != package.package_commitment {
-                return Err(RelayApiError {
-                    status: StatusCode::CONFLICT,
-                    detail: "Renewal package ID is already registered with a different commitment"
-                        .into(),
-                });
-            }
+        if let Some(existing) = store.packages.get(&package_id)
+            && existing.package.package_commitment != package.package_commitment
+        {
+            return Err(RelayApiError {
+                status: StatusCode::CONFLICT,
+                detail: "Renewal package ID is already registered with a different commitment"
+                    .into(),
+            });
         }
         let entry = store
             .packages
@@ -767,7 +818,7 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
 
 fn validate_package(
     package: &OfflineRenewalPackage,
-    max_slots: usize,
+    config: &RelayConfig,
 ) -> Result<(), RelayApiError> {
     if package.version != 1 {
         return Err(RelayApiError::bad_request(
@@ -792,7 +843,7 @@ fn validate_package(
             "Renewal package slot_count does not match slots length",
         ));
     }
-    if package.slots.len() > max_slots {
+    if package.slots.len() > config.max_package_slots {
         return Err(RelayApiError::bad_request(
             "Renewal package exceeds slot limit",
         ));
@@ -802,12 +853,32 @@ fn validate_package(
             "Renewal package epoch range is invalid",
         ));
     }
-    if package_prover_url_from_policy(package).is_none()
-        || package_coordinator_url_from_policy(package).is_none()
+    if package_prover_url(config, package).is_err()
+        || package_coordinator_url(config, package).is_err()
     {
         return Err(RelayApiError::bad_request(
             "Renewal package requires coordinator and prover URLs",
         ));
+    }
+    if config.strict_mode {
+        if let (Some(default), Some(policy)) = (
+            config.default_prover_url.as_ref(),
+            package_prover_url_from_policy(package),
+        ) && &policy != default
+        {
+            return Err(RelayApiError::bad_request(
+                "Renewal package prover URL does not match the managed relay configuration",
+            ));
+        }
+        if let (Some(default), Some(policy)) = (
+            config.default_coordinator_url.as_ref(),
+            package_coordinator_url_from_policy(package),
+        ) && &policy != default
+        {
+            return Err(RelayApiError::bad_request(
+                "Renewal package coordinator URL does not match the managed relay configuration",
+            ));
+        }
     }
     let mut slot_ids = BTreeSet::new();
     let mut commitments = BTreeSet::new();
@@ -1319,10 +1390,11 @@ fn acquire_persistent_tick_lease_sync(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .ok();
-    if let Some((existing_owner, existing_expires_at)) = existing {
-        if existing_expires_at > now as i64 && existing_owner != owner {
-            return Ok(PersistentTickLease::Busy);
-        }
+    if let Some((existing_owner, existing_expires_at)) = existing
+        && existing_expires_at > now as i64
+        && existing_owner != owner
+    {
+        return Ok(PersistentTickLease::Busy);
     }
     transaction
         .execute(
@@ -1542,7 +1614,8 @@ mod tests {
     fn validation_rejects_self_relay_packages() {
         let mut package = test_package("http://coordinator".into(), "http://prover".into());
         package.relay_mode = Some(RelayMode::SelfRelay);
-        assert!(validate_package(&package, DEFAULT_MAX_PACKAGE_SLOTS).is_err());
+        let state = test_state(temp_store_path("validate-self-relay"));
+        assert!(validate_package(&package, &state.config).is_err());
     }
 
     #[test]
@@ -1550,7 +1623,29 @@ mod tests {
         let mut package = test_package("http://coordinator".into(), "http://prover".into());
         package.slots.push(package.slots[0].clone());
         package.slot_count = package.slots.len();
-        assert!(validate_package(&package, DEFAULT_MAX_PACKAGE_SLOTS).is_err());
+        let state = test_state(temp_store_path("validate-duplicate"));
+        assert!(validate_package(&package, &state.config).is_err());
+    }
+
+    #[test]
+    fn strict_validation_rejects_unpinned_package_urls() {
+        let mut package = test_package(
+            "http://other-coordinator".into(),
+            "http://other-prover".into(),
+        );
+        let mut state = test_state(temp_sqlite_store_path("strict-url-pin"));
+        state.config.strict_mode = true;
+        state.config.default_coordinator_url = Some("http://coordinator".into());
+        state.config.default_prover_url = Some("http://prover".into());
+        state.config.package_registration_token = Some(Arc::new("package-token".into()));
+        state.config.coordinator_control_token = Some(Arc::new("control-token".into()));
+        state.config.allowed_origins = vec![HeaderValue::from_static("https://app.zylith.fi")];
+        assert!(validate_package(&package, &state.config).is_err());
+
+        package.relay_policy.coordinator_url = "http://coordinator".into();
+        package.relay_policy.prover_url = "http://prover".into();
+        assert!(validate_package(&package, &state.config).is_ok());
+        cleanup_sqlite_store(&state.config.store_path);
     }
 
     #[tokio::test]
