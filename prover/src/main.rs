@@ -127,8 +127,10 @@ const AUCTION_PROVER_ALLOW_KEYGEN_ENV: &str = "ZYLITH_AUCTION_PROVER_ALLOW_KEYGE
 const DEFAULT_PRODUCT_PAIR_IDS: &str =
     "STRK/USDC,ETH/USDC,strkBTC/USDC,STRK/ETH,STRK/strkBTC,WBTC/strkBTC,USDC/USDT";
 const DEFAULT_PROTOCOL_FEE_RECIPIENT: &str = "zylith-protocol-treasury";
+const DEFAULT_RELAY_FEE_RECIPIENT: &str = "zylith-renewal-relay";
 const PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_FEE_RECIPIENT";
 const LEGACY_PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_TREASURY_RECIPIENT";
+const RELAY_FEE_RECIPIENT_ENV: &str = "ZYLITH_RELAY_FEE_RECIPIENT";
 const PROOF_JOBS_DIR: &str = "proof_jobs";
 const SETTLEMENT_PLANS_DIR: &str = "settlement_plans";
 const SETTLEMENT_WITNESSES_DIR: &str = "settlement_witnesses";
@@ -221,6 +223,7 @@ struct AppState {
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
     protocol_fee_recipient: String,
+    relay_fee_recipient: String,
     settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
     max_stored_private_payloads: usize,
@@ -313,6 +316,7 @@ struct AppConfig {
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
     protocol_fee_recipient: String,
+    relay_fee_recipient: String,
     settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
     max_stored_private_payloads: usize,
@@ -594,6 +598,13 @@ fn protocol_fee_recipient_from_env() -> String {
     )
 }
 
+fn relay_fee_recipient_from_env() -> String {
+    env::var(RELAY_FEE_RECIPIENT_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_RELAY_FEE_RECIPIENT.into())
+}
+
 fn build_app() -> Result<Router, String> {
     let deployment_manifest = load_deployment_manifest();
     let coordinator_url =
@@ -724,6 +735,7 @@ fn build_app() -> Result<Router, String> {
             0_u128,
         ),
         protocol_fee_recipient: protocol_fee_recipient_from_env(),
+        relay_fee_recipient: relay_fee_recipient_from_env(),
         settlement_submission_jitter_ms: env_parse_or_default(
             SETTLEMENT_SUBMISSION_JITTER_MS_ENV,
             DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS,
@@ -920,6 +932,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
         protocol_fee_recipient,
+        relay_fee_recipient,
         settlement_submission_jitter_ms,
         private_payload_retention_ms,
         max_stored_private_payloads,
@@ -933,6 +946,9 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
 
     if protocol_fee_recipient.trim().is_empty() {
         return Err("protocol fee recipient must not be empty".into());
+    }
+    if relay_fee_recipient.trim().is_empty() {
+        return Err("relay fee recipient must not be empty".into());
     }
     if native_proof_entrypoint != "compile_settlement_proof" {
         return Err("native proof entrypoint must be compile_settlement_proof".into());
@@ -1021,6 +1037,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
         protocol_fee_recipient,
+        relay_fee_recipient,
         settlement_submission_jitter_ms,
         private_payload_retention_ms,
         max_stored_private_payloads,
@@ -2847,6 +2864,7 @@ async fn prepare_private_auction_batch_inner(
             prior_note_consolidation_witnesses: &[],
             privacy_gate: Default::default(),
             protocol_fee_recipient: &state.protocol_fee_recipient,
+            relay_fee_recipient: &state.relay_fee_recipient,
         },
     )?;
     eprintln!(
@@ -2954,6 +2972,7 @@ async fn prepare_private_auction_batch_inner(
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: privacy_gate_witness.clone(),
                 protocol_fee_recipient: &state.protocol_fee_recipient,
+                relay_fee_recipient: &state.relay_fee_recipient,
             },
         )?
     } else if !artifacts.transcript.matched_orders.is_empty() {
@@ -3362,7 +3381,9 @@ fn root_history_batch_to_witness(
         price_base_scale: 1,
         taker_fee_bps: 0,
         maker_fee_bps: 0,
+        relay_fee_bps: 0,
         protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+        relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT.into(),
         base_asset_id: AssetId("ROOT_HISTORY".into()),
         quote_asset_id: AssetId("ROOT_HISTORY".into()),
         matched_orders: Vec::new(),
@@ -5530,6 +5551,7 @@ struct SettlementBuildContext<'a> {
     prior_note_consolidation_witnesses: &'a [NoteConsolidationWitness],
     privacy_gate: AuctionPrivacyGateWitness,
     protocol_fee_recipient: &'a str,
+    relay_fee_recipient: &'a str,
 }
 
 fn build_settlement_artifacts(
@@ -5548,6 +5570,7 @@ fn build_settlement_artifacts(
         prior_note_consolidation_witnesses,
         privacy_gate,
         protocol_fee_recipient,
+        relay_fee_recipient,
     } = context;
     eprintln!(
         "build_settlement_artifacts batch_id={} stage=validate_orders start records={}",
@@ -5609,7 +5632,8 @@ fn build_settlement_artifacts(
 
     let mut matched_orders = Vec::with_capacity(fills.len());
     let mut consumed_inputs = Vec::with_capacity(fills.len() * 2);
-    let mut fee_accumulator: BTreeMap<String, u128> = BTreeMap::new();
+    let mut protocol_fee_accumulator: BTreeMap<String, u128> = BTreeMap::new();
+    let mut relay_fee_accumulator: BTreeMap<String, u128> = BTreeMap::new();
     let mut output_notes = Vec::with_capacity(fills.len());
     let mut matched_order_witnesses = Vec::with_capacity(fills.len());
     let mut seen_funding_notes = BTreeMap::<String, String>::new();
@@ -5691,14 +5715,25 @@ fn build_settlement_artifacts(
                 .map_err(|_| StatusCode::CONFLICT)?,
             ),
         };
-        let fee_bps = u128::from(
+        let protocol_fee_bps = u128::from(
             pair.fee_bps_for_order(&fill.order)
                 .map_err(|_| StatusCode::CONFLICT)?,
         );
-        let fee_amount = gross_amount
-            .checked_mul(fee_bps)
+        let relay_fee_bps = u128::from(
+            pair.relay_fee_bps_for_order(&fill.order)
+                .map_err(|_| StatusCode::CONFLICT)?,
+        );
+        let protocol_fee_amount = gross_amount
+            .checked_mul(protocol_fee_bps)
             .ok_or(StatusCode::CONFLICT)?
             / 10_000;
+        let relay_fee_amount = gross_amount
+            .checked_mul(relay_fee_bps)
+            .ok_or(StatusCode::CONFLICT)?
+            / 10_000;
+        let fee_amount = protocol_fee_amount
+            .checked_add(relay_fee_amount)
+            .ok_or(StatusCode::CONFLICT)?;
         let net_amount = gross_amount
             .checked_sub(fee_amount)
             .ok_or(StatusCode::CONFLICT)?;
@@ -5709,10 +5744,18 @@ fn build_settlement_artifacts(
             );
             return Err(StatusCode::CONFLICT);
         }
-        if fee_amount > 0 {
-            let accrued_fee = fee_accumulator.entry(asset_id.0.clone()).or_default();
+        if protocol_fee_amount > 0 {
+            let accrued_fee = protocol_fee_accumulator
+                .entry(asset_id.0.clone())
+                .or_default();
             *accrued_fee = accrued_fee
-                .checked_add(fee_amount)
+                .checked_add(protocol_fee_amount)
+                .ok_or(StatusCode::CONFLICT)?;
+        }
+        if relay_fee_amount > 0 {
+            let accrued_fee = relay_fee_accumulator.entry(asset_id.0.clone()).or_default();
+            *accrued_fee = accrued_fee
+                .checked_add(relay_fee_amount)
                 .ok_or(StatusCode::CONFLICT)?;
         }
 
@@ -5804,6 +5847,7 @@ fn build_settlement_artifacts(
             funding_authorization: fill.funding_authorization.clone(),
             side: fill.order.side.clone(),
             order_type: fill.order.order_type.clone(),
+            relay_mode: fill.order.relay_mode.clone(),
             maker_curve: fill.order.maker_curve.clone(),
             limit_price: fill.order.limit_price,
             order_amount: fill.order.amount,
@@ -6016,11 +6060,13 @@ fn build_settlement_artifacts(
         note_membership_witnesses.len()
     );
 
-    let fees = deterministic_protocol_fee_entries(
-        &fee_accumulator,
+    let fees = deterministic_fee_entries(
+        &protocol_fee_accumulator,
+        &relay_fee_accumulator,
         &base_asset,
         &quote_asset,
         protocol_fee_recipient,
+        relay_fee_recipient,
     );
 
     let transcript = SettlementTranscript {
@@ -6039,7 +6085,9 @@ fn build_settlement_artifacts(
         price_base_scale: pair.price_base_scale,
         taker_fee_bps: pair.taker_fee_bps,
         maker_fee_bps: pair.maker_fee_bps,
+        relay_fee_bps: pair.relay_fee_bps,
         protocol_fee_recipient: protocol_fee_recipient.into(),
+        relay_fee_recipient: relay_fee_recipient.into(),
         matched_orders,
         consumed_inputs,
         renewal_child_uses: renewal_child_uses.clone(),
@@ -6069,7 +6117,9 @@ fn build_settlement_artifacts(
         price_base_scale: pair.price_base_scale,
         taker_fee_bps: pair.taker_fee_bps,
         maker_fee_bps: pair.maker_fee_bps,
+        relay_fee_bps: pair.relay_fee_bps,
         protocol_fee_recipient: protocol_fee_recipient.into(),
+        relay_fee_recipient: relay_fee_recipient.into(),
         base_asset_id: base_asset,
         quote_asset_id: quote_asset,
         matched_orders: transcript.matched_orders.clone(),
@@ -6132,36 +6182,59 @@ fn funding_note_total(notes: &[Note]) -> Option<u128> {
         .try_fold(0u128, |total, note| total.checked_add(note.amount))
 }
 
-fn deterministic_protocol_fee_entries(
-    fee_accumulator: &BTreeMap<String, u128>,
+fn deterministic_fee_entries(
+    protocol_fee_accumulator: &BTreeMap<String, u128>,
+    relay_fee_accumulator: &BTreeMap<String, u128>,
     base_asset: &AssetId,
     quote_asset: &AssetId,
     protocol_fee_recipient: &str,
+    relay_fee_recipient: &str,
 ) -> Vec<FeeEntry> {
-    let mut fees = Vec::with_capacity(2);
-    if let Some(amount) = fee_accumulator
-        .get(&base_asset.0)
-        .copied()
-        .filter(|amount| *amount > 0)
-    {
-        fees.push(FeeEntry {
-            asset_id: base_asset.clone(),
-            amount,
-            recipient: protocol_fee_recipient.into(),
-        });
-    }
-    if let Some(amount) = fee_accumulator
-        .get(&quote_asset.0)
-        .copied()
-        .filter(|amount| *amount > 0)
-    {
-        fees.push(FeeEntry {
-            asset_id: quote_asset.clone(),
-            amount,
-            recipient: protocol_fee_recipient.into(),
-        });
-    }
+    let mut fees = Vec::with_capacity(4);
+    push_fee_entry_if_present(
+        &mut fees,
+        protocol_fee_accumulator,
+        base_asset,
+        protocol_fee_recipient,
+    );
+    push_fee_entry_if_present(
+        &mut fees,
+        protocol_fee_accumulator,
+        quote_asset,
+        protocol_fee_recipient,
+    );
+    push_fee_entry_if_present(
+        &mut fees,
+        relay_fee_accumulator,
+        base_asset,
+        relay_fee_recipient,
+    );
+    push_fee_entry_if_present(
+        &mut fees,
+        relay_fee_accumulator,
+        quote_asset,
+        relay_fee_recipient,
+    );
     fees
+}
+
+fn push_fee_entry_if_present(
+    fees: &mut Vec<FeeEntry>,
+    fee_accumulator: &BTreeMap<String, u128>,
+    asset: &AssetId,
+    recipient: &str,
+) {
+    if let Some(amount) = fee_accumulator
+        .get(&asset.0)
+        .copied()
+        .filter(|amount| *amount > 0)
+    {
+        fees.push(FeeEntry {
+            asset_id: asset.clone(),
+            amount,
+            recipient: recipient.into(),
+        });
+    }
 }
 
 fn compute_fill_plan(
@@ -7743,7 +7816,7 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PROTOCOL_FEE_RECIPIENT, DecryptedOrderRecord,
+        DEFAULT_PROTOCOL_FEE_RECIPIENT, DEFAULT_RELAY_FEE_RECIPIENT, DecryptedOrderRecord,
         NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND, NativeBlockId, NativeExecutionRequestRecord,
         NativeProverParams, NativeProverRpcRequest, NativeTransactionMode,
         NoteRootTransitionRecord, SettlementBuildContext, SettlementRoots, artifact_id_for,
@@ -7761,14 +7834,14 @@ mod tests {
         storage_key, validate_batch_nullifier_freshness,
     };
     use zylith_core::{
-        AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, MatchedOrder, Note,
-        NoteCommitment, NoteConsolidationWitness, NoteMembershipKind, Nullifier,
-        NullifierHistoryBatch, OrderIntent, OrderSide, OrderType, OutputNoteRecord, PairId,
-        ProductConfig, SettlementTranscript, SettlementWitness, SpendAuthorization, TimeInForce,
-        deposit_note_root, hash::ordered_felt_list_commitment,
-        note_recognition_public_key_from_raw_key_hex, nullifier_from_note_secret,
-        root_only_settlement_commitments, settlement_nullifier_root_after_history,
-        settlement_state_transition_root,
+        AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, HiddenMakerCurve,
+        MakerCurvePoint, MatchedOrder, Note, NoteCommitment, NoteConsolidationWitness,
+        NoteMembershipKind, Nullifier, NullifierHistoryBatch, OrderIntent, OrderSide, OrderType,
+        OutputNoteRecord, PairId, ProductConfig, RelayMode, SettlementTranscript,
+        SettlementWitness, SpendAuthorization, TimeInForce, deposit_note_root,
+        hash::ordered_felt_list_commitment, note_recognition_public_key_from_raw_key_hex,
+        nullifier_from_note_secret, root_only_settlement_commitments,
+        settlement_nullifier_root_after_history, settlement_state_transition_root,
     };
 
     #[test]
@@ -7851,7 +7924,9 @@ mod tests {
             price_base_scale: 1,
             taker_fee_bps: 4,
             maker_fee_bps: 0,
+            relay_fee_bps: 0,
             protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: Vec::new(),
             consumed_inputs: Vec::new(),
             renewal_child_uses: Vec::new(),
@@ -7907,7 +7982,9 @@ mod tests {
             price_base_scale: 1,
             taker_fee_bps: 0,
             maker_fee_bps: 0,
+            relay_fee_bps: 0,
             protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT.into(),
             base_asset_id: AssetId("STRK".into()),
             quote_asset_id: AssetId("ETH".into()),
             matched_orders: Vec::new(),
@@ -7988,7 +8065,9 @@ mod tests {
             price_base_scale: 1,
             taker_fee_bps: 0,
             maker_fee_bps: 0,
+            relay_fee_bps: 0,
             protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: Vec::new(),
             consumed_inputs: Vec::new(),
             renewal_child_uses: Vec::new(),
@@ -8449,6 +8528,7 @@ mod tests {
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
+                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
             },
         )
         .expect("no-cross artifacts");
@@ -8464,6 +8544,134 @@ mod tests {
         assert!(artifacts.transcript.fees.is_empty());
         assert_eq!(artifacts.output_bundle.padded_ciphertext_count, 4);
         assert_eq!(artifacts.output_bundle.ciphertext_count_bucket, "0-4");
+    }
+
+    #[test]
+    fn settlement_artifacts_separate_zylith_relay_fees_from_protocol_fees() {
+        let mut product_config = ProductConfig::default_v1();
+        let pair_id = PairId("STRK/USDC".into());
+        product_config
+            .pairs
+            .get_mut(&pair_id.0)
+            .expect("test pair")
+            .price_base_scale = 1;
+        let pair = product_config
+            .enabled_pair(&pair_id)
+            .expect("enabled pair")
+            .clone();
+        let base_unit = 1_000_000_000_000_000_000_u128;
+        let mut records = vec![
+            valid_test_record(
+                0,
+                OrderSide::Buy,
+                100,
+                2 * base_unit,
+                base_unit,
+                TimeInForce::CurrentBatchOnly,
+                300 * base_unit,
+            ),
+            valid_test_record(
+                1,
+                OrderSide::Sell,
+                100,
+                3 * base_unit,
+                base_unit,
+                TimeInForce::CurrentBatchOnly,
+                3 * base_unit,
+            ),
+        ];
+        let parent_secret = "0x12345";
+        let parent_secret_commitment = zylith_core::renewal_parent_secret_commitment(parent_secret)
+            .expect("parent secret commitment");
+        let parent_cancel_authority = "0x777";
+        let parent_order_commitment = zylith_core::renewal_parent_commitment(
+            &parent_secret_commitment,
+            parent_cancel_authority,
+        )
+        .expect("parent commitment");
+        records[1].order.order_type = OrderType::MakerCurve;
+        records[1].order.relay_mode = RelayMode::ZylithRelay;
+        records[1].order.limit_price = 99;
+        records[1].order.maker_curve = Some(HiddenMakerCurve {
+            points: vec![
+                MakerCurvePoint {
+                    price: 99,
+                    base_amount: base_unit,
+                },
+                MakerCurvePoint {
+                    price: 100,
+                    base_amount: base_unit,
+                },
+                MakerCurvePoint {
+                    price: 101,
+                    base_amount: base_unit,
+                },
+            ],
+        });
+        records[1].order.parent_order_commitment = parent_order_commitment;
+        records[1].order.parent_child_index = 1;
+        records[1].order.parent_secret_commitment = parent_secret_commitment;
+        records[1].order.parent_cancel_authority = parent_cancel_authority.into();
+        records[1].order.parent_authorization_secret = parent_secret.into();
+        records[1].order_commitment = records[1].order.commitment().expect("maker commitment");
+        let order_commitments = records
+            .iter()
+            .map(|record| record.order_commitment.0.clone())
+            .collect::<Vec<_>>();
+        let batch = BatchSummary {
+            batch_id: BatchId("batch-strk-usdc-1".into()),
+            pair_id,
+            epoch_id: 1,
+            close_time_unix_ms: 0,
+            status: BatchStatus::Closed,
+            order_count: records.len() as u64,
+            order_commitment_root: ordered_felt_list_commitment(
+                "zylith/batch-order-root",
+                &order_commitments,
+            )
+            .expect("order root"),
+            encrypted_order_set_commitment: "0x222".into(),
+        };
+
+        let artifacts = build_settlement_artifacts(
+            &batch.batch_id.0,
+            &batch,
+            &pair,
+            &records,
+            SettlementBuildContext {
+                product_config: &product_config,
+                prior_roots: &SettlementRoots::zero(),
+                deposit_records: &[],
+                note_root_transitions: &[],
+                prior_settlement_witnesses: &[],
+                prior_note_consolidation_witnesses: &[],
+                privacy_gate: Default::default(),
+                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
+                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+            },
+        )
+        .expect("relay fee artifacts");
+
+        assert_eq!(artifacts.transcript.clearing_price, 100);
+        assert_eq!(artifacts.transcript.relay_fee_bps, 2);
+        assert_eq!(artifacts.transcript.matched_orders.len(), 2);
+        assert_eq!(
+            artifacts.settlement_witness.matched_order_witnesses[1].relay_mode,
+            RelayMode::ZylithRelay
+        );
+        assert_eq!(artifacts.transcript.fees.len(), 2);
+        assert_eq!(artifacts.transcript.fees[0].asset_id.0, "STRK");
+        assert_eq!(
+            artifacts.transcript.fees[0].recipient,
+            DEFAULT_PROTOCOL_FEE_RECIPIENT
+        );
+        assert_eq!(artifacts.transcript.fees[0].amount, 800_000_000_000_000);
+        assert_eq!(artifacts.transcript.fees[1].asset_id.0, "USDC");
+        assert_eq!(
+            artifacts.transcript.fees[1].recipient,
+            DEFAULT_RELAY_FEE_RECIPIENT
+        );
+        assert_eq!(artifacts.transcript.fees[1].amount, 40_000_000_000_000_000);
     }
 
     #[test]
@@ -8569,6 +8777,7 @@ mod tests {
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
+                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
             },
         )
         .expect("netted artifacts");
@@ -8958,7 +9167,9 @@ mod tests {
             price_base_scale: 1,
             taker_fee_bps: 4,
             maker_fee_bps: 0,
+            relay_fee_bps: 0,
             protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT.into(),
             base_asset_id: AssetId("STRK".into()),
             quote_asset_id: AssetId("USDC".into()),
             matched_orders: vec![],
@@ -9021,6 +9232,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-1".into()),
             side,
             order_type: OrderType::LimitBatch,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price,
             amount,
@@ -9114,6 +9326,7 @@ mod tests {
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
                 protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
+                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
             },
         );
 

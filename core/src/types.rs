@@ -185,6 +185,13 @@ pub enum OrderType {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayMode {
+    #[default]
+    SelfRelay,
+    ZylithRelay,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeInForce {
     #[default]
     CurrentBatchOnly,
@@ -521,6 +528,8 @@ pub struct OrderIntent {
     pub side: OrderSide,
     #[serde(default)]
     pub order_type: OrderType,
+    #[serde(default)]
+    pub relay_mode: RelayMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maker_curve: Option<HiddenMakerCurve>,
     #[serde(with = "serde_u128_decimal")]
@@ -565,6 +574,10 @@ impl OrderIntent {
             OrderType::LimitBatch => field_from_u64(0),
             OrderType::MakerCurve => field_from_u64(1),
             OrderType::HeartbeatCover => field_from_u64(2),
+        };
+        let relay_mode = match self.relay_mode {
+            RelayMode::SelfRelay => field_from_u64(0),
+            RelayMode::ZylithRelay => field_from_u64(1),
         };
         let maker_curve_commitment = match self.order_type {
             OrderType::MakerCurve => {
@@ -612,6 +625,7 @@ impl OrderIntent {
                 batch_id,
                 side,
                 order_type,
+                relay_mode,
                 maker_curve_commitment,
                 limit_price,
                 amount,
@@ -695,6 +709,25 @@ impl OrderIntent {
     pub fn is_renewal_backed_child(&self) -> Result<bool, ProtocolError> {
         self.validate_parent_link()?;
         Ok(felt_from_hex_str(&self.parent_order_commitment)? != field_from_u64(0))
+    }
+
+    pub fn validate_relay_mode(&self) -> Result<(), ProtocolError> {
+        match self.relay_mode {
+            RelayMode::SelfRelay => Ok(()),
+            RelayMode::ZylithRelay => {
+                if !matches!(self.order_type, OrderType::MakerCurve) {
+                    return Err(ProtocolError::InvalidOrder(
+                        "Zylith relay mode requires a maker curve order".into(),
+                    ));
+                }
+                if !self.is_renewal_backed_child()? {
+                    return Err(ProtocolError::InvalidOrder(
+                        "Zylith relay mode requires a renewal-backed child".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -967,6 +1000,8 @@ pub struct MatchedOrderWitness {
     pub funding_authorization: SpendAuthorization,
     pub side: OrderSide,
     pub order_type: OrderType,
+    #[serde(default)]
+    pub relay_mode: RelayMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maker_curve: Option<HiddenMakerCurve>,
     #[serde(with = "serde_u128_decimal")]
@@ -1272,8 +1307,12 @@ pub struct SettlementTranscript {
     pub taker_fee_bps: u16,
     #[serde(default)]
     pub maker_fee_bps: u16,
+    #[serde(default)]
+    pub relay_fee_bps: u16,
     #[serde(default = "default_protocol_fee_recipient")]
     pub protocol_fee_recipient: String,
+    #[serde(default = "default_relay_fee_recipient")]
+    pub relay_fee_recipient: String,
     pub matched_orders: Vec<MatchedOrder>,
     pub consumed_inputs: Vec<ConsumedInput>,
     #[serde(default)]
@@ -1538,8 +1577,12 @@ pub struct PublicSettlementTranscript {
     pub taker_fee_bps: u16,
     #[serde(default)]
     pub maker_fee_bps: u16,
+    #[serde(default)]
+    pub relay_fee_bps: u16,
     #[serde(default = "default_protocol_fee_recipient")]
     pub protocol_fee_recipient: String,
+    #[serde(default = "default_relay_fee_recipient")]
+    pub relay_fee_recipient: String,
     pub output_bundle_ref: String,
     pub prior_note_root: String,
     pub prior_nullifier_root: String,
@@ -2199,7 +2242,9 @@ pub struct SettlementCallArguments {
     pub price_base_scale: String,
     pub taker_fee_bps: String,
     pub maker_fee_bps: String,
+    pub relay_fee_bps: String,
     pub protocol_fee_recipient: String,
+    pub relay_fee_recipient: String,
     pub output_bundle_ref: String,
     pub prior_note_root: String,
     pub prior_nullifier_root: String,
@@ -2216,6 +2261,8 @@ pub struct SettlementCallArguments {
     pub new_fee_root: String,
     #[serde(default)]
     pub fee_asset_ids: Vec<String>,
+    #[serde(default)]
+    pub fee_recipients: Vec<String>,
     #[serde(default)]
     pub fee_amounts: Vec<String>,
 }
@@ -2254,8 +2301,12 @@ pub struct SettlementWitness {
     pub taker_fee_bps: u16,
     #[serde(default)]
     pub maker_fee_bps: u16,
+    #[serde(default)]
+    pub relay_fee_bps: u16,
     #[serde(default = "default_protocol_fee_recipient")]
     pub protocol_fee_recipient: String,
+    #[serde(default = "default_relay_fee_recipient")]
+    pub relay_fee_recipient: String,
     pub base_asset_id: AssetId,
     pub quote_asset_id: AssetId,
     pub matched_orders: Vec<MatchedOrder>,
@@ -2501,6 +2552,8 @@ pub struct ProductPairConfig {
     pub taker_fee_bps: u16,
     #[serde(default)]
     pub maker_fee_bps: u16,
+    #[serde(default)]
+    pub relay_fee_bps: u16,
     pub enabled: bool,
 }
 
@@ -2527,6 +2580,14 @@ impl ProductPairConfig {
             OrderType::LimitBatch => self.taker_fee_bps,
         })
     }
+
+    pub fn relay_fee_bps_for_order(&self, order: &OrderIntent) -> Result<u16, ProtocolError> {
+        order.validate_relay_mode()?;
+        Ok(match order.relay_mode {
+            RelayMode::ZylithRelay => self.relay_fee_bps,
+            RelayMode::SelfRelay => 0,
+        })
+    }
 }
 
 fn default_heartbeat_cover_price() -> u128 {
@@ -2541,11 +2602,15 @@ fn default_protocol_fee_recipient() -> String {
     "zylith-protocol-treasury".into()
 }
 
-pub fn default_pair_fee_bps(pair_id: &PairId) -> (u16, u16) {
+fn default_relay_fee_recipient() -> String {
+    "zylith-renewal-relay".into()
+}
+
+pub fn default_pair_fee_bps(pair_id: &PairId) -> (u16, u16, u16) {
     if is_conversion_pair(pair_id) {
-        (2, 0)
+        (2, 0, 1)
     } else {
-        (4, 0)
+        (4, 0, 2)
     }
 }
 
@@ -2699,7 +2764,8 @@ impl ProductConfig {
             ("USDC/USDT", "USDC", "USDT"),
         ] {
             let pair_id_value = PairId(pair_id.to_owned());
-            let (taker_fee_bps, maker_fee_bps) = default_pair_fee_bps(&pair_id_value);
+            let (taker_fee_bps, maker_fee_bps, relay_fee_bps) =
+                default_pair_fee_bps(&pair_id_value);
             pairs.insert(
                 pair_id.to_owned(),
                 ProductPairConfig {
@@ -2711,6 +2777,7 @@ impl ProductConfig {
                     heartbeat_cover_price: default_heartbeat_cover_price(),
                     taker_fee_bps,
                     maker_fee_bps,
+                    relay_fee_bps,
                     enabled: true,
                 },
             );
@@ -2822,6 +2889,7 @@ impl ProductConfig {
             .ok_or_else(|| ProtocolError::UnsupportedPair(order.pair_id.0.clone()))?;
 
         order.validate_parent_link()?;
+        order.validate_relay_mode()?;
 
         if order.amount == 0 {
             return Err(ProtocolError::InvalidOrder(
@@ -3010,7 +3078,7 @@ impl ProductConfig {
         let base_asset_id = AssetId(base.to_owned());
         let quote_asset_id = AssetId(quote.to_owned());
         let price_base_scale = asset_amount_scale(&base_asset_id);
-        let (taker_fee_bps, maker_fee_bps) = default_pair_fee_bps(&pair_id);
+        let (taker_fee_bps, maker_fee_bps, relay_fee_bps) = default_pair_fee_bps(&pair_id);
 
         Ok(ProductPairConfig {
             pair_id,
@@ -3021,6 +3089,7 @@ impl ProductConfig {
             heartbeat_cover_price: default_heartbeat_cover_price(),
             taker_fee_bps,
             maker_fee_bps,
+            relay_fee_bps,
             enabled,
         })
     }
@@ -3087,7 +3156,7 @@ mod tests {
         HiddenMakerCurve, MAX_MAKER_CURVE_POINTS, MakerCurvePoint, NOTE_RECOGNITION_ALGORITHM,
         Note, NoteCommitment, Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIntent, OrderShareBundle,
         OrderSide, OrderSubmission, OutputCiphertextBundle, OutputNoteRecord, PairId,
-        ProductConfig, SettlementTranscript, StarknetPrivacyFundingRail,
+        ProductConfig, RelayMode, SettlementTranscript, StarknetPrivacyFundingRail,
         TRANSCRIPT_SHAPE_POLICY_VERSION, funding_input_set_commitment,
         funding_nullifier_set_commitment, renewal_parent_commitment,
         renewal_parent_secret_commitment,
@@ -3178,6 +3247,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
             amount: 1_000,
@@ -3221,6 +3291,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
             amount: 1_000,
@@ -3426,6 +3497,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
             amount: 1,
@@ -3481,6 +3553,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
             amount: 1,
@@ -3527,6 +3600,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
             amount: 2,
@@ -3581,6 +3655,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Sell,
             order_type: crate::OrderType::MakerCurve,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: Some(HiddenMakerCurve {
                 points: vec![
                     MakerCurvePoint {
@@ -3648,6 +3723,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Sell,
             order_type: crate::OrderType::MakerCurve,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: Some(HiddenMakerCurve {
                 points: vec![
                     MakerCurvePoint {
@@ -3751,6 +3827,7 @@ mod tests {
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Sell,
             order_type: crate::OrderType::MakerCurve,
+            relay_mode: RelayMode::SelfRelay,
             maker_curve: Some(HiddenMakerCurve {
                 points: vec![
                     MakerCurvePoint {
@@ -3787,7 +3864,21 @@ mod tests {
             auditor_view_allowed: false,
         };
 
+        let self_relay_parent_commitment = order.commitment().expect("self relay commitment");
         assert_eq!(pair.fee_bps_for_order(&order).expect("fee bps"), 4);
+        assert_eq!(
+            pair.relay_fee_bps_for_order(&order)
+                .expect("self relay fee bps"),
+            0
+        );
+        order.relay_mode = RelayMode::ZylithRelay;
+        assert!(
+            pair.relay_fee_bps_for_order(&order)
+                .expect_err("zylith relay requires renewal child")
+                .to_string()
+                .contains("renewal-backed child")
+        );
+        order.relay_mode = RelayMode::SelfRelay;
 
         order.parent_authorization_secret = "0x7777".into();
         order.parent_secret_commitment =
@@ -3802,6 +3893,21 @@ mod tests {
         order.parent_child_index = 1;
 
         assert_eq!(pair.fee_bps_for_order(&order).expect("fee bps"), 0);
+        assert_eq!(
+            pair.relay_fee_bps_for_order(&order)
+                .expect("self relay child fee bps"),
+            0
+        );
+        order.relay_mode = RelayMode::ZylithRelay;
+        assert_ne!(
+            self_relay_parent_commitment,
+            order.commitment().expect("zylith relay commitment")
+        );
+        assert_eq!(
+            pair.relay_fee_bps_for_order(&order)
+                .expect("zylith relay fee bps"),
+            pair.relay_fee_bps
+        );
     }
 
     #[test]
@@ -3938,7 +4044,9 @@ mod tests {
             price_base_scale: 1,
             taker_fee_bps: 4,
             maker_fee_bps: 0,
+            relay_fee_bps: 0,
             protocol_fee_recipient: "0x123".into(),
+            relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -4002,7 +4110,9 @@ mod tests {
             price_base_scale: 1,
             taker_fee_bps: 4,
             maker_fee_bps: 0,
+            relay_fee_bps: 0,
             protocol_fee_recipient: "zylith-protocol-treasury".into(),
+            relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],

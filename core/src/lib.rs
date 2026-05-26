@@ -76,7 +76,7 @@ pub use types::{
     ProofJobStatus, PublicBatchSummary, PublicSettlementTranscript,
     PublishedBatchArtifactList, PublishedBatchArtifactSummary, PublishedBatchArtifacts,
     RENEWAL_PARENT_CANCEL_DOMAIN_HEX, RecoveryArtifact, RecoveryArtifactKind, RecoveryArtifactList,
-    RecoveryArtifactUpload, RenewalChildUse, RenewalParentCancelCallArguments,
+    RecoveryArtifactUpload, RelayMode, RenewalChildUse, RenewalParentCancelCallArguments,
     RenewalParentCancelPlanRequest, RenewalParentCancelSubmissionPlan, RenewalStateHistoryBatch,
     RootOnlySettlementCommitments, SettlementCallArguments,
     SettlementOutputWithdrawalCallArguments, SettlementOutputWithdrawalSubmissionPlan,
