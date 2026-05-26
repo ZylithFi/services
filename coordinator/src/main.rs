@@ -28,7 +28,7 @@ use zylith_core::{
     validate_order_ingress_receipt_for_manifest_with_secrets,
 };
 
-const DEFAULT_BATCH_WINDOW_MS: u64 = 30 * 1_000;
+const DEFAULT_BATCH_WINDOW_MS: u64 = 90 * 1_000;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_BATCH_STORE_PATH: &str = "coordinator/batches.dev.json";
 const DEFAULT_RECOVERY_STORE_PATH: &str = "coordinator/recovery_artifacts.dev.json";
@@ -662,11 +662,11 @@ fn is_public_artifact_visible(
     delay_epochs: u64,
     batch_window_ms: u64,
 ) -> bool {
+    if delay_epochs == 0 {
+        return published.published_at_unix_ms != 0;
+    }
     if published.settled_at_unix_ms.is_none() {
         return false;
-    }
-    if delay_epochs == 0 {
-        return true;
     }
     let Some(max_epoch) = artifacts
         .values()

@@ -38,7 +38,7 @@ const DEFAULT_DEPLOYMENT_MANIFEST_PATH: &str = concat!(
 );
 const DEFAULT_SHIELDED_ASSET_ADAPTER_ADDRESS: &str = "";
 const DEFAULT_ARTIFACT_ARCHIVE_PATH: &str = "indexer/published_batch_artifacts.dev.json";
-const DEFAULT_BATCH_WINDOW_MS: u64 = 30_000;
+const DEFAULT_BATCH_WINDOW_MS: u64 = 90_000;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = 1;
 const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
 const ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_EPOCHS";
@@ -496,11 +496,11 @@ fn is_public_artifact_visible(
     delay_epochs: u64,
     batch_window_ms: u64,
 ) -> bool {
+    if delay_epochs == 0 {
+        return published.published_at_unix_ms != 0;
+    }
     if published.settled_at_unix_ms.is_none() {
         return false;
-    }
-    if delay_epochs == 0 {
-        return true;
     }
     if public_visible_epoch_cutoff(artifacts, delay_epochs)
         .map(|cutoff| batch_epoch <= cutoff)

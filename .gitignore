@@ -14,7 +14,14 @@
 /scripts/
 /contracts/target
 /contracts/.snfoundry_cache
+/proof_program/target
+/proof_program/.snfoundry_cache
 /stwo_statement/target
+/ops/target
+/paymaster/node_modules
+/paymaster/dist
+/paymaster/state
+/paymaster/*.tsbuildinfo
 /coordinator/batches.dev.json
 /.deploy
 /.external

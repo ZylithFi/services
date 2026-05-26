@@ -1,0 +1,197 @@
+import { createServer } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+import type { PaymasterConfig } from "./config.js";
+import type { SubmitterDeps } from "./starknetSubmitter.js";
+import {
+  ensurePrivacyProofSignerContract,
+  relayPrivacyProofSignerCall,
+  submitProofBearingOutsideExecution
+} from "./starknetSubmitter.js";
+import { SubmissionStore } from "./submissionStore.js";
+import {
+  validateEnsurePrivacySignerRequest,
+  validateExecuteOutsideRequest,
+  validateRelayPrivacySignerRequest
+} from "./validation.js";
+
+export type PaymasterServerDeps = SubmitterDeps & {
+  submissionStore?: SubmissionStore;
+};
+
+export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterServerDeps = {}) {
+  const rateLimiter = new SignerRateLimiter(config.signerLimitPerMinute);
+  const submissionQueue = new SubmissionQueue();
+  const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
+
+  return createServer(async (request, response) => {
+    try {
+      if (!validateCors(request, response, config)) {
+        return;
+      }
+
+      if (request.method === "OPTIONS") {
+        sendJson(request, response, 204, {});
+        return;
+      }
+
+      if (request.method === "GET" && request.url === "/health") {
+        sendJson(request, response, 200, { status: "ok" });
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/privacy-signer/ensure") {
+        const rawBody = await readBody(request, config.maxBodyBytes);
+        const body = JSON.parse(rawBody) as unknown;
+        const validated = validateEnsurePrivacySignerRequest(body, config);
+        rateLimiter.check(validated.signer_public_key);
+        const result = await submissionQueue.enqueue(() =>
+          ensurePrivacyProofSignerContract(validated, config, deps)
+        );
+        sendJson(request, response, 200, result);
+        return;
+      }
+
+      if (request.method === "POST" && request.url === "/privacy-signer/relay") {
+        const rawBody = await readBody(request, config.maxBodyBytes);
+        const body = JSON.parse(rawBody) as unknown;
+        const validated = validateRelayPrivacySignerRequest(body, config);
+        rateLimiter.check(validated.account_address);
+        const result = await submissionQueue.enqueue(() =>
+          relayPrivacyProofSignerCall(validated, config, deps)
+        );
+        sendJson(request, response, 200, result);
+        return;
+      }
+
+      if (request.method !== "POST" || request.url !== "/execute-outside") {
+        sendJson(request, response, 404, { error: "not_found" });
+        return;
+      }
+
+      const rawBody = await readBody(request, config.maxBodyBytes);
+      const body = JSON.parse(rawBody) as unknown;
+      const validated = validateExecuteOutsideRequest(body, config);
+      rateLimiter.check(validated.signer_address);
+      const result = await submissionStore.runOnce(validated, () =>
+        submissionQueue.enqueue(() => submitProofBearingOutsideExecution(validated, config, deps))
+      );
+      sendJson(request, response, 200, result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = statusForError(message);
+      sendJson(request, response, status, { error: message });
+    }
+  });
+}
+
+function readBody(request: IncomingMessage, maxBytes: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+
+    request.on("data", (chunk: Buffer) => {
+      size += chunk.byteLength;
+      if (size > maxBytes) {
+        reject(new Error("request body too large"));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    request.on("error", reject);
+  });
+}
+
+function validateCors(
+  request: IncomingMessage,
+  response: ServerResponse,
+  config: PaymasterConfig
+): boolean {
+  const origin = request.headers.origin;
+  if (!origin) {
+    return true;
+  }
+
+  if (!config.allowedOrigins.has(origin)) {
+    sendJson(request, response, 403, { error: "origin is not allowlisted" }, false);
+    return false;
+  }
+
+  return true;
+}
+
+function sendJson(
+  request: IncomingMessage,
+  response: ServerResponse,
+  statusCode: number,
+  body: unknown,
+  includeCors = true
+): void {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "cache-control": "no-store"
+  };
+  const origin = request.headers.origin;
+  if (origin && includeCors) {
+    headers["access-control-allow-origin"] = origin;
+    headers.vary = "origin";
+    headers["access-control-allow-methods"] = "POST, GET, OPTIONS";
+    headers["access-control-allow-headers"] = "content-type";
+  }
+
+  response.writeHead(statusCode, {
+    ...headers
+  });
+  response.end(JSON.stringify(body));
+}
+
+function statusForError(message: string): number {
+  if (
+    message.includes("not allowlisted") ||
+    message.includes("does not match") ||
+    message.includes("outside execution caller")
+  ) {
+    return 403;
+  }
+  if (message.includes("rate limit")) {
+    return 429;
+  }
+  return 400;
+}
+
+class SignerRateLimiter {
+  private readonly buckets = new Map<string, { windowStartedAt: number; count: number }>();
+
+  constructor(private readonly limitPerMinute: number) {}
+
+  check(signerAddress: string, now = Date.now()): void {
+    const windowMs = 60_000;
+    const existing = this.buckets.get(signerAddress);
+    if (!existing || now - existing.windowStartedAt >= windowMs) {
+      this.buckets.set(signerAddress, { windowStartedAt: now, count: 1 });
+      return;
+    }
+
+    existing.count += 1;
+    if (existing.count > this.limitPerMinute) {
+      throw new Error("signer rate limit exceeded");
+    }
+  }
+}
+
+class SubmissionQueue {
+  private tail: Promise<unknown> = Promise.resolve();
+
+  enqueue<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.tail.catch(() => undefined).then(task);
+    this.tail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+}
