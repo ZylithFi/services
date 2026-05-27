@@ -62,6 +62,35 @@ describe("paymaster server", () => {
     expect(response.headers.get("access-control-allow-origin")).toBeNull();
   });
 
+  it("allows configured wildcard preview origins", async () => {
+    const server = createPaymasterServer(
+      {
+        ...config(),
+        allowedOriginPatterns: [/^https:\/\/[a-z0-9-]+\.vercel\.app$/]
+      },
+      {
+        fetchImpl: fakeRpcFetch(),
+        runtime: fakeRuntime()
+      }
+    );
+    servers.push(server);
+    const url = await listen(server);
+
+    const response = await fetch(`${url}/execute-outside`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://zylith-git-main-tanctl.vercel.app"
+      },
+      body: JSON.stringify(request)
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("access-control-allow-origin")).toBe(
+      "https://zylith-git-main-tanctl.vercel.app"
+    );
+  });
+
   it("serializes submissions through the paymaster account", async () => {
     let active = 0;
     let maxActive = 0;
@@ -174,6 +203,7 @@ function config(): PaymasterConfig {
     port: 0,
     maxBodyBytes: 1_000_000,
     allowedOrigins: new Set(["https://app.example"]),
+    allowedOriginPatterns: [],
     signerLimitPerMinute: 20,
     submissionLogPath: null
   };

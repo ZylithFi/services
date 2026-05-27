@@ -116,12 +116,17 @@ function validateCors(
     return true;
   }
 
-  if (!config.allowedOrigins.has(origin)) {
+  if (!isOriginAllowed(config, origin)) {
     sendJson(request, response, 403, { error: "origin is not allowlisted" }, false);
     return false;
   }
 
   return true;
+}
+
+function isOriginAllowed(config: PaymasterConfig, origin: string): boolean {
+  return config.allowedOrigins.has(origin) ||
+    config.allowedOriginPatterns.some((pattern) => pattern.test(origin));
 }
 
 function sendJson(

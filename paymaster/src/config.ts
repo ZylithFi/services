@@ -12,6 +12,7 @@ export type PaymasterConfig = {
   port: number;
   maxBodyBytes: number;
   allowedOrigins: Set<string>;
+  allowedOriginPatterns: RegExp[];
   signerLimitPerMinute: number;
   submissionLogPath: string | null;
 };
@@ -37,6 +38,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       "apply_actions,submit_settlement_with_proof_facts"
   );
   const withdrawalAmountBuckets = parseAmountBucketSet(env.ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS);
+  const allowedOriginRules = parseOriginRules(env.ZYLITH_PAYMASTER_ALLOWED_ORIGINS);
 
   if (allowedContracts.size === 0) {
     throw new Error(
@@ -61,7 +63,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_MAX_BODY_BYTES,
       "ZYLITH_PAYMASTER_MAX_BODY_BYTES"
     ),
-    allowedOrigins: parseOriginSet(env.ZYLITH_PAYMASTER_ALLOWED_ORIGINS),
+    allowedOrigins: allowedOriginRules.exact,
+    allowedOriginPatterns: allowedOriginRules.patterns,
     signerLimitPerMinute: parsePositiveInt(
       env.ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE,
       DEFAULT_SIGNER_LIMIT_PER_MINUTE,
@@ -148,13 +151,25 @@ function parseAmountBucketSet(value: string | undefined): Set<string> {
   );
 }
 
-function parseOriginSet(value: string | undefined): Set<string> {
-  return new Set(
-    (value ?? "")
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean)
-  );
+function parseOriginRules(value: string | undefined): { exact: Set<string>; patterns: RegExp[] } {
+  const exact = new Set<string>();
+  const patterns: RegExp[] = [];
+  for (const item of (value ?? "").split(",").map((entry) => entry.trim()).filter(Boolean)) {
+    if (item.includes("*")) {
+      patterns.push(wildcardOriginPattern(item));
+    } else {
+      exact.add(item);
+    }
+  }
+  return { exact, patterns };
+}
+
+function wildcardOriginPattern(value: string): RegExp {
+  const escaped = value
+    .split("*")
+    .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, "\\$&"))
+    .join("[^/]*");
+  return new RegExp(`^${escaped}$`);
 }
 
 function parsePositiveInt(value: string | undefined, defaultValue: number, key: string): number {

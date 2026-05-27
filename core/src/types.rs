@@ -3517,7 +3517,7 @@ mod tests {
                 paymaster_url: None,
                 sdk_package: "@starkware-libs/starknet-privacy-sdk".into(),
                 sdk_version: "0.14.2".into(),
-                min_proving_delay_blocks: 10,
+                min_proving_delay_blocks: 20,
             }),
             ..FundingRailConfig::default()
         };
