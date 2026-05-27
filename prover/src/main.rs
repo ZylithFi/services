@@ -44,19 +44,19 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use url::Url;
 use zylith_core::hash::{encode_starknet_felt, normalize_felt_hex, ordered_felt_list_commitment};
 use zylith_core::{
-    AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchOrderSet, BatchSummary,
-    CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord, DepositRecordList,
-    FeeEntry, MakerAttributionBundle, MakerAttributionPlaintext, MakerBandAttribution,
-    MakerBandFillAttribution, MatchedOrder, MatchedOrderWitness, Note, NoteConsolidationWitness,
-    NoteMembershipKind, NoteMembershipWitness, OnchainSubmissionRecord, OrderCommitment,
-    OrderExecutionReport, OrderIngressReceipt, OrderIntent, OrderShareBundle, OrderSide,
-    OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord,
-    PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
-    PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig, ProofArtifactRecord,
-    ProofJobStatus, PublishedBatchArtifacts, SettlementRootHistoryArchive,
-    SettlementSubmissionPlan, SettlementTimestampUpdate, SettlementTranscript, SettlementWitness,
-    StarknetCall, TimeInForce, TrustedOrderIngressRequest, TrustedOrderIngressResponse,
-    admission_proof_message_hash_for_program, auction_admission_root,
+    AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchOrderSet, BatchStatus,
+    BatchSummary, CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord,
+    DepositRecordList, FeeEntry, MakerAttributionBundle, MakerAttributionPlaintext,
+    MakerBandAttribution, MakerBandFillAttribution, MatchedOrder, MatchedOrderWitness, Note,
+    NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness, OnchainSubmissionRecord,
+    OrderCommitment, OrderExecutionReport, OrderIngressReceipt, OrderIntent, OrderShareBundle,
+    OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord,
+    OutputRecoveryRecord, PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig,
+    PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig,
+    ProofArtifactRecord, ProofJobStatus, PublicBatchSummary, PublishedBatchArtifacts,
+    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTimestampUpdate,
+    SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
+    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
     build_admission_serialized_input, build_auction_result_serialized_input,
     build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
@@ -159,6 +159,10 @@ const PROVER_MAX_STORED_PRIVATE_PAYLOADS_ENV: &str = "ZYLITH_PROVER_MAX_STORED_P
 const PROVER_PRIVATE_PAYLOAD_RETENTION_MS_ENV: &str = "ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS";
 const PROVER_EMERGENCY_PAUSED_ENV: &str = "ZYLITH_PROVER_EMERGENCY_PAUSED";
 const PROVER_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_PROVER_ALLOWED_ORIGINS";
+const PROVER_WORKER_ENABLED_ENV: &str = "ZYLITH_PROVER_WORKER_ENABLED";
+const PROVER_WORKER_TICK_MS_ENV: &str = "ZYLITH_PROVER_WORKER_TICK_MS";
+const PROVER_WORKER_MAX_BATCHES_PER_TICK_ENV: &str = "ZYLITH_PROVER_WORKER_MAX_BATCHES_PER_TICK";
+const PROVER_WORKER_SUBMIT_ONCHAIN_ENV: &str = "ZYLITH_PROVER_WORKER_SUBMIT_ONCHAIN";
 const MIN_BATCH_PARTICIPANTS_ENV: &str = "ZYLITH_MIN_BATCH_PARTICIPANTS";
 const MIN_ELIGIBLE_ORDERS_ENV: &str = "ZYLITH_MIN_ELIGIBLE_ORDERS";
 const MIN_MAKER_PARTICIPANTS_ENV: &str = "ZYLITH_MIN_MAKER_PARTICIPANTS";
@@ -180,6 +184,8 @@ const DEFAULT_PROVER_MAX_STORED_PRIVATE_PAYLOADS: usize = 10_000;
 const DEFAULT_PROVER_PRIVATE_PAYLOAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS: u64 = 5_000;
 const DEFAULT_MAX_PROVABLE_BATCH_ORDERS: u64 = 32;
+const DEFAULT_PROVER_WORKER_TICK_MS: u64 = 10_000;
+const DEFAULT_PROVER_WORKER_MAX_BATCHES_PER_TICK: usize = 1;
 
 #[derive(Clone)]
 struct AppState {
@@ -232,6 +238,10 @@ struct AppState {
     max_stored_private_payloads: usize,
     private_ingress_rate_limit_per_minute: u64,
     emergency_paused: bool,
+    prover_worker_enabled: bool,
+    prover_worker_tick_ms: u64,
+    prover_worker_max_batches_per_tick: usize,
+    prover_worker_submit_onchain: bool,
     rate_limiter: RateLimiter,
     native_prover_attempts: usize,
     native_prover_retry_interval_ms: u64,
@@ -326,6 +336,10 @@ struct AppConfig {
     max_stored_private_payloads: usize,
     private_ingress_rate_limit_per_minute: u64,
     emergency_paused: bool,
+    prover_worker_enabled: bool,
+    prover_worker_tick_ms: u64,
+    prover_worker_max_batches_per_tick: usize,
+    prover_worker_submit_onchain: bool,
     max_body_bytes: usize,
     native_prover_attempts: usize,
     native_prover_retry_interval_ms: u64,
@@ -761,6 +775,16 @@ fn build_app() -> Result<Router, String> {
             DEFAULT_PROVER_PRIVATE_INGRESS_RATE_LIMIT_PER_MINUTE,
         ),
         emergency_paused: env_bool_or_default(PROVER_EMERGENCY_PAUSED_ENV, false),
+        prover_worker_enabled: env_bool_or_default(PROVER_WORKER_ENABLED_ENV, false),
+        prover_worker_tick_ms: env_parse_or_default(
+            PROVER_WORKER_TICK_MS_ENV,
+            DEFAULT_PROVER_WORKER_TICK_MS,
+        ),
+        prover_worker_max_batches_per_tick: env_parse_or_default(
+            PROVER_WORKER_MAX_BATCHES_PER_TICK_ENV,
+            DEFAULT_PROVER_WORKER_MAX_BATCHES_PER_TICK,
+        ),
+        prover_worker_submit_onchain: env_bool_or_default(PROVER_WORKER_SUBMIT_ONCHAIN_ENV, true),
         max_body_bytes: env_parse_or_default(
             PROVER_MAX_BODY_BYTES_ENV,
             DEFAULT_PROVER_MAX_BODY_BYTES,
@@ -975,6 +999,10 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_stored_private_payloads,
         private_ingress_rate_limit_per_minute,
         emergency_paused,
+        prover_worker_enabled,
+        prover_worker_tick_ms,
+        prover_worker_max_batches_per_tick,
+        prover_worker_submit_onchain,
         max_body_bytes,
         native_prover_attempts,
         native_prover_retry_interval_ms,
@@ -1081,11 +1109,19 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_stored_private_payloads,
         private_ingress_rate_limit_per_minute,
         emergency_paused,
+        prover_worker_enabled,
+        prover_worker_tick_ms,
+        prover_worker_max_batches_per_tick,
+        prover_worker_submit_onchain,
         rate_limiter: RateLimiter::default(),
         native_prover_attempts,
         native_prover_retry_interval_ms,
         native_prover_request_timeout_seconds,
     };
+
+    if state.prover_worker_enabled {
+        task::spawn(proof_worker_loop(state.clone()));
+    }
 
     Ok(Router::new()
         .route("/health", get(health))
@@ -1166,6 +1202,10 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "native_tx_prover_enabled": state.native_tx_prover_url.is_some(),
         "native_tx_prover_ohttp_enabled": state.native_tx_prover_ohttp.is_some(),
         "native_proof_aggregation_enabled": state.native_tx_prover_url.is_some() || state.native_proof_aggregator_url.is_some(),
+        "prover_worker_enabled": state.prover_worker_enabled,
+        "prover_worker_tick_ms": state.prover_worker_tick_ms,
+        "prover_worker_max_batches_per_tick": state.prover_worker_max_batches_per_tick,
+        "prover_worker_submit_onchain": state.prover_worker_submit_onchain,
         "trusted_order_ingress_enabled": state.order_ingress_receipt_secret.is_some(),
         "trusted_order_ingress_id": state.order_ingress_id,
         "trusted_order_ingress_receipt_key_count": state.order_ingress_receipt_secrets.len(),
@@ -1240,6 +1280,11 @@ async fn public_auction_keys_fingerprint(
     })))
 }
 
+fn reject_private_ingress(reason: &str) -> StatusCode {
+    eprintln!("private order ingress rejected: {reason}");
+    StatusCode::BAD_REQUEST
+}
+
 async fn ingest_private_order_payload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1259,10 +1304,10 @@ async fn ingest_private_order_payload(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let submission = request.order_submission;
     if submission.order_bundle.ingress_receipt.is_some() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(reject_private_ingress("client supplied an ingress receipt"));
     }
     let payload_commitment = private_order_payload_commitment(&submission.order_bundle)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| reject_private_ingress("payload commitment failed"))?;
     let order_commitment = submission.order_bundle.order_commitment.clone();
 
     {
@@ -1288,22 +1333,22 @@ async fn ingest_private_order_payload(
 
     let private_payload =
         decrypt_order_bundle(&submission.order_bundle, &state.auction_private_keys)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|_| reject_private_ingress("payload decryption failed"))?;
     let reconstructed_order_commitment = private_payload
         .order
         .commitment()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| reject_private_ingress("order commitment reconstruction failed"))?;
     if reconstructed_order_commitment != order_commitment {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(reject_private_ingress("order commitment mismatch"));
     }
     if submission.order_bundle.pair_id != private_payload.order.pair_id {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(reject_private_ingress("pair mismatch"));
     }
     if submission.order_bundle.batch_id != private_payload.order.batch_id {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(reject_private_ingress("batch mismatch"));
     }
     if submission.order_bundle.epoch_id != private_payload.order.expiry_epoch {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(reject_private_ingress("epoch mismatch"));
     }
     state
         .product_config
@@ -1315,9 +1360,9 @@ async fn ingest_private_order_payload(
                 .cloned()
                 .collect::<Vec<_>>(),
         )
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| reject_private_ingress("funding notes are invalid"))?;
     validate_private_order_risk_limits(&state, &private_payload.order)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| reject_private_ingress("order risk limits rejected"))?;
 
     let receipt = create_order_ingress_receipt(
         &submission.order_bundle,
@@ -1519,6 +1564,120 @@ fn maker_curve_quote_notional(order: &OrderIntent) -> Result<u128, String> {
 fn require_prover_not_paused(state: &AppState) -> Result<(), StatusCode> {
     if state.emergency_paused {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(())
+}
+
+async fn proof_worker_loop(state: AppState) {
+    eprintln!(
+        "zylith prover worker enabled tick_ms={} max_batches_per_tick={} submit_onchain={}",
+        state.prover_worker_tick_ms,
+        state.prover_worker_max_batches_per_tick,
+        state.prover_worker_submit_onchain
+    );
+    loop {
+        if let Err(error) = run_proof_worker_tick(&state).await {
+            eprintln!("zylith prover worker tick failed: {error}");
+        }
+        sleep(Duration::from_millis(state.prover_worker_tick_ms.max(1))).await;
+    }
+}
+
+async fn run_proof_worker_tick(state: &AppState) -> Result<usize, String> {
+    if state.emergency_paused {
+        return Ok(0);
+    }
+    let mut batches = fetch_public_batch_summaries(state).await?;
+    batches.sort_by(|left, right| {
+        left.close_time_unix_ms
+            .cmp(&right.close_time_unix_ms)
+            .then_with(|| left.epoch_id.cmp(&right.epoch_id))
+            .then_with(|| left.batch_id.0.cmp(&right.batch_id.0))
+    });
+
+    let mut processed = 0usize;
+    for batch in batches {
+        if processed >= state.prover_worker_max_batches_per_tick {
+            break;
+        }
+        if !matches!(batch.status, BatchStatus::Closed | BatchStatus::Clearing) {
+            continue;
+        }
+        let batch_id = batch.batch_id.0.as_str();
+        if !proof_worker_should_process_batch(state, batch_id).await {
+            continue;
+        }
+        let order_set = match fetch_batch_order_set(state, batch_id).await {
+            Ok(order_set) => order_set,
+            Err(StatusCode::NOT_FOUND) => continue,
+            Err(status) => {
+                return Err(format!(
+                    "failed to fetch closed batch {batch_id} orders: {status}"
+                ));
+            }
+        };
+        if order_set.orders.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "zylith prover worker processing batch_id={} pair={} epoch={} orders={}",
+            batch_id,
+            batch.pair_id.0,
+            batch.epoch_id,
+            order_set.orders.len()
+        );
+        if let Err(status) = process_proof_worker_batch(state, batch_id).await {
+            eprintln!("zylith prover worker batch {batch_id} failed status={status}");
+        }
+        processed += 1;
+    }
+    Ok(processed)
+}
+
+async fn fetch_public_batch_summaries(state: &AppState) -> Result<Vec<PublicBatchSummary>, String> {
+    let url = format!("{}/api/batches", state.coordinator_url);
+    state
+        .http_client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| format!("coordinator batch list request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("coordinator batch list rejected: {error}"))?
+        .json()
+        .await
+        .map_err(|error| format!("coordinator batch list decode failed: {error}"))
+}
+
+async fn proof_worker_should_process_batch(state: &AppState, batch_id: &str) -> bool {
+    if state
+        .onchain_submissions
+        .read()
+        .await
+        .contains_key(batch_id)
+    {
+        return false;
+    }
+    let proof_jobs = state.proof_jobs.read().await;
+    let Some(status) = proof_jobs.get(batch_id) else {
+        return true;
+    };
+    matches!(
+        status.state.as_str(),
+        "witness-prepared" | "proof-generated"
+    )
+}
+
+async fn process_proof_worker_batch(state: &AppState, batch_id: &str) -> Result<(), StatusCode> {
+    let existing_state = {
+        let proof_jobs = state.proof_jobs.read().await;
+        proof_jobs.get(batch_id).map(|status| status.state.clone())
+    };
+    if existing_state.as_deref() != Some("proof-generated") {
+        run_proof_job_inner(state, batch_id).await?;
+    }
+    if state.prover_worker_submit_onchain {
+        submit_onchain_inner(state, batch_id).await?;
     }
     Ok(())
 }
@@ -2281,12 +2440,19 @@ async fn run_proof_job(
 ) -> Result<Json<ProofJobStatus>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
-    let (_, settlement_witness) = ensure_prepared_job(&state, &batch_id).await?;
-    let transcript = fetch_transcript(&state, &batch_id).await?;
+    Ok(Json(run_proof_job_inner(&state, &batch_id).await?))
+}
+
+async fn run_proof_job_inner(
+    state: &AppState,
+    batch_id: &str,
+) -> Result<ProofJobStatus, StatusCode> {
+    let (_, settlement_witness) = ensure_prepared_job(state, batch_id).await?;
+    let transcript = fetch_transcript(state, batch_id).await?;
 
     set_job_state(
-        &state,
-        &batch_id,
+        state,
+        batch_id,
         JobStateUpdate {
             next_state: "proving".into(),
             proof_artifact_id: None,
@@ -2299,12 +2465,12 @@ async fn run_proof_job(
     )
     .await?;
 
-    let proof_result = match fetch_auction_order_witnesses(&state, &batch_id).await {
+    let proof_result = match fetch_auction_order_witnesses(state, batch_id).await {
         Ok(auction_order_witnesses) => {
             if state.native_tx_prover_url.is_some() {
                 execute_native_transaction_prover(
-                    &state,
-                    &batch_id,
+                    state,
+                    batch_id,
                     &transcript,
                     &settlement_witness,
                     &auction_order_witnesses,
@@ -2312,8 +2478,8 @@ async fn run_proof_job(
                 .await
             } else {
                 execute_stwo_prover(
-                    &state,
-                    &batch_id,
+                    state,
+                    batch_id,
                     &settlement_witness,
                     &auction_order_witnesses,
                 )
@@ -2328,9 +2494,9 @@ async fn run_proof_job(
     match proof_result {
         Ok(artifact) => {
             if state.native_tx_prover_url.is_some()
-                && let Err(error) = prove_and_record_auction_result(&state, &batch_id, false).await
+                && let Err(error) = prove_and_record_auction_result(state, batch_id, false).await
             {
-                set_job_error(&state, &batch_id, error).await?;
+                set_job_error(state, batch_id, error).await?;
                 return Err(StatusCode::BAD_GATEWAY);
             }
 
@@ -2345,28 +2511,28 @@ async fn run_proof_job(
             let artifact_id = artifact.artifact_id.clone();
             {
                 let mut proof_artifacts = state.proof_artifacts.write().await;
-                proof_artifacts.insert(batch_id.clone(), artifact.clone());
+                proof_artifacts.insert(batch_id.to_owned(), artifact.clone());
                 persist_record(
                     state.data_dir.as_ref(),
                     PROOF_ARTIFACTS_DIR,
-                    &batch_id,
+                    batch_id,
                     &artifact,
                 )?;
             }
             {
                 let mut settlement_plans = state.settlement_plans.write().await;
-                settlement_plans.insert(batch_id.clone(), settlement_plan.clone());
+                settlement_plans.insert(batch_id.to_owned(), settlement_plan.clone());
                 persist_record(
                     state.data_dir.as_ref(),
                     SETTLEMENT_PLANS_DIR,
-                    &batch_id,
+                    batch_id,
                     &settlement_plan,
                 )?;
             }
 
             let updated_status = set_job_state(
-                &state,
-                &batch_id,
+                state,
+                batch_id,
                 JobStateUpdate {
                     next_state: "proof-generated".into(),
                     proof_artifact_id: Some(artifact_id),
@@ -2381,10 +2547,10 @@ async fn run_proof_job(
             )
             .await?;
 
-            Ok(Json(updated_status))
+            Ok(updated_status)
         }
         Err(error) => {
-            set_job_error(&state, &batch_id, error).await?;
+            set_job_error(state, batch_id, error).await?;
             Err(StatusCode::BAD_GATEWAY)
         }
     }
@@ -2397,17 +2563,24 @@ async fn submit_onchain(
 ) -> Result<Json<OnchainSubmissionRecord>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
+    Ok(Json(submit_onchain_inner(&state, &batch_id).await?))
+}
+
+async fn submit_onchain_inner(
+    state: &AppState,
+    batch_id: &str,
+) -> Result<OnchainSubmissionRecord, StatusCode> {
     let settlement_plan = {
         let settlement_plans = state.settlement_plans.read().await;
         settlement_plans
-            .get(&batch_id)
+            .get(batch_id)
             .cloned()
             .ok_or(StatusCode::NOT_FOUND)?
     };
     let proof_artifact = {
         let proof_artifacts = state.proof_artifacts.read().await;
         proof_artifacts
-            .get(&batch_id)
+            .get(batch_id)
             .cloned()
             .ok_or(StatusCode::NOT_FOUND)?
     };
@@ -2419,8 +2592,10 @@ async fn submit_onchain(
         return Err(StatusCode::CONFLICT);
     }
 
-    if let Err(error) = prove_and_record_auction_result(&state, &batch_id, true).await {
-        set_onchain_submission_error(&state, &batch_id, error).await?;
+    set_job_submitting_onchain(state, batch_id).await?;
+
+    if let Err(error) = prove_and_record_auction_result(state, batch_id, true).await {
+        set_onchain_submission_error(state, batch_id, error).await?;
         return Err(StatusCode::BAD_GATEWAY);
     }
 
@@ -2433,32 +2608,32 @@ async fn submit_onchain(
     }
 
     let submission =
-        match submit_native_plan_onchain(&state, &settlement_plan, &proof_artifact).await {
+        match submit_native_plan_onchain(state, &settlement_plan, &proof_artifact).await {
             Ok(submission) => submission,
             Err(error) => {
-                set_onchain_submission_error(&state, &batch_id, error).await?;
+                set_onchain_submission_error(state, batch_id, error).await?;
                 return Err(StatusCode::BAD_GATEWAY);
             }
         };
 
     {
         let mut submissions = state.onchain_submissions.write().await;
-        submissions.insert(batch_id.clone(), submission.clone());
+        submissions.insert(batch_id.to_owned(), submission.clone());
         persist_record(
             state.data_dir.as_ref(),
             ONCHAIN_SUBMISSIONS_DIR,
-            &batch_id,
+            batch_id,
             &submission,
         )?;
     }
-    sync_job_with_onchain_submission(&state, &batch_id, &submission).await?;
+    sync_job_with_onchain_submission(state, batch_id, &submission).await?;
     if let Err(error) =
-        publish_settlement_timestamp_to_artifact_stores(&state, &batch_id, &submission).await
+        publish_settlement_timestamp_to_artifact_stores(state, batch_id, &submission).await
     {
         eprintln!("failed to publish settlement timestamp for batch {batch_id}: {error}");
     }
 
-    Ok(Json(submission))
+    Ok(submission)
 }
 
 async fn prove_and_record_auction_result(
@@ -3924,6 +4099,33 @@ async fn sync_job_with_onchain_submission(
     persist_record(state.data_dir.as_ref(), PROOF_JOBS_DIR, batch_id, status)?;
 
     Ok(status.clone())
+}
+
+async fn set_job_submitting_onchain(
+    state: &AppState,
+    batch_id: &str,
+) -> Result<ProofJobStatus, StatusCode> {
+    let existing = {
+        let proof_jobs = state.proof_jobs.read().await;
+        proof_jobs
+            .get(batch_id)
+            .cloned()
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+    set_job_state(
+        state,
+        batch_id,
+        JobStateUpdate {
+            next_state: "submitting-onchain".into(),
+            proof_artifact_id: existing.proof_artifact_id,
+            last_error: None,
+            proof_artifact_available: existing.proof_artifact_available,
+            settlement_plan_available: Some(existing.settlement_plan_available),
+            settlement_calldata_len: Some(existing.settlement_calldata_len),
+            settlement_entrypoint: Some(existing.settlement_entrypoint),
+        },
+    )
+    .await
 }
 
 async fn publish_settlement_timestamp_to_artifact_stores(
