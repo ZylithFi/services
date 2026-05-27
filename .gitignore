@@ -4,8 +4,11 @@
 /client/node_modules
 /client/dist
 /client/*.tsbuildinfo
+/client/.env*
+!/client/.env.example
 /client/scripts/browser-qa.mjs
 /client/test-artifacts/
+/test-artifacts/
 /client/vite.config.js
 /client/vite.config.d.ts
 /client/starknet-9.4.2.tgz

@@ -19,7 +19,7 @@ use starknet_crypto::{
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    ApprovalCallArguments, AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput,
+    AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput,
     DecryptedOrderShare, DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
     EncryptedMakerAttributionArtifact, EncryptedRecoveryPayload, FundingRailKind,
     MakerAttributionPlaintext, MakerAttributionReceipt, MatchedOrderWitness, Note, NoteCommitment,
@@ -1236,16 +1236,12 @@ pub fn build_deposit_note(intent: &DepositIntent) -> Result<Note, ProtocolError>
 
 pub fn build_deposit_submission_plan(
     intent: &DepositIntent,
-    deposit_authority_address: &str,
-    token_address: &str,
-    shielded_asset_adapter_address: &str,
+    _deposit_authority_address: &str,
+    _token_address: &str,
+    _shielded_asset_adapter_address: &str,
 ) -> Result<DepositSubmissionPlan, ProtocolError> {
     let note = build_deposit_note(intent)?;
     let note_commitment = note.commitment()?;
-    let approval_args = ApprovalCallArguments {
-        spender: normalize_felt_hex(shielded_asset_adapter_address)?,
-        amount: encode_u128(intent.amount),
-    };
     let encoded_args = DepositCallArguments {
         asset_id: encode_starknet_felt("asset-id", &intent.asset_id.0),
         amount: encode_u128(intent.amount),
@@ -1253,35 +1249,11 @@ pub fn build_deposit_submission_plan(
         note_commitment: normalize_felt_hex(&note_commitment.0)?,
         withdraw_authority: normalize_felt_hex(&intent.recipient_withdraw_authority)?,
     };
-    let approval_call = StarknetCall {
-        contract_address: normalize_felt_hex(token_address)?,
-        entrypoint: "approve".into(),
-        calldata: vec![
-            approval_args.spender.clone(),
-            approval_args.amount.clone(),
-            "0x0".into(),
-        ],
-    };
-    let deposit_call = StarknetCall {
-        contract_address: normalize_felt_hex(deposit_authority_address)?,
-        entrypoint: "execute_actions".into(),
-        calldata: vec![
-            encoded_args.asset_id.clone(),
-            encoded_args.amount.clone(),
-            encoded_args.deposit_nonce.clone(),
-            encoded_args.note_commitment.clone(),
-            encoded_args.withdraw_authority.clone(),
-        ],
-    };
 
     Ok(DepositSubmissionPlan {
         funding_rail: FundingRailKind::StarknetPrivacy,
         note,
         note_commitment,
-        approval_call: approval_call.clone(),
-        starknet_call: deposit_call.clone(),
-        starknet_calls: vec![approval_call, deposit_call],
-        approval_args,
         encoded_args,
     })
 }
@@ -6369,10 +6341,12 @@ mod tests {
         decrypt_maker_attribution_artifact, decrypt_note_for_owner, decrypt_order_bundle,
         decrypt_order_share, decrypt_output_recovery_record, decrypt_recovery_artifact_payload,
         derive_account_id, derive_order_cancellation_secret, derive_order_cancellation_tag,
-        derive_user_keys, encrypt_note_for_owner, encrypt_output_recovery_record,
+        derive_user_keys, encode_u128, encode_u64, encrypt_note_for_owner,
+        encrypt_output_recovery_record,
         native_note_consolidation_message_hash, note_consolidation_commitment,
-        note_recognition_public_key_from_raw_key_hex, output_note_merkle_proof,
-        output_note_merkle_root, private_execution_key_registry_fingerprint,
+        normalize_felt_hex, note_recognition_public_key_from_raw_key_hex,
+        output_note_merkle_proof, output_note_merkle_root,
+        private_execution_key_registry_fingerprint,
         proof_artifact_commitment, reconstruct_order_from_shares, renewal_child_nullifier,
         root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
         settlement_note_root_after_deposit_chain, settlement_nullifier_root_after_history,
@@ -6389,7 +6363,9 @@ mod tests {
         MakerBandFillAttribution, MakerCurvePoint, output_bundle_bucket_size,
         output_recovery_bundle_root,
     };
-    use crate::{AuctionPrivacyGateWitness, RelayMode, RenewalParentCancelPlanRequest};
+    use crate::{
+        AuctionPrivacyGateWitness, FundingRailKind, RelayMode, RenewalParentCancelPlanRequest,
+    };
 
     fn with_deposit_prior_note_root(mut transcript: SettlementTranscript) -> SettlementTranscript {
         if !transcript.consumed_inputs.is_empty() {
@@ -7056,13 +7032,12 @@ mod tests {
         assert_eq!(note_a, note_b);
 
         let plan = build_deposit_submission_plan(&intent, "0xabc", "0xdef", "0x456").expect("plan");
-        assert_eq!(plan.approval_call.contract_address, "0xdef");
-        assert_eq!(plan.approval_call.entrypoint, "approve");
-        assert_eq!(plan.approval_call.calldata.len(), 3);
-        assert_eq!(plan.starknet_call.contract_address, "0xabc");
-        assert_eq!(plan.starknet_call.entrypoint, "execute_actions");
-        assert_eq!(plan.starknet_call.calldata.len(), 5);
-        assert_eq!(plan.starknet_calls.len(), 2);
+        assert_eq!(plan.funding_rail, FundingRailKind::StarknetPrivacy);
+        assert_eq!(plan.encoded_args.asset_id, encode_starknet_felt("asset-id", "USDC"));
+        assert_eq!(plan.encoded_args.amount, encode_u128(intent.amount));
+        assert_eq!(plan.encoded_args.deposit_nonce, encode_u64(intent.deposit_nonce));
+        assert_eq!(plan.encoded_args.note_commitment, note_a.commitment().unwrap().0);
+        assert_eq!(plan.encoded_args.withdraw_authority, normalize_felt_hex("0x1234").unwrap());
         assert_eq!(plan.note_commitment, note_a.commitment().unwrap());
     }
 

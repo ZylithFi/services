@@ -58,7 +58,7 @@ pub use crypto::{
 pub use error::ProtocolError;
 pub use keys::{RecoverySeed, UserKeys, derive_user_keys};
 pub use types::{
-    ARTIFACT_AGGREGATION_POLICY_VERSION, ApprovalCallArguments, ArtifactAggregationPolicy, AssetId,
+    ARTIFACT_AGGREGATION_POLICY_VERSION, ArtifactAggregationPolicy, AssetId,
     AuctionOrderWitness, AuctionPrivacyGateWitness, Batch, BatchId, BatchLiquidityReport,
     BatchOrderSet, BatchShareContributions, BatchStatus, BatchSummary, ClaimWindowPolicy,
     ConsumedInput, CoordinatorStatus, DecryptedOrderShare, DeploymentContracts, DeploymentManifest,

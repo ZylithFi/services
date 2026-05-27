@@ -1130,6 +1130,10 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
             "/api/public/auction-keys/fingerprint",
             get(public_auction_keys_fingerprint),
         )
+        .route(
+            "/api/public/proof-jobs/{batch_id}",
+            get(get_public_proof_job),
+        )
         .route("/api/private/orders", post(ingest_private_order_payload))
         .route(
             "/api/internal/batches/{batch_id}/prepare",
@@ -1360,7 +1364,7 @@ async fn ingest_private_order_payload(
                 .cloned()
                 .collect::<Vec<_>>(),
         )
-        .map_err(|_| reject_private_ingress("funding notes are invalid"))?;
+        .map_err(|error| reject_private_ingress(&format!("funding notes are invalid: {error}")))?;
     validate_private_order_risk_limits(&state, &private_payload.order)
         .map_err(|_| reject_private_ingress("order risk limits rejected"))?;
 
@@ -1741,6 +1745,44 @@ async fn get_proof_job(
         .cloned()
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(status))
+}
+
+#[derive(Serialize)]
+struct PublicProofJobStatus {
+    batch_id: String,
+    state: String,
+    matched_order_count: u64,
+    witness_available: bool,
+    proof_artifact_available: bool,
+    onchain_submission_available: bool,
+    failure: Option<String>,
+    updated_at_unix_ms: u64,
+}
+
+fn public_proof_failure(state: &str) -> Option<String> {
+    match state {
+        "proving-failed" => Some("proving_failed".into()),
+        "onchain-submit-failed" => Some("onchain_submit_failed".into()),
+        _ => None,
+    }
+}
+
+async fn get_public_proof_job(
+    State(state): State<AppState>,
+    Path(batch_id): Path<String>,
+) -> Result<Json<PublicProofJobStatus>, StatusCode> {
+    let proof_jobs = state.proof_jobs.read().await;
+    let status = proof_jobs.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(PublicProofJobStatus {
+        batch_id: status.batch_id.0.clone(),
+        state: status.state.clone(),
+        matched_order_count: status.matched_order_count,
+        witness_available: status.witness_available,
+        proof_artifact_available: status.proof_artifact_available,
+        onchain_submission_available: status.onchain_submission_available,
+        failure: public_proof_failure(&status.state),
+        updated_at_unix_ms: status.updated_at_unix_ms,
+    }))
 }
 
 async fn get_settlement_plan(

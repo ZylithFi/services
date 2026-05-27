@@ -1968,12 +1968,6 @@ pub struct RenewalParentCancelSubmissionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalCallArguments {
-    pub spender: String,
-    pub amount: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositCallArguments {
     pub asset_id: String,
     pub amount: String,
@@ -1987,10 +1981,6 @@ pub struct DepositSubmissionPlan {
     pub funding_rail: FundingRailKind,
     pub note: Note,
     pub note_commitment: NoteCommitment,
-    pub approval_call: StarknetCall,
-    pub starknet_call: StarknetCall,
-    pub starknet_calls: Vec<StarknetCall>,
-    pub approval_args: ApprovalCallArguments,
     pub encoded_args: DepositCallArguments,
 }
 
