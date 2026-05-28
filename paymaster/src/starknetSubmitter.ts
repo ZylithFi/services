@@ -83,6 +83,9 @@ const defaultRuntime: StarknetRuntime = {
   outsideExecution
 };
 
+const PAYMASTER_SUBMISSION_RETRY_ATTEMPTS = 3;
+const PAYMASTER_NONCE_RETRY_DELAY_MS = 1_500;
+
 export type SubmitterDeps = {
   runtime?: StarknetRuntime;
   fetchImpl?: typeof fetch;
@@ -181,6 +184,32 @@ export async function submitProofBearingOutsideExecution(
 }
 
 async function submitPaymasterCalls(
+  calls: Call[],
+  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey">,
+  deps: SubmitterDeps = {},
+  proof?: string,
+  proofFacts?: string[]
+): Promise<ExecuteOutsideResponse> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < PAYMASTER_SUBMISSION_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await submitPaymasterCallsOnce(calls, config, deps, proof, proofFacts);
+    } catch (error) {
+      lastError = error;
+      if (
+        attempt < PAYMASTER_SUBMISSION_RETRY_ATTEMPTS - 1 &&
+        isRetryableNonceError(error)
+      ) {
+        await sleep(PAYMASTER_NONCE_RETRY_DELAY_MS * (attempt + 1));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function submitPaymasterCallsOnce(
   calls: Call[],
   config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey">,
   deps: SubmitterDeps = {},
@@ -294,6 +323,15 @@ async function submitPaymasterCalls(
   }
 
   return { transaction_hash: transactionHash };
+}
+
+function isRetryableNonceError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /NonceTooOld|Invalid transaction nonce|nonce.*too old|tx_nonce.*account_nonce/i.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function callPayloadToStarknetCall(call: ExecuteOutsideRequest["call"]): Call {

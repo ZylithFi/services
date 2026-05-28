@@ -229,6 +229,91 @@ describe("submitProofBearingOutsideExecution", () => {
     expect(result.transaction_hash).toBe("0xdirect");
     expect((seen.body as { params: { invoke_transaction: { proof?: string } } }).params.invoke_transaction.proof).toBeUndefined();
   });
+
+  it("rebuilds and retries when the paymaster account nonce is stale", async () => {
+    let nonceIndex = 0;
+    const addInvokeNonces: string[] = [];
+    const runtime = {
+      ...fakeRuntime,
+      Account: class extends fakeRuntime.Account {
+        async getNonce() {
+          const nonce = nonceIndex === 0 ? "0x7" : "0x8";
+          nonceIndex += 1;
+          return nonce;
+        }
+
+        async buildInvocation(calls: unknown, details: { resourceBounds?: unknown; nonce?: string }) {
+          const invocation = await super.buildInvocation(calls, details);
+          return {
+            ...invocation,
+            nonce: details.nonce ?? invocation.nonce
+          };
+        }
+      }
+    } satisfies StarknetRuntime;
+    let addInvokeAttempts = 0;
+    const result = await submitProofBearingOutsideExecution(
+      request,
+      {
+        rpcUrl: "https://rpc.example",
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+        privateKey: "0xkey"
+      },
+      {
+        runtime,
+        fetchImpl: async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          if (body.method === "starknet_estimateFee") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: [
+                  {
+                    l1_gas_consumed: "0x2",
+                    l1_gas_price: "0x4",
+                    l2_gas_consumed: "0x6",
+                    l2_gas_price: "0x8",
+                    l1_data_gas_consumed: "0xa",
+                    l1_data_gas_price: "0xc"
+                  }
+                ]
+              }),
+              { status: 200 }
+            );
+          }
+          addInvokeAttempts += 1;
+          addInvokeNonces.push(body.params.invoke_transaction.nonce);
+          if (addInvokeAttempts === 1) {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                error: {
+                  code: 52,
+                  message: "Invalid transaction nonce",
+                  data: "MempoolError(NonceTooOld { tx_nonce: Nonce(0x7), account_nonce: Nonce(0x8) })"
+                }
+              }),
+              { status: 200 }
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: { transaction_hash: "0xretry" }
+            }),
+            { status: 200 }
+          );
+        }
+      }
+    );
+
+    expect(result.transaction_hash).toBe("0xretry");
+    expect(addInvokeNonces).toEqual(["0x7", "0x8"]);
+  });
 });
 
 const request: ExecuteOutsideRequest = {
