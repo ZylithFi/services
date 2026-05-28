@@ -16,7 +16,10 @@ use std::{
     env,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -52,6 +55,7 @@ const ALLOWED_ORIGINS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS";
 const MAX_BODY_BYTES_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_BODY_BYTES";
 const PACKAGE_RETENTION_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS";
 const RATE_LIMIT_PER_MINUTE_ENV: &str = "ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE";
+static TICK_LEASE_OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct RelayConfig {
@@ -1376,7 +1380,12 @@ fn acquire_persistent_tick_lease_sync(
     path: &FsPath,
     lease_ms: u64,
 ) -> Result<PersistentTickLease, String> {
-    let owner = format!("pid:{}:{}", std::process::id(), now_unix_ms());
+    let owner = format!(
+        "pid:{}:{}:{}",
+        std::process::id(),
+        now_unix_ms(),
+        TICK_LEASE_OWNER_COUNTER.fetch_add(1, Ordering::Relaxed),
+    );
     let now = now_unix_ms();
     let expires_at = now.saturating_add(lease_ms) as i64;
     let mut connection = open_sqlite_store(path)?;
