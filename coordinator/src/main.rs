@@ -1082,7 +1082,7 @@ async fn query_private_settlement_report(
     let requested_orders = request
         .order_commitments
         .iter()
-        .map(|commitment| commitment.0.clone())
+        .filter_map(|commitment| zylith_core::hash::normalize_felt_hex(&commitment.0).ok())
         .collect::<BTreeSet<_>>();
     if requested_key_tags.is_empty() && requested_orders.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
@@ -1109,7 +1109,11 @@ async fn query_private_settlement_report(
     let order_execution_reports = published
         .order_execution_reports
         .iter()
-        .filter(|report| requested_orders.contains(&report.order_commitment.0))
+        .filter(|report| {
+            zylith_core::hash::normalize_felt_hex(&report.order_commitment.0)
+                .map(|commitment| requested_orders.contains(&commitment))
+                .unwrap_or(false)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if output_recovery_records.is_empty() && order_execution_reports.is_empty() {
@@ -2869,7 +2873,7 @@ mod tests {
             order_execution_reports: vec![zylith_core::OrderExecutionReport {
                 batch_id: zylith_core::BatchId(batch_id.into()),
                 pair_id: zylith_core::PairId("STRK/USDC".into()),
-                order_commitment: zylith_core::OrderCommitment("0xabc".into()),
+                order_commitment: zylith_core::OrderCommitment("0x000abc".into()),
                 funding_note_commitment: zylith_core::NoteCommitment("0xdef".into()),
                 status: "Filled".into(),
                 side: zylith_core::OrderSide::Buy,
@@ -2989,7 +2993,7 @@ mod tests {
         assert_eq!(private_json["batch_id"], batch_id);
         assert_eq!(
             private_json["order_execution_reports"][0]["order_commitment"],
-            "0xabc"
+            "0x000abc"
         );
 
         let transcript_response = app
