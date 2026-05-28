@@ -48,15 +48,16 @@ use zylith_core::{
     BatchSummary, CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord,
     DepositRecordList, FeeEntry, MakerAttributionBundle, MakerAttributionPlaintext,
     MakerBandAttribution, MakerBandFillAttribution, MatchedOrder, MatchedOrderWitness, Note,
-    NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness, OnchainSubmissionRecord,
-    OrderCommitment, OrderExecutionReport, OrderIngressReceipt, OrderIntent, OrderShareBundle,
-    OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord,
-    OutputRecoveryRecord, PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig,
-    PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig,
-    ProofArtifactRecord, ProofJobStatus, PublicBatchSummary, PublishedBatchArtifacts,
-    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTimestampUpdate,
-    SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
-    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
+    NoteCommitment, NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness,
+    OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport, OrderIngressReceipt,
+    OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle,
+    OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
+    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
+    ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublicBatchSummary,
+    PublishedBatchArtifacts, SettlementRootHistoryArchive, SettlementSubmissionPlan,
+    SettlementTimestampUpdate, SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce,
+    TrustedOrderIngressRequest, TrustedOrderIngressResponse,
+    admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
     build_admission_serialized_input, build_auction_result_serialized_input,
     build_heartbeat_cover_orders, build_output_note, build_settlement_submission_plan,
@@ -3465,6 +3466,24 @@ fn validate_batch_nullifier_freshness<'a>(
     Ok(())
 }
 
+fn funding_note_commitments_for_report(
+    funding_note: &Note,
+    funding_notes: &[Note],
+) -> Result<Vec<NoteCommitment>, StatusCode> {
+    let source_notes = if funding_notes.is_empty() {
+        std::slice::from_ref(funding_note)
+    } else {
+        funding_notes
+    };
+    source_notes
+        .iter()
+        .map(|note| {
+            note.commitment()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .collect()
+}
+
 async fn fetch_auction_order_witnesses(
     state: &AppState,
     batch_id: &str,
@@ -6210,11 +6229,14 @@ fn build_settlement_artifacts(
         };
 
         reported_orders.insert(fill.order_commitment.0.clone());
+        let funding_note_commitments =
+            funding_note_commitments_for_report(&fill.funding_note, &fill.funding_notes)?;
         order_execution_reports.push(OrderExecutionReport {
             batch_id: BatchId(batch_id.into()),
             pair_id: pair.pair_id.clone(),
             order_commitment: fill.order_commitment.clone(),
             funding_note_commitment: fill.order.funding_note_ref.clone(),
+            funding_note_commitments,
             status: "clearing".into(),
             side: fill.order.side.clone(),
             order_type: fill.order.order_type.clone(),
@@ -6288,11 +6310,14 @@ fn build_settlement_artifacts(
         ) {
             continue;
         }
+        let funding_note_commitments =
+            funding_note_commitments_for_report(&record.funding_note, &record.funding_notes)?;
         order_execution_reports.push(OrderExecutionReport {
             batch_id: BatchId(batch_id.into()),
             pair_id: pair.pair_id.clone(),
             order_commitment: record.order_commitment.clone(),
             funding_note_commitment: record.order.funding_note_ref.clone(),
+            funding_note_commitments,
             status: "clearing".into(),
             side: record.order.side.clone(),
             order_type: record.order.order_type.clone(),

@@ -1106,6 +1106,7 @@ async fn query_private_settlement_report(
             })
         })
         .collect::<Vec<_>>();
+    let funding_commitments_by_order = settlement_witness_funding_commitments_by_order(published);
     let order_execution_reports = published
         .order_execution_reports
         .iter()
@@ -1115,6 +1116,15 @@ async fn query_private_settlement_report(
                 .unwrap_or(false)
         })
         .cloned()
+        .map(|mut report| {
+            if report.funding_note_commitments.is_empty()
+                && let Some(commitments) =
+                    funding_commitments_by_order.get(&report.order_commitment.0)
+            {
+                report.funding_note_commitments = commitments.clone();
+            }
+            report
+        })
         .collect::<Vec<_>>();
     if output_recovery_records.is_empty() && order_execution_reports.is_empty() {
         return Err(StatusCode::NOT_FOUND);
@@ -1134,6 +1144,28 @@ async fn query_private_settlement_report(
         output_recovery_records,
         order_execution_reports,
     }))
+}
+
+fn settlement_witness_funding_commitments_by_order(
+    published: &PublishedBatchArtifacts,
+) -> BTreeMap<String, Vec<zylith_core::NoteCommitment>> {
+    published
+        .settlement_witness
+        .matched_order_witnesses
+        .iter()
+        .filter_map(|witness| {
+            let notes = if witness.funding_notes.is_empty() {
+                std::slice::from_ref(&witness.funding_note)
+            } else {
+                witness.funding_notes.as_slice()
+            };
+            let commitments = notes
+                .iter()
+                .filter_map(|note| note.commitment().ok())
+                .collect::<Vec<_>>();
+            (!commitments.is_empty()).then(|| (witness.order_commitment.0.clone(), commitments))
+        })
+        .collect()
 }
 
 async fn upload_recovery_artifact(
@@ -2875,6 +2907,7 @@ mod tests {
                 pair_id: zylith_core::PairId("STRK/USDC".into()),
                 order_commitment: zylith_core::OrderCommitment("0x000abc".into()),
                 funding_note_commitment: zylith_core::NoteCommitment("0xdef".into()),
+                funding_note_commitments: vec![zylith_core::NoteCommitment("0xdef".into())],
                 status: "Filled".into(),
                 side: zylith_core::OrderSide::Buy,
                 order_type: zylith_core::OrderType::LimitBatch,

@@ -1034,6 +1034,8 @@ pub struct OrderExecutionReport {
     pub pair_id: PairId,
     pub order_commitment: OrderCommitment,
     pub funding_note_commitment: NoteCommitment,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub funding_note_commitments: Vec<NoteCommitment>,
     pub status: String,
     pub side: OrderSide,
     #[serde(default)]
