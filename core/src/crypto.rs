@@ -19,8 +19,8 @@ use starknet_crypto::{
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput,
-    DecryptedOrderShare, DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
+    AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput, DecryptedOrderShare,
+    DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
     EncryptedMakerAttributionArtifact, EncryptedRecoveryPayload, FundingRailKind,
     MakerAttributionPlaintext, MakerAttributionReceipt, MatchedOrderWitness, Note, NoteCommitment,
     NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan, NoteConsolidationWitness,
@@ -1882,6 +1882,16 @@ fn output_recovery_key_tag(
         OUTPUT_RECOVERY_TAG_DOMAIN_HEX,
         &[recovery_key, batch_id_felt, &encode_usize(output_index)],
     )
+}
+
+pub fn output_recovery_key_tag_for_spend_authority(
+    spend_authority: &str,
+    batch_id: &str,
+    output_index: usize,
+) -> Result<String, ProtocolError> {
+    let recovery_key = normalize_felt_hex(spend_authority)?;
+    let batch_id_felt = encode_starknet_felt("batch-id", batch_id);
+    output_recovery_key_tag(&recovery_key, &batch_id_felt, output_index)
 }
 
 fn output_recovery_auth_tag(
@@ -6341,18 +6351,17 @@ mod tests {
         decrypt_maker_attribution_artifact, decrypt_note_for_owner, decrypt_order_bundle,
         decrypt_order_share, decrypt_output_recovery_record, decrypt_recovery_artifact_payload,
         derive_account_id, derive_order_cancellation_secret, derive_order_cancellation_tag,
-        derive_user_keys, encode_u128, encode_u64, encrypt_note_for_owner,
-        encrypt_output_recovery_record,
-        native_note_consolidation_message_hash, note_consolidation_commitment,
-        normalize_felt_hex, note_recognition_public_key_from_raw_key_hex,
+        derive_user_keys, encode_u64, encode_u128, encrypt_note_for_owner,
+        encrypt_output_recovery_record, native_note_consolidation_message_hash, normalize_felt_hex,
+        note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
         output_note_merkle_proof, output_note_merkle_root,
-        private_execution_key_registry_fingerprint,
-        proof_artifact_commitment, reconstruct_order_from_shares, renewal_child_nullifier,
-        root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
-        settlement_note_root_after_deposit_chain, settlement_nullifier_root_after_history,
-        settlement_output_withdrawal_message_hash, settlement_transcript_commitment,
-        sign_note_consolidation_authorization, sign_order_authorization,
-        validate_maker_attribution_receipt, validate_order_ingress_receipt_for_manifest,
+        private_execution_key_registry_fingerprint, proof_artifact_commitment,
+        reconstruct_order_from_shares, renewal_child_nullifier, root_only_settlement_commitments,
+        sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
+        settlement_nullifier_root_after_history, settlement_output_withdrawal_message_hash,
+        settlement_transcript_commitment, sign_note_consolidation_authorization,
+        sign_order_authorization, validate_maker_attribution_receipt,
+        validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
@@ -7033,11 +7042,23 @@ mod tests {
 
         let plan = build_deposit_submission_plan(&intent, "0xabc", "0xdef", "0x456").expect("plan");
         assert_eq!(plan.funding_rail, FundingRailKind::StarknetPrivacy);
-        assert_eq!(plan.encoded_args.asset_id, encode_starknet_felt("asset-id", "USDC"));
+        assert_eq!(
+            plan.encoded_args.asset_id,
+            encode_starknet_felt("asset-id", "USDC")
+        );
         assert_eq!(plan.encoded_args.amount, encode_u128(intent.amount));
-        assert_eq!(plan.encoded_args.deposit_nonce, encode_u64(intent.deposit_nonce));
-        assert_eq!(plan.encoded_args.note_commitment, note_a.commitment().unwrap().0);
-        assert_eq!(plan.encoded_args.withdraw_authority, normalize_felt_hex("0x1234").unwrap());
+        assert_eq!(
+            plan.encoded_args.deposit_nonce,
+            encode_u64(intent.deposit_nonce)
+        );
+        assert_eq!(
+            plan.encoded_args.note_commitment,
+            note_a.commitment().unwrap().0
+        );
+        assert_eq!(
+            plan.encoded_args.withdraw_authority,
+            normalize_felt_hex("0x1234").unwrap()
+        );
         assert_eq!(plan.note_commitment, note_a.commitment().unwrap());
     }
 

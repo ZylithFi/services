@@ -1641,6 +1641,36 @@ pub struct PublishedBatchArtifacts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivateSettlementReportQuery {
+    #[serde(default)]
+    pub output_recovery_key_tags: Vec<String>,
+    #[serde(default)]
+    pub order_commitments: Vec<OrderCommitment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivateSettlementOutputRecoveryRecord {
+    pub output_index: u64,
+    pub recovery: OutputRecoveryRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivateSettlementReport {
+    pub batch_id: BatchId,
+    pub pair_id: PairId,
+    pub batch_epoch: u64,
+    pub settled_at_unix_ms: u64,
+    pub output_note_root: String,
+    #[serde(with = "serde_u128_decimal")]
+    pub clearing_price: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub price_base_scale: u128,
+    pub matched_order_count: u64,
+    pub output_recovery_records: Vec<PrivateSettlementOutputRecoveryRecord>,
+    pub order_execution_reports: Vec<OrderExecutionReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicSettlementTranscript {
     pub batch_id: BatchId,
     pub pair_id: PairId,

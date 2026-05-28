@@ -185,7 +185,7 @@ const DEFAULT_PROVER_PRIVATE_PAYLOAD_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS: u64 = 5_000;
 const DEFAULT_MAX_PROVABLE_BATCH_ORDERS: u64 = 32;
 const DEFAULT_PROVER_WORKER_TICK_MS: u64 = 10_000;
-const DEFAULT_PROVER_WORKER_MAX_BATCHES_PER_TICK: usize = 1;
+const DEFAULT_PROVER_WORKER_MAX_BATCHES_PER_TICK: usize = 2;
 
 #[derive(Clone)]
 struct AppState {
@@ -7777,11 +7777,13 @@ async fn submit_native_invoke_with_typed_sdk_retry(
                 if native_invoke_error_is_retryable_proof_facts_delay(&formatted_error)
                     && attempt < attempts
                 {
+                    let wait_ms =
+                        proof_fact_age_wait_ms(&formatted_error, retry_interval_ms, attempt);
                     eprintln!(
-                        "native proof facts are not old enough for onchain acceptance; retrying submission in {retry_interval_ms}ms ({attempt}/{attempts})"
+                        "native proof facts are not old enough for onchain acceptance; retrying submission in {wait_ms}ms ({attempt}/{attempts})"
                     );
                     last_error = Some(formatted_error);
-                    sleep(Duration::from_millis(retry_interval_ms)).await;
+                    sleep(Duration::from_millis(wait_ms)).await;
                     continue;
                 }
 
@@ -7811,6 +7813,41 @@ fn native_invoke_error_is_retryable_proof_facts_delay(error: &str) -> bool {
     }
     formatted.contains("proof block number") && formatted.contains("too recent")
         || formatted.contains("block hash mismatch") && formatted.contains("stored block hash: 0")
+}
+
+fn proof_fact_age_wait_ms(error: &str, base_interval_ms: u64, attempt: usize) -> u64 {
+    if let Some(delta_blocks) = proof_fact_too_recent_delta_blocks(error) {
+        return base_interval_ms
+            .saturating_mul(delta_blocks.max(1))
+            .clamp(1_000, 30_000);
+    }
+    adaptive_proof_fact_age_wait_ms(base_interval_ms, attempt)
+}
+
+fn proof_fact_too_recent_delta_blocks(error: &str) -> Option<u64> {
+    let lower = error.to_lowercase();
+    if !lower.contains("proof block number") || !lower.contains("maximum allowed block number") {
+        return None;
+    }
+    let numbers = lower
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    if numbers.len() < 2 {
+        return None;
+    }
+    let proof_block = numbers[numbers.len() - 2];
+    let max_allowed = numbers[numbers.len() - 1];
+    proof_block
+        .checked_sub(max_allowed)
+        .map(|delta| delta.saturating_add(1))
+}
+
+fn adaptive_proof_fact_age_wait_ms(base_interval_ms: u64, attempt: usize) -> u64 {
+    base_interval_ms
+        .saturating_mul(attempt.max(1) as u64)
+        .clamp(1_000, 30_000)
 }
 
 fn native_invoke_error_is_retryable_after_submission(error: &str) -> bool {
@@ -8340,8 +8377,9 @@ mod tests {
         native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
-        protocol_fee_recipient_from_values, redact_native_execution_request,
-        redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
+        proof_fact_age_wait_ms, protocol_fee_recipient_from_values,
+        redact_native_execution_request, redact_native_prover_request,
+        resolve_batch_registrar_private_key, same_starknet_address,
         should_refresh_onchain_submission, storage_key, validate_batch_nullifier_freshness,
     };
     use zylith_core::{
@@ -8856,6 +8894,10 @@ mod tests {
         assert!(native_invoke_error_is_retryable_proof_facts_delay(
             &too_recent.to_string()
         ));
+        assert_eq!(
+            proof_fact_age_wait_ms(&too_recent.to_string(), 5_000, 1),
+            25_000
+        );
 
         let missing_block_hash = serde_json::json!({
             "code": 55,
@@ -8865,6 +8907,10 @@ mod tests {
         assert!(native_invoke_error_is_retryable_proof_facts_delay(
             &missing_block_hash.to_string()
         ));
+        assert_eq!(
+            proof_fact_age_wait_ms(&missing_block_hash.to_string(), 5_000, 2),
+            10_000
+        );
 
         let missing = serde_json::json!({
             "code": 55,

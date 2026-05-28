@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
@@ -19,6 +19,7 @@ use zylith_core::{
     Batch, BatchId, BatchOrderSet, BatchStatus, BatchSummary, CONTROL_PLANE_TOKEN_ENV,
     CoordinatorStatus, MakerAttributionArtifactList, OrderCancellationAccepted,
     OrderCancellationRequest, OrderShareBundle, OrderSubmission, OrderSubmissionAccepted, PairId,
+    PrivateSettlementOutputRecoveryRecord, PrivateSettlementReport, PrivateSettlementReportQuery,
     ProductConfig, PublicBatchSummary, PublicSettlementTranscript, PublishedBatchArtifacts,
     RecoveryArtifact, RecoveryArtifactList, RecoveryArtifactUpload, SettlementTimestampUpdate,
     SubmittedOrderRecord, artifact_epoch_bucket_end, artifact_epoch_bucket_start,
@@ -516,6 +517,10 @@ fn build_app_with_config(
         .route(
             "/api/recovery/{account_id}/artifacts/range/{start_sequence}/{end_sequence}",
             get(list_recovery_artifacts_range),
+        )
+        .route(
+            "/api/recovery/{account_id}/settlement-reports/{batch_id}",
+            post(query_private_settlement_report),
         )
         .route("/api/orders", post(submit_order))
         .route("/api/orders/cancel", post(cancel_order))
@@ -1039,6 +1044,91 @@ async fn list_recovery_artifacts_range(
         sequence_end: end_sequence,
         artifact_count_bucket: count_bucket_label(artifacts.len() as u64),
         artifacts,
+    }))
+}
+
+async fn query_private_settlement_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, batch_id)): Path<(String, String)>,
+    Json(request): Json<PrivateSettlementReportQuery>,
+) -> Result<Json<PrivateSettlementReport>, StatusCode> {
+    enforce_rate_limit(
+        &state.rate_limiter,
+        &headers,
+        "private-settlement-report",
+        state.public_rate_limit_per_minute,
+    )?;
+    let provided_auth_tag = require_recovery_auth_header(&headers)?;
+    {
+        let recovery_artifacts = state.recovery_artifacts.read().await;
+        let account = recovery_artifacts
+            .get(&account_id)
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let expected = account
+            .recovery_auth_tag
+            .as_ref()
+            .ok_or(StatusCode::NOT_FOUND)?;
+        if !zylith_core::constant_time_eq(expected, &provided_auth_tag) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    let requested_key_tags = request
+        .output_recovery_key_tags
+        .iter()
+        .filter_map(|value| zylith_core::hash::normalize_felt_hex(value).ok())
+        .collect::<BTreeSet<_>>();
+    let requested_orders = request
+        .order_commitments
+        .iter()
+        .map(|commitment| commitment.0.clone())
+        .collect::<BTreeSet<_>>();
+    if requested_key_tags.is_empty() && requested_orders.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let artifacts = state.published_batch_artifacts.read().await;
+    let published = artifacts.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    let settled_at_unix_ms = published.settled_at_unix_ms.ok_or(StatusCode::NOT_FOUND)?;
+    let output_recovery_records = published
+        .transcript
+        .output_recovery_records
+        .iter()
+        .enumerate()
+        .filter_map(|(output_index, recovery)| {
+            let normalized = zylith_core::hash::normalize_felt_hex(&recovery.key_tag).ok()?;
+            requested_key_tags.contains(&normalized).then(|| {
+                PrivateSettlementOutputRecoveryRecord {
+                    output_index: output_index as u64,
+                    recovery: recovery.clone(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let order_execution_reports = published
+        .order_execution_reports
+        .iter()
+        .filter(|report| requested_orders.contains(&report.order_commitment.0))
+        .cloned()
+        .collect::<Vec<_>>();
+    if output_recovery_records.is_empty() && order_execution_reports.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let roots = root_only_settlement_commitments(&published.transcript)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(PrivateSettlementReport {
+        batch_id: published.transcript.batch_id.clone(),
+        pair_id: published.transcript.pair_id.clone(),
+        batch_epoch: published.transcript.batch_epoch,
+        settled_at_unix_ms,
+        output_note_root: roots.output_note_root,
+        clearing_price: published.transcript.clearing_price,
+        price_base_scale: published.transcript.price_base_scale,
+        matched_order_count: published.transcript.matched_orders.len() as u64,
+        output_recovery_records,
+        order_execution_reports,
     }))
 }
 
@@ -2776,7 +2866,29 @@ mod tests {
             },
             published_at_unix_ms: now_unix_ms(),
             settled_at_unix_ms: None,
-            order_execution_reports: vec![],
+            order_execution_reports: vec![zylith_core::OrderExecutionReport {
+                batch_id: zylith_core::BatchId(batch_id.into()),
+                pair_id: zylith_core::PairId("STRK/USDC".into()),
+                order_commitment: zylith_core::OrderCommitment("0xabc".into()),
+                funding_note_commitment: zylith_core::NoteCommitment("0xdef".into()),
+                status: "Filled".into(),
+                side: zylith_core::OrderSide::Buy,
+                order_type: zylith_core::OrderType::LimitBatch,
+                time_in_force: zylith_core::TimeInForce::CurrentBatchOnly,
+                submitted_amount: 1_000,
+                filled_amount: 1_000,
+                unfilled_amount: 0,
+                limit_price: 150,
+                execution_price: Some(145),
+                fee_asset_id: Some(zylith_core::AssetId("USDC".into())),
+                fee_amount: 1,
+                output_note_commitment: None,
+                output_asset_id: Some(zylith_core::AssetId("STRK".into())),
+                output_amount: 999,
+                residual_note_commitment: None,
+                residual_asset_id: None,
+                residual_amount: 0,
+            }],
             transcript_shape: None,
         };
 
@@ -2814,6 +2926,71 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(settled_response.status(), StatusCode::OK);
+
+        let recovery_artifact = RecoveryArtifact {
+            artifact_id: "artifact-private-report-auth".into(),
+            account_id: "account-1".into(),
+            kind: RecoveryArtifactKind::Snapshot,
+            sequence: 1,
+            created_at_unix_ms: 1,
+            payload: EncryptedRecoveryPayload {
+                algorithm: "aes-256-gcm/recovery".into(),
+                nonce: "00".into(),
+                ciphertext: "11".into(),
+            },
+        };
+        let recovery_upload = RecoveryArtifactUpload {
+            artifact: recovery_artifact,
+        };
+        let recovery_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recovery/account-1/artifacts")
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .header(zylith_core::RECOVERY_AUTH_HEADER, TEST_RECOVERY_AUTH)
+                    .body(Body::from(
+                        serde_json::to_vec(&recovery_upload).expect("serialize recovery upload"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(recovery_response.status(), StatusCode::OK);
+
+        let private_report_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/recovery/account-1/settlement-reports/{batch_id}"
+                    ))
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .header(zylith_core::RECOVERY_AUTH_HEADER, TEST_RECOVERY_AUTH)
+                    .body(Body::from(
+                        br#"{"output_recovery_key_tags":[],"order_commitments":["0xabc"]}"#
+                            .to_vec(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(private_report_response.status(), StatusCode::OK);
+        let private_body = private_report_response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let private_json = serde_json::from_slice::<serde_json::Value>(&private_body)
+            .expect("private report json");
+        assert_eq!(private_json["batch_id"], batch_id);
+        assert_eq!(
+            private_json["order_execution_reports"][0]["order_commitment"],
+            "0xabc"
+        );
 
         let transcript_response = app
             .clone()
