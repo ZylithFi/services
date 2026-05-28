@@ -5141,26 +5141,40 @@ fn compute_candidate_clearing_price(
     candidate_prices.sort_unstable();
     candidate_prices.dedup();
 
-    let mut best: Option<(u128, u128, u128)> = None;
+    let mut best: Option<(u128, u128, u128, u128)> = None;
 
     for price in candidate_prices {
         let (matched, imbalance) = stable_pruned_score_at_price(records, price, price_base_scale)?;
 
         match best {
-            None => best = Some((price, matched, imbalance)),
-            Some((best_price, best_matched, best_imbalance)) => {
-                if matched > best_matched
-                    || (matched == best_matched
-                        && (imbalance < best_imbalance
-                            || (imbalance == best_imbalance && price < best_price)))
+            None => best = Some((price, price, matched, imbalance)),
+            Some((best_low, best_high, best_matched, best_imbalance)) => {
+                if matched > best_matched || (matched == best_matched && imbalance < best_imbalance)
                 {
-                    best = Some((price, matched, imbalance));
+                    best = Some((price, price, matched, imbalance));
+                } else if matched == best_matched && imbalance == best_imbalance {
+                    best = Some((
+                        best_low.min(price),
+                        best_high.max(price),
+                        best_matched,
+                        best_imbalance,
+                    ));
                 }
             }
         }
     }
 
-    Ok(best.map(|(price, _, _)| price))
+    Ok(best.map(|(low, high, matched, _)| {
+        if matched == 0 {
+            low
+        } else {
+            midpoint_u128(low, high)
+        }
+    }))
+}
+
+fn midpoint_u128(low: u128, high: u128) -> u128 {
+    (low / 2) + (high / 2) + ((low % 2 + high % 2) / 2)
 }
 
 fn stable_pruned_score_at_price(
@@ -8927,6 +8941,35 @@ mod tests {
         assert_eq!(
             compute_candidate_clearing_price(&records, 1).unwrap(),
             Some(6)
+        );
+    }
+
+    #[test]
+    fn clearing_price_uses_midpoint_of_best_crossing_interval() {
+        let records = vec![
+            test_record(
+                0,
+                OrderSide::Buy,
+                55,
+                20,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                1_100,
+            ),
+            test_record(
+                1,
+                OrderSide::Sell,
+                45,
+                20,
+                1,
+                TimeInForce::CurrentBatchOnly,
+                20,
+            ),
+        ];
+
+        assert_eq!(
+            compute_candidate_clearing_price(&records, 1).unwrap(),
+            Some(50)
         );
     }
 
