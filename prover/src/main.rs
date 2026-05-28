@@ -1591,6 +1591,9 @@ async fn run_proof_worker_tick(state: &AppState) -> Result<usize, String> {
     if state.emergency_paused {
         return Ok(0);
     }
+    if let Err(error) = refresh_pending_onchain_submissions(state).await {
+        eprintln!("zylith prover worker onchain refresh failed: {error}");
+    }
     let mut batches = fetch_public_batch_summaries(state).await?;
     batches.sort_by(|left, right| {
         left.close_time_unix_ms
@@ -1636,6 +1639,59 @@ async fn run_proof_worker_tick(state: &AppState) -> Result<usize, String> {
         processed += 1;
     }
     Ok(processed)
+}
+
+async fn refresh_pending_onchain_submissions(state: &AppState) -> Result<usize, String> {
+    let pending = {
+        let submissions = state.onchain_submissions.read().await;
+        submissions
+            .iter()
+            .filter(|(_, submission)| should_refresh_onchain_submission(submission))
+            .map(|(batch_id, submission)| (batch_id.clone(), submission.clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut refreshed = 0usize;
+    for (batch_id, submission) in pending {
+        let refreshed_record = refresh_submission_status(state, submission)
+            .await
+            .map_err(|_| format!("failed to refresh onchain submission for {batch_id}"))?;
+        {
+            let mut submissions = state.onchain_submissions.write().await;
+            submissions.insert(batch_id.clone(), refreshed_record.clone());
+            persist_record(
+                state.data_dir.as_ref(),
+                ONCHAIN_SUBMISSIONS_DIR,
+                &batch_id,
+                &refreshed_record,
+            )
+            .map_err(|status| {
+                format!("failed to persist refreshed onchain submission for {batch_id}: {status}")
+            })?;
+        }
+        sync_job_with_onchain_submission(state, &batch_id, &refreshed_record)
+            .await
+            .map_err(|status| {
+                format!("failed to sync proof job after onchain refresh for {batch_id}: {status}")
+            })?;
+        if let Err(error) =
+            publish_settlement_timestamp_to_artifact_stores(state, &batch_id, &refreshed_record)
+                .await
+        {
+            eprintln!("failed to publish settlement timestamp for batch {batch_id}: {error}");
+        }
+        refreshed += 1;
+    }
+    Ok(refreshed)
+}
+
+fn should_refresh_onchain_submission(submission: &OnchainSubmissionRecord) -> bool {
+    if matches!(submission.execution_status.as_deref(), Some("REVERTED")) {
+        return false;
+    }
+    !matches!(
+        submission.finality_status.as_deref(),
+        Some("ACCEPTED_ON_L1" | "ACCEPTED_ON_L2")
+    )
 }
 
 async fn fetch_public_batch_summaries(state: &AppState) -> Result<Vec<PublicBatchSummary>, String> {
@@ -8222,8 +8278,8 @@ mod tests {
         DEFAULT_PROTOCOL_FEE_RECIPIENT, DEFAULT_RELAY_FEE_RECIPIENT, DecryptedOrderRecord,
         NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND, NativeBlockId, NativeExecutionRequestRecord,
         NativeProverParams, NativeProverRpcRequest, NativeTransactionMode,
-        NoteRootTransitionRecord, SettlementBuildContext, SettlementRoots, artifact_id_for,
-        build_batch_liquidity_report, build_native_proof_program_calldata,
+        NoteRootTransitionRecord, OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots,
+        artifact_id_for, build_batch_liquidity_report, build_native_proof_program_calldata,
         build_settlement_artifacts, compute_candidate_clearing_price, decode_bhttp_response,
         derive_note_membership_witnesses, deterministic_settlement_submission_jitter_ms,
         eligible_order_count, encode_bhttp_json_post, matched_maker_participant_count,
@@ -8234,7 +8290,7 @@ mod tests {
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
         protocol_fee_recipient_from_values, redact_native_execution_request,
         redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
-        storage_key, validate_batch_nullifier_freshness,
+        should_refresh_onchain_submission, storage_key, validate_batch_nullifier_freshness,
     };
     use zylith_core::{
         AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, HiddenMakerCurve,
@@ -8254,6 +8310,21 @@ mod tests {
             "batch_2f_strk_20_usdc_3a_1"
         );
         assert_eq!(storage_key("batch-strk-usdc-1"), "batch-strk-usdc-1");
+    }
+
+    #[test]
+    fn pending_onchain_submissions_are_refreshed_until_accepted_or_reverted() {
+        let mut submission = sample_onchain_submission();
+        submission.finality_status = Some("PRE_CONFIRMED".into());
+        submission.execution_status = Some("SUCCEEDED".into());
+        assert!(should_refresh_onchain_submission(&submission));
+
+        submission.finality_status = Some("ACCEPTED_ON_L2".into());
+        assert!(!should_refresh_onchain_submission(&submission));
+
+        submission.finality_status = Some("PRE_CONFIRMED".into());
+        submission.execution_status = Some("REVERTED".into());
+        assert!(!should_refresh_onchain_submission(&submission));
     }
 
     #[test]
@@ -8287,6 +8358,25 @@ mod tests {
 
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    fn sample_onchain_submission() -> OnchainSubmissionRecord {
+        OnchainSubmissionRecord {
+            submission_id: "batch-strk-usdc-1:0xabc".into(),
+            batch_id: BatchId("batch-strk-usdc-1".into()),
+            transaction_hash: "0xabc".into(),
+            submitted_at_unix_ms: 1,
+            receipt_checked_at_unix_ms: Some(2),
+            confirmed_at_unix_ms: None,
+            finality_status: None,
+            execution_status: None,
+            revert_reason: None,
+            block_number: None,
+            block_hash: None,
+            block_timestamp_unix_ms: None,
+            submission_mode: "native-proof-facts".into(),
+            settlement_contract_address: "0x123".into(),
+        }
     }
 
     #[test]
