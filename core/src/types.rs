@@ -1743,6 +1743,10 @@ pub const ARTIFACT_AGGREGATION_POLICY_VERSION: u32 = 1;
 pub struct ArtifactAggregationPolicy {
     pub policy_version: u32,
     pub public_artifact_delay_epochs: u64,
+    #[serde(default)]
+    pub public_artifact_delay_min_epochs: u64,
+    #[serde(default)]
+    pub public_artifact_delay_max_epochs: u64,
     pub epoch_bucket_size: u64,
     pub aggregation_scope: String,
     pub proof_aggregation_mode: String,

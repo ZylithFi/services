@@ -3120,15 +3120,17 @@ async fn prepare_private_auction_batch_inner(
         let merged_witnesses = merged.into_values().collect::<Vec<_>>();
         let confirmed_witnesses =
             filter_root_history_witnesses_for_current_roots(state, merged_witnesses, &prior_roots)?;
-        validate_batch_nullifier_freshness(batch_id, &records, confirmed_witnesses.iter()).map_err(
-            |error| {
-                eprintln!(
-                    "prepare_private_auction_batch batch_id={} stage=confirmed_root_history failed=nullifier_freshness error={}",
-                    batch_id, error
-                );
-                StatusCode::CONFLICT
-            },
-        )?;
+        if let Err(error) =
+            validate_batch_nullifier_freshness(batch_id, &records, confirmed_witnesses.iter())
+        {
+            eprintln!(
+                "prepare_private_auction_batch batch_id={} stage=confirmed_root_history failed=nullifier_freshness error={}",
+                batch_id, error
+            );
+            record_prepare_job_error(state, batch_id, format!("batch witness rejected: {error}"))
+                .await?;
+            return Err(StatusCode::CONFLICT);
+        }
         confirmed_witnesses
     };
     eprintln!(
@@ -4292,6 +4294,42 @@ async fn set_job_error(
         },
     )
     .await
+}
+
+async fn record_prepare_job_error(
+    state: &AppState,
+    batch_id: &str,
+    error: String,
+) -> Result<ProofJobStatus, StatusCode> {
+    if state.proof_jobs.read().await.contains_key(batch_id) {
+        return set_job_error(state, batch_id, error).await;
+    }
+    let now = now_unix_ms();
+    let status = ProofJobStatus {
+        batch_id: BatchId(batch_id.into()),
+        state: "proving-failed".into(),
+        transcript_commitment: String::new(),
+        matched_order_count: 0,
+        settlement_plan_available: false,
+        witness_available: false,
+        proof_artifact_available: false,
+        onchain_submission_available: false,
+        proof_artifact_id: None,
+        onchain_submission_id: None,
+        prover_backend: prover_backend_label(state.native_tx_prover_url.is_some()),
+        last_error: Some(error),
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+        settlement_contract_address: state.auction_verifier_address.clone(),
+        settlement_entrypoint: "submit_settlement_with_proof_facts".into(),
+        settlement_calldata_len: 0,
+    };
+    {
+        let mut proof_jobs = state.proof_jobs.write().await;
+        proof_jobs.insert(batch_id.into(), status.clone());
+        persist_record(state.data_dir.as_ref(), PROOF_JOBS_DIR, batch_id, &status)?;
+    }
+    Ok(status)
 }
 
 async fn set_onchain_submission_error(

@@ -21,8 +21,9 @@ use zylith_core::{
     OrderCancellationRequest, OrderShareBundle, OrderSubmission, OrderSubmissionAccepted, PairId,
     ProductConfig, PublicBatchSummary, PublicSettlementTranscript, PublishedBatchArtifacts,
     RecoveryArtifact, RecoveryArtifactList, RecoveryArtifactUpload, SettlementTimestampUpdate,
-    SubmittedOrderRecord, count_bucket_label, derive_order_cancellation_tag, extract_bearer_token,
-    hash::{ordered_felt_list_commitment, tagged_field_hex},
+    SubmittedOrderRecord, artifact_epoch_bucket_end, artifact_epoch_bucket_start,
+    count_bucket_label, derive_order_cancellation_tag, extract_bearer_token,
+    hash::{ordered_felt_list_commitment, tagged_commitment_sha256, tagged_field_hex},
     heartbeat_cover_order_commitments, heartbeat_cover_order_count,
     root_only_settlement_commitments, settlement_transcript_commitment,
     validate_order_ingress_receipt_for_manifest_with_secrets,
@@ -56,9 +57,17 @@ const HEARTBEAT_COVER_PRICES_ENV: &str = "ZYLITH_HEARTBEAT_COVER_PRICES";
 const DEFAULT_COORDINATOR_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE: u64 = 120;
 const DEFAULT_COORDINATOR_MAX_ORDERS_PER_BATCH: u64 = 32;
-const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = 1;
+const DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS: u64 = 3;
+const DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS: u64 = 8;
+const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS;
+const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
 const ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_EPOCHS";
 const PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS";
+const ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MIN_EPOCHS";
+const ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MAX_EPOCHS";
+const PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS";
+const PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS";
+const ARTIFACT_EPOCH_BUCKET_SIZE_ENV: &str = "ZYLITH_ARTIFACT_EPOCH_BUCKET_SIZE";
 
 #[derive(Clone)]
 struct AppState {
@@ -80,7 +89,9 @@ struct AppState {
     max_orders_per_batch: u64,
     heartbeat_cover_secret: Arc<String>,
     public_rate_limit_per_minute: u64,
-    public_artifact_delay_epochs: u64,
+    public_artifact_delay_min_epochs: u64,
+    public_artifact_delay_max_epochs: u64,
+    artifact_epoch_bucket_size: u64,
     rate_limiter: RateLimiter,
 }
 
@@ -124,7 +135,9 @@ struct CoordinatorHardeningConfig {
     public_rate_limit_per_minute: u64,
     max_orders_per_batch: u64,
     heartbeat_cover_secret: String,
-    public_artifact_delay_epochs: u64,
+    public_artifact_delay_min_epochs: u64,
+    public_artifact_delay_max_epochs: u64,
+    artifact_epoch_bucket_size: u64,
 }
 
 impl Default for CoordinatorHardeningConfig {
@@ -135,7 +148,9 @@ impl Default for CoordinatorHardeningConfig {
             public_rate_limit_per_minute: DEFAULT_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE,
             max_orders_per_batch: DEFAULT_COORDINATOR_MAX_ORDERS_PER_BATCH,
             heartbeat_cover_secret: "test-heartbeat-cover-secret".into(),
-            public_artifact_delay_epochs: 0,
+            public_artifact_delay_min_epochs: 0,
+            public_artifact_delay_max_epochs: 0,
+            artifact_epoch_bucket_size: DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE,
         }
     }
 }
@@ -255,6 +270,45 @@ fn build_app() -> Result<Router, String> {
         })
         .transpose()?
         .unwrap_or(0);
+    let legacy_delay_override =
+        env_present(ARTIFACT_DELAY_EPOCHS_ENV) || env_present(PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV);
+    let fixed_public_artifact_delay_epochs = env_u64_alias_or_default(
+        ARTIFACT_DELAY_EPOCHS_ENV,
+        PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
+        DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
+    )?;
+    let public_artifact_delay_min_epochs = env_u64_alias_or_default(
+        ARTIFACT_DELAY_MIN_EPOCHS_ENV,
+        PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS_ENV,
+        if legacy_delay_override {
+            fixed_public_artifact_delay_epochs
+        } else {
+            DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS
+        },
+    )?;
+    let public_artifact_delay_max_epochs = env_u64_alias_or_default(
+        ARTIFACT_DELAY_MAX_EPOCHS_ENV,
+        PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS_ENV,
+        if legacy_delay_override {
+            public_artifact_delay_min_epochs
+        } else {
+            DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS
+        },
+    )?
+    .max(public_artifact_delay_min_epochs);
+    let artifact_epoch_bucket_size = env::var(ARTIFACT_EPOCH_BUCKET_SIZE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("invalid {ARTIFACT_EPOCH_BUCKET_SIZE_ENV}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE);
+    if artifact_epoch_bucket_size == 0 {
+        return Err(format!("{ARTIFACT_EPOCH_BUCKET_SIZE_ENV} must be positive"));
+    }
     let hardening = CoordinatorHardeningConfig {
         emergency_paused: env_bool_or_default(COORDINATOR_EMERGENCY_PAUSED_ENV, false),
         max_body_bytes: env::var(COORDINATOR_MAX_BODY_BYTES_ENV)
@@ -291,11 +345,9 @@ fn build_app() -> Result<Router, String> {
             "zylith-coordinator",
             HEARTBEAT_COVER_SECRET_ENV,
         )?,
-        public_artifact_delay_epochs: env_u64_alias_or_default(
-            ARTIFACT_DELAY_EPOCHS_ENV,
-            PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
-            DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
-        )?,
+        public_artifact_delay_min_epochs,
+        public_artifact_delay_max_epochs,
+        artifact_epoch_bucket_size,
     };
 
     Ok(build_app_with_config(
@@ -406,7 +458,9 @@ fn build_app_with_config(
         max_orders_per_batch: hardening.max_orders_per_batch,
         heartbeat_cover_secret: Arc::new(hardening.heartbeat_cover_secret),
         public_rate_limit_per_minute: hardening.public_rate_limit_per_minute,
-        public_artifact_delay_epochs: hardening.public_artifact_delay_epochs,
+        public_artifact_delay_min_epochs: hardening.public_artifact_delay_min_epochs,
+        public_artifact_delay_max_epochs: hardening.public_artifact_delay_max_epochs,
+        artifact_epoch_bucket_size: hardening.artifact_epoch_bucket_size,
         rate_limiter: RateLimiter::default(),
     };
 
@@ -626,7 +680,9 @@ async fn get_published_transcript(
         &artifacts,
         published,
         published.transcript.batch_epoch,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
     ) {
         return Err(StatusCode::NOT_FOUND);
@@ -655,7 +711,9 @@ async fn get_published_output_bundle(
         &artifacts,
         published,
         published.transcript.batch_epoch,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
     ) {
         return Err(StatusCode::NOT_FOUND);
@@ -673,7 +731,9 @@ async fn get_published_maker_attribution(
         &artifacts,
         published,
         published.transcript.batch_epoch,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
     ) {
         return Err(StatusCode::NOT_FOUND);
@@ -704,9 +764,21 @@ fn is_public_artifact_visible(
     artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
     published: &PublishedBatchArtifacts,
     batch_epoch: u64,
-    delay_epochs: u64,
+    min_delay_epochs: u64,
+    max_delay_epochs: u64,
+    artifact_epoch_bucket_size: u64,
     batch_window_ms: u64,
 ) -> bool {
+    let Ok(bucket_start) = artifact_epoch_bucket_start(batch_epoch, artifact_epoch_bucket_size)
+    else {
+        return false;
+    };
+    let Ok(bucket_end) = artifact_epoch_bucket_end(bucket_start, artifact_epoch_bucket_size) else {
+        return false;
+    };
+    let delay_subject = format!("{bucket_start}:{bucket_end}");
+    let delay_epochs =
+        effective_public_artifact_delay_epochs(&delay_subject, min_delay_epochs, max_delay_epochs);
     if delay_epochs == 0 {
         return published.published_at_unix_ms != 0;
     }
@@ -720,15 +792,32 @@ fn is_public_artifact_visible(
     else {
         return false;
     };
-    let Some(cutoff) = max_epoch.checked_sub(delay_epochs) else {
-        return false;
-    };
-    if batch_epoch <= cutoff {
+    let release_epoch = bucket_end.saturating_add(delay_epochs);
+    if max_epoch >= release_epoch {
         return true;
     }
-    let delay_ms = delay_epochs.saturating_mul(batch_window_ms);
+    let release_delay_epochs = release_epoch.saturating_sub(batch_epoch);
+    let delay_ms = release_delay_epochs.saturating_mul(batch_window_ms);
     published.published_at_unix_ms != 0
         && now_unix_ms() >= published.published_at_unix_ms.saturating_add(delay_ms)
+}
+
+fn effective_public_artifact_delay_epochs(
+    delay_subject: &str,
+    min_delay_epochs: u64,
+    max_delay_epochs: u64,
+) -> u64 {
+    if max_delay_epochs <= min_delay_epochs {
+        return min_delay_epochs;
+    }
+    let Ok(digest) = tagged_commitment_sha256("zylith/artifact-delay-jitter-v1", &delay_subject)
+    else {
+        return min_delay_epochs;
+    };
+    let hex = digest.trim_start_matches("0x");
+    let prefix = hex.get(..16).unwrap_or(hex);
+    let entropy = u64::from_str_radix(prefix, 16).unwrap_or(0);
+    min_delay_epochs + (entropy % (max_delay_epochs - min_delay_epochs + 1))
 }
 
 fn public_settlement_transcript(
@@ -1339,6 +1428,13 @@ fn env_u64_alias_or_default(primary: &str, fallback: &str, default: u64) -> Resu
     env_u64_or_default(fallback, default)
 }
 
+fn env_present(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 fn load_receipt_secret_keyring() -> Vec<String> {
     let mut keyring = Vec::new();
     if let Ok(current) = env::var(ORDER_INGRESS_RECEIPT_SECRET_ENV) {
@@ -1893,7 +1989,8 @@ mod tests {
     use super::{
         BatchRecord, BatchTimingConfig, DEFAULT_BATCH_WINDOW_MS, OrderIngressConfig,
         build_app_with_config, build_app_with_paths, close_expired_open_batches,
-        deterministic_batch_close_jitter_ms, empty_batch, now_unix_ms,
+        deterministic_batch_close_jitter_ms, effective_public_artifact_delay_epochs, empty_batch,
+        now_unix_ms,
     };
     use axum::http::StatusCode;
     use axum::{
@@ -2936,5 +3033,14 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(wrong_auth.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn artifact_delay_jitter_is_epoch_bucket_bound_and_capped() {
+        let first = effective_public_artifact_delay_epochs("88:95", 3, 8);
+        let second = effective_public_artifact_delay_epochs("88:95", 3, 8);
+        assert_eq!(first, second);
+        assert!((3..=8).contains(&first));
+        assert_eq!(effective_public_artifact_delay_epochs("88:95", 4, 4), 4);
     }
 }

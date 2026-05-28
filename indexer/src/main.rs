@@ -39,10 +39,16 @@ const DEFAULT_DEPLOYMENT_MANIFEST_PATH: &str = concat!(
 const DEFAULT_SHIELDED_ASSET_ADAPTER_ADDRESS: &str = "";
 const DEFAULT_ARTIFACT_ARCHIVE_PATH: &str = "indexer/published_batch_artifacts.dev.json";
 const DEFAULT_BATCH_WINDOW_MS: u64 = 90_000;
-const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = 1;
+const DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS: u64 = 3;
+const DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS: u64 = 8;
+const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS;
 const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
 const ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_EPOCHS";
 const PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS";
+const ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MIN_EPOCHS";
+const ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MAX_EPOCHS";
+const PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS";
+const PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS";
 const INDEXER_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_INDEXER_ALLOWED_ORIGINS";
 
 #[derive(Clone)]
@@ -62,7 +68,8 @@ struct AppState {
     artifact_archive_path: Option<Arc<PathBuf>>,
     internal_api_token: Option<Arc<String>>,
     batch_window_ms: u64,
-    public_artifact_delay_epochs: u64,
+    public_artifact_delay_min_epochs: u64,
+    public_artifact_delay_max_epochs: u64,
     artifact_epoch_bucket_size: u64,
 }
 
@@ -97,6 +104,35 @@ async fn main() -> Result<(), String> {
         .ok()
         .map(PathBuf::from)
         .or_else(|| Some(PathBuf::from(DEFAULT_ARTIFACT_ARCHIVE_PATH)));
+    let legacy_delay_override =
+        env_present(ARTIFACT_DELAY_EPOCHS_ENV) || env_present(PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV);
+    let fixed_public_artifact_delay_epochs = load_u64_alias_env(
+        ARTIFACT_DELAY_EPOCHS_ENV,
+        PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
+        DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
+        0,
+    );
+    let public_artifact_delay_min_epochs = load_u64_alias_env(
+        ARTIFACT_DELAY_MIN_EPOCHS_ENV,
+        PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS_ENV,
+        if legacy_delay_override {
+            fixed_public_artifact_delay_epochs
+        } else {
+            DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS
+        },
+        0,
+    );
+    let public_artifact_delay_max_epochs = load_u64_alias_env(
+        ARTIFACT_DELAY_MAX_EPOCHS_ENV,
+        PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS_ENV,
+        if legacy_delay_override {
+            public_artifact_delay_min_epochs
+        } else {
+            DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS
+        },
+        public_artifact_delay_min_epochs,
+    )
+    .max(public_artifact_delay_min_epochs);
     let state = AppState {
         rpc_url: load_rpc_url(),
         shielded_asset_adapter_address: load_shielded_asset_adapter_address(),
@@ -121,12 +157,8 @@ async fn main() -> Result<(), String> {
             CONTROL_PLANE_TOKEN_ENV,
         )?)),
         batch_window_ms: load_u64_env("ZYLITH_BATCH_WINDOW_MS", DEFAULT_BATCH_WINDOW_MS, 1_000),
-        public_artifact_delay_epochs: load_u64_alias_env(
-            ARTIFACT_DELAY_EPOCHS_ENV,
-            PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
-            DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
-            0,
-        ),
+        public_artifact_delay_min_epochs,
+        public_artifact_delay_max_epochs,
         artifact_epoch_bucket_size: load_u64_env(
             "ZYLITH_ARTIFACT_EPOCH_BUCKET_SIZE",
             DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE,
@@ -358,6 +390,13 @@ fn load_u64_alias_env(
     load_u64_env(fallback, default_value, minimum_value)
 }
 
+fn env_present(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -479,7 +518,9 @@ fn published_batch_artifact_summary(
 fn artifact_aggregation_policy(state: &AppState) -> ArtifactAggregationPolicy {
     ArtifactAggregationPolicy {
         policy_version: ARTIFACT_AGGREGATION_POLICY_VERSION,
-        public_artifact_delay_epochs: state.public_artifact_delay_epochs,
+        public_artifact_delay_epochs: state.public_artifact_delay_max_epochs,
+        public_artifact_delay_min_epochs: state.public_artifact_delay_min_epochs,
+        public_artifact_delay_max_epochs: state.public_artifact_delay_max_epochs,
         epoch_bucket_size: state.artifact_epoch_bucket_size,
         aggregation_scope: "multi_pair_epoch_bucket".into(),
         proof_aggregation_mode: "native_aggregate_proof_facts_when_prover_configured".into(),
@@ -488,42 +529,77 @@ fn artifact_aggregation_policy(state: &AppState) -> ArtifactAggregationPolicy {
 
 fn public_visible_epoch_cutoff(
     artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
-    delay_epochs: u64,
 ) -> Option<u64> {
     let max_epoch = artifacts
         .values()
         .map(|published| published.transcript.batch_epoch)
         .max()?;
-    max_epoch.checked_sub(delay_epochs)
+    Some(max_epoch)
+}
+
+fn effective_public_artifact_delay_epochs(
+    delay_subject: &str,
+    min_delay_epochs: u64,
+    max_delay_epochs: u64,
+) -> u64 {
+    if max_delay_epochs <= min_delay_epochs {
+        return min_delay_epochs;
+    }
+    let Ok(digest) = zylith_core::hash::tagged_commitment_sha256(
+        "zylith/artifact-delay-jitter-v1",
+        &delay_subject,
+    ) else {
+        return min_delay_epochs;
+    };
+    let hex = digest.trim_start_matches("0x");
+    let prefix = hex.get(..16).unwrap_or(hex);
+    let entropy = u64::from_str_radix(prefix, 16).unwrap_or(0);
+    min_delay_epochs + (entropy % (max_delay_epochs - min_delay_epochs + 1))
 }
 
 fn is_public_artifact_visible(
     artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
     published: &PublishedBatchArtifacts,
     batch_epoch: u64,
-    delay_epochs: u64,
+    min_delay_epochs: u64,
+    max_delay_epochs: u64,
+    artifact_epoch_bucket_size: u64,
     batch_window_ms: u64,
 ) -> bool {
+    let Ok(bucket_start) = artifact_epoch_bucket_start(batch_epoch, artifact_epoch_bucket_size)
+    else {
+        return false;
+    };
+    let Ok(bucket_end) = artifact_epoch_bucket_end(bucket_start, artifact_epoch_bucket_size) else {
+        return false;
+    };
+    let delay_subject = format!("{bucket_start}:{bucket_end}");
+    let delay_epochs =
+        effective_public_artifact_delay_epochs(&delay_subject, min_delay_epochs, max_delay_epochs);
     if delay_epochs == 0 {
         return published.published_at_unix_ms != 0;
     }
     if published.settled_at_unix_ms.is_none() {
         return false;
     }
-    if public_visible_epoch_cutoff(artifacts, delay_epochs)
-        .map(|cutoff| batch_epoch <= cutoff)
+    let release_epoch = bucket_end.saturating_add(delay_epochs);
+    if public_visible_epoch_cutoff(artifacts)
+        .map(|max_epoch| max_epoch >= release_epoch)
         .unwrap_or(false)
     {
         return true;
     }
-    let delay_ms = delay_epochs.saturating_mul(batch_window_ms);
+    let release_delay_epochs = release_epoch.saturating_sub(batch_epoch);
+    let delay_ms = release_delay_epochs.saturating_mul(batch_window_ms);
     published.published_at_unix_ms != 0
         && now_unix_ms() >= published.published_at_unix_ms.saturating_add(delay_ms)
 }
 
 fn public_artifact_summaries_for_epoch_range(
     artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
-    delay_epochs: u64,
+    min_delay_epochs: u64,
+    max_delay_epochs: u64,
+    artifact_epoch_bucket_size: u64,
     batch_window_ms: u64,
     start_epoch: u64,
     end_epoch: u64,
@@ -538,7 +614,9 @@ fn public_artifact_summaries_for_epoch_range(
                     artifacts,
                     published,
                     epoch,
-                    delay_epochs,
+                    min_delay_epochs,
+                    max_delay_epochs,
+                    artifact_epoch_bucket_size,
                     batch_window_ms,
                 )
         })
@@ -575,6 +653,12 @@ fn multi_pair_artifact_bundles_for_epoch_range(
         });
         let epoch_end = artifact_epoch_bucket_end(epoch_start, policy.epoch_bucket_size)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let delay_subject = format!("{epoch_start}:{epoch_end}");
+        let release_delay_epochs = effective_public_artifact_delay_epochs(
+            &delay_subject,
+            policy.public_artifact_delay_min_epochs,
+            policy.public_artifact_delay_max_epochs,
+        );
         let pair_count = members
             .iter()
             .map(|member| member.pair_id.0.clone())
@@ -642,7 +726,7 @@ fn multi_pair_artifact_bundles_for_epoch_range(
             bundle_id: format!("artifact-bundle-{epoch_start}-{epoch_end}-{suffix}"),
             epoch_start,
             epoch_end,
-            delayed_until_epoch: epoch_end.saturating_add(policy.public_artifact_delay_epochs),
+            delayed_until_epoch: epoch_end.saturating_add(release_delay_epochs),
             artifact_count_bucket: count_bucket_label(members.len() as u64),
             pair_count_bucket: count_bucket_label(pair_count as u64),
             padded_artifact_count: artifact_bundle_padded_count(members.len()) as u64,
@@ -737,7 +821,9 @@ async fn list_archived_batch_artifacts(
     let artifacts = state.published_batch_artifacts.read().await;
     let batches = public_artifact_summaries_for_epoch_range(
         &artifacts,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
         0,
         u64::MAX,
@@ -755,7 +841,9 @@ async fn list_archived_batch_artifacts_by_epoch_range(
     let artifacts = state.published_batch_artifacts.read().await;
     let batches = public_artifact_summaries_for_epoch_range(
         &artifacts,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
         start_epoch,
         end_epoch,
@@ -770,7 +858,9 @@ async fn list_multi_pair_artifact_bundles(
     let policy = artifact_aggregation_policy(&state);
     let summaries = public_artifact_summaries_for_epoch_range(
         &artifacts,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
         0,
         u64::MAX,
@@ -790,7 +880,9 @@ async fn list_multi_pair_artifact_bundles_by_epoch_range(
     let policy = artifact_aggregation_policy(&state);
     let summaries = public_artifact_summaries_for_epoch_range(
         &artifacts,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
         start_epoch,
         end_epoch,
@@ -844,7 +936,9 @@ async fn get_archived_transcript(
         &artifacts,
         published,
         published.transcript.batch_epoch,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
     ) {
         return Err(StatusCode::NOT_FOUND);
@@ -873,7 +967,9 @@ async fn get_archived_output_bundle(
         &artifacts,
         published,
         published.transcript.batch_epoch,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
     ) {
         return Err(StatusCode::NOT_FOUND);
@@ -891,7 +987,9 @@ async fn get_archived_maker_attribution(
         &artifacts,
         published,
         published.transcript.batch_epoch,
-        state.public_artifact_delay_epochs,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
         state.batch_window_ms,
     ) {
         return Err(StatusCode::NOT_FOUND);
@@ -1272,7 +1370,8 @@ fn normalize_hex(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DEFAULT_BATCH_WINDOW_MS, build_app_with_state, normalize_hex, now_unix_ms,
+        AppState, DEFAULT_BATCH_WINDOW_MS, build_app_with_state,
+        effective_public_artifact_delay_epochs, normalize_hex, now_unix_ms,
         parse_deployment_manifest, parse_hex_u64, parse_hex_u128,
     };
     use axum::{
@@ -1481,7 +1580,8 @@ mod tests {
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
-            public_artifact_delay_epochs: 0,
+            public_artifact_delay_min_epochs: 0,
+            public_artifact_delay_max_epochs: 0,
             artifact_epoch_bucket_size: 8,
         });
 
@@ -1611,6 +1711,10 @@ mod tests {
             "batch-strk-usdc-11".into(),
             sample_published_artifact_for_pair("batch-strk-usdc-11", 11, "STRK/USDC"),
         );
+        artifacts.insert(
+            "batch-strk-usdc-16".into(),
+            sample_published_artifact_for_pair("batch-strk-usdc-16", 16, "STRK/USDC"),
+        );
 
         let app = build_app_with_state(AppState {
             rpc_url: "http://127.0.0.1:5050/rpc/v0_8".into(),
@@ -1628,7 +1732,8 @@ mod tests {
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
-            public_artifact_delay_epochs: 1,
+            public_artifact_delay_min_epochs: 1,
+            public_artifact_delay_max_epochs: 1,
             artifact_epoch_bucket_size: 8,
         });
 
@@ -1722,12 +1827,22 @@ mod tests {
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0]["epoch_start"], 8);
         assert_eq!(bundles[0]["epoch_end"], 15);
+        assert_eq!(bundles[0]["delayed_until_epoch"], 16);
         assert_eq!(bundles[0]["artifact_count_bucket"], "0-7");
         assert_eq!(bundles[0]["pair_count_bucket"], "0-7");
         assert_eq!(bundles[0]["padded_artifact_count"], 8);
         assert!(bundles[0].get("batch_id").is_none());
         assert!(bundles[0].get("pair_id").is_none());
         assert!(bundles[0]["aggregate_commitment"].as_str().unwrap().len() >= 32);
+    }
+
+    #[test]
+    fn artifact_delay_jitter_is_epoch_bucket_bound_and_capped() {
+        let first = effective_public_artifact_delay_epochs("88:95", 3, 8);
+        let second = effective_public_artifact_delay_epochs("88:95", 3, 8);
+        assert_eq!(first, second);
+        assert!((3..=8).contains(&first));
+        assert_eq!(effective_public_artifact_delay_epochs("88:95", 4, 4), 4);
     }
 
     #[tokio::test]
@@ -1748,7 +1863,8 @@ mod tests {
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
-            public_artifact_delay_epochs: 1,
+            public_artifact_delay_min_epochs: 1,
+            public_artifact_delay_max_epochs: 1,
             artifact_epoch_bucket_size: 8,
         });
 
