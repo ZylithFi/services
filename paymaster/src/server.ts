@@ -20,8 +20,9 @@ export type PaymasterServerDeps = SubmitterDeps & {
 };
 
 export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterServerDeps = {}) {
-  const rateLimiter = new SignerRateLimiter(config.signerLimitPerMinute);
-  const submissionQueue = new SubmissionQueue();
+  const signerRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute);
+  const clientRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute * 3);
+  const submissionQueues = new SubmissionQueues();
   const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
 
   return createServer(async (request, response) => {
@@ -44,8 +45,8 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         const rawBody = await readBody(request, config.maxBodyBytes);
         const body = JSON.parse(rawBody) as unknown;
         const validated = validateEnsurePrivacySignerRequest(body, config);
-        rateLimiter.check(validated.signer_public_key);
-        const result = await submissionQueue.enqueue(() =>
+        enforceRequestLimits(request, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
+        const result = await submissionQueues.enqueue(config.accountAddress, () =>
           ensurePrivacyProofSignerContract(validated, config, deps)
         );
         sendJson(request, response, 200, result);
@@ -56,8 +57,8 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         const rawBody = await readBody(request, config.maxBodyBytes);
         const body = JSON.parse(rawBody) as unknown;
         const validated = validateRelayPrivacySignerRequest(body, config);
-        rateLimiter.check(validated.account_address);
-        const result = await submissionQueue.enqueue(() =>
+        enforceRequestLimits(request, signerRateLimiter, clientRateLimiter, validated.account_address);
+        const result = await submissionQueues.enqueue(config.accountAddress, () =>
           relayPrivacyProofSignerCall(validated, config, deps)
         );
         sendJson(request, response, 200, result);
@@ -72,9 +73,11 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
       const rawBody = await readBody(request, config.maxBodyBytes);
       const body = JSON.parse(rawBody) as unknown;
       const validated = validateExecuteOutsideRequest(body, config);
-      rateLimiter.check(validated.signer_address);
+      enforceRequestLimits(request, signerRateLimiter, clientRateLimiter, validated.signer_address);
       const result = await submissionStore.runOnce(validated, () =>
-        submissionQueue.enqueue(() => submitProofBearingOutsideExecution(validated, config, deps))
+        submissionQueues.enqueue(config.accountAddress, () =>
+          submitProofBearingOutsideExecution(validated, config, deps)
+        )
       );
       sendJson(request, response, 200, result);
     } catch (error) {
@@ -83,6 +86,24 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
       sendJson(request, response, status, { error: message });
     }
   });
+}
+
+function enforceRequestLimits(
+  request: IncomingMessage,
+  signerRateLimiter: FixedWindowRateLimiter,
+  clientRateLimiter: FixedWindowRateLimiter,
+  signerAddress: string
+): void {
+  signerRateLimiter.check(`signer:${signerAddress}`);
+  clientRateLimiter.check(`ip:${clientIp(request)}`);
+}
+
+function clientIp(request: IncomingMessage): string {
+  const forwarded = request.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0]?.trim() || "unknown";
+  }
+  return request.socket.remoteAddress ?? "unknown";
 }
 
 function readBody(request: IncomingMessage, maxBytes: number): Promise<string> {
@@ -168,16 +189,16 @@ function statusForError(message: string): number {
   return 400;
 }
 
-class SignerRateLimiter {
+class FixedWindowRateLimiter {
   private readonly buckets = new Map<string, { windowStartedAt: number; count: number }>();
 
   constructor(private readonly limitPerMinute: number) {}
 
-  check(signerAddress: string, now = Date.now()): void {
+  check(key: string, now = Date.now()): void {
     const windowMs = 60_000;
-    const existing = this.buckets.get(signerAddress);
+    const existing = this.buckets.get(key);
     if (!existing || now - existing.windowStartedAt >= windowMs) {
-      this.buckets.set(signerAddress, { windowStartedAt: now, count: 1 });
+      this.buckets.set(key, { windowStartedAt: now, count: 1 });
       return;
     }
 
@@ -188,15 +209,16 @@ class SignerRateLimiter {
   }
 }
 
-class SubmissionQueue {
-  private tail: Promise<unknown> = Promise.resolve();
+class SubmissionQueues {
+  private readonly tails = new Map<string, Promise<unknown>>();
 
-  enqueue<T>(task: () => Promise<T>): Promise<T> {
-    const run = this.tail.catch(() => undefined).then(task);
-    this.tail = run.then(
+  enqueue<T>(queueKey: string, task: () => Promise<T>): Promise<T> {
+    const tail = this.tails.get(queueKey) ?? Promise.resolve();
+    const run = tail.catch(() => undefined).then(task);
+    this.tails.set(queueKey, run.then(
       () => undefined,
       () => undefined
-    );
+    ));
     return run;
   }
 }

@@ -2745,6 +2745,10 @@ pub fn maker_curve_min_band_base_amount(pair_id: &PairId) -> u128 {
     }
 }
 
+pub fn default_min_order_amount(pair_id: &PairId) -> u128 {
+    maker_curve_min_band_base_amount(pair_id)
+}
+
 fn validate_maker_curve_pair_shape(
     pair_id: &PairId,
     curve: &HiddenMakerCurve,
@@ -2881,7 +2885,7 @@ impl ProductConfig {
                     pair_id: pair_id_value,
                     base_asset_id: AssetId(base_asset_id.to_owned()),
                     quote_asset_id: AssetId(quote_asset_id.to_owned()),
-                    min_order_amount: 1,
+                    min_order_amount: default_min_order_amount(&PairId(pair_id.to_owned())),
                     price_base_scale: asset_amount_scale(&AssetId(base_asset_id.to_owned())),
                     heartbeat_cover_price: default_heartbeat_cover_price(),
                     taker_fee_bps,
@@ -3190,10 +3194,10 @@ impl ProductConfig {
         let (taker_fee_bps, maker_fee_bps, relay_fee_bps) = default_pair_fee_bps(&pair_id);
 
         Ok(ProductPairConfig {
+            min_order_amount: default_min_order_amount(&pair_id),
             pair_id,
             base_asset_id,
             quote_asset_id,
-            min_order_amount: 1,
             price_base_scale,
             heartbeat_cover_price: default_heartbeat_cover_price(),
             taker_fee_bps,
@@ -3609,8 +3613,8 @@ mod tests {
             relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
-            amount: 1,
-            min_fill: 1,
+            amount: 1_000_000_000_000_000_000,
+            min_fill: 1_000_000_000_000_000_000,
             time_in_force: crate::TimeInForce::CurrentBatchOnly,
             expiry_epoch: 42,
             order_nonce: 9,
@@ -3639,8 +3643,8 @@ mod tests {
     fn product_config_rejects_duplicate_funding_inputs() {
         let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
         let funding_note = Note {
-            asset_id: AssetId("USDC".into()),
-            amount: 1_000,
+            asset_id: AssetId("STRK".into()),
+            amount: 1_000_000_000_000_000_000,
             owner_public_key: "ab".repeat(32),
             spend_authority: "0x333".into(),
             withdraw_authority: "0x333".into(),
@@ -3660,13 +3664,13 @@ mod tests {
         let order = OrderIntent {
             pair_id: PairId("STRK/USDC".into()),
             batch_id: BatchId("batch-strk-usdc-42".into()),
-            side: OrderSide::Buy,
+            side: OrderSide::Sell,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
-            amount: 1,
-            min_fill: 1,
+            amount: 1_000_000_000_000_000_000,
+            min_fill: 1_000_000_000_000_000_000,
             time_in_force: crate::TimeInForce::CurrentBatchOnly,
             expiry_epoch: 42,
             order_nonce: 9,
@@ -3712,8 +3716,8 @@ mod tests {
             relay_mode: RelayMode::SelfRelay,
             maker_curve: None,
             limit_price: 145,
-            amount: 2,
-            min_fill: 1,
+            amount: 2_000_000_000_000_000_000,
+            min_fill: 1_000_000_000_000_000_000,
             time_in_force: crate::TimeInForce::CurrentBatchOnly,
             expiry_epoch: 42,
             order_nonce: 9,

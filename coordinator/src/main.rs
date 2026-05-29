@@ -8,11 +8,12 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{
@@ -222,6 +223,32 @@ fn build_app() -> Result<Router, String> {
         .ok()
         .map(PathBuf::from)
         .or_else(|| Some(PathBuf::from(DEFAULT_ARTIFACT_STORE_PATH)));
+    if coordinator_strict_mode() {
+        ensure_non_default_store_path(
+            "ZYLITH_COORDINATOR_BATCH_PATH",
+            batch_store_path.as_deref(),
+            DEFAULT_BATCH_STORE_PATH,
+        )?;
+        ensure_non_default_store_path(
+            "ZYLITH_COORDINATOR_RECOVERY_PATH",
+            recovery_store_path.as_deref(),
+            DEFAULT_RECOVERY_STORE_PATH,
+        )?;
+        ensure_non_default_store_path(
+            "ZYLITH_COORDINATOR_ARTIFACT_PATH",
+            published_batch_artifacts_store_path.as_deref(),
+            DEFAULT_ARTIFACT_STORE_PATH,
+        )?;
+        ensure_sqlite_store_path("ZYLITH_COORDINATOR_BATCH_PATH", batch_store_path.as_deref())?;
+        ensure_sqlite_store_path(
+            "ZYLITH_COORDINATOR_RECOVERY_PATH",
+            recovery_store_path.as_deref(),
+        )?;
+        ensure_sqlite_store_path(
+            "ZYLITH_COORDINATOR_ARTIFACT_PATH",
+            published_batch_artifacts_store_path.as_deref(),
+        )?;
+    }
 
     let internal_api_token = Some(load_required_control_plane_token(
         "zylith-coordinator",
@@ -351,7 +378,7 @@ fn build_app() -> Result<Router, String> {
         artifact_epoch_bucket_size,
     };
 
-    Ok(build_app_with_config(
+    build_app_with_config(
         CoordinatorStoreConfig {
             batch_store_path,
             recovery_store_path,
@@ -370,7 +397,7 @@ fn build_app() -> Result<Router, String> {
             allow_direct_private_payloads: allow_direct_private_order_payloads,
         },
         hardening,
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -401,6 +428,7 @@ fn build_app_with_paths(
         },
         CoordinatorHardeningConfig::default(),
     )
+    .expect("test coordinator app should build")
 }
 
 fn build_app_with_config(
@@ -410,7 +438,7 @@ fn build_app_with_config(
     batch_timing: BatchTimingConfig,
     order_ingress: OrderIngressConfig,
     hardening: CoordinatorHardeningConfig,
-) -> Router {
+) -> Result<Router, String> {
     let CoordinatorStoreConfig {
         batch_store_path,
         recovery_store_path,
@@ -465,10 +493,11 @@ fn build_app_with_config(
         rate_limiter: RateLimiter::default(),
     };
 
-    Router::new()
+    Ok(Router::new()
         .route("/health", get(health))
         .route("/api/batches", get(list_batches))
         .route("/api/batches/current", get(current_batch))
+        .route("/api/batches/transcripts", get(list_published_transcripts))
         .route(
             "/api/pairs/{base}/{quote}/batches/current",
             get(current_pair_batch),
@@ -533,7 +562,7 @@ fn build_app_with_config(
         .route("/api/maker/batches/{batch_id}", get(get_maker_batch))
         .with_state(app_state)
         .layer(DefaultBodyLimit::max(hardening.max_body_bytes))
-        .layer(service_cors_layer(COORDINATOR_ALLOWED_ORIGINS_ENV))
+        .layer(service_cors_layer(COORDINATOR_ALLOWED_ORIGINS_ENV)?))
 }
 
 async fn health(State(state): State<AppState>) -> Json<CoordinatorStatus> {
@@ -693,6 +722,42 @@ async fn get_published_transcript(
         return Err(StatusCode::NOT_FOUND);
     }
     public_settlement_transcript(published).map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptBatchQuery {
+    batch_ids: String,
+}
+
+async fn list_published_transcripts(
+    State(state): State<AppState>,
+    Query(query): Query<TranscriptBatchQuery>,
+) -> Json<Vec<PublicSettlementTranscript>> {
+    let requested = query
+        .batch_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|batch_id| !batch_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    let artifacts = state.published_batch_artifacts.read().await;
+    let transcripts = requested
+        .into_iter()
+        .filter_map(|batch_id| {
+            let published = artifacts.get(batch_id)?;
+            is_public_artifact_visible(
+                &artifacts,
+                published,
+                published.transcript.batch_epoch,
+                state.public_artifact_delay_min_epochs,
+                state.public_artifact_delay_max_epochs,
+                state.artifact_epoch_bucket_size,
+                state.batch_window_ms,
+            )
+            .then(|| public_settlement_transcript(published).ok())
+            .flatten()
+        })
+        .collect();
+    Json(transcripts)
 }
 
 async fn get_internal_published_transcript(
@@ -1061,16 +1126,19 @@ async fn query_private_settlement_report(
     )?;
     let provided_auth_tag = require_recovery_auth_header(&headers)?;
     {
-        let recovery_artifacts = state.recovery_artifacts.read().await;
-        let account = recovery_artifacts
-            .get(&account_id)
-            .ok_or(StatusCode::NOT_FOUND)?;
-        let expected = account
-            .recovery_auth_tag
-            .as_ref()
-            .ok_or(StatusCode::NOT_FOUND)?;
-        if !zylith_core::constant_time_eq(expected, &provided_auth_tag) {
-            return Err(StatusCode::UNAUTHORIZED);
+        let mut recovery_artifacts = state.recovery_artifacts.write().await;
+        let account = recovery_artifacts.entry(account_id.clone()).or_default();
+        let mut changed = false;
+        if let Some(expected) = &account.recovery_auth_tag {
+            if !zylith_core::constant_time_eq(expected, &provided_auth_tag) {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        } else {
+            account.recovery_auth_tag = Some(provided_auth_tag);
+            changed = true;
+        }
+        if changed && let Some(path) = state.recovery_store_path.as_deref() {
+            persist_recovery_store(path, &recovery_artifacts)?;
         }
     }
 
@@ -1597,14 +1665,52 @@ fn load_required_control_plane_token(service_name: &str, env_name: &str) -> Resu
         })
 }
 
-fn service_cors_layer(env_name: &str) -> CorsLayer {
+fn service_cors_layer(env_name: &str) -> Result<CorsLayer, String> {
     let base = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
         .allow_headers(Any);
     match allowed_origins_from_env(env_name) {
-        Some(origins) => base.allow_origin(AllowOrigin::list(origins)),
-        None => base.allow_origin(Any),
+        Some(origins) => Ok(base.allow_origin(AllowOrigin::list(origins))),
+        None if coordinator_strict_mode() => Err(format!(
+            "{env_name} is required when ZYLITH_ENV=production or ZYLITH_COORDINATOR_STRICT=true"
+        )),
+        None => Ok(base.allow_origin(Any)),
     }
+}
+
+fn coordinator_strict_mode() -> bool {
+    env::var("ZYLITH_COORDINATOR_STRICT")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        || env::var("ZYLITH_ENV")
+            .ok()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("production"))
+}
+
+fn ensure_non_default_store_path(
+    env_name: &str,
+    path: Option<&FsPath>,
+    default_path: &str,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Err(format!("{env_name} is required in production"));
+    };
+    if path == FsPath::new(default_path) {
+        return Err(format!("{env_name} must point at a production volume"));
+    }
+    Ok(())
+}
+
+fn ensure_sqlite_store_path(env_name: &str, path: Option<&FsPath>) -> Result<(), String> {
+    let Some(path) = path else {
+        return Err(format!("{env_name} is required in production"));
+    };
+    if !is_sqlite_store(path) {
+        return Err(format!(
+            "{env_name} must point to a .db, .sqlite, or .sqlite3 durable store in production"
+        ));
+    }
+    Ok(())
 }
 
 fn allowed_origins_from_env(env_name: &str) -> Option<Vec<HeaderValue>> {
@@ -1990,6 +2096,9 @@ fn compute_batch_commitments_for(
 }
 
 fn load_batch_store(path: &FsPath) -> BTreeMap<String, BatchRecord> {
+    if is_sqlite_store(path) {
+        return load_sqlite_records(path, "batches").unwrap_or_default();
+    }
     let Ok(contents) = fs::read_to_string(path) else {
         return BTreeMap::default();
     };
@@ -2013,6 +2122,9 @@ fn persist_batch_store(
     path: &FsPath,
     batches: &BTreeMap<String, BatchRecord>,
 ) -> Result<(), StatusCode> {
+    if is_sqlite_store(path) {
+        return persist_sqlite_records(path, "batches", batches);
+    }
     let encoded = serde_json::to_string_pretty(&BatchStoreFile {
         batches_by_id: batches.clone(),
     })
@@ -2029,6 +2141,9 @@ fn now_unix_ms() -> u64 {
 }
 
 fn load_recovery_store(path: &FsPath) -> BTreeMap<String, RecoveryAccountRecord> {
+    if is_sqlite_store(path) {
+        return load_sqlite_records(path, "recovery_accounts").unwrap_or_default();
+    }
     let Ok(contents) = fs::read_to_string(path) else {
         return BTreeMap::default();
     };
@@ -2059,6 +2174,9 @@ fn load_recovery_store(path: &FsPath) -> BTreeMap<String, RecoveryAccountRecord>
 fn load_published_batch_artifacts_store(
     path: &FsPath,
 ) -> BTreeMap<String, PublishedBatchArtifacts> {
+    if is_sqlite_store(path) {
+        return load_sqlite_records(path, "published_batch_artifacts").unwrap_or_default();
+    }
     let Ok(contents) = fs::read_to_string(path) else {
         return BTreeMap::default();
     };
@@ -2072,6 +2190,9 @@ fn persist_recovery_store(
     path: &FsPath,
     accounts: &BTreeMap<String, RecoveryAccountRecord>,
 ) -> Result<(), StatusCode> {
+    if is_sqlite_store(path) {
+        return persist_sqlite_records(path, "recovery_accounts", accounts);
+    }
     let encoded = serde_json::to_string_pretty(&RecoveryStoreFile {
         accounts_by_id: accounts.clone(),
         artifacts_by_account: BTreeMap::new(),
@@ -2085,12 +2206,131 @@ fn persist_published_batch_artifacts_store(
     path: &FsPath,
     artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
 ) -> Result<(), StatusCode> {
+    if is_sqlite_store(path) {
+        return persist_sqlite_records(path, "published_batch_artifacts", artifacts);
+    }
     let encoded = serde_json::to_string_pretty(&PublishedBatchArtifactsStoreFile {
         artifacts_by_batch: artifacts.clone(),
     })
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     atomic_write(path, &encoded)
+}
+
+fn is_sqlite_store(path: &FsPath) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "db" | "sqlite" | "sqlite3"
+            )
+        })
+}
+
+fn open_sqlite_store(path: &FsPath) -> rusqlite::Result<Connection> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    }
+    let connection = Connection::open(path)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "synchronous", "NORMAL")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS coordinator_records (
+            namespace TEXT NOT NULL,
+            record_key TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            updated_at_unix_ms INTEGER NOT NULL,
+            PRIMARY KEY(namespace, record_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_coordinator_records_namespace
+            ON coordinator_records(namespace);",
+    )?;
+    Ok(connection)
+}
+
+fn load_sqlite_records<T: DeserializeOwned>(
+    path: &FsPath,
+    namespace: &str,
+) -> Result<BTreeMap<String, T>, StatusCode> {
+    let connection = open_sqlite_store(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT record_key, value_json
+             FROM coordinator_records
+             WHERE namespace = ?1
+             ORDER BY record_key",
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = statement
+        .query_map([namespace], |row| {
+            let key: String = row.get(0)?;
+            let value_json: String = row.get(1)?;
+            Ok((key, value_json))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut records = BTreeMap::new();
+    for row in rows {
+        let (key, value_json) = row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let value =
+            serde_json::from_str(&value_json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        records.insert(key, value);
+    }
+    Ok(records)
+}
+
+fn persist_sqlite_records<T: Serialize>(
+    path: &FsPath,
+    namespace: &str,
+    records: &BTreeMap<String, T>,
+) -> Result<(), StatusCode> {
+    let mut connection = open_sqlite_store(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut existing_keys = {
+        let mut statement = transaction
+            .prepare("SELECT record_key FROM coordinator_records WHERE namespace = ?1")
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let rows = statement
+            .query_map([namespace], |row| row.get::<_, String>(0))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut keys = BTreeSet::new();
+        for row in rows {
+            keys.insert(row.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+        }
+        keys
+    };
+    let updated_at_unix_ms = now_unix_ms() as i64;
+    for (key, value) in records {
+        let value_json =
+            serde_json::to_string(value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        transaction
+            .execute(
+                "INSERT INTO coordinator_records
+                    (namespace, record_key, value_json, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace, record_key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                rusqlite::params![namespace, key, value_json, updated_at_unix_ms],
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        existing_keys.remove(key);
+    }
+    for key in existing_keys {
+        transaction
+            .execute(
+                "DELETE FROM coordinator_records WHERE namespace = ?1 AND record_key = ?2",
+                rusqlite::params![namespace, key],
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn atomic_write(path: &FsPath, contents: &str) -> Result<(), StatusCode> {
@@ -2116,7 +2356,8 @@ mod tests {
         BatchRecord, BatchTimingConfig, DEFAULT_BATCH_WINDOW_MS, OrderIngressConfig,
         build_app_with_config, build_app_with_paths, close_expired_open_batches,
         deterministic_batch_close_jitter_ms, effective_public_artifact_delay_epochs, empty_batch,
-        now_unix_ms,
+        load_batch_store, load_recovery_store, now_unix_ms, persist_batch_store,
+        persist_recovery_store,
     };
     use axum::http::StatusCode;
     use axum::{
@@ -2124,7 +2365,7 @@ mod tests {
         http::{Method, Request},
     };
     use http_body_util::BodyExt;
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
     use tower::ServiceExt;
     use zylith_core::{
         EncryptedRecoveryPayload, OrderCancellationRequest, OrderShareBundle, OrderSubmission,
@@ -2146,6 +2387,63 @@ mod tests {
         assert_eq!(same, deterministic_batch_close_jitter_ms(&pair, 7, 1_000));
         assert!(same <= 1_000);
         assert_eq!(deterministic_batch_close_jitter_ms(&pair, 7, 0), 0);
+    }
+
+    #[test]
+    fn sqlite_stores_round_trip_namespaced_records() {
+        let path = std::env::temp_dir().join(format!(
+            "zylith-coordinator-store-{}-{}.sqlite",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let product_config =
+            ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product config");
+        let pair = PairId("STRK/USDC".into());
+        let mut batches = BTreeMap::new();
+        batches.insert(
+            "strk-usdc-7".into(),
+            BatchRecord {
+                batch: empty_batch(
+                    &product_config,
+                    &pair,
+                    7,
+                    now_unix_ms(),
+                    DEFAULT_BATCH_WINDOW_MS,
+                    0,
+                    "test-heartbeat-cover-secret",
+                ),
+                order_count: 2,
+                orders: Vec::new(),
+            },
+        );
+        persist_batch_store(&path, &batches).expect("persist batch sqlite store");
+        assert_eq!(
+            load_batch_store(&path)
+                .get("strk-usdc-7")
+                .expect("batch record")
+                .order_count,
+            2
+        );
+
+        let mut recovery = BTreeMap::new();
+        recovery.insert(
+            "account-1".into(),
+            super::RecoveryAccountRecord {
+                recovery_auth_tag: Some("auth-tag".into()),
+                artifacts: Vec::new(),
+            },
+        );
+        persist_recovery_store(&path, &recovery).expect("persist recovery sqlite store");
+        assert_eq!(
+            load_recovery_store(&path)
+                .get("account-1")
+                .expect("recovery record")
+                .recovery_auth_tag
+                .as_deref(),
+            Some("auth-tag")
+        );
+        assert_eq!(load_batch_store(&path).len(), 1);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2249,7 +2547,8 @@ mod tests {
                 allow_direct_private_payloads: true,
             },
             super::CoordinatorHardeningConfig::default(),
-        );
+        )
+        .expect("test app should build");
 
         let response = app
             .oneshot(
@@ -2353,7 +2652,8 @@ mod tests {
                 allow_direct_private_payloads: false,
             },
             super::CoordinatorHardeningConfig::default(),
-        );
+        )
+        .expect("test app should build");
         let mut full_bundle = OrderShareBundle {
             order_commitment: zylith_core::OrderCommitment("0xabc".into()),
             cancellation_auth_tag: "cancel-tag-receipt".into(),
@@ -2963,6 +3263,26 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(settled_response.status(), StatusCode::OK);
+
+        let early_private_report_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/recovery/account-1/settlement-reports/{batch_id}"
+                    ))
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .header(zylith_core::RECOVERY_AUTH_HEADER, TEST_RECOVERY_AUTH)
+                    .body(Body::from(
+                        br#"{"output_recovery_key_tags":[],"order_commitments":["0xabc"]}"#
+                            .to_vec(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(early_private_report_response.status(), StatusCode::OK);
 
         let recovery_artifact = RecoveryArtifact {
             artifact_id: "artifact-private-report-auth".into(),

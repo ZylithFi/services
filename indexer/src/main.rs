@@ -8,7 +8,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
@@ -209,6 +209,7 @@ fn build_app_with_state(state: AppState) -> Router {
             "/api/batches/artifact-bundles/epochs/{start_epoch}/{end_epoch}",
             get(list_multi_pair_artifact_bundles_by_epoch_range),
         )
+        .route("/api/batches/transcripts", get(list_archived_transcripts))
         .route(
             "/api/internal/batches/root-history/epochs/{start_epoch}/{end_epoch}",
             get(list_internal_root_history_by_epoch_range),
@@ -944,6 +945,42 @@ async fn get_archived_transcript(
         return Err(StatusCode::NOT_FOUND);
     }
     public_settlement_transcript(published).map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptBatchQuery {
+    batch_ids: String,
+}
+
+async fn list_archived_transcripts(
+    State(state): State<AppState>,
+    Query(query): Query<TranscriptBatchQuery>,
+) -> Json<Vec<PublicSettlementTranscript>> {
+    let requested = query
+        .batch_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|batch_id| !batch_id.is_empty())
+        .collect::<BTreeSet<_>>();
+    let artifacts = state.published_batch_artifacts.read().await;
+    let transcripts = requested
+        .into_iter()
+        .filter_map(|batch_id| {
+            let published = artifacts.get(batch_id)?;
+            is_public_artifact_visible(
+                &artifacts,
+                published,
+                published.transcript.batch_epoch,
+                state.public_artifact_delay_min_epochs,
+                state.public_artifact_delay_max_epochs,
+                state.artifact_epoch_bucket_size,
+                state.batch_window_ms,
+            )
+            .then(|| public_settlement_transcript(published).ok())
+            .flatten()
+        })
+        .collect();
+    Json(transcripts)
 }
 
 async fn get_internal_archived_transcript(

@@ -857,7 +857,7 @@ pub fn build_output_note(
         spend_authority: order.recipient_spend_authority.clone(),
         withdraw_authority,
         blinding,
-        nonce: output_index as u64,
+        nonce: (output_index as u64).saturating_add(1),
         metadata_commitment,
     })
 }
