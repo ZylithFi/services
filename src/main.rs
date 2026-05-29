@@ -577,33 +577,43 @@ async fn process_due_slots_once(state: &AppState) -> Vec<OfflineRenewalRelayResu
             .collect::<Vec<_>>()
     };
     let mut emitted = Vec::new();
-    let mut batch_cache: BTreeMap<String, Option<PublicBatchSummary>> = BTreeMap::new();
     for package in snapshots {
-        for slot in package.slots.iter() {
+        let batch = fetch_current_batch(state, &package, &package.pair)
+            .await
+            .ok();
+        let Some(batch) = batch else {
+            eprintln!(
+                "renewal relay skipped package {} because current batch is unavailable",
+                package.package_id
+            );
+            continue;
+        };
+        let slots = due_slots_for_package_tick(state, &package, batch.epoch_id).await;
+        for slot in slots.iter() {
             if !should_attempt_slot(state, &package.package_id, slot).await {
                 continue;
             }
-            let cache_key = batch_cache_key(state, &package, &slot.pair);
-            let batch = if let Some(cached) = batch_cache.get(&cache_key) {
-                cached.clone()
-            } else {
-                let fetched = fetch_current_batch(state, &package, &slot.pair).await.ok();
-                batch_cache.insert(cache_key, fetched.clone());
-                fetched
-            };
-            let result = match batch.as_ref() {
-                Some(batch) => process_slot_against_batch(state, &package, slot, batch).await,
-                None => slot_result(
-                    slot,
-                    RelaySlotStatus::Failed,
-                    Some("Current batch unavailable".into()),
-                ),
-            };
-            record_slot_result(state, &package.package_id, result.clone()).await;
+            let result = process_slot_against_batch(state, &package, slot, &batch).await;
+            let stored_result =
+                record_slot_result(state, &package.package_id, result.clone()).await;
+            if let Some(stored_result) = stored_result
+                && is_sqlite_store(&state.config.store_path)
+                && let Err(error) = persist_sqlite_slot_result(
+                    &state.config.store_path,
+                    &package.package_id,
+                    stored_result,
+                )
+                .await
+            {
+                eprintln!(
+                    "renewal relay failed to persist slot result package={} slot={}: {error}",
+                    package.package_id, result.slot_id
+                );
+            }
             emitted.push(result);
         }
     }
-    if !emitted.is_empty() {
+    if !emitted.is_empty() && !is_sqlite_store(&state.config.store_path) {
         let _ = persist_store(&state.config.store_path, &state.store).await;
     }
     if let PersistentTickLease::Acquired(owner) = persistent_lease {
@@ -612,9 +622,28 @@ async fn process_due_slots_once(state: &AppState) -> Vec<OfflineRenewalRelayResu
     emitted
 }
 
-fn batch_cache_key(state: &AppState, package: &OfflineRenewalPackage, pair: &str) -> String {
-    let coordinator_url = package_coordinator_url(&state.config, package).unwrap_or_default();
-    format!("{coordinator_url}|{pair}")
+async fn due_slots_for_package_tick(
+    state: &AppState,
+    package: &OfflineRenewalPackage,
+    current_epoch: u64,
+) -> Vec<OfflineRenewalSlot> {
+    if is_sqlite_store(&state.config.store_path) {
+        match load_sqlite_due_slots_for_package(&state.config, &package.package_id, current_epoch)
+            .await
+        {
+            Ok(slots) => return slots,
+            Err(error) => eprintln!(
+                "renewal relay due-slot index unavailable for package {}: {error}; falling back to in-memory scan",
+                package.package_id
+            ),
+        }
+    }
+    package
+        .slots
+        .iter()
+        .take_while(|slot| slot.epoch_id <= current_epoch)
+        .cloned()
+        .collect()
 }
 
 async fn should_attempt_slot(
@@ -741,12 +770,14 @@ async fn fetch_current_batch(
     .await
 }
 
-async fn record_slot_result(state: &AppState, package_id: &str, result: OfflineRenewalRelayResult) {
+async fn record_slot_result(
+    state: &AppState,
+    package_id: &str,
+    result: OfflineRenewalRelayResult,
+) -> Option<StoredSlotResult> {
     let now = now_unix_ms();
     let mut store = state.store.write().await;
-    let Some(package) = store.packages.get_mut(package_id) else {
-        return;
-    };
+    let package = store.packages.get_mut(package_id)?;
     let previous_attempts = package
         .results
         .get(&result.slot_id)
@@ -757,15 +788,16 @@ async fn record_slot_result(state: &AppState, package_id: &str, result: OfflineR
     } else {
         previous_attempts.saturating_add(1)
     };
-    package.results.insert(
-        result.slot_id.clone(),
-        StoredSlotResult {
-            result,
-            attempts,
-            last_attempt_unix_ms: now,
-        },
-    );
+    let stored = StoredSlotResult {
+        result: result.clone(),
+        attempts,
+        last_attempt_unix_ms: now,
+    };
+    package
+        .results
+        .insert(result.slot_id.clone(), stored.clone());
     package.updated_at_unix_ms = now;
+    Some(stored)
 }
 
 async fn post_json<T: for<'de> Deserialize<'de>>(
@@ -855,6 +887,15 @@ fn validate_package(
     if package.start_epoch > package.end_epoch {
         return Err(RelayApiError::bad_request(
             "Renewal package epoch range is invalid",
+        ));
+    }
+    if !package
+        .slots
+        .windows(2)
+        .all(|window| window[0].epoch_id <= window[1].epoch_id)
+    {
+        return Err(RelayApiError::bad_request(
+            "Renewal package slots must be sorted by epoch",
         ));
     }
     if package_prover_url(config, package).is_err()
@@ -1245,12 +1286,6 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    transaction
-        .execute("DELETE FROM relay_slot_results", [])
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute("DELETE FROM relay_packages", [])
-        .map_err(|error| error.to_string())?;
     for (package_id, stored) in snapshot.packages {
         let package_json =
             serde_json::to_string(&stored.package).map_err(|error| error.to_string())?;
@@ -1259,7 +1294,15 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
                 "INSERT INTO relay_packages \
                  (package_id, package_commitment, pair, start_epoch, end_epoch, slot_count, \
                   package_json, registered_at_unix_ms, updated_at_unix_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(package_id) DO UPDATE SET \
+                    package_commitment=excluded.package_commitment, \
+                    pair=excluded.pair, \
+                    start_epoch=excluded.start_epoch, \
+                    end_epoch=excluded.end_epoch, \
+                    slot_count=excluded.slot_count, \
+                    package_json=excluded.package_json, \
+                    updated_at_unix_ms=excluded.updated_at_unix_ms",
                 params![
                     package_id.as_str(),
                     stored.package.package_commitment.as_str(),
@@ -1273,18 +1316,51 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
                 ],
             )
             .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM relay_due_slots WHERE package_id = ?1",
+                params![package_id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+        for slot in &stored.package.slots {
+            let slot_json = serde_json::to_string(slot).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO relay_due_slots \
+                     (package_id, slot_id, pair, epoch_id, slot_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(package_id, slot_id) DO UPDATE SET \
+                        pair=excluded.pair, \
+                        epoch_id=excluded.epoch_id, \
+                        slot_json=excluded.slot_json",
+                    params![
+                        package_id.as_str(),
+                        slot.slot_id.as_str(),
+                        slot.pair.as_str(),
+                        slot.epoch_id as i64,
+                        slot_json.as_str(),
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         for (slot_id, result) in stored.results {
             let result_json =
                 serde_json::to_string(&result.result).map_err(|error| error.to_string())?;
             transaction
                 .execute(
                     "INSERT INTO relay_slot_results \
-                     (package_id, slot_id, result_json, attempts, last_attempt_unix_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (package_id, slot_id, result_json, status, attempts, last_attempt_unix_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(package_id, slot_id) DO UPDATE SET \
+                        result_json=excluded.result_json, \
+                        status=excluded.status, \
+                        attempts=excluded.attempts, \
+                        last_attempt_unix_ms=excluded.last_attempt_unix_ms",
                     params![
                         package_id.as_str(),
                         slot_id.as_str(),
                         result_json.as_str(),
+                        slot_status_label(&result.result.status),
                         result.attempts as i64,
                         result.last_attempt_unix_ms as i64,
                     ],
@@ -1293,6 +1369,115 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
         }
     }
     transaction.commit().map_err(|error| error.to_string())
+}
+
+async fn load_sqlite_due_slots_for_package(
+    config: &RelayConfig,
+    package_id: &str,
+    current_epoch: u64,
+) -> Result<Vec<OfflineRenewalSlot>, String> {
+    let path = config.store_path.clone();
+    let package_id = package_id.to_string();
+    let max_attempts = config.max_attempts;
+    let retry_cutoff_unix_ms = now_unix_ms().saturating_sub(config.retry_backoff_ms);
+    tokio::task::spawn_blocking(move || {
+        let connection = open_sqlite_store(&path)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT d.slot_json \
+                 FROM relay_due_slots d \
+                 LEFT JOIN relay_slot_results r \
+                    ON r.package_id = d.package_id AND r.slot_id = d.slot_id \
+                 WHERE d.package_id = ?1 \
+                   AND d.epoch_id <= ?2 \
+                   AND ( \
+                        r.slot_id IS NULL \
+                        OR ( \
+                            r.status NOT IN ('submitted', 'already_submitted', 'missed') \
+                            AND r.attempts < ?3 \
+                            AND r.last_attempt_unix_ms <= ?4 \
+                        ) \
+                   ) \
+                 ORDER BY d.epoch_id ASC, d.slot_id ASC \
+                 LIMIT 512",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement
+            .query(params![
+                package_id.as_str(),
+                current_epoch as i64,
+                max_attempts as i64,
+                retry_cutoff_unix_ms as i64,
+            ])
+            .map_err(|error| error.to_string())?;
+        let mut slots = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let slot_json: String = row.get(0).map_err(|error| error.to_string())?;
+            slots.push(
+                serde_json::from_str::<OfflineRenewalSlot>(&slot_json)
+                    .map_err(|error| format!("invalid indexed renewal slot JSON: {error}"))?,
+            );
+        }
+        Ok(slots)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn persist_sqlite_slot_result(
+    path: &FsPath,
+    package_id: &str,
+    result: StoredSlotResult,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let package_id = package_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let connection = open_sqlite_store(&path)?;
+        let result_json =
+            serde_json::to_string(&result.result).map_err(|error| error.to_string())?;
+        let now = now_unix_ms();
+        connection
+            .execute(
+                "INSERT INTO relay_slot_results \
+                 (package_id, slot_id, result_json, status, attempts, last_attempt_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(package_id, slot_id) DO UPDATE SET \
+                    result_json=excluded.result_json, \
+                    status=excluded.status, \
+                    attempts=excluded.attempts, \
+                    last_attempt_unix_ms=excluded.last_attempt_unix_ms",
+                params![
+                    package_id.as_str(),
+                    result.result.slot_id.as_str(),
+                    result_json.as_str(),
+                    slot_status_label(&result.result.status),
+                    result.attempts as i64,
+                    result.last_attempt_unix_ms as i64,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "UPDATE relay_packages SET updated_at_unix_ms = ?2 WHERE package_id = ?1",
+                params![package_id.as_str(), now as i64],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn slot_status_label(status: &RelaySlotStatus) -> &'static str {
+    match status {
+        RelaySlotStatus::Submitted => "submitted",
+        RelaySlotStatus::AlreadySubmitted => "already_submitted",
+        RelaySlotStatus::NotDue => "not_due",
+        RelaySlotStatus::BatchNotOpen => "batch_not_open",
+        RelaySlotStatus::SafetyBuffer => "safety_buffer",
+        RelaySlotStatus::Missed => "missed",
+        RelaySlotStatus::Failed => "failed",
+    }
 }
 
 fn open_sqlite_store(path: &FsPath) -> Result<Connection, String> {
@@ -1336,6 +1521,7 @@ fn configure_sqlite_store(connection: &Connection) -> Result<(), String> {
                 package_id TEXT NOT NULL,
                 slot_id TEXT NOT NULL,
                 result_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
                 attempts INTEGER NOT NULL,
                 last_attempt_unix_ms INTEGER NOT NULL,
                 PRIMARY KEY (package_id, slot_id),
@@ -1343,12 +1529,59 @@ fn configure_sqlite_store(connection: &Connection) -> Result<(), String> {
             );
             CREATE INDEX IF NOT EXISTS relay_slot_results_last_attempt_idx
                 ON relay_slot_results(last_attempt_unix_ms);
+            CREATE TABLE IF NOT EXISTS relay_due_slots (
+                package_id TEXT NOT NULL,
+                slot_id TEXT NOT NULL,
+                pair TEXT NOT NULL,
+                epoch_id INTEGER NOT NULL,
+                slot_json TEXT NOT NULL,
+                PRIMARY KEY (package_id, slot_id),
+                FOREIGN KEY(package_id) REFERENCES relay_packages(package_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS relay_due_slots_package_epoch_idx
+                ON relay_due_slots(package_id, epoch_id);
+            CREATE INDEX IF NOT EXISTS relay_due_slots_pair_epoch_idx
+                ON relay_due_slots(pair, epoch_id);
             CREATE TABLE IF NOT EXISTS relay_locks (
                 name TEXT PRIMARY KEY,
                 owner TEXT NOT NULL,
                 expires_at_unix_ms INTEGER NOT NULL
             );",
         )
+        .map_err(|error| error.to_string())?;
+    ensure_sqlite_column(
+        connection,
+        "relay_slot_results",
+        "status",
+        "ALTER TABLE relay_slot_results ADD COLUMN status TEXT NOT NULL DEFAULT ''",
+    )?;
+    connection
+        .execute(
+            "CREATE INDEX IF NOT EXISTS relay_slot_results_status_idx ON relay_slot_results(status)",
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn ensure_sqlite_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let name: String = row.get(1).map_err(|error| error.to_string())?;
+        if name == column {
+            return Ok(());
+        }
+    }
+    connection
+        .execute(alter_sql, [])
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -1749,6 +1982,14 @@ mod tests {
                 .attempts,
             2,
         );
+        let indexed_due_slots = load_sqlite_due_slots_for_package(
+            &test_state(path.clone()).config,
+            &package.package_id,
+            package.slots[0].epoch_id,
+        )
+        .await
+        .unwrap();
+        assert!(indexed_due_slots.is_empty());
 
         let lease = acquire_persistent_tick_lease_sync(&path, 60_000).unwrap();
         let owner = match lease {
