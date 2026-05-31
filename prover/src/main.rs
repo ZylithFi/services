@@ -46,12 +46,12 @@ use zylith_core::hash::{encode_starknet_felt, normalize_felt_hex, ordered_felt_l
 use zylith_core::{
     AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchOrderSet, BatchStatus,
     BatchSummary, CONTROL_PLANE_TOKEN_ENV, ConsumedInput, DeploymentManifest, DepositRecord,
-    DepositRecordList, FeeEntry, MakerAttributionBundle, MakerAttributionPlaintext,
-    MakerBandAttribution, MakerBandFillAttribution, MatchedOrder, MatchedOrderWitness, Note,
-    NoteCommitment, NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness,
-    OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport, OrderIngressReceipt,
-    OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle,
-    OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
+    DepositRecordList, FeeEntry, FeeOutputNoteInput, MakerAttributionBundle,
+    MakerAttributionPlaintext, MakerBandAttribution, MakerBandFillAttribution, MatchedOrder,
+    MatchedOrderWitness, Note, NoteCommitment, NoteConsolidationWitness, NoteMembershipKind,
+    NoteMembershipWitness, OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport,
+    OrderIngressReceipt, OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType,
+    OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
     PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
     ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublicBatchSummary,
     PublishedBatchArtifacts, SettlementRootHistoryArchive, SettlementSubmissionPlan,
@@ -7300,16 +7300,16 @@ fn append_fee_output_notes(
         }
         let output_index = output_notes.len();
         let fee_slot = format!("{slot_prefix}:{}", fee.asset_id.0);
-        let note = build_fee_output_note(
+        let note = build_fee_output_note(FeeOutputNoteInput {
             batch_id,
             output_index,
-            &fee_slot,
-            fee.asset_id.clone(),
-            fee.amount,
-            &recipient_config.owner_public_key,
-            &recipient_config.spend_authority,
-            &recipient_config.withdraw_authority,
-        )
+            fee_slot: &fee_slot,
+            asset_id: fee.asset_id.clone(),
+            amount: fee.amount,
+            owner_public_key: &recipient_config.owner_public_key,
+            spend_authority: &recipient_config.spend_authority,
+            withdraw_authority: &recipient_config.withdraw_authority,
+        })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let note_commitment = note
             .commitment()

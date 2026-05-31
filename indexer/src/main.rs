@@ -166,6 +166,13 @@ async fn main() -> Result<(), String> {
         ),
     };
 
+    if let Err(status) = sync_deposits(&state).await {
+        eprintln!("indexer startup deposit sync skipped: {status}");
+    }
+    if let Err(status) = sync_withdrawals(&state).await {
+        eprintln!("indexer startup withdrawal sync skipped: {status}");
+    }
+
     let app = build_app_with_state(state);
 
     let bind_addr =
@@ -342,13 +349,14 @@ fn load_rpc_url() -> String {
 }
 
 fn load_shielded_asset_adapter_address() -> String {
-    if let Ok(address) = env::var("ZYLITH_SHIELDED_ASSET_ADAPTER_ADDRESS") {
-        return address;
-    }
-
-    load_deployment_manifest()
-        .map(|manifest| selected_shielded_asset_adapter_address(&manifest))
-        .unwrap_or_else(|| DEFAULT_SHIELDED_ASSET_ADAPTER_ADDRESS.into())
+    let manifest_address = load_deployment_manifest()
+        .map(|manifest| selected_shielded_asset_adapter_address(&manifest));
+    select_shielded_asset_adapter_address(
+        manifest_address.as_deref(),
+        env::var("ZYLITH_SHIELDED_ASSET_ADAPTER_ADDRESS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn selected_shielded_asset_adapter_address(manifest: &DeploymentManifest) -> String {
@@ -358,6 +366,15 @@ fn selected_shielded_asset_adapter_address(manifest: &DeploymentManifest) -> Str
         .as_ref()
         .and_then(|config| nonempty_string(config.shielded_asset_adapter.as_deref()))
         .unwrap_or_else(|| manifest.contracts.shielded_asset_adapter.clone())
+}
+
+fn select_shielded_asset_adapter_address(
+    manifest_address: Option<&str>,
+    env_address: Option<&str>,
+) -> String {
+    nonempty_string(manifest_address)
+        .or_else(|| nonempty_string(env_address))
+        .unwrap_or_else(|| DEFAULT_SHIELDED_ASSET_ADAPTER_ADDRESS.into())
 }
 
 fn nonempty_string(value: Option<&str>) -> Option<String> {
@@ -1410,6 +1427,7 @@ mod tests {
         AppState, DEFAULT_BATCH_WINDOW_MS, build_app_with_state,
         effective_public_artifact_delay_epochs, normalize_hex, now_unix_ms,
         parse_deployment_manifest, parse_hex_u64, parse_hex_u128,
+        select_shielded_asset_adapter_address,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -1593,6 +1611,22 @@ mod tests {
         let live = parse_deployment_manifest(&live_manifest).expect("live manifest");
         assert_eq!(public, live);
         assert_eq!(live.contracts.shielded_asset_adapter, "0x4");
+    }
+
+    #[test]
+    fn deployment_manifest_adapter_wins_over_stale_env_adapter() {
+        assert_eq!(
+            select_shielded_asset_adapter_address(Some("0xcurrent"), Some("0xstale")),
+            "0xcurrent"
+        );
+        assert_eq!(
+            select_shielded_asset_adapter_address(None, Some("0xenv")),
+            "0xenv"
+        );
+        assert_eq!(
+            select_shielded_asset_adapter_address(Some("  "), Some("0xenv")),
+            "0xenv"
+        );
     }
 
     #[tokio::test]

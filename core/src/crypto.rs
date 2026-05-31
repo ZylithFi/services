@@ -862,44 +862,46 @@ pub fn build_output_note(
     })
 }
 
-pub fn build_fee_output_note(
-    batch_id: &str,
-    output_index: usize,
-    fee_slot: &str,
-    asset_id: AssetId,
-    amount: u128,
-    owner_public_key: &str,
-    spend_authority: &str,
-    withdraw_authority: &str,
-) -> Result<Note, ProtocolError> {
-    let withdraw_authority = normalize_felt_hex(withdraw_authority)?;
-    let spend_authority = normalize_felt_hex(spend_authority)?;
+pub struct FeeOutputNoteInput<'a> {
+    pub batch_id: &'a str,
+    pub output_index: usize,
+    pub fee_slot: &'a str,
+    pub asset_id: AssetId,
+    pub amount: u128,
+    pub owner_public_key: &'a str,
+    pub spend_authority: &'a str,
+    pub withdraw_authority: &'a str,
+}
+
+pub fn build_fee_output_note(input: FeeOutputNoteInput<'_>) -> Result<Note, ProtocolError> {
+    let withdraw_authority = normalize_felt_hex(input.withdraw_authority)?;
+    let spend_authority = normalize_felt_hex(input.spend_authority)?;
     let blinding = tagged_field_hex(
         "zylith/fee-output-blinding",
         &serde_json::json!({
-            "batch_id": batch_id,
-            "fee_slot": fee_slot,
-            "output_index": output_index,
+            "batch_id": input.batch_id,
+            "fee_slot": input.fee_slot,
+            "output_index": input.output_index,
         }),
     )?;
     let metadata_commitment = tagged_field_hex(
         "zylith/fee-output-metadata",
         &serde_json::json!({
-            "batch_id": batch_id,
-            "fee_slot": fee_slot,
-            "asset_id": asset_id.0,
+            "batch_id": input.batch_id,
+            "fee_slot": input.fee_slot,
+            "asset_id": input.asset_id.0,
             "withdraw_authority": withdraw_authority,
         }),
     )?;
 
     Ok(Note {
-        asset_id,
-        amount,
-        owner_public_key: owner_public_key.into(),
+        asset_id: input.asset_id,
+        amount: input.amount,
+        owner_public_key: input.owner_public_key.into(),
         spend_authority,
         withdraw_authority,
         blinding,
-        nonce: (output_index as u64).saturating_add(1),
+        nonce: (input.output_index as u64).saturating_add(1),
         metadata_commitment,
     })
 }
