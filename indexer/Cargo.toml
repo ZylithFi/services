@@ -1,7 +1,6 @@
 [package]
 name = "zylith-indexer"
 edition.workspace = true
-license.workspace = true
 version.workspace = true
 authors.workspace = true
 
