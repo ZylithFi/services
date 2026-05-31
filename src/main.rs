@@ -471,9 +471,18 @@ async fn register_package(
     headers: HeaderMap,
     Json(package): Json<OfflineRenewalPackage>,
 ) -> Result<Json<PackageStatus>, RelayApiError> {
-    validate_package(&package, &state.config)?;
-    require_package_auth(&state, &headers, Some(&package))?;
-    enforce_rate_limit(&state, &headers).await?;
+    if let Err(error) = validate_package(&package, &state.config) {
+        log_package_api_error("validate", &package, &error);
+        return Err(error);
+    }
+    if let Err(error) = require_package_auth(&state, &headers, Some(&package)) {
+        log_package_api_error("auth", &package, &error);
+        return Err(error);
+    }
+    if let Err(error) = enforce_rate_limit(&state, &headers).await {
+        log_package_api_error("rate_limit", &package, &error);
+        return Err(error);
+    }
     let now = now_unix_ms();
     let package_id = package.package_id.clone();
     let status = {
@@ -482,11 +491,13 @@ async fn register_package(
         if let Some(existing) = store.packages.get(&package_id)
             && existing.package.package_commitment != package.package_commitment
         {
-            return Err(RelayApiError {
+            let error = RelayApiError {
                 status: StatusCode::CONFLICT,
                 detail: "Renewal package ID is already registered with a different commitment"
                     .into(),
-            });
+            };
+            log_package_api_error("conflict", &package, &error);
+            return Err(error);
         }
         let entry = store
             .packages
@@ -502,6 +513,7 @@ async fn register_package(
         package_status(entry)
     };
     persist_store(&state.config.store_path, &state.store).await?;
+    log_package_registered(&status);
     Ok(Json(status))
 }
 
@@ -541,6 +553,77 @@ async fn get_package_results(
             .map(|entry| entry.result.clone())
             .collect(),
     }))
+}
+
+fn log_package_api_error(stage: &str, package: &OfflineRenewalPackage, error: &RelayApiError) {
+    eprintln!(
+        "renewal package rejected stage={} status={} detail={} package_id={} commitment={} pair={} relay_mode={} slots={} epochs={}..{}",
+        stage,
+        error.status.as_u16(),
+        sanitize_log_field(&error.detail),
+        short_log_id(&package.package_id),
+        short_log_id(&package.package_commitment),
+        sanitize_log_field(&package.pair),
+        relay_mode_log_label(package.relay_mode.as_ref()),
+        package.slots.len(),
+        package.start_epoch,
+        package.end_epoch,
+    );
+}
+
+fn log_package_registered(status: &PackageStatus) {
+    println!(
+        "renewal package registered package_id={} commitment={} pair={} slots={} submitted={} failed={} epochs={}..{}",
+        short_log_id(&status.package_id),
+        short_log_id(&status.package_commitment),
+        sanitize_log_field(&status.pair),
+        status.slot_count,
+        status.submitted_slots,
+        status.failed_slots,
+        status.start_epoch,
+        status.end_epoch,
+    );
+}
+
+fn short_log_id(value: &str) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    if chars.len() <= 18 {
+        return sanitize_log_field(trimmed);
+    }
+    let prefix = chars.iter().take(10).collect::<String>();
+    let suffix = chars
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    sanitize_log_field(&format!("{prefix}…{suffix}"))
+}
+
+fn sanitize_log_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '.' | '/' | ':' | '…')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn relay_mode_log_label(mode: Option<&RelayMode>) -> &'static str {
+    match mode {
+        Some(RelayMode::ZylithRelay) => "ZylithRelay",
+        Some(RelayMode::SelfRelay) => "SelfRelay",
+        None => "None",
+    }
 }
 
 async fn delete_package(
@@ -1175,9 +1258,7 @@ fn bearer_auth_status(expected: &str, headers: &HeaderMap) -> BearerAuthStatus {
     }
 }
 
-fn verify_package_authorization_from_body(
-    package: &OfflineRenewalPackage,
-) -> Result<bool, String> {
+fn verify_package_authorization_from_body(package: &OfflineRenewalPackage) -> Result<bool, String> {
     let Some(authority) = package.parent_cancel_authority.as_deref() else {
         return Ok(false);
     };
