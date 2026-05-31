@@ -59,7 +59,7 @@ use zylith_core::{
     StarknetCall, TimeInForce, TrustedOrderIngressRequest, TrustedOrderIngressResponse,
     admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
-    build_admission_serialized_input, build_auction_result_serialized_input,
+    build_admission_serialized_input, build_auction_result_serialized_input, build_fee_output_note,
     build_heartbeat_cover_orders, build_note_consolidation_serialized_input,
     build_note_consolidation_submission_plan, build_output_note, build_settlement_submission_plan,
     create_maker_attribution_artifact, create_order_ingress_receipt, decrypt_order_bundle,
@@ -67,7 +67,8 @@ use zylith_core::{
     extract_bearer_token, format_bearer_token, funding_input_set_commitment,
     funding_nullifier_set_commitment, native_note_consolidation_message_hash,
     native_settlement_message_hash, note_consolidation_commitment,
-    note_consolidation_proof_message_hash_for_program, nullifier_from_note_secret,
+    note_consolidation_proof_message_hash_for_program,
+    note_recognition_public_key_from_raw_key_hex, nullifier_from_note_secret,
     nullifier_proof_message_hash_for_program,
     nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
     private_execution_key_registry_fingerprint, private_order_payload_commitment,
@@ -76,7 +77,8 @@ use zylith_core::{
     root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
     settlement_note_root_after_deposit_chain, settlement_proof_message_hash_for_program,
     settlement_state_transition_root, settlement_transcript_commitment,
-    validate_order_ingress_receipt_for_manifest_with_secrets, verify_output_note_membership,
+    spend_authority_from_raw_key_hex, validate_order_ingress_receipt_for_manifest_with_secrets,
+    verify_output_note_membership, withdraw_authority_from_raw_key_hex,
 };
 
 const DEFAULT_COORDINATOR_URL: &str = "http://127.0.0.1:3000";
@@ -133,9 +135,24 @@ const DEFAULT_PRODUCT_PAIR_IDS: &str =
     "STRK/USDC,ETH/USDC,strkBTC/USDC,STRK/ETH,STRK/strkBTC,WBTC/strkBTC,USDC/USDT";
 const DEFAULT_PROTOCOL_FEE_RECIPIENT: &str = "zylith-protocol-treasury";
 const DEFAULT_RELAY_FEE_RECIPIENT: &str = "zylith-renewal-relay";
-const PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_FEE_RECIPIENT";
-const LEGACY_PROTOCOL_FEE_RECIPIENT_ENV: &str = "ZYLITH_PROTOCOL_TREASURY_RECIPIENT";
-const RELAY_FEE_RECIPIENT_ENV: &str = "ZYLITH_RELAY_FEE_RECIPIENT";
+const PROTOCOL_FEE_OWNER_KEY_ENV: &str = "ZYLITH_PROTOCOL_FEE_OWNER_KEY_HEX";
+const PROTOCOL_FEE_SPEND_KEY_ENV: &str = "ZYLITH_PROTOCOL_FEE_SPEND_KEY_HEX";
+const PROTOCOL_FEE_WITHDRAW_KEY_ENV: &str = "ZYLITH_PROTOCOL_FEE_WITHDRAW_KEY_HEX";
+const RELAY_FEE_OWNER_KEY_ENV: &str = "ZYLITH_RELAY_FEE_OWNER_KEY_HEX";
+const RELAY_FEE_SPEND_KEY_ENV: &str = "ZYLITH_RELAY_FEE_SPEND_KEY_HEX";
+const RELAY_FEE_WITHDRAW_KEY_ENV: &str = "ZYLITH_RELAY_FEE_WITHDRAW_KEY_HEX";
+const DEFAULT_PROTOCOL_FEE_OWNER_KEY_HEX: &str =
+    "7171717171717171717171717171717171717171717171717171717171717171";
+const DEFAULT_PROTOCOL_FEE_SPEND_KEY_HEX: &str =
+    "7272727272727272727272727272727272727272727272727272727272727272";
+const DEFAULT_PROTOCOL_FEE_WITHDRAW_KEY_HEX: &str =
+    "7373737373737373737373737373737373737373737373737373737373737373";
+const DEFAULT_RELAY_FEE_OWNER_KEY_HEX: &str =
+    "8181818181818181818181818181818181818181818181818181818181818181";
+const DEFAULT_RELAY_FEE_SPEND_KEY_HEX: &str =
+    "8282828282828282828282828282828282828282828282828282828282828282";
+const DEFAULT_RELAY_FEE_WITHDRAW_KEY_HEX: &str =
+    "8383838383838383838383838383838383838383838383838383838383838383";
 const PROOF_JOBS_DIR: &str = "proof_jobs";
 const SETTLEMENT_PLANS_DIR: &str = "settlement_plans";
 const SETTLEMENT_WITNESSES_DIR: &str = "settlement_witnesses";
@@ -239,6 +256,8 @@ struct AppState {
     max_maker_curve_quote_notional: u128,
     protocol_fee_recipient: String,
     relay_fee_recipient: String,
+    protocol_fee_note_recipient: FeeNoteRecipientConfig,
+    relay_fee_note_recipient: FeeNoteRecipientConfig,
     settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
     max_stored_private_payloads: usize,
@@ -279,6 +298,13 @@ struct BatchRegistrarConfig {
     private_key: String,
     chain_id: String,
     batch_registry_address: String,
+}
+
+#[derive(Clone, Debug)]
+struct FeeNoteRecipientConfig {
+    owner_public_key: String,
+    spend_authority: String,
+    withdraw_authority: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -337,6 +363,8 @@ struct AppConfig {
     max_maker_curve_quote_notional: u128,
     protocol_fee_recipient: String,
     relay_fee_recipient: String,
+    protocol_fee_note_recipient: FeeNoteRecipientConfig,
+    relay_fee_note_recipient: FeeNoteRecipientConfig,
     settlement_submission_jitter_ms: u64,
     private_payload_retention_ms: u64,
     max_stored_private_payloads: usize,
@@ -609,6 +637,7 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("prover service failed: {error}"))
 }
 
+#[cfg(test)]
 fn protocol_fee_recipient_from_values(canonical: Option<String>, legacy: Option<String>) -> String {
     canonical
         .or(legacy)
@@ -616,18 +645,54 @@ fn protocol_fee_recipient_from_values(canonical: Option<String>, legacy: Option<
         .unwrap_or_else(|| DEFAULT_PROTOCOL_FEE_RECIPIENT.into())
 }
 
-fn protocol_fee_recipient_from_env() -> String {
-    protocol_fee_recipient_from_values(
-        env::var(PROTOCOL_FEE_RECIPIENT_ENV).ok(),
-        env::var(LEGACY_PROTOCOL_FEE_RECIPIENT_ENV).ok(),
+fn env_or_default(name: &str, default: &str) -> String {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.into())
+}
+
+fn fee_note_recipient_from_env(
+    owner_key_env: &str,
+    default_owner_key: &str,
+    spend_key_env: &str,
+    default_spend_key: &str,
+    withdraw_key_env: &str,
+    default_withdraw_key: &str,
+) -> Result<FeeNoteRecipientConfig, String> {
+    let owner_key = env_or_default(owner_key_env, default_owner_key);
+    let spend_key = env_or_default(spend_key_env, default_spend_key);
+    let withdraw_key = env_or_default(withdraw_key_env, default_withdraw_key);
+    Ok(FeeNoteRecipientConfig {
+        owner_public_key: note_recognition_public_key_from_raw_key_hex(&owner_key)
+            .map_err(|error| format!("invalid fee note owner key: {error}"))?,
+        spend_authority: spend_authority_from_raw_key_hex(&spend_key)
+            .map_err(|error| format!("invalid fee note spend key: {error}"))?,
+        withdraw_authority: withdraw_authority_from_raw_key_hex(&withdraw_key)
+            .map_err(|error| format!("invalid fee note withdraw key: {error}"))?,
+    })
+}
+
+fn protocol_fee_note_recipient_from_env() -> Result<FeeNoteRecipientConfig, String> {
+    fee_note_recipient_from_env(
+        PROTOCOL_FEE_OWNER_KEY_ENV,
+        DEFAULT_PROTOCOL_FEE_OWNER_KEY_HEX,
+        PROTOCOL_FEE_SPEND_KEY_ENV,
+        DEFAULT_PROTOCOL_FEE_SPEND_KEY_HEX,
+        PROTOCOL_FEE_WITHDRAW_KEY_ENV,
+        DEFAULT_PROTOCOL_FEE_WITHDRAW_KEY_HEX,
     )
 }
 
-fn relay_fee_recipient_from_env() -> String {
-    env::var(RELAY_FEE_RECIPIENT_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_RELAY_FEE_RECIPIENT.into())
+fn relay_fee_note_recipient_from_env() -> Result<FeeNoteRecipientConfig, String> {
+    fee_note_recipient_from_env(
+        RELAY_FEE_OWNER_KEY_ENV,
+        DEFAULT_RELAY_FEE_OWNER_KEY_HEX,
+        RELAY_FEE_SPEND_KEY_ENV,
+        DEFAULT_RELAY_FEE_SPEND_KEY_HEX,
+        RELAY_FEE_WITHDRAW_KEY_ENV,
+        DEFAULT_RELAY_FEE_WITHDRAW_KEY_HEX,
+    )
 }
 
 fn build_app() -> Result<Router, String> {
@@ -717,6 +782,8 @@ fn build_app() -> Result<Router, String> {
         NATIVE_PROVER_REQUEST_TIMEOUT_SECONDS_ENV,
         DEFAULT_NATIVE_PROVER_REQUEST_TIMEOUT_SECONDS,
     );
+    let protocol_fee_note_recipient = protocol_fee_note_recipient_from_env()?;
+    let relay_fee_note_recipient = relay_fee_note_recipient_from_env()?;
 
     build_app_with_config(AppConfig {
         coordinator_url,
@@ -762,8 +829,10 @@ fn build_app() -> Result<Router, String> {
             MAX_MAKER_CURVE_QUOTE_NOTIONAL_ENV,
             0_u128,
         ),
-        protocol_fee_recipient: protocol_fee_recipient_from_env(),
-        relay_fee_recipient: relay_fee_recipient_from_env(),
+        protocol_fee_recipient: protocol_fee_note_recipient.withdraw_authority.clone(),
+        relay_fee_recipient: relay_fee_note_recipient.withdraw_authority.clone(),
+        protocol_fee_note_recipient,
+        relay_fee_note_recipient,
         settlement_submission_jitter_ms: env_parse_or_default(
             SETTLEMENT_SUBMISSION_JITTER_MS_ENV,
             DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS,
@@ -1000,6 +1069,8 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_maker_curve_quote_notional,
         protocol_fee_recipient,
         relay_fee_recipient,
+        protocol_fee_note_recipient,
+        relay_fee_note_recipient,
         settlement_submission_jitter_ms,
         private_payload_retention_ms,
         max_stored_private_payloads,
@@ -1121,6 +1192,8 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_maker_curve_quote_notional,
         protocol_fee_recipient,
         relay_fee_recipient,
+        protocol_fee_note_recipient,
+        relay_fee_note_recipient,
         settlement_submission_jitter_ms,
         private_payload_retention_ms,
         max_stored_private_payloads,
@@ -3710,6 +3783,8 @@ async fn prepare_private_auction_batch_inner(
             privacy_gate: Default::default(),
             protocol_fee_recipient: &state.protocol_fee_recipient,
             relay_fee_recipient: &state.relay_fee_recipient,
+            protocol_fee_note_recipient: &state.protocol_fee_note_recipient,
+            relay_fee_note_recipient: &state.relay_fee_note_recipient,
             attribution_signing_private_key: &state.attribution_signing_private_key,
         },
     )?;
@@ -3819,6 +3894,8 @@ async fn prepare_private_auction_batch_inner(
                 privacy_gate: privacy_gate_witness.clone(),
                 protocol_fee_recipient: &state.protocol_fee_recipient,
                 relay_fee_recipient: &state.relay_fee_recipient,
+                protocol_fee_note_recipient: &state.protocol_fee_note_recipient,
+                relay_fee_note_recipient: &state.relay_fee_note_recipient,
                 attribution_signing_private_key: &state.attribution_signing_private_key,
             },
         )?
@@ -6033,6 +6110,7 @@ fn build_canonical_output_bundle(
     batch_id: &str,
     output_notes: &[OutputNoteRecord],
     matched_order_witnesses: &[MatchedOrderWitness],
+    extra_note_preimages: &[Note],
 ) -> Result<OutputNettingResult, StatusCode> {
     let mut note_preimages = Vec::with_capacity(output_notes.len());
     for witness in matched_order_witnesses {
@@ -6041,6 +6119,7 @@ fn build_canonical_output_bundle(
             note_preimages.push(residual_note.clone());
         }
     }
+    note_preimages.extend(extra_note_preimages.iter().cloned());
     if note_preimages.len() != output_notes.len() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -6392,6 +6471,8 @@ struct SettlementBuildContext<'a> {
     privacy_gate: AuctionPrivacyGateWitness,
     protocol_fee_recipient: &'a str,
     relay_fee_recipient: &'a str,
+    protocol_fee_note_recipient: &'a FeeNoteRecipientConfig,
+    relay_fee_note_recipient: &'a FeeNoteRecipientConfig,
     attribution_signing_private_key: &'a str,
 }
 
@@ -6412,6 +6493,8 @@ fn build_settlement_artifacts(
         privacy_gate,
         protocol_fee_recipient,
         relay_fee_recipient,
+        protocol_fee_note_recipient,
+        relay_fee_note_recipient,
         attribution_signing_private_key,
     } = context;
     eprintln!(
@@ -6766,9 +6849,31 @@ fn build_settlement_artifacts(
         });
     }
 
+    let fees = deterministic_fee_entries(
+        &protocol_fee_accumulator,
+        &relay_fee_accumulator,
+        &base_asset,
+        &quote_asset,
+        protocol_fee_recipient,
+        relay_fee_recipient,
+    );
+    let fee_note_preimages = append_fee_output_notes(
+        batch_id,
+        &mut output_notes,
+        &fees,
+        protocol_fee_recipient,
+        relay_fee_recipient,
+        protocol_fee_note_recipient,
+        relay_fee_note_recipient,
+    )?;
+
     eprintln!("build_settlement_artifacts batch_id={batch_id} stage=output_bundle start");
-    let output_netting =
-        build_canonical_output_bundle(batch_id, &output_notes, &matched_order_witnesses)?;
+    let output_netting = build_canonical_output_bundle(
+        batch_id,
+        &output_notes,
+        &matched_order_witnesses,
+        &fee_note_preimages,
+    )?;
     eprintln!(
         "build_settlement_artifacts batch_id={} stage=output_bundle ok outputs={} recovery_records={}",
         batch_id,
@@ -6912,15 +7017,6 @@ fn build_settlement_artifacts(
         "build_settlement_artifacts batch_id={} stage=note_membership ok witnesses={}",
         batch_id,
         note_membership_witnesses.len()
-    );
-
-    let fees = deterministic_fee_entries(
-        &protocol_fee_accumulator,
-        &relay_fee_accumulator,
-        &base_asset,
-        &quote_asset,
-        protocol_fee_recipient,
-        relay_fee_recipient,
     );
 
     let transcript = SettlementTranscript {
@@ -7176,6 +7272,57 @@ fn deterministic_fee_entries(
         relay_fee_recipient,
     );
     fees
+}
+
+fn append_fee_output_notes(
+    batch_id: &str,
+    output_notes: &mut Vec<OutputNoteRecord>,
+    fees: &[FeeEntry],
+    protocol_fee_recipient: &str,
+    relay_fee_recipient: &str,
+    protocol_fee_note_recipient: &FeeNoteRecipientConfig,
+    relay_fee_note_recipient: &FeeNoteRecipientConfig,
+) -> Result<Vec<Note>, StatusCode> {
+    let mut note_preimages = Vec::with_capacity(fees.len());
+    for fee in fees {
+        let (slot_prefix, recipient_config) = if fee.recipient == protocol_fee_recipient {
+            ("protocol", protocol_fee_note_recipient)
+        } else if fee.recipient == relay_fee_recipient {
+            ("relay", relay_fee_note_recipient)
+        } else {
+            return Err(StatusCode::CONFLICT);
+        };
+        if normalize_felt_hex(&recipient_config.withdraw_authority)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            != normalize_felt_hex(&fee.recipient).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        let output_index = output_notes.len();
+        let fee_slot = format!("{slot_prefix}:{}", fee.asset_id.0);
+        let note = build_fee_output_note(
+            batch_id,
+            output_index,
+            &fee_slot,
+            fee.asset_id.clone(),
+            fee.amount,
+            &recipient_config.owner_public_key,
+            &recipient_config.spend_authority,
+            &recipient_config.withdraw_authority,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let note_commitment = note
+            .commitment()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        output_notes.push(OutputNoteRecord {
+            note_commitment,
+            asset_id: note.asset_id.clone(),
+            amount: note.amount,
+            withdraw_authority: note.withdraw_authority.clone(),
+        });
+        note_preimages.push(note);
+    }
+    Ok(note_preimages)
 }
 
 fn push_fee_entry_if_present(
@@ -8815,16 +8962,16 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::{
         DEFAULT_PROTOCOL_FEE_RECIPIENT, DEFAULT_RELAY_FEE_RECIPIENT, DecryptedOrderRecord,
-        NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND, NativeBlockId, NativeExecutionRequestRecord,
-        NativeProverParams, NativeProverRpcRequest, NativeTransactionMode,
-        NoteRootTransitionRecord, OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots,
-        artifact_id_for, build_batch_liquidity_report, build_native_proof_program_calldata,
-        build_settlement_artifacts, compute_candidate_clearing_price, decode_bhttp_response,
-        derive_note_membership_witnesses, deterministic_settlement_submission_jitter_ms,
-        eligible_order_count, encode_bhttp_json_post, matched_maker_participant_count,
-        matched_participant_count, max_maker_fill_share_bps, max_single_order_fill_share_bps,
-        max_single_owner_fill_share_bps, native_execution_context_block_id,
-        native_fee_estimate_requires_proof_facts,
+        FeeNoteRecipientConfig, NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND, NativeBlockId,
+        NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
+        NativeTransactionMode, NoteRootTransitionRecord, OnchainSubmissionRecord,
+        SettlementBuildContext, SettlementRoots, artifact_id_for, build_batch_liquidity_report,
+        build_native_proof_program_calldata, build_settlement_artifacts,
+        compute_candidate_clearing_price, decode_bhttp_response, derive_note_membership_witnesses,
+        deterministic_settlement_submission_jitter_ms, eligible_order_count,
+        encode_bhttp_json_post, matched_maker_participant_count, matched_participant_count,
+        max_maker_fill_share_bps, max_single_order_fill_share_bps, max_single_owner_fill_share_bps,
+        native_execution_context_block_id, native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
         proof_fact_age_wait_ms, protocol_fee_recipient_from_values,
@@ -8842,6 +8989,20 @@ mod tests {
         nullifier_from_note_secret, root_only_settlement_commitments,
         settlement_nullifier_root_after_history, settlement_state_transition_root,
     };
+
+    fn test_fee_note_recipient(
+        owner_key_byte: &str,
+        withdraw_authority: &str,
+    ) -> FeeNoteRecipientConfig {
+        FeeNoteRecipientConfig {
+            owner_public_key: note_recognition_public_key_from_raw_key_hex(
+                &owner_key_byte.repeat(32),
+            )
+            .expect("test fee owner key"),
+            spend_authority: "0x789".into(),
+            withdraw_authority: withdraw_authority.into(),
+        }
+    }
 
     #[test]
     fn storage_key_sanitizes_non_alphanumeric_batch_ids() {
@@ -9589,6 +9750,8 @@ mod tests {
             encrypted_order_set_commitment: "0x222".into(),
         };
 
+        let protocol_fee_note_recipient = test_fee_note_recipient("91", "0xf01");
+        let relay_fee_note_recipient = test_fee_note_recipient("92", "0xf02");
         let artifacts = build_settlement_artifacts(
             &batch.batch_id.0,
             &batch,
@@ -9602,8 +9765,10 @@ mod tests {
                 prior_settlement_witnesses: &[],
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
-                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
-                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                protocol_fee_recipient: &protocol_fee_note_recipient.withdraw_authority,
+                relay_fee_recipient: &relay_fee_note_recipient.withdraw_authority,
+                protocol_fee_note_recipient: &protocol_fee_note_recipient,
+                relay_fee_note_recipient: &relay_fee_note_recipient,
                 attribution_signing_private_key: "0x12345",
             },
         )
@@ -9715,6 +9880,8 @@ mod tests {
             encrypted_order_set_commitment: "0x222".into(),
         };
 
+        let protocol_fee_note_recipient = test_fee_note_recipient("91", "0xf01");
+        let relay_fee_note_recipient = test_fee_note_recipient("92", "0xf02");
         let artifacts = build_settlement_artifacts(
             &batch.batch_id.0,
             &batch,
@@ -9728,8 +9895,10 @@ mod tests {
                 prior_settlement_witnesses: &[],
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
-                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
-                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                protocol_fee_recipient: &protocol_fee_note_recipient.withdraw_authority,
+                relay_fee_recipient: &relay_fee_note_recipient.withdraw_authority,
+                protocol_fee_note_recipient: &protocol_fee_note_recipient,
+                relay_fee_note_recipient: &relay_fee_note_recipient,
                 attribution_signing_private_key: "0x12345",
             },
         )
@@ -9779,15 +9948,35 @@ mod tests {
         assert_eq!(artifacts.transcript.fees[0].asset_id.0, "STRK");
         assert_eq!(
             artifacts.transcript.fees[0].recipient,
-            DEFAULT_PROTOCOL_FEE_RECIPIENT
+            protocol_fee_note_recipient.withdraw_authority
         );
         assert_eq!(artifacts.transcript.fees[0].amount, 800_000_000_000_000);
         assert_eq!(artifacts.transcript.fees[1].asset_id.0, "USDC");
         assert_eq!(
             artifacts.transcript.fees[1].recipient,
-            DEFAULT_RELAY_FEE_RECIPIENT
+            relay_fee_note_recipient.withdraw_authority
         );
         assert_eq!(artifacts.transcript.fees[1].amount, 40_000_000_000_000_000);
+        for fee in &artifacts.transcript.fees {
+            let output_record = artifacts
+                .transcript
+                .output_notes
+                .iter()
+                .find(|note| {
+                    note.asset_id == fee.asset_id
+                        && note.amount == fee.amount
+                        && note.withdraw_authority == fee.recipient
+                })
+                .expect("fee row has encrypted output note");
+            assert!(
+                artifacts
+                    .transcript
+                    .output_note_preimages
+                    .iter()
+                    .any(|note| note.commitment().expect("fee note commitment")
+                        == output_record.note_commitment)
+            );
+        }
     }
 
     #[test]
@@ -9884,6 +10073,8 @@ mod tests {
             encrypted_order_set_commitment: "0x222".into(),
         };
 
+        let protocol_fee_note_recipient = test_fee_note_recipient("91", "0xf01");
+        let relay_fee_note_recipient = test_fee_note_recipient("92", "0xf02");
         let artifacts = build_settlement_artifacts(
             &batch.batch_id.0,
             &batch,
@@ -9897,8 +10088,10 @@ mod tests {
                 prior_settlement_witnesses: &[],
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
-                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
-                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                protocol_fee_recipient: &protocol_fee_note_recipient.withdraw_authority,
+                relay_fee_recipient: &relay_fee_note_recipient.withdraw_authority,
+                protocol_fee_note_recipient: &protocol_fee_note_recipient,
+                relay_fee_note_recipient: &relay_fee_note_recipient,
                 attribution_signing_private_key: "0x12345",
             },
         )
@@ -10434,6 +10627,8 @@ mod tests {
             encrypted_order_set_commitment: "0x222".into(),
         };
 
+        let protocol_fee_note_recipient = test_fee_note_recipient("91", "0xf01");
+        let relay_fee_note_recipient = test_fee_note_recipient("92", "0xf02");
         let result = build_settlement_artifacts(
             &batch.batch_id.0,
             &batch,
@@ -10447,8 +10642,10 @@ mod tests {
                 prior_settlement_witnesses: &[],
                 prior_note_consolidation_witnesses: &[],
                 privacy_gate: Default::default(),
-                protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT,
-                relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT,
+                protocol_fee_recipient: &protocol_fee_note_recipient.withdraw_authority,
+                relay_fee_recipient: &relay_fee_note_recipient.withdraw_authority,
+                protocol_fee_note_recipient: &protocol_fee_note_recipient,
+                relay_fee_note_recipient: &relay_fee_note_recipient,
                 attribution_signing_private_key: "0x12345",
             },
         );

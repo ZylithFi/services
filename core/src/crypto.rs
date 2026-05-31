@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput, DecryptedOrderShare,
     DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
-    EncryptedMakerAttributionArtifact, EncryptedRecoveryPayload, FeeEntry, FundingRailKind,
+    EncryptedMakerAttributionArtifact, EncryptedRecoveryPayload, FundingRailKind,
     MakerAttributionPlaintext, MakerAttributionReceipt, MatchedOrderWitness, Note, NoteCommitment,
     NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan, NoteConsolidationWitness,
     NoteMembershipKind, NoteMembershipWitness, Nullifier, NullifierHistoryBatch,
@@ -855,6 +855,48 @@ pub fn build_output_note(
         amount,
         owner_public_key: order.recipient_owner_public_key.clone(),
         spend_authority: order.recipient_spend_authority.clone(),
+        withdraw_authority,
+        blinding,
+        nonce: (output_index as u64).saturating_add(1),
+        metadata_commitment,
+    })
+}
+
+pub fn build_fee_output_note(
+    batch_id: &str,
+    output_index: usize,
+    fee_slot: &str,
+    asset_id: AssetId,
+    amount: u128,
+    owner_public_key: &str,
+    spend_authority: &str,
+    withdraw_authority: &str,
+) -> Result<Note, ProtocolError> {
+    let withdraw_authority = normalize_felt_hex(withdraw_authority)?;
+    let spend_authority = normalize_felt_hex(spend_authority)?;
+    let blinding = tagged_field_hex(
+        "zylith/fee-output-blinding",
+        &serde_json::json!({
+            "batch_id": batch_id,
+            "fee_slot": fee_slot,
+            "output_index": output_index,
+        }),
+    )?;
+    let metadata_commitment = tagged_field_hex(
+        "zylith/fee-output-metadata",
+        &serde_json::json!({
+            "batch_id": batch_id,
+            "fee_slot": fee_slot,
+            "asset_id": asset_id.0,
+            "withdraw_authority": withdraw_authority,
+        }),
+    )?;
+
+    Ok(Note {
+        asset_id,
+        amount,
+        owner_public_key: owner_public_key.into(),
+        spend_authority,
         withdraw_authority,
         blinding,
         nonce: (output_index as u64).saturating_add(1),
@@ -3289,7 +3331,6 @@ pub fn build_settlement_submission_plan(
     let transcript_commitment = settlement_transcript_commitment(transcript)?;
     let roots = root_only_settlement_commitments(transcript)?;
     let normalized_proof_artifact_commitment = normalize_felt_hex(proof_artifact_commitment)?;
-    let fee_slots = fixed_settlement_fee_slots(transcript)?;
     let settlement_entrypoint = "submit_settlement_with_proof_facts";
     let encoded_args = SettlementCallArguments {
         batch_id: encode_starknet_felt("batch-id", &transcript.batch_id.0),
@@ -3322,18 +3363,6 @@ pub fn build_settlement_submission_plan(
         new_nullifier_root: roots.new_nullifier_root,
         new_renewal_root: roots.new_renewal_root,
         new_fee_root: roots.new_fee_root,
-        fee_asset_ids: fee_slots
-            .iter()
-            .map(|fee| encode_asset_id(&fee.asset_id.0))
-            .collect(),
-        fee_recipients: fee_slots
-            .iter()
-            .map(|fee| encode_fee_recipient(&fee.recipient))
-            .collect(),
-        fee_amounts: fee_slots
-            .iter()
-            .map(|fee| encode_u128(fee.amount))
-            .collect(),
     };
 
     let calldata = flatten_settlement_call_arguments(&encoded_args);
@@ -3349,104 +3378,6 @@ pub fn build_settlement_submission_plan(
         },
         encoded_args,
     })
-}
-
-fn fixed_settlement_fee_slots(
-    transcript: &SettlementTranscript,
-) -> Result<[FeeEntry; 4], ProtocolError> {
-    let (base, quote) = transcript.pair_id.0.split_once('/').ok_or_else(|| {
-        ProtocolError::InvalidSettlementProof("pair id must be BASE/QUOTE for fee slots".into())
-    })?;
-    let base_asset = AssetId(base.to_owned());
-    let quote_asset = AssetId(quote.to_owned());
-    let mut protocol_base_amount = 0u128;
-    let mut protocol_quote_amount = 0u128;
-    let mut relay_base_amount = 0u128;
-    let mut relay_quote_amount = 0u128;
-
-    for fee in &transcript.fees {
-        if fee.amount == 0 {
-            return Err(ProtocolError::InvalidSettlementProof(
-                "settlement fee entries must be nonzero".into(),
-            ));
-        }
-        let amount_slot = match (fee.asset_id.0.as_str(), fee.recipient.as_str()) {
-            (asset, recipient)
-                if asset == base && recipient == transcript.protocol_fee_recipient.as_str() =>
-            {
-                &mut protocol_base_amount
-            }
-            (asset, recipient)
-                if asset == quote && recipient == transcript.protocol_fee_recipient.as_str() =>
-            {
-                &mut protocol_quote_amount
-            }
-            (asset, recipient)
-                if asset == base && recipient == transcript.relay_fee_recipient.as_str() =>
-            {
-                &mut relay_base_amount
-            }
-            (asset, recipient)
-                if asset == quote && recipient == transcript.relay_fee_recipient.as_str() =>
-            {
-                &mut relay_quote_amount
-            }
-            _ => {
-                return Err(ProtocolError::InvalidSettlementProof(
-                    "fee entry outside fixed pair fee slots".into(),
-                ));
-            }
-        };
-        if *amount_slot != 0 {
-            return Err(ProtocolError::InvalidSettlementProof(
-                "duplicate settlement fee slot".into(),
-            ));
-        }
-        *amount_slot = fee.amount;
-    }
-
-    let slots = [
-        FeeEntry {
-            asset_id: base_asset.clone(),
-            amount: protocol_base_amount,
-            recipient: transcript.protocol_fee_recipient.clone(),
-        },
-        FeeEntry {
-            asset_id: quote_asset.clone(),
-            amount: protocol_quote_amount,
-            recipient: transcript.protocol_fee_recipient.clone(),
-        },
-        FeeEntry {
-            asset_id: base_asset,
-            amount: relay_base_amount,
-            recipient: transcript.relay_fee_recipient.clone(),
-        },
-        FeeEntry {
-            asset_id: quote_asset,
-            amount: relay_quote_amount,
-            recipient: transcript.relay_fee_recipient.clone(),
-        },
-    ];
-    let canonical_nonzero = slots
-        .iter()
-        .filter(|fee| fee.amount != 0)
-        .collect::<Vec<_>>();
-    if canonical_nonzero.len() != transcript.fees.len()
-        || canonical_nonzero
-            .iter()
-            .zip(transcript.fees.iter())
-            .any(|(expected, actual)| {
-                expected.asset_id != actual.asset_id
-                    || expected.recipient != actual.recipient
-                    || expected.amount != actual.amount
-            })
-    {
-        return Err(ProtocolError::InvalidSettlementProof(
-            "settlement fees must be in canonical fixed-slot order".into(),
-        ));
-    }
-
-    Ok(slots)
 }
 
 pub fn settlement_proof_message_hash(
@@ -6351,9 +6282,6 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
     calldata.push(args.new_nullifier_root.clone());
     calldata.push(args.new_renewal_root.clone());
     calldata.push(args.new_fee_root.clone());
-    push_span(&mut calldata, &args.fee_asset_ids);
-    push_span(&mut calldata, &args.fee_recipients);
-    push_span(&mut calldata, &args.fee_amounts);
     calldata
 }
 
@@ -7356,11 +7284,7 @@ mod tests {
         assert_eq!(plan.proof_artifact_commitment, proof_commitment);
         assert_ne!(plan.encoded_args.consumed_note_root, "0x0");
         assert_ne!(plan.encoded_args.output_note_root, "0x0");
-        assert_eq!(plan.settlement_call.calldata.len(), 41);
-        assert_eq!(plan.encoded_args.fee_asset_ids.len(), 4);
-        assert_eq!(plan.encoded_args.fee_recipients.len(), 4);
-        assert_eq!(plan.encoded_args.fee_amounts.len(), 4);
-        assert_eq!(plan.encoded_args.fee_amounts[1], encode_u128(10));
+        assert_eq!(plan.settlement_call.calldata.len(), 26);
     }
 
     #[test]
@@ -7502,7 +7426,7 @@ mod tests {
             settlement_transcript_commitment(&transcript).expect("transcript commitment");
         let plan = build_settlement_submission_plan(&transcript, "0x123", "0x456").expect("plan");
         assert_eq!(commitment, plan.encoded_args.transcript_commitment);
-        assert_eq!(plan.settlement_call.calldata.len(), 41);
+        assert_eq!(plan.settlement_call.calldata.len(), 26);
     }
 
     #[test]

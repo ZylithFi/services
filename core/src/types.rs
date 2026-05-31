@@ -2368,12 +2368,6 @@ pub struct SettlementCallArguments {
     pub new_nullifier_root: String,
     pub new_renewal_root: String,
     pub new_fee_root: String,
-    #[serde(default)]
-    pub fee_asset_ids: Vec<String>,
-    #[serde(default)]
-    pub fee_recipients: Vec<String>,
-    #[serde(default)]
-    pub fee_amounts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
