@@ -372,15 +372,6 @@ fn app(state: AppState) -> Router {
             get(get_package_status).delete(delete_package),
         )
         .route("/packages/{package_id}/results", get(get_package_results))
-        .route("/api/relay/packages", post(register_package))
-        .route(
-            "/api/relay/packages/{package_id}",
-            get(get_package_status).delete(delete_package),
-        )
-        .route(
-            "/api/relay/packages/{package_id}/results",
-            get(get_package_results),
-        )
         .route("/api/internal/relay/tick", post(trigger_tick))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(cors)
@@ -2168,7 +2159,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/relay/packages")
+                    .uri("/packages")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::to_vec(&package).unwrap(),
@@ -2197,7 +2188,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/relay/packages")
+                    .uri("/packages")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::to_vec(&package).unwrap(),
@@ -2225,7 +2216,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/relay/packages")
+                    .uri("/packages")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::to_vec(&package).unwrap(),
@@ -2257,7 +2248,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/relay/packages")
+                    .uri("/packages")
                     .header("content-type", "application/json")
                     .body(axum::body::Body::from(
                         serde_json::to_vec(&package).unwrap(),
@@ -2272,7 +2263,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("DELETE")
-                    .uri("/api/relay/packages/pkg-1")
+                    .uri("/packages/pkg-1")
                     .header(RELAY_PACKAGE_COMMITMENT_HEADER, &package.package_commitment)
                     .header(
                         RELAY_PARENT_CANCEL_AUTHORITY_HEADER,
