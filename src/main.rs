@@ -366,6 +366,12 @@ fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
+        .route("/packages", post(register_package))
+        .route(
+            "/packages/{package_id}",
+            get(get_package_status).delete(delete_package),
+        )
+        .route("/packages/{package_id}/results", get(get_package_results))
         .route("/api/relay/packages", post(register_package))
         .route(
             "/api/relay/packages/{package_id}",
