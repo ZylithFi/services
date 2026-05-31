@@ -952,26 +952,6 @@ fn validate_package(
             "Renewal package requires coordinator and prover URLs",
         ));
     }
-    if config.strict_mode {
-        if let (Some(default), Some(policy)) = (
-            config.default_prover_url.as_ref(),
-            package_prover_url_from_policy(package),
-        ) && &policy != default
-        {
-            return Err(RelayApiError::bad_request(
-                "Renewal package prover URL does not match the managed relay configuration",
-            ));
-        }
-        if let (Some(default), Some(policy)) = (
-            config.default_coordinator_url.as_ref(),
-            package_coordinator_url_from_policy(package),
-        ) && &policy != default
-        {
-            return Err(RelayApiError::bad_request(
-                "Renewal package coordinator URL does not match the managed relay configuration",
-            ));
-        }
-    }
     let mut slot_ids = BTreeSet::new();
     let mut commitments = BTreeSet::new();
     for slot in &package.slots {
@@ -2066,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_validation_rejects_unpinned_package_urls() {
+    fn strict_validation_uses_pinned_urls_over_package_policy() {
         let mut package = test_package(
             "http://other-coordinator".into(),
             "http://other-prover".into(),
@@ -2078,8 +2058,14 @@ mod tests {
         state.config.package_registration_token = Some(Arc::new("package-token".into()));
         state.config.coordinator_control_token = Some(Arc::new("control-token".into()));
         state.config.allowed_origins = vec![HeaderValue::from_static("https://app.zylith.fi")];
-        assert!(validate_package(&package, &state.config).is_err());
+        assert!(validate_package(&package, &state.config).is_ok());
 
+        state.config.default_coordinator_url = None;
+        state.config.default_prover_url = None;
+        assert!(validate_package(&package, &state.config).is_ok());
+        package.relay_policy.coordinator_url = String::new();
+        package.relay_policy.prover_url = String::new();
+        assert!(validate_package(&package, &state.config).is_err());
         package.relay_policy.coordinator_url = "http://coordinator".into();
         package.relay_policy.prover_url = "http://prover".into();
         assert!(validate_package(&package, &state.config).is_ok());
