@@ -55,6 +55,11 @@ const ALLOWED_ORIGINS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS";
 const MAX_BODY_BYTES_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_BODY_BYTES";
 const PACKAGE_RETENTION_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS";
 const RATE_LIMIT_PER_MINUTE_ENV: &str = "ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE";
+const RELAY_PACKAGE_COMMITMENT_HEADER: &str = "x-zylith-relay-package-commitment";
+const RELAY_PARENT_CANCEL_AUTHORITY_HEADER: &str = "x-zylith-relay-parent-cancel-authority";
+const RELAY_SIGNER_HEADER: &str = "x-zylith-relay-signer";
+const RELAY_SIGNATURE_R_HEADER: &str = "x-zylith-relay-signature-r";
+const RELAY_SIGNATURE_S_HEADER: &str = "x-zylith-relay-signature-s";
 static TICK_LEASE_OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -89,11 +94,6 @@ impl RelayConfig {
         let store_path =
             PathBuf::from(env::var(STORE_PATH_ENV).unwrap_or_else(|_| DEFAULT_STORE_PATH.into()));
         if strict_mode {
-            if package_registration_token.is_none() {
-                return Err(format!(
-                    "{PACKAGE_TOKEN_ENV} is required when {STRICT_MODE_ENV}=true"
-                ));
-            }
             if coordinator_control_token.is_none() {
                 return Err(format!(
                     "{COORDINATOR_CONTROL_TOKEN_ENV} or {} is required when {STRICT_MODE_ENV}=true",
@@ -211,6 +211,10 @@ struct OfflineRenewalPackage {
     #[serde(default)]
     relay_mode: Option<RelayMode>,
     #[serde(default)]
+    parent_cancel_authority: Option<String>,
+    #[serde(default)]
+    relay_authorization: Option<RelayPackageAuthorization>,
+    #[serde(default)]
     ingress_key_registry_fingerprint: Option<String>,
     relay_policy: RelayPolicy,
     slots: Vec<OfflineRenewalSlot>,
@@ -233,6 +237,13 @@ struct OfflineRenewalSlot {
     parent_child_index: u64,
     order_commitment: String,
     ingress_request: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RelayPackageAuthorization {
+    signer_public_key: String,
+    signature_r: String,
+    signature_s: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,9 +469,9 @@ async fn register_package(
     headers: HeaderMap,
     Json(package): Json<OfflineRenewalPackage>,
 ) -> Result<Json<PackageStatus>, RelayApiError> {
-    require_package_auth(&state, &headers)?;
-    enforce_rate_limit(&state, &headers).await?;
     validate_package(&package, &state.config)?;
+    require_package_auth(&state, &headers, Some(&package))?;
+    enforce_rate_limit(&state, &headers).await?;
     let now = now_unix_ms();
     let package_id = package.package_id.clone();
     let status = {
@@ -497,13 +508,13 @@ async fn get_package_status(
     headers: HeaderMap,
     Path(package_id): Path<String>,
 ) -> Result<Json<PackageStatus>, RelayApiError> {
-    require_package_auth(&state, &headers)?;
-    enforce_rate_limit(&state, &headers).await?;
     let store = state.store.read().await;
     let package = store
         .packages
         .get(&package_id)
         .ok_or(RelayApiError::status(StatusCode::NOT_FOUND))?;
+    require_package_auth(&state, &headers, Some(&package.package))?;
+    enforce_rate_limit(&state, &headers).await?;
     Ok(Json(package_status(package)))
 }
 
@@ -512,13 +523,13 @@ async fn get_package_results(
     headers: HeaderMap,
     Path(package_id): Path<String>,
 ) -> Result<Json<PackageResults>, RelayApiError> {
-    require_package_auth(&state, &headers)?;
-    enforce_rate_limit(&state, &headers).await?;
     let store = state.store.read().await;
     let package = store
         .packages
         .get(&package_id)
         .ok_or(RelayApiError::status(StatusCode::NOT_FOUND))?;
+    require_package_auth(&state, &headers, Some(&package.package))?;
+    enforce_rate_limit(&state, &headers).await?;
     Ok(Json(PackageResults {
         package_id: package.package.package_id.clone(),
         package_commitment: package.package.package_commitment.clone(),
@@ -1065,16 +1076,39 @@ fn package_coordinator_url_from_policy(package: &OfflineRenewalPackage) -> Optio
     non_empty(&package.relay_policy.coordinator_url).map(normalize_url)
 }
 
-fn require_package_auth(state: &AppState, headers: &HeaderMap) -> Result<(), RelayApiError> {
-    require_optional_bearer(
-        state
-            .config
-            .package_registration_token
-            .as_deref()
-            .map(String::as_str),
-        headers,
-    )
-    .map_err(RelayApiError::status)
+fn require_package_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    package: Option<&OfflineRenewalPackage>,
+) -> Result<(), RelayApiError> {
+    let expected_bearer = state
+        .config
+        .package_registration_token
+        .as_deref()
+        .map(String::as_str);
+    if let Some(expected) = expected_bearer {
+        match bearer_auth_status(expected, headers) {
+            BearerAuthStatus::Valid => return Ok(()),
+            BearerAuthStatus::Invalid => {
+                return Err(RelayApiError::status(StatusCode::UNAUTHORIZED));
+            }
+            BearerAuthStatus::Missing => {}
+        }
+    }
+    if let Some(package) = package
+        && verify_package_authorization_from_body(package).unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if let Some(package) = package
+        && verify_package_authorization_from_headers(package, headers).unwrap_or(false)
+    {
+        return Ok(());
+    }
+    if state.config.strict_mode || expected_bearer.is_some() {
+        return Err(RelayApiError::status(StatusCode::UNAUTHORIZED));
+    }
+    Ok(())
 }
 
 fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), RelayApiError> {
@@ -1102,6 +1136,88 @@ fn require_optional_bearer(expected: Option<&str>, headers: &HeaderMap) -> Resul
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
+}
+
+enum BearerAuthStatus {
+    Valid,
+    Missing,
+    Invalid,
+}
+
+fn bearer_auth_status(expected: &str, headers: &HeaderMap) -> BearerAuthStatus {
+    let Some(token) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer_token)
+    else {
+        return BearerAuthStatus::Missing;
+    };
+    if constant_time_eq(token, expected) {
+        BearerAuthStatus::Valid
+    } else {
+        BearerAuthStatus::Invalid
+    }
+}
+
+fn verify_package_authorization_from_body(
+    package: &OfflineRenewalPackage,
+) -> Result<bool, String> {
+    let Some(authority) = package.parent_cancel_authority.as_deref() else {
+        return Ok(false);
+    };
+    let Some(auth) = package.relay_authorization.as_ref() else {
+        return Ok(false);
+    };
+    verify_package_authorization(authority, &package.package_commitment, auth)
+}
+
+fn verify_package_authorization_from_headers(
+    package: &OfflineRenewalPackage,
+    headers: &HeaderMap,
+) -> Result<bool, String> {
+    let package_commitment = header_str(headers, RELAY_PACKAGE_COMMITMENT_HEADER)?;
+    if package_commitment != package.package_commitment {
+        return Ok(false);
+    }
+    let parent_cancel_authority = header_str(headers, RELAY_PARENT_CANCEL_AUTHORITY_HEADER)?;
+    let body_authority = package.parent_cancel_authority.as_deref().unwrap_or("");
+    if !body_authority.is_empty() && parent_cancel_authority != body_authority {
+        return Ok(false);
+    }
+    let auth = RelayPackageAuthorization {
+        signer_public_key: header_str(headers, RELAY_SIGNER_HEADER)?.to_string(),
+        signature_r: header_str(headers, RELAY_SIGNATURE_R_HEADER)?.to_string(),
+        signature_s: header_str(headers, RELAY_SIGNATURE_S_HEADER)?.to_string(),
+    };
+    verify_package_authorization(parent_cancel_authority, package_commitment, &auth)
+}
+
+fn verify_package_authorization(
+    parent_cancel_authority: &str,
+    package_commitment: &str,
+    auth: &RelayPackageAuthorization,
+) -> Result<bool, String> {
+    if auth.signer_public_key != parent_cancel_authority {
+        return Ok(false);
+    }
+    zylith_core::verify_renewal_relay_package_authorization(
+        parent_cancel_authority,
+        package_commitment,
+        &zylith_core::SpendAuthorization {
+            signature_r: auth.signature_r.clone(),
+            signature_s: auth.signature_s.clone(),
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name} missing"))
 }
 
 async fn enforce_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), RelayApiError> {
@@ -1806,6 +1922,8 @@ mod tests {
             end_epoch: 42,
             slot_count: 1,
             relay_mode: Some(RelayMode::ZylithRelay),
+            parent_cancel_authority: None,
+            relay_authorization: None,
             ingress_key_registry_fingerprint: None,
             relay_policy: RelayPolicy {
                 prover_url,
@@ -1823,6 +1941,25 @@ mod tests {
                 ingress_request: json!({ "order_submission": { "opaque": true } }),
             }],
         }
+    }
+
+    fn authorize_package(package: &mut OfflineRenewalPackage) {
+        let private_key = "0x12345";
+        let parent_cancel_authority =
+            zylith_core::renewal_cancel_authority_from_renewal_cancel_auth_key_felt(private_key)
+                .expect("relay auth authority");
+        let authorization = zylith_core::sign_renewal_relay_package_authorization(
+            private_key,
+            &package.package_commitment,
+            &parent_cancel_authority,
+        )
+        .expect("relay auth signature");
+        package.parent_cancel_authority = Some(parent_cancel_authority.clone());
+        package.relay_authorization = Some(RelayPackageAuthorization {
+            signer_public_key: parent_cancel_authority,
+            signature_r: authorization.signature_r,
+            signature_s: authorization.signature_s,
+        });
     }
 
     fn test_state(path: PathBuf) -> AppState {
@@ -1911,6 +2048,63 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(path.exists());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn strict_register_accepts_signed_package_without_bearer_token() {
+        let path = temp_sqlite_store_path("strict-signed-register");
+        let mut state = test_state(path.clone());
+        state.config.strict_mode = true;
+        state.config.default_coordinator_url = Some("http://coordinator".into());
+        state.config.default_prover_url = Some("http://prover".into());
+        state.config.coordinator_control_token = Some(Arc::new("control-token".into()));
+        let mut package = test_package("http://coordinator".into(), "http://prover".into());
+        authorize_package(&mut package);
+
+        let response = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/relay/packages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&package).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
+    async fn strict_register_rejects_unsigned_package_without_bearer_token() {
+        let path = temp_sqlite_store_path("strict-unsigned-register");
+        let mut state = test_state(path.clone());
+        state.config.strict_mode = true;
+        state.config.default_coordinator_url = Some("http://coordinator".into());
+        state.config.default_prover_url = Some("http://prover".into());
+        state.config.coordinator_control_token = Some(Arc::new("control-token".into()));
+        let package = test_package("http://coordinator".into(), "http://prover".into());
+
+        let response = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/relay/packages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&package).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        cleanup_sqlite_store(&path);
     }
 
     #[tokio::test]
