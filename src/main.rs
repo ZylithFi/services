@@ -367,7 +367,10 @@ fn app(state: AppState) -> Router {
         .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
         .route("/api/relay/packages", post(register_package))
-        .route("/api/relay/packages/{package_id}", get(get_package_status))
+        .route(
+            "/api/relay/packages/{package_id}",
+            get(get_package_status).delete(delete_package),
+        )
         .route(
             "/api/relay/packages/{package_id}/results",
             get(get_package_results),
@@ -397,8 +400,7 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     };
     let ready = store_ok
         && (!state.config.strict_mode
-            || (state.config.package_registration_token.is_some()
-                && state.config.coordinator_control_token.is_some()
+            || (state.config.coordinator_control_token.is_some()
                 && state.config.default_coordinator_url.is_some()
                 && state.config.default_prover_url.is_some()
                 && !state.config.allowed_origins.is_empty()
@@ -539,6 +541,40 @@ async fn get_package_results(
             .map(|entry| entry.result.clone())
             .collect(),
     }))
+}
+
+async fn delete_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(package_id): Path<String>,
+) -> Result<StatusCode, RelayApiError> {
+    let package = {
+        let store = state.store.read().await;
+        store
+            .packages
+            .get(&package_id)
+            .cloned()
+            .ok_or(RelayApiError::status(StatusCode::NOT_FOUND))?
+    };
+    require_package_auth(&state, &headers, Some(&package.package))?;
+    enforce_rate_limit(&state, &headers).await?;
+    let removed = {
+        let mut store = state.store.write().await;
+        let Some(current) = store.packages.get(&package_id) else {
+            return Ok(StatusCode::NO_CONTENT);
+        };
+        if current.package.package_commitment != package.package.package_commitment {
+            return Err(RelayApiError {
+                status: StatusCode::CONFLICT,
+                detail: "Renewal package changed before deletion".into(),
+            });
+        }
+        store.packages.remove(&package_id).is_some()
+    };
+    if removed {
+        persist_store(&state.config.store_path, &state.store).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn trigger_tick(
@@ -1402,6 +1438,7 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
+    let retained_package_ids = snapshot.packages.keys().cloned().collect::<BTreeSet<_>>();
     for (package_id, stored) in snapshot.packages {
         let package_json =
             serde_json::to_string(&stored.package).map_err(|error| error.to_string())?;
@@ -1483,6 +1520,28 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
                 )
                 .map_err(|error| error.to_string())?;
         }
+    }
+    let existing_package_ids = {
+        let mut statement = transaction
+            .prepare("SELECT package_id FROM relay_packages")
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+        let mut package_ids = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            package_ids.push(row.get::<_, String>(0).map_err(|error| error.to_string())?);
+        }
+        package_ids
+    };
+    for package_id in existing_package_ids {
+        if retained_package_ids.contains(&package_id) {
+            continue;
+        }
+        transaction
+            .execute(
+                "DELETE FROM relay_packages WHERE package_id = ?1",
+                params![package_id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
     }
     transaction.commit().map_err(|error| error.to_string())
 }
@@ -2104,6 +2163,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
+    async fn strict_delete_removes_signed_package_without_bearer_token() {
+        let path = temp_sqlite_store_path("strict-signed-delete");
+        let mut state = test_state(path.clone());
+        state.config.strict_mode = true;
+        state.config.default_coordinator_url = Some("http://coordinator".into());
+        state.config.default_prover_url = Some("http://prover".into());
+        state.config.coordinator_control_token = Some(Arc::new("control-token".into()));
+        let mut package = test_package("http://coordinator".into(), "http://prover".into());
+        authorize_package(&mut package);
+        let auth = package.relay_authorization.as_ref().unwrap().clone();
+        let router = app(state.clone());
+
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/relay/packages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&package).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/relay/packages/pkg-1")
+                    .header(RELAY_PACKAGE_COMMITMENT_HEADER, &package.package_commitment)
+                    .header(
+                        RELAY_PARENT_CANCEL_AUTHORITY_HEADER,
+                        package.parent_cancel_authority.as_deref().unwrap(),
+                    )
+                    .header(RELAY_SIGNER_HEADER, &auth.signer_public_key)
+                    .header(RELAY_SIGNATURE_R_HEADER, &auth.signature_r)
+                    .header(RELAY_SIGNATURE_S_HEADER, &auth.signature_s)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        assert!(!loaded.packages.contains_key("pkg-1"));
         cleanup_sqlite_store(&path);
     }
 
