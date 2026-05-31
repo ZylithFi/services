@@ -89,7 +89,7 @@ checkCsv("ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS");
 checkRequired("ZYLITH_RENEWAL_RELAY_STRICT");
 expectValue("ZYLITH_RENEWAL_RELAY_STRICT", "true", "renewal relay strict mode must be enabled in production");
 checkRequired("ZYLITH_RENEWAL_RELAY_STORE_PATH");
-checkSecret("ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN", 32);
+checkRecommended("ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN", "renewal relay bearer fallback is unset; package-signed authorization will be required");
 checkSecret("ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN", 32);
 checkRequired("ZYLITH_RENEWAL_RELAY_COORDINATOR_URL");
 checkRequired("ZYLITH_RENEWAL_RELAY_PROVER_URL");

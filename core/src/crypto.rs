@@ -823,6 +823,56 @@ pub fn sign_order_authorization(
     })
 }
 
+pub fn renewal_relay_package_registration_message_hash(
+    package_commitment: &str,
+    parent_cancel_authority: &str,
+) -> Result<String, ProtocolError> {
+    tagged_field_hex(
+        "zylith/renewal-relay-package-registration-v1",
+        &serde_json::json!({
+            "package_commitment": package_commitment.trim().to_ascii_lowercase(),
+            "parent_cancel_authority": normalize_felt_hex(parent_cancel_authority)?,
+        }),
+    )
+}
+
+pub fn sign_renewal_relay_package_authorization(
+    renewal_cancel_auth_key_felt: &str,
+    package_commitment: &str,
+    parent_cancel_authority: &str,
+) -> Result<crate::SpendAuthorization, ProtocolError> {
+    let private_key = felt_from_hex_str(&normalize_felt_hex(renewal_cancel_auth_key_felt)?)?;
+    let message = felt_from_hex_str(&renewal_relay_package_registration_message_hash(
+        package_commitment,
+        parent_cancel_authority,
+    )?)?;
+    let k = rfc6979_generate_k(&message, &private_key, None);
+    let signature = sign(&private_key, &message, &k).map_err(|err| {
+        ProtocolError::Crypto(format!("renewal relay package authorization signing failed: {err}"))
+    })?;
+    Ok(crate::SpendAuthorization {
+        signature_r: felt_hex(&signature.r),
+        signature_s: felt_hex(&signature.s),
+    })
+}
+
+pub fn verify_renewal_relay_package_authorization(
+    parent_cancel_authority: &str,
+    package_commitment: &str,
+    authorization: &crate::SpendAuthorization,
+) -> Result<bool, ProtocolError> {
+    let public_key = felt_from_hex_str(&normalize_felt_hex(parent_cancel_authority)?)?;
+    let message = felt_from_hex_str(&renewal_relay_package_registration_message_hash(
+        package_commitment,
+        parent_cancel_authority,
+    )?)?;
+    let signature_r = felt_from_hex_str(&normalize_felt_hex(&authorization.signature_r)?)?;
+    let signature_s = felt_from_hex_str(&normalize_felt_hex(&authorization.signature_s)?)?;
+    verify(&public_key, &message, &signature_r, &signature_s).map_err(|err| {
+        ProtocolError::Crypto(format!("renewal relay package authorization verify failed: {err}"))
+    })
+}
+
 pub fn build_output_note(
     batch_id: &str,
     output_index: usize,
@@ -6386,11 +6436,13 @@ mod tests {
         sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
         settlement_nullifier_root_after_history, settlement_output_withdrawal_message_hash,
         settlement_transcript_commitment, sign_note_consolidation_authorization,
-        sign_order_authorization, validate_maker_attribution_receipt,
+        sign_order_authorization, sign_renewal_relay_package_authorization,
+        validate_maker_attribution_receipt,
         validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
+        verify_renewal_relay_package_authorization,
         withdrawal_message_hash,
     };
     use crate::types::{
@@ -9391,6 +9443,38 @@ mod tests {
             super::RENEWAL_SPARSE_TREE_DEPTH,
         );
         assert_eq!(plan.starknet_call.calldata[4], "0x80");
+    }
+
+    #[test]
+    fn renewal_relay_package_authorization_round_trips() {
+        let private_key = "0x12345";
+        let parent_cancel_authority =
+            crate::renewal_cancel_authority_from_renewal_cancel_auth_key_felt(private_key)
+                .expect("authority");
+        let package_commitment = "0xabc";
+        let authorization = sign_renewal_relay_package_authorization(
+            private_key,
+            package_commitment,
+            &parent_cancel_authority,
+        )
+        .expect("relay package signature");
+
+        assert!(
+            verify_renewal_relay_package_authorization(
+                &parent_cancel_authority,
+                package_commitment,
+                &authorization,
+            )
+            .expect("verify")
+        );
+        assert!(
+            !verify_renewal_relay_package_authorization(
+                &parent_cancel_authority,
+                "0xabd",
+                &authorization,
+            )
+            .expect("wrong package rejected")
+        );
     }
 
     #[test]

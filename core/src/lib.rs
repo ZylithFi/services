@@ -44,17 +44,20 @@ pub use crypto::{
     proof_artifact_commitment, reconstruct_order_from_shares,
     renewal_child_uses_from_matched_witnesses, renewal_parent_cancel_marker_message_hash,
     renewal_proof_message_hash_for_program, renewal_proof_message_hash_from_statement,
+    renewal_relay_package_registration_message_hash,
     renewal_sparse_witnesses_for_child_uses, root_only_settlement_commitments,
     sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
     settlement_nullifier_root_after_history, settlement_output_withdrawal_message_hash,
     settlement_proof_message_hash, settlement_proof_message_hash_for_program,
     settlement_proof_message_hash_from_statement, settlement_state_transition_root,
     settlement_transcript_commitment, sign_note_consolidation_authorization,
-    sign_order_authorization, validate_maker_attribution_receipt,
+    sign_order_authorization, sign_renewal_relay_package_authorization,
+    validate_maker_attribution_receipt,
     validate_order_ingress_receipt_for_manifest,
     validate_order_ingress_receipt_for_manifest_with_secrets,
     validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
     verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
+    verify_renewal_relay_package_authorization,
 };
 pub use error::ProtocolError;
 pub use keys::{RecoverySeed, UserKeys, derive_user_keys};
