@@ -118,6 +118,7 @@ const NATIVE_PROVER_RETRY_INTERVAL_MS_ENV: &str = "ZYLITH_NATIVE_PROVER_RETRY_IN
 const NATIVE_PROVER_REQUEST_TIMEOUT_SECONDS_ENV: &str =
     "ZYLITH_NATIVE_PROVER_REQUEST_TIMEOUT_SECONDS";
 const NATIVE_PROVER_BLOCKS_BACK_ENV: &str = "ZYLITH_NATIVE_PROVER_BLOCKS_BACK";
+const NATIVE_PROVER_BLOCK_TAG_ENV: &str = "ZYLITH_NATIVE_PROVER_BLOCK_TAG";
 const NATIVE_PROOF_FACTS_SUBMIT_RETRY_ATTEMPTS_ENV: &str =
     "ZYLITH_NATIVE_PROOF_FACTS_SUBMIT_RETRY_ATTEMPTS";
 const NATIVE_PROOF_FACTS_SUBMIT_RETRY_INTERVAL_MS_ENV: &str =
@@ -635,14 +636,6 @@ async fn main() -> Result<(), String> {
     axum::serve(listener, app)
         .await
         .map_err(|error| format!("prover service failed: {error}"))
-}
-
-#[cfg(test)]
-fn protocol_fee_recipient_from_values(canonical: Option<String>, legacy: Option<String>) -> String {
-    canonical
-        .or(legacy)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_PROTOCOL_FEE_RECIPIENT.into())
 }
 
 fn env_or_default(name: &str, default: &str) -> String {
@@ -1291,11 +1284,29 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let proof_artifacts = state.proof_artifacts.read().await;
     let onchain_submissions = state.onchain_submissions.read().await;
     let private_order_payloads = state.private_order_payloads.read().await;
+    let mut proof_jobs_by_state = BTreeMap::<String, usize>::new();
+    for status in proof_jobs.values() {
+        *proof_jobs_by_state.entry(status.state.clone()).or_default() += 1;
+    }
+    let latest_failed_job = proof_jobs
+        .values()
+        .filter(|status| is_failed_proof_job_state(&status.state))
+        .max_by_key(|status| status.updated_at_unix_ms)
+        .map(|status| {
+            serde_json::json!({
+                "batch_id": status.batch_id.0,
+                "state": status.state,
+                "error_class": proof_job_error_class(status.last_error.as_deref()),
+                "updated_at_unix_ms": status.updated_at_unix_ms,
+            })
+        });
     Json(serde_json::json!({
         "service": "zylith-prover",
         "coordinator_configured": !state.coordinator_url.trim().is_empty(),
         "indexer_configured": !state.indexer_url.trim().is_empty(),
         "prepared_jobs_bucket": count_bucket(proof_jobs.len()),
+        "proof_jobs_by_state": proof_jobs_by_state,
+        "latest_failed_job": latest_failed_job,
         "auction_verifier_address": state.auction_verifier_address,
         "prepared_settlement_plans_bucket": count_bucket(settlement_plans.len()),
         "prepared_settlement_witnesses_bucket": count_bucket(settlement_witnesses.len()),
@@ -1559,6 +1570,31 @@ fn historical_consumed_inputs(
         consumed.extend(consumed_inputs_for_notes(&witness.input_notes)?);
     }
     Ok(consumed)
+}
+
+fn consumed_nullifier_set(
+    consumed_inputs: &[ConsumedInput],
+) -> Result<BTreeSet<String>, StatusCode> {
+    consumed_inputs
+        .iter()
+        .map(|input| {
+            normalize_felt_hex(&input.nullifier.0).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        })
+        .collect()
+}
+
+fn record_uses_spent_funding(
+    record: &DecryptedOrderRecord,
+    spent_nullifiers: &BTreeSet<String>,
+) -> Result<bool, StatusCode> {
+    for input in consumed_inputs_for_notes(&record.funding_notes)? {
+        let nullifier = normalize_felt_hex(&input.nullifier.0)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if spent_nullifiers.contains(&nullifier) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn submit_note_consolidation_inner(
@@ -2391,6 +2427,35 @@ fn public_proof_failure(state: &str) -> Option<String> {
         "onchain-submit-failed" => Some("onchain_submit_failed".into()),
         _ => None,
     }
+}
+
+fn is_failed_proof_job_state(state: &str) -> bool {
+    matches!(
+        state,
+        "proving-failed" | "onchain-submit-failed" | "onchain-reverted"
+    )
+}
+
+fn proof_job_error_class(error: Option<&str>) -> &'static str {
+    let Some(error) = error else {
+        return "unknown";
+    };
+    if error.contains("not deployed") {
+        return "contract_not_deployed";
+    }
+    if error.contains("Invalid Starknet version") {
+        return "unsupported_starknet_version";
+    }
+    if error.contains("Service busy") || error.contains("-32005") {
+        return "prover_busy";
+    }
+    if error.contains("timed out") || error.contains("timeout") {
+        return "timeout";
+    }
+    if error.contains("reverted") || error.contains("REVERTED") {
+        return "onchain_revert";
+    }
+    "prover_error"
 }
 
 async fn get_public_proof_job(
@@ -4030,9 +4095,9 @@ async fn decrypt_private_auction_orders(
 }
 
 fn validate_batch_nullifier_freshness<'a>(
-    current_batch_id: &str,
+    _current_batch_id: &str,
     records: &[DecryptedOrderRecord],
-    historical_witnesses: impl IntoIterator<Item = &'a SettlementWitness>,
+    _historical_witnesses: impl IntoIterator<Item = &'a SettlementWitness>,
 ) -> Result<(), String> {
     let mut current_nullifiers = BTreeMap::new();
     for record in records {
@@ -4051,22 +4116,6 @@ fn validate_batch_nullifier_freshness<'a>(
                 .is_some()
             {
                 return Err("duplicate funding nullifier in current batch".into());
-            }
-        }
-    }
-
-    for witness in historical_witnesses {
-        if witness.batch_id.0 == current_batch_id {
-            continue;
-        }
-        for input in &witness.consumed_inputs {
-            let historical_nullifier = normalize_felt_hex(&input.nullifier.0)
-                .map_err(|error| format!("invalid historical nullifier: {error}"))?;
-            if let Some(current_commitment) = current_nullifiers.get(&historical_nullifier) {
-                return Err(format!(
-                    "funding nullifier for note {} was already reserved by batch {}",
-                    current_commitment, witness.batch_id.0
-                ));
             }
         }
     }
@@ -6536,14 +6585,39 @@ fn build_settlement_artifacts(
         }
     }
 
+    let prior_consumed_inputs = historical_consumed_inputs(
+        prior_settlement_witnesses,
+        prior_note_consolidation_witnesses,
+    )?;
+    let spent_nullifiers = consumed_nullifier_set(&prior_consumed_inputs)?;
+    let mut fillable_records = Vec::with_capacity(records.len());
+    let mut spent_funding_records = 0usize;
+    for record in records {
+        if !matches!(
+            record.order.order_type,
+            zylith_core::OrderType::HeartbeatCover
+        ) && record_uses_spent_funding(record, &spent_nullifiers)?
+        {
+            spent_funding_records += 1;
+            continue;
+        }
+        fillable_records.push(record.clone());
+    }
+    if spent_funding_records > 0 {
+        eprintln!(
+            "build_settlement_artifacts batch_id={} stage=filter_spent_funding excluded={}",
+            batch_id, spent_funding_records
+        );
+    }
+
     eprintln!("build_settlement_artifacts batch_id={batch_id} stage=compute_price start");
     let candidate_clearing_price =
-        compute_candidate_clearing_price(records, pair.price_base_scale)?;
+        compute_candidate_clearing_price(&fillable_records, pair.price_base_scale)?;
     let candidate_price = candidate_clearing_price.unwrap_or(0);
     let fills = if privacy_gate.enforced {
         Vec::new()
     } else {
-        compute_fill_plan(records, candidate_price, pair.price_base_scale)
+        compute_fill_plan(&fillable_records, candidate_price, pair.price_base_scale)
     };
     eprintln!(
         "build_settlement_artifacts batch_id={} stage=compute_price ok price={} fills={}",
@@ -6894,10 +6968,6 @@ fn build_settlement_artifacts(
         eprintln!("build_settlement_artifacts batch_id={batch_id} stage=renewal_child_uses failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let prior_consumed_inputs = historical_consumed_inputs(
-        prior_settlement_witnesses,
-        prior_note_consolidation_witnesses,
-    )?;
     eprintln!(
         "build_settlement_artifacts batch_id={} stage=nullifier_witnesses start prior_consumed={} consumed={}",
         batch_id,
@@ -8043,12 +8113,14 @@ async fn fetch_native_execution_context(
         NATIVE_PROVER_BLOCKS_BACK_ENV,
         DEFAULT_NATIVE_PROVER_BLOCKS_BACK,
     );
+    let proof_block_tag_override = native_proof_block_tag_override();
     match block {
         MaybePreConfirmedBlockWithTxHashes::Block(block) => Ok(NativeExecutionContext {
             block_id: native_execution_context_block_id(
                 mode,
                 block.block_number,
                 proving_blocks_back,
+                proof_block_tag_override.as_deref(),
             ),
             l1_gas_price: native_gas_price_bound(block.l1_gas_price.price_in_fri)?,
             l2_gas_price: native_gas_price_bound(block.l2_gas_price.price_in_fri)?,
@@ -8063,6 +8135,7 @@ async fn fetch_native_execution_context(
                     mode,
                     block.block_number,
                     proving_blocks_back,
+                    proof_block_tag_override.as_deref(),
                 ),
                 l1_gas_price: native_gas_price_bound(block.l1_gas_price.price_in_fri)?,
                 l2_gas_price: native_gas_price_bound(block.l2_gas_price.price_in_fri)?,
@@ -8076,12 +8149,31 @@ fn native_execution_context_block_id(
     mode: NativeTransactionMode,
     latest_block_number: u64,
     proving_blocks_back: u64,
+    proof_block_tag_override: Option<&str>,
 ) -> NativeBlockId {
     match mode {
+        NativeTransactionMode::ProofOnly if proof_block_tag_override == Some("latest") => {
+            NativeBlockId::Tag("latest".into())
+        }
         NativeTransactionMode::ProofOnly => NativeBlockId::Number {
             block_number: latest_block_number.saturating_sub(proving_blocks_back),
         },
         NativeTransactionMode::SubmitOnchain => NativeBlockId::Tag("latest".into()),
+    }
+}
+
+fn native_proof_block_tag_override() -> Option<String> {
+    let value = env::var(NATIVE_PROVER_BLOCK_TAG_ENV).ok()?;
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" => None,
+        "latest" => Some("latest".to_string()),
+        unsupported => {
+            eprintln!(
+                "unsupported {NATIVE_PROVER_BLOCK_TAG_ENV}={unsupported}; using numbered proof block"
+            );
+            None
+        }
     }
 }
 
@@ -8287,61 +8379,12 @@ async fn submit_native_invoke_with_typed_sdk_retry(
     if proof.is_empty() {
         return Err("native proof cannot be empty".into());
     }
-    let (execution_context, nonce, resource_bounds, _) = prepare_native_execution_fields(
-        executor,
-        settlement_call,
-        NativeTransactionMode::SubmitOnchain,
-    )
-    .await?;
-
-    let rpc_url = Url::parse(&executor.rpc_url)
-        .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?;
-    let provider = JsonRpcClient::new(HttpTransport::new(rpc_url));
-    let signer = LocalWallet::from(SigningKey::from_secret_scalar(parse_felt(
-        &executor.private_key,
-        "ZYLITH_STARKNET_PRIVATE_KEY",
-    )?));
-    let account = SingleOwnerAccount::new(
-        provider,
-        signer,
-        parse_felt(&executor.account_address, "ZYLITH_STARKNET_ACCOUNT_ADDRESS")?,
-        parse_felt(&executor.chain_id, "ZYLITH_STARKNET_CHAIN_ID")?,
-        ExecutionEncoding::New,
-    );
     let typed_proof_facts = proof_facts
         .iter()
         .map(|value| parse_felt(value, "proof_facts felt"))
         .collect::<Result<Vec<_>, _>>()?;
     let signature_binds_proof_facts =
         env_bool_or_default(NATIVE_SIGNATURE_BINDS_PROOF_FACTS_ENV, true);
-    let mut execution = account
-        .execute_v3(vec![starknet_call_to_call(settlement_call)?])
-        .nonce(nonce)
-        .l1_gas(resource_bounds.l1_gas)
-        .l1_gas_price(execution_context.l1_gas_price)
-        .l2_gas(resource_bounds.l2_gas)
-        .l2_gas_price(execution_context.l2_gas_price)
-        .l1_data_gas(resource_bounds.l1_data_gas)
-        .l1_data_gas_price(execution_context.l1_data_gas_price)
-        .tip(0)
-        .proof(proof.to_owned());
-    if signature_binds_proof_facts {
-        execution = execution.proof_facts(typed_proof_facts.clone());
-    }
-    let prepared_invoke = execution
-        .prepared()
-        .map_err(|_| "failed to prepare typed native proof-bearing invoke".to_string())?;
-    let expected_tx_hash = prepared_invoke.transaction_hash(false);
-    let mut invoke_request = prepared_invoke
-        .get_invoke_request(false, false)
-        .await
-        .map_err(|error| format!("failed to build typed native proof-bearing invoke: {error}"))?;
-    if !signature_binds_proof_facts {
-        // Non-proof-aware RPC debugging path: some providers accept the extra JSON field but do
-        // not propagate it into `tx_info.proof_facts`. Keep this opt-in only; production proof
-        // submission must bind facts in the signed transaction hash.
-        invoke_request.broadcasted_invoke_txn_v3.proof_facts = Some(typed_proof_facts);
-    }
 
     let attempts = env_parse_or_default(
         NATIVE_PROOF_FACTS_SUBMIT_RETRY_ATTEMPTS_ENV,
@@ -8355,6 +8398,58 @@ async fn submit_native_invoke_with_typed_sdk_retry(
 
     let mut last_error = None;
     for attempt in 1..=attempts {
+        let (execution_context, nonce, resource_bounds, _) = prepare_native_execution_fields(
+            executor,
+            settlement_call,
+            NativeTransactionMode::SubmitOnchain,
+        )
+        .await?;
+
+        let rpc_url = Url::parse(&executor.rpc_url)
+            .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?;
+        let provider = JsonRpcClient::new(HttpTransport::new(rpc_url));
+        let signer = LocalWallet::from(SigningKey::from_secret_scalar(parse_felt(
+            &executor.private_key,
+            "ZYLITH_STARKNET_PRIVATE_KEY",
+        )?));
+        let account = SingleOwnerAccount::new(
+            provider,
+            signer,
+            parse_felt(&executor.account_address, "ZYLITH_STARKNET_ACCOUNT_ADDRESS")?,
+            parse_felt(&executor.chain_id, "ZYLITH_STARKNET_CHAIN_ID")?,
+            ExecutionEncoding::New,
+        );
+        let mut execution = account
+            .execute_v3(vec![starknet_call_to_call(settlement_call)?])
+            .nonce(nonce)
+            .l1_gas(resource_bounds.l1_gas)
+            .l1_gas_price(execution_context.l1_gas_price)
+            .l2_gas(resource_bounds.l2_gas)
+            .l2_gas_price(execution_context.l2_gas_price)
+            .l1_data_gas(resource_bounds.l1_data_gas)
+            .l1_data_gas_price(execution_context.l1_data_gas_price)
+            .tip(0)
+            .proof(proof.to_owned());
+        if signature_binds_proof_facts {
+            execution = execution.proof_facts(typed_proof_facts.clone());
+        }
+        let prepared_invoke = execution
+            .prepared()
+            .map_err(|_| "failed to prepare typed native proof-bearing invoke".to_string())?;
+        let expected_tx_hash = prepared_invoke.transaction_hash(false);
+        let mut invoke_request = prepared_invoke
+            .get_invoke_request(false, false)
+            .await
+            .map_err(|error| {
+                format!("failed to build typed native proof-bearing invoke: {error}")
+            })?;
+        if !signature_binds_proof_facts {
+            // Non-proof-aware RPC debugging path: some providers accept the extra JSON field but do
+            // not propagate it into `tx_info.proof_facts`. Keep this opt-in only; production proof
+            // submission must bind facts in the signed transaction hash.
+            invoke_request.broadcasted_invoke_txn_v3.proof_facts = Some(typed_proof_facts.clone());
+        }
+
         match account
             .provider()
             .add_invoke_transaction(&invoke_request)
@@ -8383,6 +8478,15 @@ async fn submit_native_invoke_with_typed_sdk_retry(
                     continue;
                 }
 
+                if native_invoke_error_is_retryable_nonce(&formatted_error) && attempt < attempts {
+                    eprintln!(
+                        "native invoke submission hit a stale nonce; rebuilding with a fresh nonce in {retry_interval_ms}ms ({attempt}/{attempts})"
+                    );
+                    last_error = Some(formatted_error);
+                    sleep(Duration::from_millis(retry_interval_ms)).await;
+                    continue;
+                }
+
                 if native_invoke_error_is_retryable_after_submission(&formatted_error)
                     && attempt < attempts
                 {
@@ -8400,6 +8504,16 @@ async fn submit_native_invoke_with_typed_sdk_retry(
     }
 
     Err(last_error.unwrap_or_else(|| "native invoke submission failed without response".into()))
+}
+
+fn native_invoke_error_is_retryable_nonce(error: &str) -> bool {
+    let formatted = error.to_lowercase();
+    formatted.contains("invalidtransactionnonce")
+        || formatted.contains("invalid transaction nonce")
+        || formatted.contains("invalid nonce")
+        || formatted.contains("nonce")
+            && formatted.contains("expected")
+            && formatted.contains("got")
 }
 
 fn native_invoke_error_is_retryable_proof_facts_delay(error: &str) -> bool {
@@ -8972,10 +9086,9 @@ mod tests {
         encode_bhttp_json_post, matched_maker_participant_count, matched_participant_count,
         max_maker_fill_share_bps, max_single_order_fill_share_bps, max_single_owner_fill_share_bps,
         native_execution_context_block_id, native_fee_estimate_requires_proof_facts,
-        native_invoke_error_is_retryable_after_submission,
+        native_invoke_error_is_retryable_after_submission, native_invoke_error_is_retryable_nonce,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
-        proof_fact_age_wait_ms, protocol_fee_recipient_from_values,
-        redact_native_execution_request, redact_native_prover_request,
+        proof_fact_age_wait_ms, redact_native_execution_request, redact_native_prover_request,
         resolve_batch_registrar_private_key, same_starknet_address,
         should_refresh_onchain_submission, storage_key, validate_batch_nullifier_freshness,
     };
@@ -9026,29 +9139,6 @@ mod tests {
         submission.finality_status = Some("PRE_CONFIRMED".into());
         submission.execution_status = Some("REVERTED".into());
         assert!(!should_refresh_onchain_submission(&submission));
-    }
-
-    #[test]
-    fn protocol_fee_recipient_prefers_canonical_env_value() {
-        assert_eq!(
-            protocol_fee_recipient_from_values(
-                Some("0xabc".into()),
-                Some("legacy-recipient".into())
-            ),
-            "0xabc"
-        );
-    }
-
-    #[test]
-    fn protocol_fee_recipient_keeps_legacy_env_fallback() {
-        assert_eq!(
-            protocol_fee_recipient_from_values(None, Some("legacy-recipient".into())),
-            "legacy-recipient"
-        );
-        assert_eq!(
-            protocol_fee_recipient_from_values(Some("   ".into()), None),
-            DEFAULT_PROTOCOL_FEE_RECIPIENT
-        );
     }
 
     #[test]
@@ -9484,14 +9574,38 @@ mod tests {
 
     #[test]
     fn native_execution_context_pins_proof_but_uses_latest_for_submit() {
-        match native_execution_context_block_id(NativeTransactionMode::ProofOnly, 100, 7) {
+        match native_execution_context_block_id(NativeTransactionMode::ProofOnly, 100, 7, None) {
             NativeBlockId::Number { block_number } => assert_eq!(block_number, 93),
             other => panic!("proof context must use numbered block, got {other:?}"),
         }
 
-        match native_execution_context_block_id(NativeTransactionMode::SubmitOnchain, 100, 7) {
+        match native_execution_context_block_id(NativeTransactionMode::SubmitOnchain, 100, 7, None)
+        {
             NativeBlockId::Tag(tag) => assert_eq!(tag, "latest"),
             other => panic!("submit context must use latest block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_execution_context_can_use_latest_tag_for_official_prover() {
+        match native_execution_context_block_id(
+            NativeTransactionMode::ProofOnly,
+            100,
+            7,
+            Some("latest"),
+        ) {
+            NativeBlockId::Tag(tag) => assert_eq!(tag, "latest"),
+            other => panic!("proof context must use latest tag, got {other:?}"),
+        }
+
+        match native_execution_context_block_id(
+            NativeTransactionMode::SubmitOnchain,
+            100,
+            7,
+            Some("latest"),
+        ) {
+            NativeBlockId::Tag(tag) => assert_eq!(tag, "latest"),
+            other => panic!("submit context must use latest tag, got {other:?}"),
         }
     }
 
@@ -9557,6 +9671,19 @@ mod tests {
         ));
         assert!(!native_invoke_error_is_retryable_after_submission(
             "Account validation failed: Invalid proof facts: EMPTY_PROOF_FACTS"
+        ));
+    }
+
+    #[test]
+    fn native_submit_rebuilds_for_stale_nonce_errors() {
+        assert!(native_invoke_error_is_retryable_nonce(
+            "InvalidTransactionNonce: \"Invalid transaction nonce. Expected: 2822, got: 2821.\""
+        ));
+        assert!(native_invoke_error_is_retryable_nonce(
+            "RPC error: nonce expected 3022 got 3021"
+        ));
+        assert!(!native_invoke_error_is_retryable_nonce(
+            "Invalid proof facts: EMPTY_PROOF_FACTS"
         ));
     }
 
@@ -10223,7 +10350,7 @@ mod tests {
     }
 
     #[test]
-    fn nullifier_freshness_rejects_historical_replay() {
+    fn nullifier_freshness_allows_historical_replay_for_no_fill_filtering() {
         let records = vec![test_record(
             0,
             OrderSide::Buy,
@@ -10238,11 +10365,8 @@ mod tests {
             records[0].order.funding_nullifier.clone(),
         )];
 
-        let error =
-            validate_batch_nullifier_freshness("batch-strk-usdc-1", &records, historical.iter())
-                .expect_err("historical nullifier rejected");
-
-        assert!(error.contains("already reserved"));
+        validate_batch_nullifier_freshness("batch-strk-usdc-1", &records, historical.iter())
+            .expect("historically spent notes are filtered as no-fill during settlement");
     }
 
     #[test]

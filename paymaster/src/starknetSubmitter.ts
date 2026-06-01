@@ -24,7 +24,7 @@ import type {
 } from "./types.js";
 
 type AccountInstance = {
-  getNonce(): Promise<string>;
+  getNonce(blockIdentifier?: string): Promise<string>;
   getCairoVersion(): Promise<string>;
   deploy(payload: {
     classHash: string;
@@ -85,6 +85,7 @@ const defaultRuntime: StarknetRuntime = {
 
 const PAYMASTER_SUBMISSION_RETRY_ATTEMPTS = 3;
 const PAYMASTER_NONCE_RETRY_DELAY_MS = 1_500;
+const PAYMASTER_DEPLOY_RETRY_ATTEMPTS = 5;
 
 export type SubmitterDeps = {
   runtime?: StarknetRuntime;
@@ -112,9 +113,7 @@ export async function ensurePrivacyProofSignerContract(
     "contract_address"
   );
 
-  const existingClassHash = await provider
-    .getClassHashAt(contractAddress, "latest")
-    .catch(() => null);
+  const existingClassHash = await deployedClassHash(provider, contractAddress);
   if (existingClassHash) {
     return { contract_address: contractAddress, deployed: false };
   }
@@ -125,7 +124,7 @@ export async function ensurePrivacyProofSignerContract(
     signer: config.privateKey,
     transactionVersion: runtime.ETransactionVersion3.V3
   });
-  const result = await account.deploy({
+  const result = await deployWithNonceRetry(account, provider, contractAddress, {
     classHash,
     salt,
     unique: false,
@@ -137,6 +136,53 @@ export async function ensurePrivacyProofSignerContract(
     deployed: true,
     ...(transactionHash ? { transaction_hash: transactionHash } : {})
   };
+}
+
+async function deployWithNonceRetry(
+  account: AccountInstance,
+  provider: RpcProviderInstance,
+  contractAddress: string,
+  payload: {
+    classHash: string;
+    salt: string;
+    unique: boolean;
+    constructorCalldata: string[];
+  }
+): ReturnType<AccountInstance["deploy"]> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < PAYMASTER_DEPLOY_RETRY_ATTEMPTS; attempt += 1) {
+    const existingClassHash = await deployedClassHash(provider, contractAddress);
+    if (existingClassHash) {
+      return { contract_address: contractAddress };
+    }
+    try {
+      const nonce = await account.getNonce("pre_confirmed")
+        .catch(() => account.getNonce());
+      return await account.deploy(payload, { nonce });
+    } catch (error) {
+      lastError = error;
+      if (
+        attempt < PAYMASTER_DEPLOY_RETRY_ATTEMPTS - 1 &&
+        isRetryableNonceError(error)
+      ) {
+        await sleep(PAYMASTER_NONCE_RETRY_DELAY_MS * (attempt + 1));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function deployedClassHash(
+  provider: RpcProviderInstance,
+  contractAddress: string
+): Promise<string | null> {
+  return (
+    await provider.getClassHashAt(contractAddress, "pre_confirmed").catch(() => null)
+  ) ?? (
+    await provider.getClassHashAt(contractAddress, "latest").catch(() => null)
+  );
 }
 
 export async function relayPrivacyProofSignerCall(
@@ -327,7 +373,7 @@ async function submitPaymasterCallsOnce(
 
 function isRetryableNonceError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /NonceTooOld|Invalid transaction nonce|nonce.*too old|tx_nonce.*account_nonce/i.test(message);
+  return /NonceTooOld|DuplicateNonce|Invalid transaction nonce|nonce.*too old|tx_nonce.*account_nonce/i.test(message);
 }
 
 function sleep(ms: number): Promise<void> {

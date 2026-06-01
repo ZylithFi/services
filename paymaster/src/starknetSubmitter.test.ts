@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { StarknetRuntime } from "./starknetSubmitter.js";
-import { submitProofBearingOutsideExecution } from "./starknetSubmitter.js";
-import type { ExecuteOutsideRequest } from "./types.js";
+import {
+  ensurePrivacyProofSignerContract,
+  submitProofBearingOutsideExecution
+} from "./starknetSubmitter.js";
+import type { EnsurePrivacySignerRequest, ExecuteOutsideRequest } from "./types.js";
 
 describe("submitProofBearingOutsideExecution", () => {
   it("submits a proof-bearing invoke directly through JSON-RPC", async () => {
@@ -314,6 +317,48 @@ describe("submitProofBearingOutsideExecution", () => {
     expect(result.transaction_hash).toBe("0xretry");
     expect(addInvokeNonces).toEqual(["0x7", "0x8"]);
   });
+
+  it("retries embedded signer deployment when the paymaster nonce is already pending", async () => {
+    const deployNonces: unknown[] = [];
+    let deployAttempts = 0;
+    let nonceIndex = 0;
+    const runtime = {
+      ...fakeRuntime,
+      Account: class extends fakeRuntime.Account {
+        async getNonce() {
+          const nonce = nonceIndex === 0 ? "0x7" : "0x8";
+          nonceIndex += 1;
+          return nonce;
+        }
+
+        async deploy(_payload: unknown, details?: Record<string, unknown>) {
+          deployAttempts += 1;
+          deployNonces.push(details?.nonce);
+          if (deployAttempts === 1) {
+            throw new Error("MempoolError(DuplicateNonce { nonce: Nonce(0x7) })");
+          }
+          return { transaction_hash: "0xdeploy" };
+        }
+      }
+    } satisfies StarknetRuntime;
+
+    const result = await ensurePrivacyProofSignerContract(
+      ensureRequest,
+      {
+        rpcUrl: "https://rpc.example",
+        accountAddress: "0xabc",
+        privateKey: "0xkey"
+      },
+      { runtime }
+    );
+
+    expect(result).toEqual({
+      contract_address: "0x1234",
+      deployed: true,
+      transaction_hash: "0xdeploy"
+    });
+    expect(deployNonces).toEqual(["0x7", "0x8"]);
+  });
 });
 
 const request: ExecuteOutsideRequest = {
@@ -341,9 +386,19 @@ const request: ExecuteOutsideRequest = {
   proof_facts: ["0x1"]
 };
 
+const ensureRequest: EnsurePrivacySignerRequest = {
+  signer_public_key: "0x111",
+  salt: "0x222",
+  class_hash: "0x333"
+};
+
 const fakeRuntime = {
   RpcProvider: class {
     constructor(_options: { nodeUrl: string }) {}
+
+    async getClassHashAt() {
+      return null;
+    }
   },
   Account: class {
     constructor(_options: unknown) {}
@@ -374,6 +429,10 @@ const fakeRuntime = {
         feeDataAvailabilityMode: "L1"
       };
     }
+
+    async deploy(_payload: unknown, _details?: Record<string, unknown>) {
+      return { transaction_hash: "0xdeploy" };
+    }
   },
   CallData: {
     toHex: (values: unknown[]) => values.map(String)
@@ -383,6 +442,9 @@ const fakeRuntime = {
   },
   ETransactionVersion3: {
     V3: "0x3"
+  },
+  hash: {
+    calculateContractAddressFromHash: () => "0x1234"
   },
   outsideExecution: {
     buildExecuteFromOutsideCall: () => [

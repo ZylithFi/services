@@ -848,7 +848,9 @@ pub fn sign_renewal_relay_package_authorization(
     )?)?;
     let k = rfc6979_generate_k(&message, &private_key, None);
     let signature = sign(&private_key, &message, &k).map_err(|err| {
-        ProtocolError::Crypto(format!("renewal relay package authorization signing failed: {err}"))
+        ProtocolError::Crypto(format!(
+            "renewal relay package authorization signing failed: {err}"
+        ))
     })?;
     Ok(crate::SpendAuthorization {
         signature_r: felt_hex(&signature.r),
@@ -869,7 +871,9 @@ pub fn verify_renewal_relay_package_authorization(
     let signature_r = felt_from_hex_str(&normalize_felt_hex(&authorization.signature_r)?)?;
     let signature_s = felt_from_hex_str(&normalize_felt_hex(&authorization.signature_s)?)?;
     verify(&public_key, &message, &signature_r, &signature_s).map_err(|err| {
-        ProtocolError::Crypto(format!("renewal relay package authorization verify failed: {err}"))
+        ProtocolError::Crypto(format!(
+            "renewal relay package authorization verify failed: {err}"
+        ))
     })
 }
 
@@ -6437,13 +6441,11 @@ mod tests {
         settlement_nullifier_root_after_history, settlement_output_withdrawal_message_hash,
         settlement_transcript_commitment, sign_note_consolidation_authorization,
         sign_order_authorization, sign_renewal_relay_package_authorization,
-        validate_maker_attribution_receipt,
-        validate_order_ingress_receipt_for_manifest,
+        validate_maker_attribution_receipt, validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
-        verify_renewal_relay_package_authorization,
-        withdrawal_message_hash,
+        verify_renewal_relay_package_authorization, withdrawal_message_hash,
     };
     use crate::types::{
         HiddenMakerCurve, MakerAttributionPlaintext, MakerBandAttribution,

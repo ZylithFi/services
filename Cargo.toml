@@ -1,8 +1,9 @@
 [workspace]
-members = ["core", "coordinator", "indexer", "prover"]
+members = ["core", "coordinator", "indexer", "prover", "renewal_relayer"]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
+license = "MIT"
 version = "0.1.0"
 authors = ["Tanya"]

@@ -41,14 +41,9 @@ const DEFAULT_ARTIFACT_ARCHIVE_PATH: &str = "indexer/published_batch_artifacts.d
 const DEFAULT_BATCH_WINDOW_MS: u64 = 90_000;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS: u64 = 3;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS: u64 = 8;
-const DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS: u64 = DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS;
 const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
-const ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_EPOCHS";
-const PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_EPOCHS";
 const ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MIN_EPOCHS";
 const ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MAX_EPOCHS";
-const PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS";
-const PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS";
 const INDEXER_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_INDEXER_ALLOWED_ORIGINS";
 
 #[derive(Clone)]
@@ -104,32 +99,14 @@ async fn main() -> Result<(), String> {
         .ok()
         .map(PathBuf::from)
         .or_else(|| Some(PathBuf::from(DEFAULT_ARTIFACT_ARCHIVE_PATH)));
-    let legacy_delay_override =
-        env_present(ARTIFACT_DELAY_EPOCHS_ENV) || env_present(PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV);
-    let fixed_public_artifact_delay_epochs = load_u64_alias_env(
-        ARTIFACT_DELAY_EPOCHS_ENV,
-        PUBLIC_ARTIFACT_DELAY_EPOCHS_ENV,
-        DEFAULT_PUBLIC_ARTIFACT_DELAY_EPOCHS,
-        0,
-    );
-    let public_artifact_delay_min_epochs = load_u64_alias_env(
+    let public_artifact_delay_min_epochs = load_u64_env(
         ARTIFACT_DELAY_MIN_EPOCHS_ENV,
-        PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS_ENV,
-        if legacy_delay_override {
-            fixed_public_artifact_delay_epochs
-        } else {
-            DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS
-        },
+        DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS,
         0,
     );
-    let public_artifact_delay_max_epochs = load_u64_alias_env(
+    let public_artifact_delay_max_epochs = load_u64_env(
         ARTIFACT_DELAY_MAX_EPOCHS_ENV,
-        PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS_ENV,
-        if legacy_delay_override {
-            public_artifact_delay_min_epochs
-        } else {
-            DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS
-        },
+        DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS,
         public_artifact_delay_min_epochs,
     )
     .max(public_artifact_delay_min_epochs);
@@ -390,29 +367,6 @@ fn load_u64_env(name: &str, default_value: u64, minimum_value: u64) -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value >= minimum_value)
         .unwrap_or(default_value)
-}
-
-fn load_u64_alias_env(
-    primary: &str,
-    fallback: &str,
-    default_value: u64,
-    minimum_value: u64,
-) -> u64 {
-    if env::var(primary)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .is_some()
-    {
-        return load_u64_env(primary, default_value, minimum_value);
-    }
-    load_u64_env(fallback, default_value, minimum_value)
-}
-
-fn env_present(name: &str) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
 }
 
 fn now_unix_ms() -> u64 {
