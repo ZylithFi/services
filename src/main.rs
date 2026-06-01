@@ -236,6 +236,8 @@ struct OfflineRenewalSlot {
     epoch_id: u64,
     parent_child_index: u64,
     order_commitment: String,
+    #[serde(default)]
+    funding_note_commitments: Vec<String>,
     ingress_request: Value,
 }
 
@@ -260,6 +262,8 @@ enum RelaySlotStatus {
     NotDue,
     BatchNotOpen,
     SafetyBuffer,
+    AwaitingSettlement,
+    AwaitingWalletRefresh,
     Missed,
     Failed,
 }
@@ -292,6 +296,15 @@ struct PublicBatchSummary {
     epoch_id: u64,
     close_time_unix_ms: u64,
     status: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PublicProofJobStatus {
+    state: String,
+    #[serde(default)]
+    matched_order_count: Option<u64>,
+    #[serde(default)]
+    failure: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -424,6 +437,7 @@ async fn metrics(State(state): State<AppState>) -> String {
     let store = state.store.read().await;
     let mut total_slots = 0usize;
     let mut submitted = 0usize;
+    let mut missed = 0usize;
     let mut failed = 0usize;
     for package in store.packages.values() {
         total_slots += package.package.slot_count;
@@ -436,6 +450,11 @@ async fn metrics(State(state): State<AppState>) -> String {
                     RelaySlotStatus::Submitted | RelaySlotStatus::AlreadySubmitted
                 )
             })
+            .count();
+        missed += package
+            .results
+            .values()
+            .filter(|entry| matches!(entry.result.status, RelaySlotStatus::Missed))
             .count();
         failed += package
             .results
@@ -453,12 +472,16 @@ async fn metrics(State(state): State<AppState>) -> String {
          # HELP zylith_renewal_relay_submitted_slots Submitted renewal slots.\n\
          # TYPE zylith_renewal_relay_submitted_slots gauge\n\
          zylith_renewal_relay_submitted_slots {}\n\
+         # HELP zylith_renewal_relay_missed_slots Renewal slots whose authorized epoch window passed before submission.\n\
+         # TYPE zylith_renewal_relay_missed_slots gauge\n\
+         zylith_renewal_relay_missed_slots {}\n\
          # HELP zylith_renewal_relay_failed_slots Failed renewal slots.\n\
          # TYPE zylith_renewal_relay_failed_slots gauge\n\
          zylith_renewal_relay_failed_slots {}\n",
         store.packages.len(),
         total_slots,
         submitted,
+        missed,
         failed,
     )
 }
@@ -485,16 +508,26 @@ async fn register_package(
     let status = {
         let mut store = state.store.write().await;
         prune_store_locked(&mut store, &state.config, now);
-        if let Some(existing) = store.packages.get(&package_id)
+        if let Some(existing) = store.packages.get_mut(&package_id)
             && existing.package.package_commitment != package.package_commitment
         {
-            let error = RelayApiError {
-                status: StatusCode::CONFLICT,
-                detail: "Renewal package ID is already registered with a different commitment"
-                    .into(),
-            };
-            log_package_api_error("conflict", &package, &error);
-            return Err(error);
+            if existing.package.parent_cancel_authority != package.parent_cancel_authority {
+                let error = RelayApiError {
+                    status: StatusCode::CONFLICT,
+                    detail: "Renewal package ID is already registered for a different parent"
+                        .into(),
+                };
+                log_package_api_error("conflict", &package, &error);
+                return Err(error);
+            }
+            let retained_slot_ids = package
+                .slots
+                .iter()
+                .map(|slot| slot.slot_id.clone())
+                .collect::<BTreeSet<_>>();
+            existing
+                .results
+                .retain(|slot_id, _| retained_slot_ids.contains(slot_id));
         }
         let entry = store
             .packages
@@ -676,7 +709,9 @@ fn spawn_worker(state: AppState) {
             for result in results {
                 if matches!(
                     result.status,
-                    RelaySlotStatus::Submitted | RelaySlotStatus::Failed
+                    RelaySlotStatus::Submitted
+                        | RelaySlotStatus::Failed
+                        | RelaySlotStatus::AwaitingWalletRefresh
                 ) {
                     println!(
                         "renewal relay slot {} epoch {} {:?}",
@@ -694,13 +729,20 @@ async fn process_due_slots_once(state: &AppState) -> Vec<OfflineRenewalRelayResu
     if matches!(persistent_lease, PersistentTickLease::Busy) {
         return Vec::new();
     }
+    let sqlite_store = is_sqlite_store(&state.config.store_path);
     let snapshots = {
         let mut store = state.store.write().await;
         prune_store_locked(&mut store, &state.config, now_unix_ms());
         store
             .packages
             .values()
-            .map(|stored| stored.package.clone())
+            .map(|stored| {
+                let mut package = stored.package.clone();
+                if sqlite_store {
+                    package.slots.clear();
+                }
+                package
+            })
             .collect::<Vec<_>>()
     };
     let mut emitted = Vec::new();
@@ -760,10 +802,11 @@ async fn due_slots_for_package_tick(
         {
             Ok(slots) => return slots,
             Err(error) => eprintln!(
-                "renewal relay due-slot index unavailable for package {}: {error}; falling back to in-memory scan",
+                "renewal relay due-slot index unavailable for package {}: {error}; skipping tick",
                 package.package_id
             ),
         }
+        return Vec::new();
     }
     package
         .slots
@@ -787,7 +830,10 @@ async fn should_attempt_slot(
     };
     if matches!(
         result.result.status,
-        RelaySlotStatus::Submitted | RelaySlotStatus::AlreadySubmitted | RelaySlotStatus::Missed
+        RelaySlotStatus::Submitted
+            | RelaySlotStatus::AlreadySubmitted
+            | RelaySlotStatus::AwaitingWalletRefresh
+            | RelaySlotStatus::Missed
     ) {
         return false;
     }
@@ -836,6 +882,9 @@ async fn process_slot_against_batch(
             Some(format!("scheduled at {scheduled_at}")),
         );
     }
+    if let Some(guarded) = prior_slot_reuse_guard(state, package, slot).await {
+        return guarded;
+    }
     match submit_slot(state, package, slot).await {
         Ok(accepted) => {
             let mut result = slot_result(slot, RelaySlotStatus::Submitted, None);
@@ -844,6 +893,141 @@ async fn process_slot_against_batch(
         }
         Err(error) => slot_result(slot, RelaySlotStatus::Failed, Some(error)),
     }
+}
+
+async fn prior_slot_reuse_guard(
+    state: &AppState,
+    package: &OfflineRenewalPackage,
+    slot: &OfflineRenewalSlot,
+) -> Option<OfflineRenewalRelayResult> {
+    let prior_submitted = if is_sqlite_store(&state.config.store_path) {
+        match load_sqlite_prior_submitted_reused_funding_slots(
+            &state.config,
+            &package.package_id,
+            slot,
+        )
+        .await
+        {
+            Ok(slots) => slots,
+            Err(error) => {
+                return Some(slot_result(
+                    slot,
+                    RelaySlotStatus::AwaitingSettlement,
+                    Some(format!(
+                        "Prior child index unavailable; retrying later: {error}"
+                    )),
+                ));
+            }
+        }
+    } else {
+        prior_submitted_reused_funding_slots(state, package, slot).await
+    };
+    if prior_submitted.is_empty() {
+        return None;
+    }
+    for prior in prior_submitted {
+        match fetch_proof_job_status(state, package, &prior.batch_id).await {
+            Ok(Some(status)) => {
+                if proof_job_failed(&status) {
+                    continue;
+                }
+                if proof_job_confirmed(&status) {
+                    if status.matched_order_count.unwrap_or_default() == 0 {
+                        continue;
+                    }
+                    return Some(slot_result(
+                        slot,
+                        RelaySlotStatus::AwaitingWalletRefresh,
+                        Some(format!(
+                            "Prior child batch {} settled with matched orders; refresh the package from the wallet before reusing maker capital",
+                            prior.batch_id
+                        )),
+                    ));
+                }
+                continue;
+            }
+            Ok(None) | Err(_) => continue,
+        }
+    }
+    None
+}
+
+async fn prior_submitted_reused_funding_slots(
+    state: &AppState,
+    package: &OfflineRenewalPackage,
+    slot: &OfflineRenewalSlot,
+) -> Vec<OfflineRenewalSlot> {
+    let submitted_slot_ids = {
+        let store = state.store.read().await;
+        let Some(stored) = store.packages.get(&package.package_id) else {
+            return Vec::new();
+        };
+        stored
+            .results
+            .iter()
+            .filter_map(|(slot_id, result)| {
+                if matches!(
+                    result.result.status,
+                    RelaySlotStatus::Submitted | RelaySlotStatus::AlreadySubmitted
+                ) {
+                    Some(slot_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    package
+        .slots
+        .iter()
+        .filter(|candidate| {
+            candidate.parent_child_index < slot.parent_child_index
+                && submitted_slot_ids.contains(&candidate.slot_id)
+                && slots_reuse_funding_notes(candidate, slot)
+        })
+        .cloned()
+        .collect()
+}
+
+fn slots_reuse_funding_notes(candidate: &OfflineRenewalSlot, slot: &OfflineRenewalSlot) -> bool {
+    if candidate.funding_note_commitments.is_empty() || slot.funding_note_commitments.is_empty() {
+        return true;
+    }
+    let current = slot
+        .funding_note_commitments
+        .iter()
+        .collect::<BTreeSet<_>>();
+    candidate
+        .funding_note_commitments
+        .iter()
+        .any(|commitment| current.contains(commitment))
+}
+
+async fn fetch_proof_job_status(
+    state: &AppState,
+    package: &OfflineRenewalPackage,
+    batch_id: &str,
+) -> Result<Option<PublicProofJobStatus>, String> {
+    let prover_url = package_prover_url(&state.config, package)?;
+    match get_json::<PublicProofJobStatus>(
+        &state.http,
+        &prover_url,
+        &format!("/api/public/proof-jobs/{batch_id}"),
+    )
+    .await
+    {
+        Ok(status) => Ok(Some(status)),
+        Err(error) if error.starts_with("HTTP 404") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn proof_job_confirmed(status: &PublicProofJobStatus) -> bool {
+    status.state.eq_ignore_ascii_case("confirmed-onchain")
+}
+
+fn proof_job_failed(status: &PublicProofJobStatus) -> bool {
+    status.failure.is_some() || status.state.to_ascii_lowercase().contains("failed")
 }
 
 async fn submit_slot(
@@ -910,7 +1094,10 @@ async fn record_slot_result(
         .get(&result.slot_id)
         .map(|entry| entry.attempts)
         .unwrap_or_default();
-    let attempts = if matches!(result.status, RelaySlotStatus::NotDue) {
+    let attempts = if matches!(
+        result.status,
+        RelaySlotStatus::NotDue | RelaySlotStatus::AwaitingSettlement
+    ) {
         previous_attempts
     } else {
         previous_attempts.saturating_add(1)
@@ -1554,6 +1741,12 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
                 )
                 .map_err(|error| error.to_string())?;
         }
+        transaction
+            .execute(
+                "DELETE FROM relay_slot_results WHERE package_id = ?1",
+                params![package_id.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
         for (slot_id, result) in stored.results {
             let result_json =
                 serde_json::to_string(&result.result).map_err(|error| error.to_string())?;
@@ -1626,7 +1819,7 @@ async fn load_sqlite_due_slots_for_package(
                    AND ( \
                         r.slot_id IS NULL \
                         OR ( \
-                            r.status NOT IN ('submitted', 'already_submitted', 'missed') \
+                            r.status NOT IN ('submitted', 'already_submitted', 'awaiting_wallet_refresh', 'missed') \
                             AND r.attempts < ?3 \
                             AND r.last_attempt_unix_ms <= ?4 \
                         ) \
@@ -1650,6 +1843,49 @@ async fn load_sqlite_due_slots_for_package(
                 serde_json::from_str::<OfflineRenewalSlot>(&slot_json)
                     .map_err(|error| format!("invalid indexed renewal slot JSON: {error}"))?,
             );
+        }
+        Ok(slots)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn load_sqlite_prior_submitted_reused_funding_slots(
+    config: &RelayConfig,
+    package_id: &str,
+    slot: &OfflineRenewalSlot,
+) -> Result<Vec<OfflineRenewalSlot>, String> {
+    let path = config.store_path.clone();
+    let package_id = package_id.to_string();
+    let slot = slot.clone();
+    tokio::task::spawn_blocking(move || {
+        let connection = open_sqlite_store(&path)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT d.slot_json \
+                 FROM relay_due_slots d \
+                 INNER JOIN relay_slot_results r \
+                    ON r.package_id = d.package_id AND r.slot_id = d.slot_id \
+                 WHERE d.package_id = ?1 \
+                   AND d.epoch_id <= ?2 \
+                   AND r.status IN ('submitted', 'already_submitted') \
+                 ORDER BY d.epoch_id DESC, d.slot_id DESC \
+                 LIMIT 1024",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement
+            .query(params![package_id.as_str(), slot.epoch_id as i64])
+            .map_err(|error| error.to_string())?;
+        let mut slots = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let slot_json: String = row.get(0).map_err(|error| error.to_string())?;
+            let candidate = serde_json::from_str::<OfflineRenewalSlot>(&slot_json)
+                .map_err(|error| format!("invalid indexed renewal slot JSON: {error}"))?;
+            if candidate.parent_child_index < slot.parent_child_index
+                && slots_reuse_funding_notes(&candidate, &slot)
+            {
+                slots.push(candidate);
+            }
         }
         Ok(slots)
     })
@@ -1708,6 +1944,8 @@ fn slot_status_label(status: &RelaySlotStatus) -> &'static str {
         RelaySlotStatus::NotDue => "not_due",
         RelaySlotStatus::BatchNotOpen => "batch_not_open",
         RelaySlotStatus::SafetyBuffer => "safety_buffer",
+        RelaySlotStatus::AwaitingSettlement => "awaiting_settlement",
+        RelaySlotStatus::AwaitingWalletRefresh => "awaiting_wallet_refresh",
         RelaySlotStatus::Missed => "missed",
         RelaySlotStatus::Failed => "failed",
     }
@@ -2055,8 +2293,74 @@ mod tests {
                 epoch_id: 42,
                 parent_child_index: 1,
                 order_commitment: "0x123".into(),
+                funding_note_commitments: vec!["0xfunding".into()],
                 ingress_request: json!({ "order_submission": { "opaque": true } }),
             }],
+        }
+    }
+
+    fn two_slot_test_package(
+        coordinator_url: String,
+        prover_url: String,
+        reuse_funding_notes: bool,
+    ) -> OfflineRenewalPackage {
+        let mut package = test_package(coordinator_url, prover_url);
+        package.end_epoch = 43;
+        package.slot_count = 2;
+        let mut second = package.slots[0].clone();
+        second.slot_id = "pkg-1:2".into();
+        second.batch_id = "STRK-USDC-43".into();
+        second.epoch_id = 43;
+        second.parent_child_index = 2;
+        second.order_commitment = "0x456".into();
+        if !reuse_funding_notes {
+            second.funding_note_commitments = vec!["0xotherfunding".into()];
+        }
+        package.slots.push(second);
+        package
+    }
+
+    fn long_window_test_package(
+        coordinator_url: String,
+        prover_url: String,
+        start_epoch: u64,
+        slot_count: usize,
+    ) -> OfflineRenewalPackage {
+        let slots = (0..slot_count)
+            .map(|index| {
+                let epoch = start_epoch + index as u64;
+                OfflineRenewalSlot {
+                    slot_id: format!("pkg-long:{}", index + 1),
+                    pair: "STRK/USDC".into(),
+                    batch_id: format!("STRK-USDC-{epoch}"),
+                    epoch_id: epoch,
+                    parent_child_index: index as u64 + 1,
+                    order_commitment: format!("0x{:x}", 0x1000u128 + index as u128),
+                    funding_note_commitments: vec![format!("0xfunding{:x}", index + 1)],
+                    ingress_request: json!({ "order_submission": { "opaque": true } }),
+                }
+            })
+            .collect::<Vec<_>>();
+        OfflineRenewalPackage {
+            version: 1,
+            package_id: "pkg-long".into(),
+            package_commitment: "0xabc90d".into(),
+            created_at_unix_ms: 1,
+            pair: "STRK/USDC".into(),
+            start_epoch,
+            end_epoch: start_epoch + slot_count as u64 - 1,
+            slot_count,
+            relay_mode: Some(RelayMode::ZylithRelay),
+            parent_cancel_authority: None,
+            relay_authorization: None,
+            ingress_key_registry_fingerprint: None,
+            relay_policy: RelayPolicy {
+                prover_url,
+                coordinator_url,
+                submission_safety_buffer_ms: 1_000,
+                max_submission_delay_ms: 0,
+            },
+            slots,
         }
     }
 
@@ -2231,6 +2535,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_package_replaces_refreshed_window_for_same_parent() {
+        let path = temp_sqlite_store_path("refresh-register");
+        let state = test_state(path.clone());
+        let mut package = test_package("http://coordinator".into(), "http://prover".into());
+        package.parent_cancel_authority = Some("0xparent".into());
+        let router = app(state.clone());
+
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/packages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&package).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        package.package_commitment = "0xdef".into();
+        package.start_epoch = 43;
+        package.end_epoch = 43;
+        package.slots[0].slot_id = "pkg-1:2".into();
+        package.slots[0].batch_id = "STRK-USDC-43".into();
+        package.slots[0].epoch_id = 43;
+        package.slots[0].parent_child_index = 2;
+        package.slots[0].order_commitment = "0x456".into();
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/packages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&package).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        let stored = loaded.packages.get("pkg-1").unwrap();
+        assert_eq!(stored.package.package_commitment, "0xdef");
+        assert_eq!(stored.package.slots[0].slot_id, "pkg-1:2");
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
     async fn strict_delete_removes_signed_package_without_bearer_token() {
         let path = temp_sqlite_store_path("strict-signed-delete");
         let mut state = test_state(path.clone());
@@ -2320,6 +2679,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_due_slot_submits_reused_funding_while_prior_batch_is_pending() {
+        let (coordinator_url, coordinator_shutdown) =
+            spawn_mock_coordinator_for_batch("STRK-USDC-43", 43).await;
+        let mut statuses = BTreeMap::new();
+        statuses.insert(
+            "STRK-USDC-42".into(),
+            json!({ "state": "proving", "matched_order_count": null }),
+        );
+        let (prover_url, prover_shutdown) = spawn_mock_prover_with_statuses(statuses).await;
+        let path = temp_store_path("reuse-wait");
+        let state = test_state(path.clone());
+        let package = two_slot_test_package(coordinator_url, prover_url, true);
+        {
+            let mut store = state.store.write().await;
+            let now = now_unix_ms();
+            let first_result = slot_result(&package.slots[0], RelaySlotStatus::Submitted, None);
+            store.packages.insert(
+                package.package_id.clone(),
+                StoredPackage {
+                    package: package.clone(),
+                    registered_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                    results: BTreeMap::from([(
+                        package.slots[0].slot_id.clone(),
+                        StoredSlotResult {
+                            result: first_result,
+                            attempts: 1,
+                            last_attempt_unix_ms: now,
+                        },
+                    )]),
+                },
+            );
+        }
+        let results = process_due_slots_once(&state).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RelaySlotStatus::Submitted);
+        assert_eq!(results[0].slot_id, "pkg-1:2");
+        let _ = coordinator_shutdown.send(());
+        let _ = prover_shutdown.send(());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn process_due_slot_pauses_after_matched_reused_funding_settles() {
+        let (coordinator_url, coordinator_shutdown) =
+            spawn_mock_coordinator_for_batch("STRK-USDC-43", 43).await;
+        let mut statuses = BTreeMap::new();
+        statuses.insert(
+            "STRK-USDC-42".into(),
+            json!({ "state": "confirmed-onchain", "matched_order_count": 2 }),
+        );
+        let (prover_url, prover_shutdown) = spawn_mock_prover_with_statuses(statuses).await;
+        let path = temp_store_path("reuse-refresh");
+        let state = test_state(path.clone());
+        let package = two_slot_test_package(coordinator_url, prover_url, true);
+        {
+            let mut store = state.store.write().await;
+            let now = now_unix_ms();
+            let first_result = slot_result(&package.slots[0], RelaySlotStatus::Submitted, None);
+            store.packages.insert(
+                package.package_id.clone(),
+                StoredPackage {
+                    package: package.clone(),
+                    registered_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                    results: BTreeMap::from([(
+                        package.slots[0].slot_id.clone(),
+                        StoredSlotResult {
+                            result: first_result,
+                            attempts: 1,
+                            last_attempt_unix_ms: now,
+                        },
+                    )]),
+                },
+            );
+        }
+        let results = process_due_slots_once(&state).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RelaySlotStatus::AwaitingWalletRefresh);
+        let _ = coordinator_shutdown.send(());
+        let _ = prover_shutdown.send(());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn process_due_slot_allows_distinct_funding_notes() {
+        let (coordinator_url, coordinator_shutdown) =
+            spawn_mock_coordinator_for_batch("STRK-USDC-43", 43).await;
+        let (prover_url, prover_shutdown) = spawn_mock_prover().await;
+        let path = temp_store_path("distinct-funding");
+        let state = test_state(path.clone());
+        let package = two_slot_test_package(coordinator_url, prover_url, false);
+        {
+            let mut store = state.store.write().await;
+            let now = now_unix_ms();
+            let first_result = slot_result(&package.slots[0], RelaySlotStatus::Submitted, None);
+            store.packages.insert(
+                package.package_id.clone(),
+                StoredPackage {
+                    package: package.clone(),
+                    registered_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                    results: BTreeMap::from([(
+                        package.slots[0].slot_id.clone(),
+                        StoredSlotResult {
+                            result: first_result,
+                            attempts: 1,
+                            last_attempt_unix_ms: now,
+                        },
+                    )]),
+                },
+            );
+        }
+        let results = process_due_slots_once(&state).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RelaySlotStatus::Submitted);
+        let _ = coordinator_shutdown.send(());
+        let _ = prover_shutdown.send(());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn sqlite_long_window_tick_uses_due_slot_index_after_restart() {
+        let start_epoch = 10_000;
+        let ninety_day_slots_at_90s_epochs = 90 * 24 * 60 * 60 / 90;
+        let (coordinator_url, coordinator_shutdown) =
+            spawn_mock_coordinator_for_batch("STRK-USDC-10000", start_epoch).await;
+        let (prover_url, prover_shutdown) = spawn_mock_prover().await;
+        let path = temp_sqlite_store_path("long-window");
+        let package = long_window_test_package(
+            coordinator_url,
+            prover_url,
+            start_epoch,
+            ninety_day_slots_at_90s_epochs,
+        );
+        let mut store = RelayStore::default();
+        let now = now_unix_ms();
+        store.packages.insert(
+            package.package_id.clone(),
+            StoredPackage {
+                package,
+                registered_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                results: BTreeMap::new(),
+            },
+        );
+        persist_sqlite_store(&path, store).await.unwrap();
+
+        let state = test_state(path.clone());
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        assert_eq!(
+            loaded.packages.get("pkg-long").unwrap().package.slot_count,
+            86_400
+        );
+        {
+            let mut live_store = state.store.write().await;
+            *live_store = loaded;
+            live_store
+                .packages
+                .get_mut("pkg-long")
+                .unwrap()
+                .package
+                .slots
+                .clear();
+        }
+
+        let results = process_due_slots_once(&state).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RelaySlotStatus::Submitted);
+        assert_eq!(results[0].slot_id, "pkg-long:1");
+        assert_eq!(results[0].parent_child_index, 1);
+
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        let stored = loaded.packages.get("pkg-long").unwrap();
+        assert_eq!(stored.results.len(), 1);
+        assert_eq!(
+            stored.results.get("pkg-long:1").unwrap().result.status,
+            RelaySlotStatus::Submitted
+        );
+        let due_slots =
+            load_sqlite_due_slots_for_package(&state.config, "pkg-long", start_epoch + 10)
+                .await
+                .unwrap();
+        assert_eq!(due_slots.len(), 10);
+
+        let _ = coordinator_shutdown.send(());
+        let _ = prover_shutdown.send(());
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
     async fn sqlite_store_persists_packages_results_and_tick_lease() {
         let path = temp_sqlite_store_path("sqlite");
         let package = test_package("http://coordinator".into(), "http://prover".into());
@@ -2382,14 +2932,21 @@ mod tests {
     }
 
     async fn spawn_mock_coordinator() -> (String, oneshot::Sender<()>) {
+        spawn_mock_coordinator_for_batch("STRK-USDC-42", 42).await
+    }
+
+    async fn spawn_mock_coordinator_for_batch(
+        batch_id: &'static str,
+        epoch_id: u64,
+    ) -> (String, oneshot::Sender<()>) {
         let app = Router::new()
             .route(
                 "/api/pairs/STRK/USDC/batches/current",
-                get(|| async {
+                get(move || async move {
                     Json(json!({
-                        "batch_id": "STRK-USDC-42",
+                        "batch_id": batch_id,
                         "pair_id": "STRK/USDC",
-                        "epoch_id": 42,
+                        "epoch_id": epoch_id,
                         "close_time_unix_ms": now_unix_ms() + 60_000,
                         "status": "Open",
                         "order_count_bucket": "0"
@@ -2398,9 +2955,9 @@ mod tests {
             )
             .route(
                 "/api/orders",
-                post(|Json(_body): Json<Value>| async {
+                post(move |Json(_body): Json<Value>| async move {
                     Json(json!({
-                        "batch_id": "STRK-USDC-42",
+                        "batch_id": batch_id,
                         "order_commitment": "0x123",
                         "accepted_at_unix_ms": now_unix_ms()
                     }))
@@ -2410,15 +2967,38 @@ mod tests {
     }
 
     async fn spawn_mock_prover() -> (String, oneshot::Sender<()>) {
-        let app = Router::new().route(
-            "/api/private/orders",
-            post(|Json(_body): Json<Value>| async {
-                Json(json!({
-                    "receipt": { "payload_commitment": "0xabc" },
-                    "coordinator_submission": { "order_bundle": { "opaque": true } }
-                }))
-            }),
-        );
+        spawn_mock_prover_with_statuses(BTreeMap::new()).await
+    }
+
+    async fn spawn_mock_prover_with_statuses(
+        statuses: BTreeMap<String, Value>,
+    ) -> (String, oneshot::Sender<()>) {
+        let statuses = Arc::new(statuses);
+        let app = Router::new()
+            .route(
+                "/api/private/orders",
+                post(|Json(_body): Json<Value>| async {
+                    Json(json!({
+                        "receipt": { "payload_commitment": "0xabc" },
+                        "coordinator_submission": { "order_bundle": { "opaque": true } }
+                    }))
+                }),
+            )
+            .route(
+                "/api/public/proof-jobs/{batch_id}",
+                get({
+                    let statuses = statuses.clone();
+                    move |Path(batch_id): Path<String>| {
+                        let statuses = statuses.clone();
+                        async move {
+                            statuses
+                                .get(&batch_id)
+                                .map(|status| Json(status.clone()).into_response())
+                                .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+                        }
+                    }
+                }),
+            );
         spawn_mock(app).await
     }
 
