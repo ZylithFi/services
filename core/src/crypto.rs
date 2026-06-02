@@ -13,24 +13,22 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use starknet_crypto::{
-    Felt, get_public_key, poseidon_hash, poseidon_permute_comp, rfc6979_generate_k, sign, verify,
-};
+use starknet_crypto::{Felt, get_public_key, poseidon_hash, rfc6979_generate_k, sign, verify};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput, DecryptedOrderShare,
-    DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
+    AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchSummary, ConsumedInput,
+    DecryptedOrderShare, DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
     EncryptedMakerAttributionArtifact, EncryptedRecoveryPayload, FundingRailKind,
     MakerAttributionPlaintext, MakerAttributionReceipt, MatchedOrderWitness, Note, NoteCommitment,
     NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan, NoteConsolidationWitness,
     NoteMembershipKind, NoteMembershipWitness, Nullifier, NullifierHistoryBatch,
-    NullifierSparseUpdateWitness, OrderCommitment, OrderIngressReceipt, OrderIntent, OrderShare,
-    OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputNoteMerkleProof,
-    OutputNoteRecord, OutputRecoveryRecord, OwnedOutputNotePayload, PairId,
-    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyRegistry, PrivateOrderPayload,
-    ProtocolError, RecoveryArtifact, RecoveryArtifactKind, RecoverySeed, RelayMode,
-    RenewalChildUse, RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
+    NullifierSparseUpdateWitness, OrderCommitment, OrderIngressReceipt,
+    OrderIngressReceiptAttestation, OrderIntent, OrderShare, OrderShareBundle, OrderSide,
+    OrderSubmission, OrderType, OutputNoteMerkleProof, OutputNoteRecord, OutputRecoveryRecord,
+    OwnedOutputNotePayload, PairId, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyRegistry,
+    PrivateOrderPayload, ProtocolError, RecoveryArtifact, RecoveryArtifactKind, RecoverySeed,
+    RelayMode, RenewalChildUse, RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
     RenewalParentCancelSubmissionPlan, RenewalStateHistoryBatch, RootOnlySettlementCommitments,
     SettlementCallArguments, SettlementOutputWithdrawalCallArguments,
     SettlementOutputWithdrawalSubmissionPlan, SettlementSubmissionPlan, SettlementTranscript,
@@ -84,6 +82,8 @@ const NULLIFIER_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6e756c6c5f7631
 const RENEWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f72656e65775f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
+const PRIVACY_GATE_CONFIG_DOMAIN_HEX: &str =
+    "0x7a796c6974685f707269766163795f676174655f6366675f7631";
 const NOTE_CONSOLIDATION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f636f6e736f6c5f7631";
 const ADMISSION_ROOT_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f726f6f745f7631";
 const ADMISSION_LEAF_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f6c6561665f7631";
@@ -266,6 +266,7 @@ pub fn create_order_ingress_receipt(
     signer: &str,
     receipt_secret: &str,
     issued_at_unix_ms: u64,
+    attestation: OrderIngressReceiptAttestation,
 ) -> Result<OrderIngressReceipt, ProtocolError> {
     let payload_commitment = private_order_payload_commitment(bundle)?;
     let mut receipt = OrderIngressReceipt {
@@ -275,6 +276,9 @@ pub fn create_order_ingress_receipt(
         pair_id: bundle.pair_id.clone(),
         batch_id: bundle.batch_id.clone(),
         epoch_id: bundle.epoch_id,
+        relay_mode: attestation.relay_mode,
+        renewal_package_id: attestation.renewal_package_id,
+        renewal_package_commitment: attestation.renewal_package_commitment,
         payload_commitment,
         issued_at_unix_ms,
         signer: signer.into(),
@@ -424,6 +428,9 @@ fn order_ingress_receipt_payload(receipt: &OrderIngressReceipt) -> Result<Vec<u8
         pair_id: &'a PairId,
         batch_id: &'a crate::BatchId,
         epoch_id: u64,
+        relay_mode: &'a Option<RelayMode>,
+        renewal_package_id: &'a Option<String>,
+        renewal_package_commitment: &'a Option<String>,
         payload_commitment: &'a str,
         issued_at_unix_ms: u64,
         signer: &'a str,
@@ -436,6 +443,9 @@ fn order_ingress_receipt_payload(receipt: &OrderIngressReceipt) -> Result<Vec<u8
         pair_id: &receipt.pair_id,
         batch_id: &receipt.batch_id,
         epoch_id: receipt.epoch_id,
+        relay_mode: &receipt.relay_mode,
+        renewal_package_id: &receipt.renewal_package_id,
+        renewal_package_commitment: &receipt.renewal_package_commitment,
         payload_commitment: &receipt.payload_commitment,
         issued_at_unix_ms: receipt.issued_at_unix_ms,
         signer: &receipt.signer,
@@ -1497,11 +1507,14 @@ pub fn build_renewal_parent_cancel_submission_plan(
     let cancel_marker =
         renewal_parent_cancel_marker(&request.parent_secret_commitment, &cancel_authority)?;
 
-    let mut entries = BTreeMap::<Vec<bool>, Felt>::new();
-    for entry in &request.prior_renewal_entries {
-        insert_renewal_sparse_entry(&mut entries, entry)?;
-    }
-    let witness = renewal_sparse_witness_for_entry(&entries, &cancel_marker)?;
+    let witness = if let Some(witness) = request.renewal_cancel_sparse_witness {
+        witness
+    } else {
+        renewal_sparse_witness_for_parent_cancel_marker(
+            &request.prior_renewal_entries,
+            &cancel_marker,
+        )?
+    };
 
     let message = renewal_parent_cancel_marker_message_hash(
         &chain_id,
@@ -1535,6 +1548,17 @@ pub fn build_renewal_parent_cancel_submission_plan(
         },
         encoded_args,
     })
+}
+
+pub fn renewal_sparse_witness_for_parent_cancel_marker(
+    prior_entries: &[String],
+    cancel_marker: &str,
+) -> Result<NullifierSparseUpdateWitness, ProtocolError> {
+    let mut entries = BTreeMap::<Vec<bool>, Felt>::new();
+    for entry in prior_entries {
+        insert_renewal_sparse_entry(&mut entries, entry)?;
+    }
+    renewal_sparse_witness_for_entry(&entries, cancel_marker)
 }
 
 pub fn withdrawal_message_hash(
@@ -2795,17 +2819,21 @@ fn nullifier_sparse_leaf(nullifier: Felt) -> Result<Felt, ProtocolError> {
     Ok(poseidon_hash(leaf_domain, nullifier))
 }
 
-fn nullifier_sparse_node(left: Felt, right: Felt) -> Result<Felt, ProtocolError> {
-    if left == Felt::ZERO {
-        return Ok(right);
-    }
-    if right == Felt::ZERO {
-        return Ok(left);
-    }
+fn nullifier_sparse_node(left: Felt, right: Felt, level: usize) -> Result<Felt, ProtocolError> {
     let node_domain = felt_from_hex_str(NULLIFIER_SPARSE_NODE_DOMAIN_HEX)?;
-    let mut state = [node_domain, left, right];
-    poseidon_permute_comp(&mut state);
-    Ok(state[0])
+    let mut state = poseidon_hash(node_domain, Felt::from(level as u64));
+    state = poseidon_hash(state, left);
+    Ok(poseidon_hash(state, right))
+}
+
+fn nullifier_empty_subtrees() -> Result<Vec<Felt>, ProtocolError> {
+    let mut empty = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH + 1);
+    empty.push(Felt::ZERO);
+    for level in 0..NULLIFIER_SPARSE_TREE_DEPTH {
+        let child = empty[level];
+        empty.push(nullifier_sparse_node(child, child, level)?);
+    }
+    Ok(empty)
 }
 
 fn nullifier_key_low_high(nullifier: &str) -> Result<(u128, u128), ProtocolError> {
@@ -2861,6 +2889,7 @@ fn sparse_key_bits(entry: &str, bit_count: usize) -> Result<Vec<bool>, ProtocolE
 fn sparse_nullifier_levels(
     entries: &BTreeMap<Vec<bool>, Felt>,
 ) -> Result<Vec<BTreeMap<Vec<bool>, Felt>>, ProtocolError> {
+    let empty = nullifier_empty_subtrees()?;
     let mut levels = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH + 1);
     levels.push(entries.clone());
     for _ in 0..NULLIFIER_SPARSE_TREE_DEPTH {
@@ -2875,9 +2904,10 @@ fn sparse_nullifier_levels(
                 ));
             }
             let parent_key = key[1..].to_vec();
+            let level = levels.len() - 1;
             let entry = parent_pairs
                 .entry(parent_key)
-                .or_insert((Felt::ZERO, Felt::ZERO));
+                .or_insert((empty[level], empty[level]));
             if key[0] {
                 entry.1 = *value;
             } else {
@@ -2886,8 +2916,9 @@ fn sparse_nullifier_levels(
         }
         let mut parent_level = BTreeMap::<Vec<bool>, Felt>::new();
         for (key, (left, right)) in parent_pairs {
-            let node = nullifier_sparse_node(left, right)?;
-            if node != Felt::ZERO {
+            let level = levels.len() - 1;
+            let node = nullifier_sparse_node(left, right, level)?;
+            if node != empty[level + 1] {
                 parent_level.insert(key, node);
             }
         }
@@ -2948,6 +2979,7 @@ pub fn nullifier_sparse_update_witnesses_for_nullifiers(
         let (merkle_path, merkle_directions) = if entries.is_empty() {
             (Vec::new(), Vec::new())
         } else {
+            let empty = nullifier_empty_subtrees()?;
             let levels = sparse_nullifier_levels(&entries)?;
             let mut merkle_path = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH);
             let mut merkle_directions = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH);
@@ -2957,7 +2989,7 @@ pub fn nullifier_sparse_update_witnesses_for_nullifiers(
                 let sibling = levels[level]
                     .get(&sibling_key)
                     .copied()
-                    .unwrap_or(Felt::ZERO);
+                    .unwrap_or(empty[level]);
                 merkle_path.push(felt_hex(&sibling));
                 merkle_directions.push(if key[level] {
                     "0x1".into()
@@ -3000,22 +3032,27 @@ fn renewal_sparse_leaf(entry: Felt) -> Result<Felt, ProtocolError> {
     Ok(poseidon_hash(leaf_domain, entry))
 }
 
-fn renewal_sparse_node(left: Felt, right: Felt) -> Result<Felt, ProtocolError> {
+fn renewal_sparse_node(left: Felt, right: Felt, level: usize) -> Result<Felt, ProtocolError> {
     let node_domain = felt_from_hex_str(NULLIFIER_SPARSE_NODE_DOMAIN_HEX)?;
-    if left == Felt::ZERO {
-        return Ok(right);
+    let mut state = poseidon_hash(node_domain, Felt::from(level as u64));
+    state = poseidon_hash(state, left);
+    Ok(poseidon_hash(state, right))
+}
+
+fn renewal_empty_subtrees() -> Result<Vec<Felt>, ProtocolError> {
+    let mut empty = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH + 1);
+    empty.push(Felt::ZERO);
+    for level in 0..RENEWAL_SPARSE_TREE_DEPTH {
+        let child = empty[level];
+        empty.push(renewal_sparse_node(child, child, level)?);
     }
-    if right == Felt::ZERO {
-        return Ok(left);
-    }
-    let mut state = [node_domain, left, right];
-    poseidon_permute_comp(&mut state);
-    Ok(state[0])
+    Ok(empty)
 }
 
 fn renewal_sparse_levels(
     entries: &BTreeMap<Vec<bool>, Felt>,
 ) -> Result<Vec<BTreeMap<Vec<bool>, Felt>>, ProtocolError> {
+    let empty = renewal_empty_subtrees()?;
     let mut levels = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH + 1);
     levels.push(entries.clone());
     for _ in 0..RENEWAL_SPARSE_TREE_DEPTH {
@@ -3035,13 +3072,16 @@ fn renewal_sparse_levels(
                 sibling[0] = !sibling[0];
                 sibling
             };
-            let sibling = current.get(&sibling_key).copied().unwrap_or(Felt::ZERO);
+            let level = levels.len() - 1;
+            let sibling = current.get(&sibling_key).copied().unwrap_or(empty[level]);
             let node = if key[0] {
-                renewal_sparse_node(sibling, *value)?
+                renewal_sparse_node(sibling, *value, level)?
             } else {
-                renewal_sparse_node(*value, sibling)?
+                renewal_sparse_node(*value, sibling, level)?
             };
-            next.entry(parent_key).or_insert(node);
+            if node != empty[level + 1] {
+                next.entry(parent_key).or_insert(node);
+            }
         }
         levels.push(next);
     }
@@ -3091,6 +3131,7 @@ fn renewal_sparse_witness_for_entry(
     let (merkle_path, merkle_directions) = if entries.is_empty() {
         (Vec::new(), Vec::new())
     } else {
+        let empty = renewal_empty_subtrees()?;
         let levels = renewal_sparse_levels(entries)?;
         let mut merkle_path = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH);
         let mut merkle_directions = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH);
@@ -3100,7 +3141,7 @@ fn renewal_sparse_witness_for_entry(
             let sibling = levels[level]
                 .get(&sibling_key)
                 .copied()
-                .unwrap_or(Felt::ZERO);
+                .unwrap_or(empty[level]);
             merkle_path.push(felt_hex(&sibling));
             merkle_directions.push(if key[level] {
                 "0x1".into()
@@ -3643,6 +3684,7 @@ pub fn native_auction_result_message_hash(
     order_commitment_root: &str,
     admission_root: &str,
     transcript_commitment: &str,
+    privacy_gate_config_commitment: &str,
 ) -> Result<String, ProtocolError> {
     let mut state = poseidon_hash(
         felt_from_hex_str(AUCTION_RESULT_MESSAGE_DOMAIN_HEX)?,
@@ -3661,6 +3703,10 @@ pub fn native_auction_result_message_hash(
         state,
         felt_from_hex_str(&normalize_felt_hex(transcript_commitment)?)?,
     );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(privacy_gate_config_commitment)?)?,
+    );
     Ok(felt_hex(&state))
 }
 
@@ -3671,6 +3717,7 @@ pub fn auction_result_proof_message_hash_for_program(
     order_commitment_root: &str,
     admission_root: &str,
     transcript_commitment: &str,
+    privacy_gate_config_commitment: &str,
 ) -> Result<String, ProtocolError> {
     let statement_message_hash = native_auction_result_message_hash(
         auction_verifier_address,
@@ -3678,8 +3725,25 @@ pub fn auction_result_proof_message_hash_for_program(
         order_commitment_root,
         admission_root,
         transcript_commitment,
+        privacy_gate_config_commitment,
     )?;
     auction_result_proof_message_hash_from_statement(proof_program_address, &statement_message_hash)
+}
+
+pub fn auction_privacy_gate_config_commitment(
+    gate: &AuctionPrivacyGateWitness,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(PRIVACY_GATE_CONFIG_DOMAIN_HEX)?,
+        Felt::from(gate.min_batch_base_liquidity),
+    );
+    state = poseidon_hash(state, Felt::from(gate.min_batch_participants));
+    state = poseidon_hash(state, Felt::from(gate.min_eligible_orders));
+    state = poseidon_hash(state, Felt::from(gate.max_single_order_fill_bps));
+    state = poseidon_hash(state, Felt::from(gate.max_single_owner_fill_bps));
+    state = poseidon_hash(state, Felt::from(gate.min_maker_participants));
+    state = poseidon_hash(state, Felt::from(gate.max_maker_fill_bps));
+    Ok(felt_hex(&state))
 }
 
 pub fn auction_result_proof_message_hash_from_statement(
@@ -6436,7 +6500,8 @@ mod tests {
         note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
         output_note_merkle_proof, output_note_merkle_root,
         private_execution_key_registry_fingerprint, proof_artifact_commitment,
-        reconstruct_order_from_shares, renewal_child_nullifier, root_only_settlement_commitments,
+        reconstruct_order_from_shares, renewal_child_nullifier, renewal_parent_cancel_marker,
+        renewal_sparse_witness_for_parent_cancel_marker, root_only_settlement_commitments,
         sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
         settlement_nullifier_root_after_history, settlement_output_withdrawal_message_hash,
         settlement_transcript_commitment, sign_note_consolidation_authorization,
@@ -6709,6 +6774,7 @@ mod tests {
             "zylith-prover",
             receipt_secret,
             123,
+            Default::default(),
         )
         .expect("receipt");
         verify_order_ingress_receipt(&receipt, receipt_secret).expect("receipt verifies");
@@ -6757,6 +6823,7 @@ mod tests {
             "zylith-prover",
             "previous-secret",
             123,
+            Default::default(),
         )
         .expect("receipt");
 
@@ -9386,6 +9453,7 @@ mod tests {
             parent_cancel_authority: parent_cancel_authority.clone(),
             renewal_cancel_auth_key,
             prior_renewal_entries: vec![],
+            renewal_cancel_sparse_witness: None,
         })
         .expect("renewal parent cancel plan");
 
@@ -9433,6 +9501,7 @@ mod tests {
                 &order_cancel_key_hex,
             ),
             prior_renewal_entries: vec![prior_entry],
+            renewal_cancel_sparse_witness: None,
         })
         .expect("renewal parent cancel plan");
 
@@ -9443,6 +9512,43 @@ mod tests {
         assert_eq!(
             plan.encoded_args.merkle_directions.len(),
             super::RENEWAL_SPARSE_TREE_DEPTH,
+        );
+        assert_eq!(plan.starknet_call.calldata[4], "0x80");
+    }
+
+    #[test]
+    fn renewal_parent_cancel_submission_plan_accepts_precomputed_sparse_witness() {
+        let order_cancel_key_hex = "46".repeat(32);
+        let parent_secret_commitment =
+            crate::renewal_parent_secret_commitment("0x56789").expect("parent secret commitment");
+        let parent_cancel_authority =
+            crate::renewal_cancel_authority_from_raw_key_hex(&order_cancel_key_hex)
+                .expect("cancel authority");
+        let cancel_marker =
+            renewal_parent_cancel_marker(&parent_secret_commitment, &parent_cancel_authority)
+                .expect("cancel marker");
+        let prior_entry =
+            renewal_child_nullifier("0xabc", 2, "0xdef").expect("prior renewal child nullifier");
+        let witness =
+            renewal_sparse_witness_for_parent_cancel_marker(&[prior_entry], &cancel_marker)
+                .expect("cancel witness");
+
+        let plan = build_renewal_parent_cancel_submission_plan(RenewalParentCancelPlanRequest {
+            chain_id: "0x534e5f5345504f4c4941".into(),
+            auction_verifier_address: "0x1234".into(),
+            parent_secret_commitment,
+            parent_cancel_authority,
+            renewal_cancel_auth_key: crate::renewal_cancel_auth_key_felt_from_raw_key_hex(
+                &order_cancel_key_hex,
+            ),
+            prior_renewal_entries: vec![],
+            renewal_cancel_sparse_witness: Some(witness),
+        })
+        .expect("renewal parent cancel plan");
+
+        assert_eq!(
+            plan.encoded_args.merkle_path.len(),
+            super::RENEWAL_SPARSE_TREE_DEPTH
         );
         assert_eq!(plan.starknet_call.calldata[4], "0x80");
     }

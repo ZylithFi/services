@@ -8,12 +8,14 @@ export type PaymasterConfig = {
   allowedEntrypoints: Set<string>;
   proofRequiredEntrypoints: Set<string>;
   withdrawalAmountBuckets: Set<string>;
+  allowDirectWithdrawalRelays: boolean;
   bindHost: string;
   port: number;
   maxBodyBytes: number;
   allowedOrigins: Set<string>;
   allowedOriginPatterns: RegExp[];
   signerLimitPerMinute: number;
+  trustProxyHeaders: boolean;
   submissionLogPath: string | null;
 };
 
@@ -38,11 +40,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       "apply_actions,submit_settlement_with_proof_facts"
   );
   const withdrawalAmountBuckets = parseAmountBucketSet(env.ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS);
+  const allowDirectWithdrawalRelays = parseBool(env.ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS, false);
   const allowedOriginRules = parseOriginRules(env.ZYLITH_PAYMASTER_ALLOWED_ORIGINS);
 
   if (allowedContracts.size === 0) {
     throw new Error(
       "ZYLITH_PAYMASTER_ALLOWED_CONTRACTS or ZYLITH_PRIVACY_POOL_ADDRESS must be configured"
+    );
+  }
+  if (allowDirectWithdrawalRelays && withdrawalAmountBuckets.size === 0) {
+    throw new Error(
+      "ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS is required when ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS=true"
     );
   }
 
@@ -56,6 +64,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     allowedEntrypoints,
     proofRequiredEntrypoints,
     withdrawalAmountBuckets,
+    allowDirectWithdrawalRelays,
     bindHost: env.ZYLITH_PAYMASTER_HOST ?? "127.0.0.1",
     port: parsePositiveInt(env.ZYLITH_PAYMASTER_PORT, DEFAULT_PORT, "ZYLITH_PAYMASTER_PORT"),
     maxBodyBytes: parsePositiveInt(
@@ -70,6 +79,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_SIGNER_LIMIT_PER_MINUTE,
       "ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE"
     ),
+    trustProxyHeaders: parseBool(env.ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS, false),
     submissionLogPath: env.ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH?.trim() || "state/submissions.json"
   };
 }
@@ -149,6 +159,11 @@ function parseAmountBucketSet(value: string | undefined): Set<string> {
         throw new Error(`invalid withdrawal amount bucket: ${item}`);
       })
   );
+}
+
+function parseBool(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined || value.trim() === "") return defaultValue;
+  return ["1", "true", "TRUE", "yes", "YES"].includes(value.trim());
 }
 
 function parseOriginRules(value: string | undefined): { exact: Set<string>; patterns: RegExp[] } {

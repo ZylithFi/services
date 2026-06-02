@@ -12,8 +12,10 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
+use reqwest::Client;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use starknet_rust_core::utils::get_selector_from_name;
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{
@@ -25,10 +27,13 @@ use zylith_core::{
     RecoveryArtifact, RecoveryArtifactList, RecoveryArtifactUpload, SettlementTimestampUpdate,
     SubmittedOrderRecord, artifact_epoch_bucket_end, artifact_epoch_bucket_start,
     count_bucket_label, derive_order_cancellation_tag, extract_bearer_token,
-    hash::{ordered_felt_list_commitment, tagged_commitment_sha256, tagged_field_hex},
+    hash::{
+        encode_starknet_felt, normalize_felt_hex, ordered_felt_list_commitment,
+        tagged_commitment_sha256, tagged_field_hex,
+    },
     heartbeat_cover_order_commitments, heartbeat_cover_order_count,
-    root_only_settlement_commitments, settlement_transcript_commitment,
-    validate_order_ingress_receipt_for_manifest_with_secrets,
+    renewal_sparse_witness_for_parent_cancel_marker, root_only_settlement_commitments,
+    settlement_transcript_commitment, validate_order_ingress_receipt_for_manifest_with_secrets,
 };
 
 const DEFAULT_BATCH_WINDOW_MS: u64 = 90 * 1_000;
@@ -65,6 +70,9 @@ const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
 const ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MIN_EPOCHS";
 const ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MAX_EPOCHS";
 const ARTIFACT_EPOCH_BUCKET_SIZE_ENV: &str = "ZYLITH_ARTIFACT_EPOCH_BUCKET_SIZE";
+const STARKNET_RPC_URL_ENV: &str = "ZYLITH_STARKNET_RPC_URL";
+const REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV: &str =
+    "ZYLITH_REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION";
 
 #[derive(Clone)]
 struct AppState {
@@ -89,7 +97,31 @@ struct AppState {
     public_artifact_delay_min_epochs: u64,
     public_artifact_delay_max_epochs: u64,
     artifact_epoch_bucket_size: u64,
+    require_artifact_onchain_verification: bool,
+    starknet_rpc_url: Option<Arc<String>>,
+    http_client: Client,
+    output_note_root_selector: String,
     rate_limiter: RateLimiter,
+}
+
+#[derive(Serialize)]
+struct StarknetRpcRequest<'a> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'static str,
+    params: (&'a StarknetCallRequest<'a>, &'static str),
+}
+
+#[derive(Serialize)]
+struct StarknetCallRequest<'a> {
+    contract_address: &'a str,
+    entry_point_selector: &'a str,
+    calldata: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct StarknetRpcResponse {
+    result: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -135,6 +167,8 @@ struct CoordinatorHardeningConfig {
     public_artifact_delay_min_epochs: u64,
     public_artifact_delay_max_epochs: u64,
     artifact_epoch_bucket_size: u64,
+    require_artifact_onchain_verification: bool,
+    starknet_rpc_url: Option<String>,
 }
 
 impl Default for CoordinatorHardeningConfig {
@@ -148,6 +182,8 @@ impl Default for CoordinatorHardeningConfig {
             public_artifact_delay_min_epochs: 0,
             public_artifact_delay_max_epochs: 0,
             artifact_epoch_bucket_size: DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE,
+            require_artifact_onchain_verification: false,
+            starknet_rpc_url: None,
         }
     }
 }
@@ -185,9 +221,19 @@ struct RecoveryAccountRecord {
     artifacts: Vec<RecoveryArtifact>,
 }
 
+const MAX_RECOVERY_ARTIFACTS_PER_ACCOUNT: usize = 512;
+const MAX_RECOVERY_ARTIFACT_PAYLOAD_CHARS: usize = 1_048_576;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct PublishedBatchArtifactsStoreFile {
     artifacts_by_batch: BTreeMap<String, PublishedBatchArtifacts>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RenewalCancelWitnessResponse {
+    cancel_marker: String,
+    entry_count: usize,
+    renewal_cancel_sparse_witness: zylith_core::NullifierSparseUpdateWitness,
 }
 
 #[tokio::main]
@@ -315,6 +361,19 @@ fn build_app() -> Result<Router, String> {
     if artifact_epoch_bucket_size == 0 {
         return Err(format!("{ARTIFACT_EPOCH_BUCKET_SIZE_ENV} must be positive"));
     }
+    let require_artifact_onchain_verification = env_bool_or_default(
+        REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV,
+        coordinator_strict_mode(),
+    );
+    let starknet_rpc_url = env::var(STARKNET_RPC_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if require_artifact_onchain_verification && starknet_rpc_url.is_none() {
+        return Err(format!(
+            "{STARKNET_RPC_URL_ENV} is required when {REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV}=true"
+        ));
+    }
     let hardening = CoordinatorHardeningConfig {
         emergency_paused: env_bool_or_default(COORDINATOR_EMERGENCY_PAUSED_ENV, false),
         max_body_bytes: env::var(COORDINATOR_MAX_BODY_BYTES_ENV)
@@ -354,6 +413,8 @@ fn build_app() -> Result<Router, String> {
         public_artifact_delay_min_epochs,
         public_artifact_delay_max_epochs,
         artifact_epoch_bucket_size,
+        require_artifact_onchain_verification,
+        starknet_rpc_url,
     };
 
     build_app_with_config(
@@ -468,6 +529,10 @@ fn build_app_with_config(
         public_artifact_delay_min_epochs: hardening.public_artifact_delay_min_epochs,
         public_artifact_delay_max_epochs: hardening.public_artifact_delay_max_epochs,
         artifact_epoch_bucket_size: hardening.artifact_epoch_bucket_size,
+        require_artifact_onchain_verification: hardening.require_artifact_onchain_verification,
+        starknet_rpc_url: hardening.starknet_rpc_url.map(Arc::new),
+        http_client: Client::new(),
+        output_note_root_selector: selector_hex("output_note_root"),
         rate_limiter: RateLimiter::default(),
     };
 
@@ -528,6 +593,10 @@ fn build_app_with_config(
         .route(
             "/api/recovery/{account_id}/settlement-reports/{batch_id}",
             post(query_private_settlement_report),
+        )
+        .route(
+            "/api/renewal/cancel-witness/{cancel_marker}",
+            get(get_renewal_cancel_witness),
         )
         .route("/api/orders", post(submit_order))
         .route("/api/orders/cancel", post(cancel_order))
@@ -827,11 +896,11 @@ fn is_public_artifact_visible(
     let delay_subject = format!("{bucket_start}:{bucket_end}");
     let delay_epochs =
         effective_public_artifact_delay_epochs(&delay_subject, min_delay_epochs, max_delay_epochs);
-    if delay_epochs == 0 {
-        return published.published_at_unix_ms != 0;
-    }
     if published.settled_at_unix_ms.is_none() {
         return false;
+    }
+    if delay_epochs == 0 {
+        return published.published_at_unix_ms != 0;
     }
     let Some(max_epoch) = artifacts
         .values()
@@ -923,6 +992,40 @@ async fn get_published_witness(
     Ok(Json(published.settlement_witness.clone()))
 }
 
+async fn get_renewal_cancel_witness(
+    State(state): State<AppState>,
+    Path(cancel_marker): Path<String>,
+) -> Result<Json<RenewalCancelWitnessResponse>, StatusCode> {
+    let artifacts = state.published_batch_artifacts.read().await;
+    let entries = settled_renewal_entries(&artifacts);
+    let witness = renewal_sparse_witness_for_parent_cancel_marker(&entries, &cancel_marker)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Json(RenewalCancelWitnessResponse {
+        cancel_marker,
+        entry_count: entries.len(),
+        renewal_cancel_sparse_witness: witness,
+    }))
+}
+
+fn settled_renewal_entries(artifacts: &BTreeMap<String, PublishedBatchArtifacts>) -> Vec<String> {
+    let mut entries = BTreeSet::new();
+    for published in artifacts.values() {
+        if published.settled_at_unix_ms.is_none() {
+            continue;
+        }
+        for renewal in &published.transcript.renewal_child_uses {
+            entries.insert(renewal.child_nullifier.clone());
+        }
+    }
+    entries.into_iter().collect()
+}
+
+fn recovery_artifact_payload_len(artifact: &RecoveryArtifact) -> usize {
+    artifact.payload.algorithm.len()
+        + artifact.payload.nonce.len()
+        + artifact.payload.ciphertext.len()
+}
+
 async fn publish_batch_artifacts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -976,6 +1079,15 @@ async fn mark_published_batch_settled(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let published_snapshot = {
+        let artifacts = state.published_batch_artifacts.read().await;
+        artifacts
+            .get(&batch_id)
+            .cloned()
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+    verify_settlement_timestamp_update(&state, &published_snapshot, &request).await?;
+
     let mut artifacts = state.published_batch_artifacts.write().await;
     let published = artifacts.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
     published.settled_at_unix_ms = Some(request.settled_at_unix_ms);
@@ -998,6 +1110,103 @@ async fn mark_published_batch_settled(
     Ok(Json(response))
 }
 
+async fn verify_settlement_timestamp_update(
+    state: &AppState,
+    published: &PublishedBatchArtifacts,
+    request: &SettlementTimestampUpdate,
+) -> Result<(), StatusCode> {
+    let roots = root_only_settlement_commitments(&published.transcript)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if let Some(output_note_root) = request.output_note_root.as_deref() {
+        let provided = normalize_required_felt(output_note_root)?;
+        let expected = normalize_required_felt(&roots.output_note_root)?;
+        if provided != expected {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    if let Some(transcript_commitment) = request.transcript_commitment.as_deref() {
+        let provided = normalize_required_felt(transcript_commitment)?;
+        let expected = normalize_required_felt(
+            &settlement_transcript_commitment(&published.transcript)
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        )?;
+        if provided != expected {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    if !state.require_artifact_onchain_verification {
+        return Ok(());
+    }
+    if request
+        .transaction_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let contract_address = request
+        .settlement_contract_address
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&published.settlement_witness.auction_verifier_address);
+    let chain_root =
+        fetch_onchain_output_note_root(state, contract_address, &published.transcript.batch_id.0)
+            .await?;
+    let expected = normalize_required_felt(&roots.output_note_root)?;
+    if chain_root != expected {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(())
+}
+
+async fn fetch_onchain_output_note_root(
+    state: &AppState,
+    contract_address: &str,
+    batch_id: &str,
+) -> Result<String, StatusCode> {
+    let rpc_url = state
+        .starknet_rpc_url
+        .as_deref()
+        .ok_or(StatusCode::BAD_GATEWAY)?;
+    let contract_address = normalize_required_felt(contract_address)?;
+    if contract_address == "0x0" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let batch_id_felt = encode_starknet_felt("batch-id", batch_id);
+    let calldata = vec![batch_id_felt];
+    let call = StarknetCallRequest {
+        contract_address: &contract_address,
+        entry_point_selector: &state.output_note_root_selector,
+        calldata: &calldata,
+    };
+    let payload = StarknetRpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "starknet_call",
+        params: (&call, "latest"),
+    };
+    let response = state
+        .http_client
+        .post(rpc_url.as_str())
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .error_for_status()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let body = response
+        .json::<StarknetRpcResponse>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let root = body
+        .result
+        .and_then(|mut result| result.drain(..).next())
+        .ok_or(StatusCode::BAD_GATEWAY)?;
+    normalize_required_felt(&root)
+}
+
 async fn list_recovery_artifacts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1018,6 +1227,9 @@ async fn list_recovery_artifacts(
                 return Err(StatusCode::UNAUTHORIZED);
             }
         } else {
+            if !account.artifacts.is_empty() {
+                return Err(StatusCode::NOT_FOUND);
+            }
             account.recovery_auth_tag = Some(provided_auth_tag);
             changed = true;
         }
@@ -1112,6 +1324,9 @@ async fn query_private_settlement_report(
                 return Err(StatusCode::UNAUTHORIZED);
             }
         } else {
+            if !account.artifacts.is_empty() {
+                return Err(StatusCode::NOT_FOUND);
+            }
             account.recovery_auth_tag = Some(provided_auth_tag);
             changed = true;
         }
@@ -1125,12 +1340,10 @@ async fn query_private_settlement_report(
         .iter()
         .filter_map(|value| zylith_core::hash::normalize_felt_hex(value).ok())
         .collect::<BTreeSet<_>>();
-    let requested_orders = request
-        .order_commitments
-        .iter()
-        .filter_map(|commitment| zylith_core::hash::normalize_felt_hex(&commitment.0).ok())
-        .collect::<BTreeSet<_>>();
-    if requested_key_tags.is_empty() && requested_orders.is_empty() {
+    if !request.order_commitments.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if requested_key_tags.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -1152,27 +1365,7 @@ async fn query_private_settlement_report(
             })
         })
         .collect::<Vec<_>>();
-    let funding_commitments_by_order = settlement_witness_funding_commitments_by_order(published);
-    let order_execution_reports = published
-        .order_execution_reports
-        .iter()
-        .filter(|report| {
-            zylith_core::hash::normalize_felt_hex(&report.order_commitment.0)
-                .map(|commitment| requested_orders.contains(&commitment))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .map(|mut report| {
-            if report.funding_note_commitments.is_empty()
-                && let Some(commitments) =
-                    funding_commitments_by_order.get(&report.order_commitment.0)
-            {
-                report.funding_note_commitments = commitments.clone();
-            }
-            report
-        })
-        .collect::<Vec<_>>();
-    if output_recovery_records.is_empty() && order_execution_reports.is_empty() {
+    if output_recovery_records.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
     let roots = root_only_settlement_commitments(&published.transcript)
@@ -1188,30 +1381,8 @@ async fn query_private_settlement_report(
         price_base_scale: published.transcript.price_base_scale,
         matched_order_count: published.transcript.matched_orders.len() as u64,
         output_recovery_records,
-        order_execution_reports,
+        order_execution_reports: Vec::new(),
     }))
-}
-
-fn settlement_witness_funding_commitments_by_order(
-    published: &PublishedBatchArtifacts,
-) -> BTreeMap<String, Vec<zylith_core::NoteCommitment>> {
-    published
-        .settlement_witness
-        .matched_order_witnesses
-        .iter()
-        .filter_map(|witness| {
-            let notes = if witness.funding_notes.is_empty() {
-                std::slice::from_ref(&witness.funding_note)
-            } else {
-                witness.funding_notes.as_slice()
-            };
-            let commitments = notes
-                .iter()
-                .filter_map(|note| note.commitment().ok())
-                .collect::<Vec<_>>();
-            (!commitments.is_empty()).then(|| (witness.order_commitment.0.clone(), commitments))
-        })
-        .collect()
 }
 
 async fn upload_recovery_artifact(
@@ -1229,6 +1400,9 @@ async fn upload_recovery_artifact(
     if request.artifact.account_id != account_id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    if recovery_artifact_payload_len(&request.artifact) > MAX_RECOVERY_ARTIFACT_PAYLOAD_CHARS {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     let provided_auth_tag = require_recovery_auth_header(&headers)?;
     let artifact = request.artifact;
@@ -1239,7 +1413,25 @@ async fn upload_recovery_artifact(
             return Err(StatusCode::UNAUTHORIZED);
         }
     } else {
+        if !account.artifacts.is_empty() {
+            return Err(StatusCode::NOT_FOUND);
+        }
         account.recovery_auth_tag = Some(provided_auth_tag);
+    }
+    if account
+        .artifacts
+        .iter()
+        .any(|existing| existing.artifact_id == artifact.artifact_id)
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    if let Some(latest) = account.artifacts.iter().map(|entry| entry.sequence).max()
+        && artifact.sequence <= latest
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+    if account.artifacts.len() >= MAX_RECOVERY_ARTIFACTS_PER_ACCOUNT {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     account.artifacts.push(artifact.clone());
     account
@@ -1589,6 +1781,17 @@ fn env_u64_or_default(env_name: &str, default: u64) -> Result<u64, String> {
         .map(|value| value.unwrap_or(default))
 }
 
+fn selector_hex(name: &str) -> String {
+    format!(
+        "{:#x}",
+        get_selector_from_name(name).expect("known Starknet selector name")
+    )
+}
+
+fn normalize_required_felt(value: &str) -> Result<String, StatusCode> {
+    normalize_felt_hex(value).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
 fn load_receipt_secret_keyring() -> Vec<String> {
     let mut keyring = Vec::new();
     if let Ok(current) = env::var(ORDER_INGRESS_RECEIPT_SECRET_ENV) {
@@ -1751,6 +1954,9 @@ fn enforce_rate_limit(
 }
 
 fn rate_limit_subject(headers: &HeaderMap) -> String {
+    if !trusted_proxy_headers_enabled() {
+        return "anonymous".into();
+    }
     for header in ["x-forwarded-for", "x-real-ip"] {
         if let Some(value) = headers
             .get(header)
@@ -1762,6 +1968,17 @@ fn rate_limit_subject(headers: &HeaderMap) -> String {
         }
     }
     "anonymous".into()
+}
+
+fn trusted_proxy_headers_enabled() -> bool {
+    matches!(
+        env::var("ZYLITH_TRUST_PROXY_HEADERS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 fn require_recovery_auth_header(headers: &HeaderMap) -> Result<String, StatusCode> {
@@ -2057,15 +2274,20 @@ fn compute_batch_commitments_for(
 
 fn load_batch_store(path: &FsPath) -> BTreeMap<String, BatchRecord> {
     if is_sqlite_store(path) {
-        return load_sqlite_records(path, "batches").unwrap_or_default();
+        return load_sqlite_records(path, "batches").unwrap_or_else(|error| {
+            panic!("failed to load batch store {}: {error}", path.display())
+        });
     }
     let Ok(contents) = fs::read_to_string(path) else {
+        if path.exists() {
+            panic!("failed to read batch store {}", path.display());
+        }
         return BTreeMap::default();
     };
 
     serde_json::from_str::<BatchStoreFile>(&contents)
         .map(|store| store.batches_by_id)
-        .unwrap_or_default()
+        .unwrap_or_else(|error| panic!("failed to parse batch store {}: {error}", path.display()))
 }
 
 fn persist_batch_store_if_configured(
@@ -2102,9 +2324,14 @@ fn now_unix_ms() -> u64 {
 
 fn load_recovery_store(path: &FsPath) -> BTreeMap<String, RecoveryAccountRecord> {
     if is_sqlite_store(path) {
-        return load_sqlite_records(path, "recovery_accounts").unwrap_or_default();
+        return load_sqlite_records(path, "recovery_accounts").unwrap_or_else(|error| {
+            panic!("failed to load recovery store {}: {error}", path.display())
+        });
     }
     let Ok(contents) = fs::read_to_string(path) else {
+        if path.exists() {
+            panic!("failed to read recovery store {}", path.display());
+        }
         return BTreeMap::default();
     };
 
@@ -2128,22 +2355,40 @@ fn load_recovery_store(path: &FsPath) -> BTreeMap<String, RecoveryAccountRecord>
                     .collect()
             }
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            panic!("failed to parse recovery store {}: {error}", path.display())
+        })
 }
 
 fn load_published_batch_artifacts_store(
     path: &FsPath,
 ) -> BTreeMap<String, PublishedBatchArtifacts> {
     if is_sqlite_store(path) {
-        return load_sqlite_records(path, "published_batch_artifacts").unwrap_or_default();
+        return load_sqlite_records(path, "published_batch_artifacts").unwrap_or_else(|error| {
+            panic!(
+                "failed to load published batch artifacts store {}: {error}",
+                path.display()
+            )
+        });
     }
     let Ok(contents) = fs::read_to_string(path) else {
+        if path.exists() {
+            panic!(
+                "failed to read published batch artifacts store {}",
+                path.display()
+            );
+        }
         return BTreeMap::default();
     };
 
     serde_json::from_str::<PublishedBatchArtifactsStoreFile>(&contents)
         .map(|store| store.artifacts_by_batch)
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to parse published batch artifacts store {}: {error}",
+                path.display()
+            )
+        })
 }
 
 fn persist_recovery_store(
@@ -2637,6 +2882,7 @@ mod tests {
             "zylith-prover",
             receipt_secret,
             123,
+            Default::default(),
         )
         .expect("receipt");
         full_bundle.ingress_receipt = Some(receipt);
@@ -3113,7 +3359,12 @@ mod tests {
                 fees: vec![],
                 output_notes: vec![],
                 output_note_preimages: vec![],
-                output_recovery_records: vec![],
+                output_recovery_records: vec![zylith_core::OutputRecoveryRecord {
+                    key_tag: "0x1234".into(),
+                    ciphertext_fields: vec!["0x1".into()],
+                    auth_tag: "0x2".into(),
+                    commitment: "0x3".into(),
+                }],
                 output_recovery_dummy_commitments: output_recovery_dummy_commitments.clone(),
                 output_ciphertext_bundle_ref: output_bundle_ref.clone(),
             },
@@ -3156,7 +3407,12 @@ mod tests {
                 fees: vec![],
                 output_notes: vec![],
                 output_note_preimages: vec![],
-                output_recovery_records: vec![],
+                output_recovery_records: vec![zylith_core::OutputRecoveryRecord {
+                    key_tag: "0x1234".into(),
+                    ciphertext_fields: vec!["0x1".into()],
+                    auth_tag: "0x2".into(),
+                    commitment: "0x3".into(),
+                }],
                 output_recovery_dummy_commitments,
                 output_ciphertext_bundle_ref: output_bundle_ref.clone(),
             },
@@ -3242,7 +3498,10 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(early_private_report_response.status(), StatusCode::OK);
+        assert_eq!(
+            early_private_report_response.status(),
+            StatusCode::BAD_REQUEST
+        );
 
         let recovery_artifact = RecoveryArtifact {
             artifact_id: "artifact-private-report-auth".into(),
@@ -3287,7 +3546,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header(zylith_core::RECOVERY_AUTH_HEADER, TEST_RECOVERY_AUTH)
                     .body(Body::from(
-                        br#"{"output_recovery_key_tags":[],"order_commitments":["0xabc"]}"#
+                        br#"{"output_recovery_key_tags":["0x1234"],"order_commitments":[]}"#
                             .to_vec(),
                     ))
                     .expect("request"),
@@ -3305,8 +3564,15 @@ mod tests {
             .expect("private report json");
         assert_eq!(private_json["batch_id"], batch_id);
         assert_eq!(
-            private_json["order_execution_reports"][0]["order_commitment"],
-            "0x000abc"
+            private_json["output_recovery_records"][0]["recovery"]["key_tag"],
+            "0x1234"
+        );
+        assert_eq!(
+            private_json["order_execution_reports"]
+                .as_array()
+                .expect("order reports array")
+                .len(),
+            0
         );
 
         let transcript_response = app

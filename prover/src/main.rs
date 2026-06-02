@@ -50,19 +50,20 @@ use zylith_core::{
     MakerAttributionPlaintext, MakerBandAttribution, MakerBandFillAttribution, MatchedOrder,
     MatchedOrderWitness, Note, NoteCommitment, NoteConsolidationWitness, NoteMembershipKind,
     NoteMembershipWitness, OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport,
-    OrderIngressReceipt, OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OrderType,
-    OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
-    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
-    ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublicBatchSummary,
-    PublishedBatchArtifacts, SettlementRootHistoryArchive, SettlementSubmissionPlan,
-    SettlementTimestampUpdate, SettlementTranscript, SettlementWitness, SpendAuthorization,
-    StarknetCall, TimeInForce, TrustedOrderIngressRequest, TrustedOrderIngressResponse,
-    admission_proof_message_hash_for_program, auction_admission_root,
-    auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
-    build_admission_serialized_input, build_auction_result_serialized_input, build_fee_output_note,
-    build_heartbeat_cover_orders, build_note_consolidation_serialized_input,
-    build_note_consolidation_submission_plan, build_output_note, build_settlement_submission_plan,
-    create_maker_attribution_artifact, create_order_ingress_receipt, decrypt_order_bundle,
+    OrderIngressReceipt, OrderIngressReceiptAttestation, OrderIntent, OrderShareBundle, OrderSide,
+    OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord,
+    PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
+    PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig, ProofArtifactRecord,
+    ProofJobStatus, PublicBatchSummary, PublishedBatchArtifacts, SettlementRootHistoryArchive,
+    SettlementSubmissionPlan, SettlementTimestampUpdate, SettlementTranscript, SettlementWitness,
+    SpendAuthorization, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
+    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
+    auction_privacy_gate_config_commitment, auction_result_proof_message_hash_for_program,
+    base_amount_affordable_for_quote, build_admission_serialized_input,
+    build_auction_result_serialized_input, build_fee_output_note, build_heartbeat_cover_orders,
+    build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
+    build_output_note, build_settlement_submission_plan, create_maker_attribution_artifact,
+    create_order_ingress_receipt, decrypt_order_bundle,
     deposit_note_membership_witnesses_for_chain, encrypt_output_note_for_owner,
     extract_bearer_token, format_bearer_token, funding_input_set_commitment,
     funding_nullifier_set_commitment, native_note_consolidation_message_hash,
@@ -209,6 +210,7 @@ const DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS: u64 = 5_000;
 const DEFAULT_MAX_PROVABLE_BATCH_ORDERS: u64 = 32;
 const DEFAULT_PROVER_WORKER_TICK_MS: u64 = 10_000;
 const DEFAULT_PROVER_WORKER_MAX_BATCHES_PER_TICK: usize = 2;
+const ENABLE_HOSTED_NOTE_CONSOLIDATION_ENV: &str = "ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION";
 
 #[derive(Clone)]
 struct AppState {
@@ -255,6 +257,7 @@ struct AppState {
     max_order_amount: u128,
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
+    hosted_note_consolidation_enabled: bool,
     protocol_fee_recipient: String,
     relay_fee_recipient: String,
     protocol_fee_note_recipient: FeeNoteRecipientConfig,
@@ -362,6 +365,7 @@ struct AppConfig {
     max_order_amount: u128,
     max_maker_curve_base_amount: u128,
     max_maker_curve_quote_notional: u128,
+    hosted_note_consolidation_enabled: bool,
     protocol_fee_recipient: String,
     relay_fee_recipient: String,
     protocol_fee_note_recipient: FeeNoteRecipientConfig,
@@ -822,6 +826,10 @@ fn build_app() -> Result<Router, String> {
             MAX_MAKER_CURVE_QUOTE_NOTIONAL_ENV,
             0_u128,
         ),
+        hosted_note_consolidation_enabled: env_bool_or_default(
+            ENABLE_HOSTED_NOTE_CONSOLIDATION_ENV,
+            false,
+        ),
         protocol_fee_recipient: protocol_fee_note_recipient.withdraw_authority.clone(),
         relay_fee_recipient: relay_fee_note_recipient.withdraw_authority.clone(),
         protocol_fee_note_recipient,
@@ -1060,6 +1068,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_order_amount,
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
+        hosted_note_consolidation_enabled,
         protocol_fee_recipient,
         relay_fee_recipient,
         protocol_fee_note_recipient,
@@ -1093,13 +1102,6 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
             "native aggregate proof entrypoint must be compile_settlement_aggregate_proof".into(),
         );
     }
-    if min_batch_participants != 0 || max_single_owner_fill_bps != 0 || min_maker_participants != 0
-    {
-        return Err(
-            "owner-participant privacy gates are disabled in the current statement; set min_batch_participants, max_single_owner_fill_bps, and min_maker_participants to 0".into(),
-        );
-    }
-
     ensure_prover_dirs(&data_dir)?;
     let auction_key_registry = PrivateExecutionKeyRegistry {
         keys: auction_private_keys
@@ -1183,6 +1185,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
         max_order_amount,
         max_maker_curve_base_amount,
         max_maker_curve_quote_notional,
+        hosted_note_consolidation_enabled,
         protocol_fee_recipient,
         relay_fee_recipient,
         protocol_fee_note_recipient,
@@ -1439,6 +1442,9 @@ async fn prepare_note_consolidation(
     Json(request): Json<NoteConsolidationPrepareRequest>,
 ) -> Result<Json<NoteConsolidationPrepareResponse>, StatusCode> {
     require_prover_not_paused(&state)?;
+    if !state.hosted_note_consolidation_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
     enforce_rate_limit(
         &state.rate_limiter,
         &headers,
@@ -1531,6 +1537,9 @@ async fn submit_note_consolidation(
     Json(request): Json<NoteConsolidationSubmitRequest>,
 ) -> Result<Json<NoteConsolidationSubmitResponse>, StatusCode> {
     require_prover_not_paused(&state)?;
+    if !state.hosted_note_consolidation_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
     enforce_rate_limit(
         &state.rate_limiter,
         &headers,
@@ -1884,7 +1893,13 @@ async fn ingest_private_order_payload(
         .order_ingress_receipt_secret
         .as_deref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let submission = request.order_submission;
+    let TrustedOrderIngressRequest {
+        order_submission: submission,
+        renewal_package_id,
+        renewal_package_commitment,
+        renewal_relay_mode,
+        padding: _padding,
+    } = request;
     if submission.order_bundle.ingress_receipt.is_some() {
         return Err(reject_private_ingress("client supplied an ingress receipt"));
     }
@@ -1945,6 +1960,16 @@ async fn ingest_private_order_payload(
         .map_err(|error| reject_private_ingress(&format!("funding notes are invalid: {error}")))?;
     validate_private_order_risk_limits(&state, &private_payload.order)
         .map_err(|_| reject_private_ingress("order risk limits rejected"))?;
+    if let Some(expected_relay_mode) = renewal_relay_mode.as_ref()
+        && expected_relay_mode != &private_payload.order.relay_mode
+    {
+        return Err(reject_private_ingress("renewal relay mode mismatch"));
+    }
+    if renewal_package_id.is_some() != renewal_package_commitment.is_some() {
+        return Err(reject_private_ingress(
+            "renewal package attestation incomplete",
+        ));
+    }
 
     let receipt = create_order_ingress_receipt(
         &submission.order_bundle,
@@ -1952,6 +1977,11 @@ async fn ingest_private_order_payload(
         "zylith-prover",
         receipt_secret,
         now_unix_ms(),
+        OrderIngressReceiptAttestation {
+            relay_mode: Some(private_payload.order.relay_mode.clone()),
+            renewal_package_id,
+            renewal_package_commitment,
+        },
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let coordinator_submission =
@@ -2382,6 +2412,9 @@ fn enforce_rate_limit(
 }
 
 fn rate_limit_subject(headers: &HeaderMap) -> String {
+    if !trusted_proxy_headers_enabled() {
+        return "anonymous".into();
+    }
     for header in ["x-forwarded-for", "x-real-ip"] {
         if let Some(value) = headers
             .get(header)
@@ -2393,6 +2426,17 @@ fn rate_limit_subject(headers: &HeaderMap) -> String {
         }
     }
     "anonymous".into()
+}
+
+fn trusted_proxy_headers_enabled() -> bool {
+    matches!(
+        env::var("ZYLITH_TRUST_PROXY_HEADERS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
 }
 
 async fn get_proof_job(
@@ -2413,7 +2457,7 @@ async fn get_proof_job(
 struct PublicProofJobStatus {
     batch_id: String,
     state: String,
-    matched_order_count: u64,
+    matched_order_count_bucket: String,
     witness_available: bool,
     proof_artifact_available: bool,
     onchain_submission_available: bool,
@@ -2495,7 +2539,7 @@ fn public_proof_job_status(status: &ProofJobStatus) -> PublicProofJobStatus {
     PublicProofJobStatus {
         batch_id: status.batch_id.0.clone(),
         state: status.state.clone(),
-        matched_order_count: status.matched_order_count,
+        matched_order_count_bucket: zylith_core::count_bucket_label(status.matched_order_count),
         witness_available: status.witness_available,
         proof_artifact_available: status.proof_artifact_available,
         onchain_submission_available: status.onchain_submission_available,
@@ -3577,6 +3621,9 @@ async fn prove_and_record_auction_result(
         None
     };
 
+    let privacy_gate_config_commitment =
+        auction_privacy_gate_config_commitment(&settlement_witness.privacy_gate)
+            .map_err(|error| error.to_string())?;
     let expected_proof_message_hash = auction_result_proof_message_hash_for_program(
         &state.native_proof_program_address,
         &state.auction_verifier_address,
@@ -3584,6 +3631,7 @@ async fn prove_and_record_auction_result(
         &order_commitment_root,
         &admission_root,
         &transcript_commitment,
+        &privacy_gate_config_commitment,
     )
     .map_err(|error| error.to_string())?;
     let serialized_native_witness =
@@ -3684,6 +3732,7 @@ async fn prove_and_record_auction_result(
                 order_commitment_root,
                 admission_root,
                 transcript_commitment,
+                privacy_gate_config_commitment,
             ],
         };
         let tx_hash = submit_native_invoke_with_typed_sdk_retry(
@@ -4923,7 +4972,18 @@ async fn publish_settlement_timestamp_to_artifact_stores(
     else {
         return Ok(());
     };
-    let payload = SettlementTimestampUpdate { settled_at_unix_ms };
+    let settlement_plan = state.settlement_plans.read().await.get(batch_id).cloned();
+    let payload = SettlementTimestampUpdate {
+        settled_at_unix_ms,
+        transaction_hash: Some(submission.transaction_hash.clone()),
+        settlement_contract_address: Some(submission.settlement_contract_address.clone()),
+        output_note_root: settlement_plan
+            .as_ref()
+            .map(|plan| plan.encoded_args.output_note_root.clone()),
+        transcript_commitment: settlement_plan
+            .as_ref()
+            .map(|plan| plan.transcript_commitment.clone()),
+    };
     let targets = [
         format!(
             "{}/api/internal/batches/{batch_id}/settled-at",
@@ -8757,7 +8817,13 @@ where
     let directory = data_dir.join(subdir);
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
-        Err(_) => return BTreeMap::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(error) => {
+            panic!(
+                "failed to read prover record directory {}: {error}",
+                directory.display()
+            )
+        }
     };
 
     let mut records = BTreeMap::new();
@@ -8768,17 +8834,13 @@ where
             continue;
         }
 
-        match fs::read_to_string(&path)
-            .ok()
-            .and_then(|body| serde_json::from_str::<T>(&body).ok())
-        {
-            Some(record) => {
-                records.insert(key_fn(&record), record);
-            }
-            None => {
-                eprintln!("Skipping invalid prover record at {}", path.display());
-            }
-        }
+        let body = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("failed to read prover record {}: {error}", path.display())
+        });
+        let record = serde_json::from_str::<T>(&body).unwrap_or_else(|error| {
+            panic!("failed to parse prover record {}: {error}", path.display())
+        });
+        records.insert(key_fn(&record), record);
     }
 
     records

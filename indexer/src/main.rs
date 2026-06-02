@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -22,12 +22,13 @@ use zylith_core::{
     DepositConfirmationRequest, DepositRecord, DepositRecordList, DepositSyncStatus,
     MakerAttributionArtifactList, MultiPairArtifactBundleList, MultiPairArtifactBundleSummary,
     NoteCommitment, OutputCiphertextBundle, PublicSettlementTranscript, PublishedBatchArtifactList,
-    PublishedBatchArtifactSummary, PublishedBatchArtifacts, RootOnlySettlementCommitments,
-    SettlementRootHistoryArchive, SettlementRootHistoryBatch, SettlementTimestampUpdate,
-    SettlementTranscript, WithdrawalAmountBucketPolicy, WithdrawalRecord, WithdrawalRecordList,
+    PublishedBatchArtifactSummary, PublishedBatchArtifacts, SettlementRootHistoryArchive,
+    SettlementRootHistoryBatch, SettlementTimestampUpdate, SettlementTranscript,
+    WithdrawalAmountBucketPolicy, WithdrawalRecord, WithdrawalRecordList,
     artifact_bundle_padded_count, artifact_epoch_bucket_end, artifact_epoch_bucket_start,
-    count_bucket_label, extract_bearer_token, root_only_settlement_commitments,
-    settlement_transcript_commitment, transcript_shape_metadata,
+    count_bucket_label, extract_bearer_token,
+    hash::{encode_starknet_felt, normalize_felt_hex},
+    root_only_settlement_commitments, settlement_transcript_commitment, transcript_shape_metadata,
 };
 
 const DEFAULT_RPC_URL: &str = "http://127.0.0.1:5050/rpc/v0_8";
@@ -45,6 +46,10 @@ const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
 const ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MIN_EPOCHS";
 const ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MAX_EPOCHS";
 const INDEXER_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_INDEXER_ALLOWED_ORIGINS";
+const INDEXER_SYNC_INTERVAL_MS_ENV: &str = "ZYLITH_INDEXER_SYNC_INTERVAL_MS";
+const REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV: &str =
+    "ZYLITH_REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION";
+const DEFAULT_INDEXER_SYNC_INTERVAL_MS: u64 = 15_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -59,6 +64,7 @@ struct AppState {
     confirmed_withdrawals: Arc<RwLock<BTreeMap<String, WithdrawalRecord>>>,
     synced_deposit_count: Arc<RwLock<u64>>,
     synced_withdrawal_count: Arc<RwLock<u64>>,
+    last_successful_sync_unix_ms: Arc<RwLock<u64>>,
     published_batch_artifacts: Arc<RwLock<BTreeMap<String, PublishedBatchArtifacts>>>,
     artifact_archive_path: Option<Arc<PathBuf>>,
     internal_api_token: Option<Arc<String>>,
@@ -66,6 +72,8 @@ struct AppState {
     public_artifact_delay_min_epochs: u64,
     public_artifact_delay_max_epochs: u64,
     artifact_epoch_bucket_size: u64,
+    require_artifact_onchain_verification: bool,
+    output_note_root_selector: String,
 }
 
 #[derive(Serialize)]
@@ -122,6 +130,7 @@ async fn main() -> Result<(), String> {
         confirmed_withdrawals: Arc::new(RwLock::new(BTreeMap::new())),
         synced_deposit_count: Arc::new(RwLock::new(0)),
         synced_withdrawal_count: Arc::new(RwLock::new(0)),
+        last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
         published_batch_artifacts: Arc::new(RwLock::new(
             artifact_archive_path
                 .as_deref()
@@ -141,6 +150,11 @@ async fn main() -> Result<(), String> {
             DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE,
             1,
         ),
+        require_artifact_onchain_verification: env_bool_or_default(
+            REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV,
+            true,
+        ),
+        output_note_root_selector: selector_hex("output_note_root"),
     };
 
     if let Err(status) = sync_deposits(&state).await {
@@ -149,6 +163,13 @@ async fn main() -> Result<(), String> {
     if let Err(status) = sync_withdrawals(&state).await {
         eprintln!("indexer startup withdrawal sync skipped: {status}");
     }
+
+    let sync_interval_ms = load_u64_env(
+        INDEXER_SYNC_INTERVAL_MS_ENV,
+        DEFAULT_INDEXER_SYNC_INTERVAL_MS,
+        1_000,
+    );
+    spawn_background_sync(state.clone(), sync_interval_ms);
 
     let app = build_app_with_state(state);
 
@@ -249,6 +270,26 @@ fn build_app_with_state(state: AppState) -> Router {
         .route("/api/deposits/confirmations", post(confirm_deposits))
         .with_state(state)
         .layer(service_cors_layer(INDEXER_ALLOWED_ORIGINS_ENV))
+}
+
+fn spawn_background_sync(state: AppState, interval_ms: u64) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+        loop {
+            interval.tick().await;
+            let deposits = sync_deposits(&state).await;
+            let withdrawals = sync_withdrawals(&state).await;
+            if deposits.is_ok() || withdrawals.is_ok() {
+                *state.last_successful_sync_unix_ms.write().await = now_unix_ms();
+            }
+            if let Err(status) = deposits {
+                eprintln!("indexer background deposit sync skipped: {status}");
+            }
+            if let Err(status) = withdrawals {
+                eprintln!("indexer background withdrawal sync skipped: {status}");
+            }
+        }
+    });
 }
 
 fn load_required_control_plane_token(service_name: &str, env_name: &str) -> Result<String, String> {
@@ -369,6 +410,13 @@ fn load_u64_env(name: &str, default_value: u64, minimum_value: u64) -> u64 {
         .unwrap_or(default_value)
 }
 
+fn env_bool_or_default(name: &str, default_value: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(default_value)
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -404,12 +452,23 @@ fn load_published_batch_artifacts_store(
     path: &FsPath,
 ) -> BTreeMap<String, PublishedBatchArtifacts> {
     let Ok(contents) = fs::read_to_string(path) else {
+        if path.exists() {
+            panic!(
+                "failed to read published batch artifacts store {}",
+                path.display()
+            );
+        }
         return BTreeMap::default();
     };
 
     serde_json::from_str::<PublishedBatchArtifactsStoreFile>(&contents)
         .map(|store| store.artifacts_by_batch)
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to parse published batch artifacts store {}: {error}",
+                path.display()
+            )
+        })
 }
 
 fn persist_published_batch_artifacts_store(
@@ -443,29 +502,13 @@ fn atomic_write(path: &FsPath, contents: &str) -> Result<(), StatusCode> {
 
 fn published_batch_artifact_summary(
     published: &PublishedBatchArtifacts,
-) -> PublishedBatchArtifactSummary {
-    let roots = root_only_settlement_commitments(&published.transcript).unwrap_or_else(|_| {
-        RootOnlySettlementCommitments {
-            prior_note_root: "0x0".into(),
-            prior_nullifier_root: "0x0".into(),
-            prior_renewal_root: "0x0".into(),
-            prior_fee_root: "0x0".into(),
-            consumed_note_root: "0x0".into(),
-            consumed_nullifier_root: "0x0".into(),
-            renewal_child_root: "0x0".into(),
-            output_note_root: "0x0".into(),
-            fee_root: "0x0".into(),
-            new_note_root: "0x0".into(),
-            new_nullifier_root: "0x0".into(),
-            new_renewal_root: "0x0".into(),
-            new_fee_root: "0x0".into(),
-        }
-    });
+) -> Option<PublishedBatchArtifactSummary> {
+    let roots = root_only_settlement_commitments(&published.transcript).ok()?;
     let shape = published.transcript_shape.clone().unwrap_or_else(|| {
         transcript_shape_metadata(&published.transcript, &published.output_bundle)
     });
 
-    PublishedBatchArtifactSummary {
+    Some(PublishedBatchArtifactSummary {
         batch_id: published.transcript.batch_id.clone(),
         pair_id: published.transcript.pair_id.clone(),
         batch_epoch: published.transcript.batch_epoch,
@@ -484,7 +527,7 @@ fn published_batch_artifact_summary(
         fee_count_bucket: shape.fee_count_bucket,
         output_note_count_bucket: shape.output_note_count_bucket,
         transcript_shape_policy_version: shape.policy_version,
-    }
+    })
 }
 
 fn artifact_aggregation_policy(state: &AppState) -> ArtifactAggregationPolicy {
@@ -548,11 +591,11 @@ fn is_public_artifact_visible(
     let delay_subject = format!("{bucket_start}:{bucket_end}");
     let delay_epochs =
         effective_public_artifact_delay_epochs(&delay_subject, min_delay_epochs, max_delay_epochs);
-    if delay_epochs == 0 {
-        return published.published_at_unix_ms != 0;
-    }
     if published.settled_at_unix_ms.is_none() {
         return false;
+    }
+    if delay_epochs == 0 {
+        return published.published_at_unix_ms != 0;
     }
     let release_epoch = bucket_end.saturating_add(delay_epochs);
     if public_visible_epoch_cutoff(artifacts)
@@ -592,7 +635,7 @@ fn public_artifact_summaries_for_epoch_range(
                     batch_window_ms,
                 )
         })
-        .map(published_batch_artifact_summary)
+        .filter_map(published_batch_artifact_summary)
         .collect::<Vec<_>>();
     summaries.sort_by(|left, right| {
         left.batch_epoch
@@ -1144,6 +1187,15 @@ async fn mark_published_batch_settled(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let published_snapshot = {
+        let artifacts = state.published_batch_artifacts.read().await;
+        artifacts
+            .get(&batch_id)
+            .cloned()
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+    verify_settlement_timestamp_update(&state, &published_snapshot, &request).await?;
+
     let mut artifacts = state.published_batch_artifacts.write().await;
     let published = artifacts.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
     published.settled_at_unix_ms = Some(request.settled_at_unix_ms);
@@ -1154,6 +1206,57 @@ async fn mark_published_batch_settled(
     }
 
     Ok(Json(response))
+}
+
+async fn verify_settlement_timestamp_update(
+    state: &AppState,
+    published: &PublishedBatchArtifacts,
+    request: &SettlementTimestampUpdate,
+) -> Result<(), StatusCode> {
+    let roots = root_only_settlement_commitments(&published.transcript)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if let Some(output_note_root) = request.output_note_root.as_deref() {
+        let provided = normalize_required_felt(output_note_root)?;
+        let expected = normalize_required_felt(&roots.output_note_root)?;
+        if provided != expected {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    if let Some(transcript_commitment) = request.transcript_commitment.as_deref() {
+        let provided = normalize_required_felt(transcript_commitment)?;
+        let expected = normalize_required_felt(
+            &settlement_transcript_commitment(&published.transcript)
+                .map_err(|_| StatusCode::BAD_REQUEST)?,
+        )?;
+        if provided != expected {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    if !state.require_artifact_onchain_verification {
+        return Ok(());
+    }
+    if request
+        .transaction_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let contract_address = request
+        .settlement_contract_address
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&published.settlement_witness.auction_verifier_address);
+    let chain_root =
+        fetch_onchain_output_note_root(state, contract_address, &published.transcript.batch_id.0)
+            .await?;
+    let expected = normalize_required_felt(&roots.output_note_root)?;
+    if chain_root != expected {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(())
 }
 
 async fn get_confirmed_withdrawal(
@@ -1209,6 +1312,7 @@ async fn current_status(state: &AppState) -> DepositSyncStatus {
     let withdrawals = state.confirmed_withdrawals.read().await;
     let synced_count = state.synced_deposit_count.read().await;
     let synced_withdrawal_count = state.synced_withdrawal_count.read().await;
+    let last_successful_sync_unix_ms = *state.last_successful_sync_unix_ms.read().await;
     DepositSyncStatus {
         service: "zylith-indexer".into(),
         rpc_configured: !state.rpc_url.trim().is_empty(),
@@ -1219,6 +1323,12 @@ async fn current_status(state: &AppState) -> DepositSyncStatus {
         synced_deposit_count_bucket: count_bucket_label(*synced_count),
         cached_withdrawals_bucket: count_bucket_label(withdrawals.len() as u64),
         synced_withdrawal_count_bucket: count_bucket_label(*synced_withdrawal_count),
+        last_successful_sync_unix_ms,
+        sync_lag_ms: if last_successful_sync_unix_ms == 0 {
+            0
+        } else {
+            now_unix_ms().saturating_sub(last_successful_sync_unix_ms)
+        },
     }
 }
 
@@ -1243,6 +1353,7 @@ async fn sync_deposits(state: &AppState) -> Result<(), StatusCode> {
     }
 
     *state.synced_deposit_count.write().await = remote_count;
+    *state.last_successful_sync_unix_ms.write().await = now_unix_ms();
     Ok(())
 }
 
@@ -1267,6 +1378,7 @@ async fn sync_withdrawals(state: &AppState) -> Result<(), StatusCode> {
     }
 
     *state.synced_withdrawal_count.write().await = remote_count;
+    *state.last_successful_sync_unix_ms.write().await = now_unix_ms();
     Ok(())
 }
 
@@ -1325,8 +1437,44 @@ async fn starknet_call(
     entry_point_selector: &str,
     calldata: &[String],
 ) -> Result<Vec<String>, StatusCode> {
+    starknet_call_contract(
+        state,
+        &state.shielded_asset_adapter_address,
+        entry_point_selector,
+        calldata,
+    )
+    .await
+}
+
+async fn fetch_onchain_output_note_root(
+    state: &AppState,
+    contract_address: &str,
+    batch_id: &str,
+) -> Result<String, StatusCode> {
+    let contract_address = normalize_required_felt(contract_address)?;
+    if contract_address == "0x0" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let batch_id_felt = encode_starknet_felt("batch-id", batch_id);
+    let result = starknet_call_contract(
+        state,
+        &contract_address,
+        &state.output_note_root_selector,
+        &[batch_id_felt],
+    )
+    .await?;
+    let root = result.into_iter().next().ok_or(StatusCode::BAD_GATEWAY)?;
+    normalize_required_felt(&root)
+}
+
+async fn starknet_call_contract(
+    state: &AppState,
+    contract_address: &str,
+    entry_point_selector: &str,
+    calldata: &[String],
+) -> Result<Vec<String>, StatusCode> {
     let call = StarknetCallRequest {
-        contract_address: &state.shielded_asset_adapter_address,
+        contract_address,
         entry_point_selector,
         calldata,
     };
@@ -1375,13 +1523,17 @@ fn normalize_hex(value: &str) -> String {
     }
 }
 
+fn normalize_required_felt(value: &str) -> Result<String, StatusCode> {
+    normalize_felt_hex(value).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AppState, DEFAULT_BATCH_WINDOW_MS, build_app_with_state,
         effective_public_artifact_delay_epochs, normalize_hex, now_unix_ms,
         parse_deployment_manifest, parse_hex_u64, parse_hex_u128,
-        select_shielded_asset_adapter_address,
+        select_shielded_asset_adapter_address, selector_hex,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -1601,6 +1753,7 @@ mod tests {
             confirmed_withdrawals: Arc::new(RwLock::new(BTreeMap::new())),
             synced_deposit_count: Arc::new(RwLock::new(0)),
             synced_withdrawal_count: Arc::new(RwLock::new(0)),
+            last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: Arc::new(RwLock::new(artifacts)),
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
@@ -1608,6 +1761,8 @@ mod tests {
             public_artifact_delay_min_epochs: 0,
             public_artifact_delay_max_epochs: 0,
             artifact_epoch_bucket_size: 8,
+            require_artifact_onchain_verification: false,
+            output_note_root_selector: selector_hex("output_note_root"),
         });
 
         let settled_response = app
@@ -1753,6 +1908,7 @@ mod tests {
             confirmed_withdrawals: Arc::new(RwLock::new(BTreeMap::new())),
             synced_deposit_count: Arc::new(RwLock::new(0)),
             synced_withdrawal_count: Arc::new(RwLock::new(0)),
+            last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: Arc::new(RwLock::new(artifacts)),
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
@@ -1760,6 +1916,8 @@ mod tests {
             public_artifact_delay_min_epochs: 1,
             public_artifact_delay_max_epochs: 1,
             artifact_epoch_bucket_size: 8,
+            require_artifact_onchain_verification: false,
+            output_note_root_selector: selector_hex("output_note_root"),
         });
 
         for batch_id in ["batch-strk-usdc-10", "batch-strk-eth-10"] {
@@ -1884,6 +2042,7 @@ mod tests {
             confirmed_withdrawals: Arc::new(RwLock::new(BTreeMap::new())),
             synced_deposit_count: Arc::new(RwLock::new(0)),
             synced_withdrawal_count: Arc::new(RwLock::new(0)),
+            last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
@@ -1891,6 +2050,8 @@ mod tests {
             public_artifact_delay_min_epochs: 1,
             public_artifact_delay_max_epochs: 1,
             artifact_epoch_bucket_size: 8,
+            require_artifact_onchain_verification: false,
+            output_note_root_selector: selector_hex("output_note_root"),
         });
 
         let unauthorized = app

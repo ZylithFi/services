@@ -45,7 +45,7 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         const rawBody = await readBody(request, config.maxBodyBytes);
         const body = JSON.parse(rawBody) as unknown;
         const validated = validateEnsurePrivacySignerRequest(body, config);
-        enforceRequestLimits(request, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
+        enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
         const result = await submissionQueues.enqueue(config.accountAddress, () =>
           ensurePrivacyProofSignerContract(validated, config, deps)
         );
@@ -57,7 +57,7 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         const rawBody = await readBody(request, config.maxBodyBytes);
         const body = JSON.parse(rawBody) as unknown;
         const validated = validateRelayPrivacySignerRequest(body, config);
-        enforceRequestLimits(request, signerRateLimiter, clientRateLimiter, validated.account_address);
+        enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.account_address);
         const result = await submissionQueues.enqueue(config.accountAddress, () =>
           relayPrivacyProofSignerCall(validated, config, deps)
         );
@@ -73,7 +73,7 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
       const rawBody = await readBody(request, config.maxBodyBytes);
       const body = JSON.parse(rawBody) as unknown;
       const validated = validateExecuteOutsideRequest(body, config);
-      enforceRequestLimits(request, signerRateLimiter, clientRateLimiter, validated.signer_address);
+      enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_address);
       const result = await submissionStore.runOnce(validated, () =>
         submissionQueues.enqueue(config.accountAddress, () =>
           submitProofBearingOutsideExecution(validated, config, deps)
@@ -90,18 +90,25 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
 
 function enforceRequestLimits(
   request: IncomingMessage,
+  config: PaymasterConfig,
   signerRateLimiter: FixedWindowRateLimiter,
   clientRateLimiter: FixedWindowRateLimiter,
   signerAddress: string
 ): void {
   signerRateLimiter.check(`signer:${signerAddress}`);
-  clientRateLimiter.check(`ip:${clientIp(request)}`);
+  clientRateLimiter.check(`ip:${clientIp(request, config)}`);
 }
 
-function clientIp(request: IncomingMessage): string {
-  const forwarded = request.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.trim()) {
-    return forwarded.split(",")[0]?.trim() || "unknown";
+function clientIp(request: IncomingMessage, config: PaymasterConfig): string {
+  if (config.trustProxyHeaders) {
+    const forwarded = request.headers["x-forwarded-for"];
+    if (typeof forwarded === "string" && forwarded.trim()) {
+      return forwarded.split(",")[0]?.trim() || "unknown";
+    }
+    const realIp = request.headers["x-real-ip"];
+    if (typeof realIp === "string" && realIp.trim()) {
+      return realIp.trim();
+    }
   }
   return request.socket.remoteAddress ?? "unknown";
 }

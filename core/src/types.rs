@@ -868,10 +868,23 @@ pub struct OrderIngressReceipt {
     pub pair_id: PairId,
     pub batch_id: BatchId,
     pub epoch_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_mode: Option<RelayMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_package_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_package_commitment: Option<String>,
     pub payload_commitment: String,
     pub issued_at_unix_ms: u64,
     pub signer: String,
     pub signature: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OrderIngressReceiptAttestation {
+    pub relay_mode: Option<RelayMode>,
+    pub renewal_package_id: Option<String>,
+    pub renewal_package_commitment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -900,6 +913,12 @@ fn zero_felt_string() -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedOrderIngressRequest {
     pub order_submission: OrderSubmission,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_package_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_package_commitment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_relay_mode: Option<RelayMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub padding: Option<String>,
 }
@@ -1965,6 +1984,14 @@ pub struct OnchainSubmissionRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementTimestampUpdate {
     pub settled_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_contract_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_note_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_commitment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1983,6 +2010,8 @@ pub struct RenewalParentCancelPlanRequest {
     pub renewal_cancel_auth_key: String,
     #[serde(default)]
     pub prior_renewal_entries: Vec<String>,
+    #[serde(default)]
+    pub renewal_cancel_sparse_witness: Option<NullifierSparseUpdateWitness>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2117,6 +2146,10 @@ pub struct DepositSyncStatus {
     pub synced_deposit_count_bucket: String,
     pub cached_withdrawals_bucket: String,
     pub synced_withdrawal_count_bucket: String,
+    #[serde(default)]
+    pub last_successful_sync_unix_ms: u64,
+    #[serde(default)]
+    pub sync_lag_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2657,7 +2690,27 @@ pub struct ProductPairConfig {
     pub maker_fee_bps: u16,
     #[serde(default)]
     pub relay_fee_bps: u16,
+    #[serde(default)]
+    pub privacy_gate: ProductPrivacyGateConfig,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductPrivacyGateConfig {
+    #[serde(default, with = "serde_u128_decimal")]
+    pub min_batch_base_liquidity: u128,
+    #[serde(default)]
+    pub min_batch_participants: u64,
+    #[serde(default)]
+    pub min_eligible_orders: u64,
+    #[serde(default)]
+    pub max_single_order_fill_bps: u64,
+    #[serde(default)]
+    pub max_single_owner_fill_bps: u64,
+    #[serde(default)]
+    pub min_maker_participants: u64,
+    #[serde(default)]
+    pub max_maker_fill_bps: u64,
 }
 
 impl ProductPairConfig {
@@ -2885,6 +2938,7 @@ impl ProductConfig {
                     taker_fee_bps,
                     maker_fee_bps,
                     relay_fee_bps,
+                    privacy_gate: ProductPrivacyGateConfig::default(),
                     enabled: true,
                 },
             );
@@ -3197,6 +3251,7 @@ impl ProductConfig {
             taker_fee_bps,
             maker_fee_bps,
             relay_fee_bps,
+            privacy_gate: ProductPrivacyGateConfig::default(),
             enabled,
         })
     }

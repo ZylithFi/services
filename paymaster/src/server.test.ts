@@ -164,7 +164,8 @@ describe("paymaster server", () => {
         ...config(),
         allowedEntrypoints: new Set(["withdraw_settlement_output_to_l2"]),
         proofRequiredEntrypoints: new Set(),
-        withdrawalAmountBuckets: new Set(["100"])
+        withdrawalAmountBuckets: new Set(["100"]),
+        allowDirectWithdrawalRelays: true
       },
       {
         fetchImpl: fakeRpcFetch(),
@@ -199,12 +200,14 @@ function config(): PaymasterConfig {
     allowedEntrypoints: new Set(["apply_actions"]),
     proofRequiredEntrypoints: new Set(["apply_actions"]),
     withdrawalAmountBuckets: new Set(),
+    allowDirectWithdrawalRelays: false,
     bindHost: "127.0.0.1",
     port: 0,
     maxBodyBytes: 1_000_000,
     allowedOrigins: new Set(["https://app.example"]),
     allowedOriginPatterns: [],
     signerLimitPerMinute: 20,
+    trustProxyHeaders: false,
     submissionLogPath: null
   };
 }

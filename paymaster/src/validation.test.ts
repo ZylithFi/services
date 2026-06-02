@@ -15,13 +15,15 @@ const config: Pick<
   | "chainId"
   | "proofRequiredEntrypoints"
   | "withdrawalAmountBuckets"
+  | "allowDirectWithdrawalRelays"
 > = {
   accountAddress: "0xabc",
   chainId: "0x534e5f5345504f4c4941",
   allowedContracts: new Set(["0x123"]),
   allowedEntrypoints: new Set(["apply_actions"]),
   proofRequiredEntrypoints: new Set(["apply_actions"]),
-  withdrawalAmountBuckets: new Set()
+  withdrawalAmountBuckets: new Set(),
+  allowDirectWithdrawalRelays: false
 };
 
 describe("validateExecuteOutsideRequest", () => {
@@ -99,7 +101,8 @@ describe("validateExecuteOutsideRequest", () => {
       ...config,
       allowedEntrypoints: new Set(["withdraw_settlement_output_to_l2"]),
       proofRequiredEntrypoints: new Set<string>(),
-      withdrawalAmountBuckets: new Set(["100"])
+      withdrawalAmountBuckets: new Set(["100"]),
+      allowDirectWithdrawalRelays: true
     };
     const validated = validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000);
 
@@ -126,7 +129,8 @@ describe("validateExecuteOutsideRequest", () => {
       ...config,
       allowedEntrypoints: new Set(["withdraw_settlement_output_to_l2"]),
       proofRequiredEntrypoints: new Set<string>(),
-      withdrawalAmountBuckets: new Set(["100"])
+      withdrawalAmountBuckets: new Set(["100"]),
+      allowDirectWithdrawalRelays: true
     };
     const validated = validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000);
 
@@ -134,7 +138,7 @@ describe("validateExecuteOutsideRequest", () => {
     expect(validated.relay_nonce).toBe("0x456");
   });
 
-  it("accepts direct adapter note withdrawals from embedded wallet signatures", () => {
+  it("rejects direct adapter note withdrawals by default", () => {
     const request = baseRequest();
     request.call.entrypoint = "withdraw_to_l2";
     request.call.calldata = ["0xabc", "0x11", "0x22", "0x1234"];
@@ -145,10 +149,9 @@ describe("validateExecuteOutsideRequest", () => {
       allowedEntrypoints: new Set(["withdraw_to_l2"]),
       proofRequiredEntrypoints: new Set<string>()
     };
-    const validated = validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000);
-
-    expect(validated.call.entrypoint).toBe("withdraw_to_l2");
-    expect(validated.outside_transaction).toBeUndefined();
+    expect(() => validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)).toThrow(
+      "direct withdrawal relay sponsorship is disabled"
+    );
   });
 
   it("accepts direct proof-bearing apply_actions relays", () => {
@@ -158,6 +161,34 @@ describe("validateExecuteOutsideRequest", () => {
     const validated = validateExecuteOutsideRequest(request, config, 1_700_000_000);
 
     expect(validated.call.entrypoint).toBe("apply_actions");
+    expect(validated.outside_transaction).toBeUndefined();
+  });
+
+  it("accepts direct renewal parent cancellation relays", () => {
+    const request = baseRequest();
+    request.call.entrypoint = "cancel_renewal_parent_marker";
+    request.call.calldata = [
+      "0x111",
+      "0x222",
+      "0x111",
+      "0x0",
+      "0x0",
+      "0x0",
+      "0x333",
+      "0x444"
+    ];
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+    delete (request as { proof?: unknown }).proof;
+    delete (request as { proof_facts?: unknown }).proof_facts;
+
+    const cancelConfig = {
+      ...config,
+      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
+      proofRequiredEntrypoints: new Set<string>()
+    };
+    const validated = validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000);
+
+    expect(validated.call.entrypoint).toBe("cancel_renewal_parent_marker");
     expect(validated.outside_transaction).toBeUndefined();
   });
 

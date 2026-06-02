@@ -21,6 +21,7 @@ export function validateExecuteOutsideRequest(
     | "chainId"
     | "proofRequiredEntrypoints"
     | "withdrawalAmountBuckets"
+    | "allowDirectWithdrawalRelays"
   >,
   nowUnixSeconds = Math.floor(Date.now() / 1000)
 ): ExecuteOutsideRequest {
@@ -67,7 +68,11 @@ export function validateExecuteOutsideRequest(
   if (outsideTransaction) {
     validateOutsideTransaction(outsideTransaction, signerAddress, config.accountAddress, call, nowUnixSeconds);
   } else {
-    validateDirectRelayedCall(call, Boolean(proof && proofFacts && proofFacts.length > 0));
+    validateDirectRelayedCall(
+      call,
+      Boolean(proof && proofFacts && proofFacts.length > 0),
+      config.allowDirectWithdrawalRelays,
+    );
     if (request.relay_nonce !== undefined) {
       normalizeFeltValue(request.relay_nonce, "relay_nonce");
     }
@@ -205,8 +210,15 @@ export function validateRelayPrivacySignerRequest(
   };
 }
 
-function validateDirectRelayedCall(call: StarknetCallPayload, hasProof: boolean): void {
+function validateDirectRelayedCall(
+  call: StarknetCallPayload,
+  hasProof: boolean,
+  allowDirectWithdrawalRelays: boolean,
+): void {
   if (call.entrypoint === "apply_actions" && hasProof) {
+    return;
+  }
+  if (call.entrypoint === "cancel_renewal_parent_marker") {
     return;
   }
   if (
@@ -215,6 +227,9 @@ function validateDirectRelayedCall(call: StarknetCallPayload, hasProof: boolean)
     call.entrypoint !== "withdraw_to_l2"
   ) {
     throw new Error("direct paymaster relay is only allowed for withdrawals");
+  }
+  if (!allowDirectWithdrawalRelays) {
+    throw new Error("direct withdrawal relay sponsorship is disabled");
   }
 }
 

@@ -7,9 +7,11 @@ authors.workspace = true
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+starknet-rust-core = "0.19"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net"] }
 tower-http = { version = "0.6", features = ["cors"] }
 zylith-core = { path = "../core" }

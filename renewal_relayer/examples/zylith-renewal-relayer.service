@@ -1,0 +1,23 @@
+[Unit]
+Description=Zylith self-hosted renewal relayer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zylith
+Group=zylith
+WorkingDirectory=/opt/zylith
+EnvironmentFile=/etc/zylith/renewal-relayer.env
+ExecStart=/opt/zylith/bin/zylith-renewal-relayer
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zylith-renewal-relayer
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
