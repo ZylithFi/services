@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
+ipnet = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -14,6 +15,7 @@ sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
+url = "2"
 zylith-core = { path = "../core" }
 
 [dev-dependencies]

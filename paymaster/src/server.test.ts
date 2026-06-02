@@ -146,7 +146,7 @@ describe("paymaster server", () => {
     expect(submits).toBe(1);
   });
 
-  it("handles direct embedded-wallet withdrawal relays without outside execution", async () => {
+  it("rejects direct embedded-wallet withdrawal relays while exits are paused", async () => {
     const directRequest = {
       ...request,
       call: {
@@ -184,8 +184,69 @@ describe("paymaster server", () => {
       body: JSON.stringify(directRequest)
     });
 
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({ transaction_hash: "0xtx" });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "withdrawals are paused until nullifier-consuming exits are available"
+    });
+  });
+
+  it("relays privacy signer approvals without process-local ensure state", async () => {
+    const server = createPaymasterServer(config(), {
+      fetchImpl: fakeRpcFetch(),
+      runtime: fakeRuntime()
+    });
+    servers.push(server);
+    const url = await listen(server);
+    const relayBody = {
+      account_address: "0x1234",
+      calls: [{
+        contract_address: "0x123",
+        entrypoint: "approve",
+        calldata: ["0x123", "0x1", "0x0"]
+      }],
+      nonce: "0x55",
+      signature_r: "0xaa",
+      signature_s: "0xbb"
+    };
+
+    const relayBeforeEnsure = await fetch(`${url}/privacy-signer/relay`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://app.example"
+      },
+      body: JSON.stringify(relayBody)
+    });
+    expect(relayBeforeEnsure.status).toBe(200);
+    await expect(relayBeforeEnsure.json()).resolves.toEqual({ transaction_hash: "0xtx" });
+
+    const ensure = await fetch(`${url}/privacy-signer/ensure`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://app.example"
+      },
+      body: JSON.stringify({
+        signer_public_key: "0x777",
+        salt: "0x88",
+        class_hash: "0xabc"
+      })
+    });
+    expect(ensure.status).toBe(200);
+    await expect(ensure.json()).resolves.toMatchObject({
+      contract_address: "0x1234"
+    });
+
+    const relayAfterEnsure = await fetch(`${url}/privacy-signer/relay`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://app.example"
+      },
+      body: JSON.stringify(relayBody)
+    });
+    expect(relayAfterEnsure.status).toBe(200);
+    await expect(relayAfterEnsure.json()).resolves.toEqual({ transaction_hash: "0xtx" });
   });
 });
 
@@ -195,7 +256,7 @@ function config(): PaymasterConfig {
     chainId: "0x534e5f5345504f4c4941",
     accountAddress: "0xabc",
     privateKey: "0xkey",
-    privacySignerClassHash: "0xclass",
+    privacySignerClassHash: "0xabc",
     allowedContracts: new Set(["0x123"]),
     allowedEntrypoints: new Set(["apply_actions"]),
     proofRequiredEntrypoints: new Set(["apply_actions"]),
@@ -300,6 +361,10 @@ function fakeRuntime(): StarknetRuntime {
   return {
     RpcProvider: class {
       constructor(_options: { nodeUrl: string }) {}
+
+      async getClassHashAt() {
+        return "0xabc";
+      }
     },
     Account: class {
       constructor(_options: unknown) {}
@@ -310,6 +375,10 @@ function fakeRuntime(): StarknetRuntime {
 
       async getCairoVersion() {
         return "1";
+      }
+
+      async deploy() {
+        return { transaction_hash: "0xdeploy", contract_address: "0x1234" };
       }
 
       async estimateInvokeFee() {
@@ -358,6 +427,9 @@ function fakeRuntime(): StarknetRuntime {
           calldata: ["0x1"]
         }
       ]
+    },
+    hash: {
+      calculateContractAddressFromHash: () => "0x1234"
     }
   } as const satisfies StarknetRuntime;
 }

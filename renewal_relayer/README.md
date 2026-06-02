@@ -8,11 +8,11 @@ There are two deployment modes:
 
 | Mode | `ZYLITH_RENEWAL_RELAY_ACCEPT_RELAY_MODE` | Relay fee | Operator |
 | --- | --- | --- | --- |
-| Self relay | `SelfRelay` | 0bps | The maker |
-| Zylith relay | `ZylithRelay` | 1-2bps on matched maker volume | Zylith |
+| Self Relay | `SelfRelay` | 0bps | The maker |
+| Zylith Relay | `ZylithRelay` | 1-2bps on matched maker volume | Zylith |
 
-`relay_mode` is bound into the package/order commitment. A self-hosted relay should
-only accept `SelfRelay` packages. The managed Zylith relay should only accept
+`relay_mode` is bound into the package/order commitment. A Self Relay should
+only accept `SelfRelay` packages. The managed Zylith Relay should only accept
 `ZylithRelay` packages.
 
 ## Trust Model
@@ -21,6 +21,8 @@ The relayer can:
 
 - submit an authorized child order for its exact epoch;
 - observe the pair, epoch, submission outcome, and relay health metadata;
+- observe package schedule metadata, package identifiers, due-slot timing, and
+  retry/result metadata required to operate renewal submission;
 - report child submission/fill status back to the wallet.
 
 The relayer cannot:
@@ -28,10 +30,18 @@ The relayer cannot:
 - spend or withdraw maker funds;
 - alter price bands, depth, side, or inventory caps;
 - submit a slot for the wrong epoch;
-- continue after the maker submits the parent cancellation marker on-chain.
+- continue as a compliant relay once the accepted package's parent cancellation
+  marker is recorded on-chain.
 
-Missed epochs are not backfilled. If a self-hosted relay is down, liquidity for
+Missed epochs are not backfilled. If a Self Relay is down, liquidity for
 those epochs is simply not submitted.
+
+Managed Zylith Relay is therefore a metadata trust boundary. It does not receive
+spend or withdrawal keys, but it necessarily sees the operational schedule and
+package metadata needed to submit authorized children. Production deployments
+mitigate that boundary with registration-time package authorization, stripped
+reusable auth material at rest, bounded retention, protected metrics, rate
+limits, strict URL allowlists, and explicit disclosure in the maker UX.
 
 ## Quick Start
 
@@ -94,14 +104,19 @@ ZYLITH_RENEWAL_RELAY_STORE_PATH=/var/lib/zylith-renewal-relayer/relay.sqlite
 ZYLITH_RENEWAL_RELAY_COORDINATOR_URL=https://api.zylith.fi
 ZYLITH_RENEWAL_RELAY_PROVER_URL=https://api.zylith.fi
 ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN=...
+ZYLITH_RENEWAL_RELAY_PROVER_CONTROL_TOKEN=...
 ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS=https://app.zylith.fi
 ```
 
 Strict mode fails closed if the durable SQLite store, pinned coordinator/prover
-URLs, internal tick token, or allowed origins are missing. Self-hosted maker
-relays do not need Zylith's coordinator control token; they submit children
-through the public coordinator order route after the official private ingress
-returns an accepted coordinator submission.
+URLs, internal tick token, prover proof-status token, or allowed origins are
+missing. The prover proof-status token is used only to read exact
+`reuse_state` for previously submitted reused-funding slots. Public proof-job
+routes expose bucketed counts and always report `reuse_state=unknown`, so they
+cannot be used to infer no-fill safely.
+Self-hosted maker relays do not need Zylith's coordinator control token; they
+submit children through the public coordinator order route after the official
+private ingress returns an accepted coordinator submission.
 
 `ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN` is only for Zylith-operated or
 otherwise authorized deployments that are allowed to submit through the managed
@@ -117,16 +132,23 @@ maker-order route.
 | `ZYLITH_RENEWAL_RELAY_STORE_PATH` | yes | Durable `.sqlite` or `.db` state path. |
 | `ZYLITH_RENEWAL_RELAY_COORDINATOR_URL` | yes | Pinned coordinator base URL. |
 | `ZYLITH_RENEWAL_RELAY_PROVER_URL` | yes | Pinned private ingress/prover base URL. |
+| `ZYLITH_RENEWAL_RELAY_COORDINATOR_URLS` | no | Comma-separated ordered coordinator failover URLs. Overrides the single coordinator URL when set. |
+| `ZYLITH_RENEWAL_RELAY_PROVER_URLS` | no | Comma-separated ordered private-ingress/prover failover URLs. Overrides the single prover URL when set. |
 | `ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN` | yes | Bearer token for internal tick trigger access. |
+| `ZYLITH_RENEWAL_RELAY_PROVER_CONTROL_TOKEN` | yes | Bearer token for the prover proof-job status route used by reused-funding guards. |
 | `ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS` | yes | Comma-separated browser origins allowed to register packages. |
 | `ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS` | no | Upper bound for accepted package size. Default supports 90d at 90s epochs. |
 | `ZYLITH_RENEWAL_RELAY_RETRY_BACKOFF_MS` | no | Failed-slot retry backoff. |
 | `ZYLITH_RENEWAL_RELAY_MAX_ATTEMPTS` | no | Max failed submission attempts per slot. |
 | `ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE` | no | Package API rate limit per caller. |
+| `ZYLITH_RENEWAL_RELAY_PACKAGE_EXPIRY_WARNING_EPOCHS` | no | Epoch horizon for package-expiry warnings in ops summaries and metrics. |
+| `ZYLITH_RENEWAL_RELAY_ALERT_WEBHOOK_URLS` | no | Comma-separated webhook URLs for active ops alerts. |
+| `ZYLITH_RENEWAL_RELAY_ALERT_WEBHOOK_TOKEN` | no | Optional bearer token attached to alert webhook requests. |
+| `ZYLITH_RENEWAL_RELAY_ALERT_REPEAT_MS` | no | Minimum repeat interval for the same alert key. Default: 15 minutes. |
 
 ## HTTP Surface
 
-Public maker package routes:
+Maker package routes:
 
 - `POST /packages`
 - `GET /packages/{package_id}`
@@ -134,15 +156,27 @@ Public maker package routes:
 - `GET /packages/{package_id}/results.csv`
 - `DELETE /packages/{package_id}`
 
+`POST /packages` accepts either the configured package bearer token or the
+package's embedded registration signature. Browser clients may also use
+package-signed access headers for status, results, CSV export, and delete so
+they do not need a shared bearer token. The relay strips the embedded
+`relay_authorization` before durable storage; request headers must present the
+package commitment, parent cancel authority, signer, and signature each time.
+Operators can alternatively use the configured package bearer token or internal
+relay token.
+
 Operational routes:
 
 - `GET /health`
 - `GET /ready`
 - `GET /metrics`
+- `GET /ops/summary`
+- `GET /ops/alerts`
 - `POST /api/internal/relay/tick`
 
-`/api/internal/relay/tick` requires `ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN` when
-configured. Strict production mode requires this token.
+`/health` and `/ready` are intentionally minimal. `/api/internal/relay/tick`,
+`/metrics`, `/ops/summary`, and `/ops/alerts` require
+`ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN`.
 
 ## Metrics and Alerts
 
@@ -155,6 +189,21 @@ configured. Strict production mode requires this token.
 - `zylith_renewal_relay_missed_slots`
 - `zylith_renewal_relay_failed_slots`
 - `zylith_renewal_relay_awaiting_wallet_refresh_slots`
+- `zylith_renewal_relay_retryable_failed_slots`
+- `zylith_renewal_relay_package_expiring_soon`
+- `zylith_renewal_relay_warning_alerts`
+- `zylith_renewal_relay_critical_alerts`
+
+`GET /ops/summary` returns the same operational state as JSON: readiness,
+configured relay mode, store kind, package count, slot counters, per-package
+horizon, and active alerts. `GET /ops/alerts` returns just the active alert list.
+These endpoints are intended for a maker's Prometheus exporter, cron checks,
+webhook bridge, or local dashboard.
+
+If `ZYLITH_RENEWAL_RELAY_ALERT_WEBHOOK_URLS` is configured, the relayer posts the
+active ops-alert payload after worker or manual ticks. Delivery is de-duplicated
+by severity, alert code, and package id for `ZYLITH_RENEWAL_RELAY_ALERT_REPEAT_MS`
+so a persistent condition does not spam the destination every tick.
 
 Minimum production alerts:
 
@@ -164,6 +213,10 @@ Minimum production alerts:
 - Package expiry is less than the maker's renewal lead time.
 - Disk free space for the SQLite volume is low.
 - RPC/prover/coordinator request latency or error rate spikes.
+
+`renewal_relayer/examples/prometheus-alerts.yml` contains a starter Prometheus
+rule group for readiness, missed slots, failed slots, package expiry, and
+critical/warning alert gauges.
 
 The open-source relayer exposes raw operational counters. Zylith Relay turns the
 same underlying events into managed monitoring, alerting, maker-facing reports,
@@ -184,12 +237,14 @@ without a shared bearer token.
 
 ## Security Boundary
 
-The self-hosted relay should be treated as an order-routing component, not a
+The Self Relay should be treated as an order-routing component, not a
 wallet. It only receives exact-slot child submissions generated by the maker's
 wallet. It should not hold spend keys, withdrawal keys, wallet passphrases, or
 seed material.
 
-The package signature proves the maker authorized this relay package. The
+The package signature proves the maker authorized this exact relay package. It
+is also accepted as a package-scoped status/results/delete credential when
+presented in request headers, but it is not stored durably by the relayer. The
 `relay_mode` field prevents a self-relay package from being accepted by the
 managed Zylith Relay endpoint and prevents managed-relay packages from being
 accepted by a correctly configured self-host relay.
@@ -211,12 +266,12 @@ accepted by a correctly configured self-host relay.
 
 ## Zylith Relay vs Self Relay
 
-Self relay gives 0bps managed-relay fees and full control, but the maker owns
+Self Relay gives 0bps managed-relay fees and full control, but the maker owns
 all operations: hosting, upgrades, queue monitoring, gas/paymaster configuration,
-RPC failover, retries, package-expiry handling, migrations, and incident
-response.
+RPC failover configuration, retries, package-expiry handling, migrations, and
+incident response.
 
 Zylith Relay is managed maker liquidity operations: multi-region runtime, RPC
-failover, queue monitoring, missed-slot and package-expiry alerts, retries, gas
-operations, encrypted reports, maker dashboards, CSV exports, support, release
-management, and privacy-safe timing defaults.
+failover operation, queue monitoring, missed-slot and package-expiry alerts,
+retries, gas operations, encrypted reports, maker dashboards, CSV/API exports,
+support, release management, and managed timing defaults.

@@ -10,6 +10,8 @@ import type {
 } from "./types.js";
 
 const MAX_OUTSIDE_EXECUTION_WINDOW_SECONDS = 3_900;
+const RENEWAL_SPARSE_TREE_DEPTH = 128;
+const U128_MAX = (1n << 128n) - 1n;
 
 export function validateExecuteOutsideRequest(
   value: unknown,
@@ -47,6 +49,9 @@ export function validateExecuteOutsideRequest(
   }
   if (!config.allowedEntrypoints.has(call.entrypoint)) {
     throw new Error("call entrypoint is not allowlisted");
+  }
+  if (isPausedWithdrawalEntrypoint(call.entrypoint)) {
+    throw new Error("withdrawals are paused until nullifier-consuming exits are available");
   }
   if (config.proofRequiredEntrypoints.has(call.entrypoint)) {
     if (!proof) {
@@ -218,19 +223,88 @@ function validateDirectRelayedCall(
   if (call.entrypoint === "apply_actions" && hasProof) {
     return;
   }
-  if (call.entrypoint === "cancel_renewal_parent_marker") {
+  if (call.entrypoint === "withdraw_settlement_output_with_proof_facts" && hasProof) {
+    if (!allowDirectWithdrawalRelays) {
+      throw new Error("direct withdrawal relay sponsorship is disabled");
+    }
     return;
   }
-  if (
-    call.entrypoint !== "withdraw_verified_note" &&
-    call.entrypoint !== "withdraw_settlement_output_to_l2" &&
-    call.entrypoint !== "withdraw_to_l2"
-  ) {
+  if (call.entrypoint === "cancel_renewal_parent_marker") {
+    assertRenewalCancelMarkerCalldata(call);
+    return;
+  }
+  if (!isPausedWithdrawalEntrypoint(call.entrypoint)) {
     throw new Error("direct paymaster relay is only allowed for withdrawals");
   }
   if (!allowDirectWithdrawalRelays) {
     throw new Error("direct withdrawal relay sponsorship is disabled");
   }
+}
+
+function assertRenewalCancelMarkerCalldata(call: StarknetCallPayload): void {
+  const calldata = call.calldata;
+  if (calldata.length < 8) {
+    throw new Error("renewal cancellation calldata is invalid");
+  }
+
+  const cancelMarker = feltToBigInt(calldata[0], "cancel marker");
+  const cancelAuthority = feltToBigInt(calldata[1], "cancel authority");
+  const sparseKeyLow = feltToBigInt(calldata[2], "renewal sparse key low");
+  const sparseKeyHigh = feltToBigInt(calldata[3], "renewal sparse key high");
+  if (cancelMarker === 0n) {
+    throw new Error("renewal cancellation marker cannot be zero");
+  }
+  if (cancelAuthority === 0n) {
+    throw new Error("renewal cancellation authority cannot be zero");
+  }
+  if (sparseKeyLow > U128_MAX || sparseKeyHigh > U128_MAX) {
+    throw new Error("renewal cancellation sparse key is out of range");
+  }
+
+  const pathCount = Number(feltToBigInt(calldata[4], "renewal merkle path length"));
+  if (!Number.isSafeInteger(pathCount) || pathCount < 0) {
+    throw new Error("renewal cancellation merkle path length is invalid");
+  }
+  if (pathCount !== 0 && pathCount !== RENEWAL_SPARSE_TREE_DEPTH) {
+    throw new Error("renewal cancellation merkle path length is invalid");
+  }
+
+  const directionsLenIndex = 5 + pathCount;
+  if (directionsLenIndex >= calldata.length) {
+    throw new Error("renewal cancellation calldata is invalid");
+  }
+  const directionsCount = Number(
+    feltToBigInt(calldata[directionsLenIndex], "renewal merkle directions length")
+  );
+  if (directionsCount !== pathCount) {
+    throw new Error("renewal cancellation merkle path and direction lengths differ");
+  }
+
+  const expectedLength = 4 + 1 + pathCount + 1 + directionsCount + 2;
+  if (calldata.length !== expectedLength) {
+    throw new Error("renewal cancellation calldata is invalid");
+  }
+
+  const directionsStart = directionsLenIndex + 1;
+  for (let index = 0; index < directionsCount; index += 1) {
+    const bit = feltToBigInt(calldata[directionsStart + index], "renewal merkle direction");
+    if (bit !== 0n && bit !== 1n) {
+      throw new Error("renewal cancellation merkle direction is invalid");
+    }
+  }
+
+  const signatureR = feltToBigInt(calldata[calldata.length - 2], "renewal cancellation signature r");
+  const signatureS = feltToBigInt(calldata[calldata.length - 1], "renewal cancellation signature s");
+  if (signatureR === 0n || signatureS === 0n) {
+    throw new Error("renewal cancellation signature cannot be zero");
+  }
+}
+
+function isPausedWithdrawalEntrypoint(entrypoint: string): boolean {
+  return (
+    entrypoint === "withdraw_settlement_output_to_l2" ||
+    entrypoint === "withdraw_to_l2"
+  );
 }
 
 function validateCall(value: unknown): StarknetCallPayload {
@@ -345,6 +419,10 @@ function assertWithdrawalAmountBucket(
 }
 
 function withdrawalAmountForEntrypoint(call: StarknetCallPayload): bigint | null {
+  if (call.entrypoint === "withdraw_settlement_output_with_proof_facts") {
+    const amount = call.calldata[7];
+    return amount === undefined ? null : BigInt(amount);
+  }
   if (call.entrypoint === "withdraw_settlement_output_to_l2") {
     const amount = call.calldata[3];
     return amount === undefined ? null : BigInt(amount);
@@ -380,6 +458,17 @@ function normalizeFeltValue(value: unknown, label: string): string {
     return normalizeFelt(String(value));
   }
   throw new Error(`${label} must be a felt string or non-negative integer`);
+}
+
+function feltToBigInt(value: string | undefined, label: string): bigint {
+  if (value === undefined) {
+    throw new Error(`${label} must be a felt value`);
+  }
+  try {
+    return BigInt(value);
+  } catch {
+    throw new Error(`${label} must be a felt value`);
+  }
 }
 
 function sameArray(left: string[], right: string[]): boolean {

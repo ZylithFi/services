@@ -187,9 +187,21 @@ async function deployedClassHash(
 
 export async function relayPrivacyProofSignerCall(
   request: RelayPrivacySignerRequest,
-  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey">,
+  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "privacySignerClassHash">,
   deps: SubmitterDeps = {}
 ): Promise<ExecuteOutsideResponse> {
+  if (!config.privacySignerClassHash) {
+    throw new Error("privacy proof signer relay is not configured");
+  }
+  const runtime = deps.runtime ?? defaultRuntime;
+  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
+  const deployed = await deployedClassHash(provider, request.account_address);
+  if (!deployed) {
+    throw new Error("privacy proof signer account is not deployed");
+  }
+  if (toRpcFelt(deployed, "privacy signer class hash") !== config.privacySignerClassHash) {
+    throw new Error("privacy proof signer account class is not allowlisted");
+  }
   const calls = request.calls.map((call) => ({
     contractAddress: call.contract_address,
     entrypoint: call.entrypoint,

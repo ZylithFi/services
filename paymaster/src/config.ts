@@ -37,7 +37,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
   );
   const proofRequiredEntrypoints = parseOptionalNameSet(
     env.ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS ??
-      "apply_actions,submit_settlement_with_proof_facts"
+      "apply_actions,submit_settlement_with_proof_facts,withdraw_settlement_output_with_proof_facts"
   );
   const withdrawalAmountBuckets = parseAmountBucketSet(env.ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS);
   const allowDirectWithdrawalRelays = parseBool(env.ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS, false);
@@ -51,6 +51,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
   if (allowDirectWithdrawalRelays && withdrawalAmountBuckets.size === 0) {
     throw new Error(
       "ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS is required when ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS=true"
+    );
+  }
+  if (
+    allowDirectWithdrawalRelays &&
+    !parseBool(env.ZYLITH_PAYMASTER_ACK_DIRECT_WITHDRAWAL_SPONSORSHIP_RISK, false)
+  ) {
+    throw new Error(
+      "ZYLITH_PAYMASTER_ACK_DIRECT_WITHDRAWAL_SPONSORSHIP_RISK=true is required when ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS=true"
     );
   }
 

@@ -22,6 +22,8 @@ pub enum ProtocolError {
     UnsupportedPair(String),
     #[error("invalid order: {0}")]
     InvalidOrder(String),
+    #[error("invalid withdrawal: {0}")]
+    InvalidWithdrawal(String),
     #[error("invalid settlement proof: {0}")]
     InvalidSettlementProof(String),
 }

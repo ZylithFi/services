@@ -17,8 +17,8 @@ use starknet_crypto::{Felt, get_public_key, poseidon_hash, rfc6979_generate_k, s
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    AssetId, AuctionOrderWitness, AuctionPrivacyGateWitness, BatchId, BatchSummary, ConsumedInput,
-    DecryptedOrderShare, DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
+    AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput, DecryptedOrderShare,
+    DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
     EncryptedMakerAttributionArtifact, EncryptedRecoveryPayload, FundingRailKind,
     MakerAttributionPlaintext, MakerAttributionReceipt, MatchedOrderWitness, Note, NoteCommitment,
     NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan, NoteConsolidationWitness,
@@ -31,8 +31,8 @@ use crate::{
     RelayMode, RenewalChildUse, RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
     RenewalParentCancelSubmissionPlan, RenewalStateHistoryBatch, RootOnlySettlementCommitments,
     SettlementCallArguments, SettlementOutputWithdrawalCallArguments,
-    SettlementOutputWithdrawalSubmissionPlan, SettlementSubmissionPlan, SettlementTranscript,
-    SettlementWitness, StarknetCall, TimeInForce, WithdrawalCallArguments,
+    SettlementOutputWithdrawalSubmissionPlan, SettlementOutputWithdrawalWitness,
+    SettlementSubmissionPlan, SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce,
     WithdrawalSubmissionPlan, derive_user_keys,
     hash::{
         domain_felt, domain_felt_hex, encode_starknet_felt, felt_from_hex_str, felt_hex,
@@ -55,6 +55,7 @@ const NATIVE_SETTLEMENT_MESSAGE_DOMAIN_HEX: &str =
 const PUBLIC_SETTLEMENT_DOMAIN_HEX: &str =
     "0x0283f626418aa97a073f64500f7e35dd8bf7c01ff8611917c3c38e5be92eb205";
 const PUBLIC_NOTE_CONSOLIDATION_DOMAIN_HEX: &str = "0x7a796c6974685f6e6f74655f636f6e736f6c5f7631";
+const PUBLIC_NOTE_WITHDRAWAL_DOMAIN_HEX: &str = "0x7a796c6974685f6e6f74655f77697468647261775f7631";
 const ROOT_ONLY_STATE_TRANSITION_DOMAIN_HEX: &str =
     "0x01f14f0555b0b80fd6af9553623a021c472d8c930dfcb5b204b35b26f0d2b1b2";
 const OUTPUT_NOTE_LEAF_DOMAIN_HEX: &str =
@@ -66,8 +67,6 @@ const EMPTY_OUTPUT_NOTE_ROOT_DOMAIN_HEX: &str =
 const OUTPUT_RECOVERY_STREAM_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f73747265616d5f7631";
 const OUTPUT_RECOVERY_AUTH_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f617574685f7631";
 const OUTPUT_RECOVERY_TAG_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f7461675f7631";
-const DEPOSIT_NOTE_ROOT_DOMAIN_HEX: &str =
-    "0x7a796c6974685f6465706f7369745f6e6f74655f726f6f745f7631";
 const NULLIFIER_SPARSE_LEAF_DOMAIN_HEX: &str =
     "0x03fd7c748b95292c230aa528dc391912cd4557ad3e157e94ab06b22af433f967";
 const NULLIFIER_SPARSE_NODE_DOMAIN_HEX: &str =
@@ -82,9 +81,8 @@ const NULLIFIER_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6e756c6c5f7631
 const RENEWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f72656e65775f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
-const PRIVACY_GATE_CONFIG_DOMAIN_HEX: &str =
-    "0x7a796c6974685f707269766163795f676174655f6366675f7631";
 const NOTE_CONSOLIDATION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f636f6e736f6c5f7631";
+const WITHDRAWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f77697468647261775f7631";
 const ADMISSION_ROOT_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f726f6f745f7631";
 const ADMISSION_LEAF_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f6c6561665f7631";
 const PRIVATE_ORDER_SHARE_ALGORITHM_V1: &str = "ecdh-p256+hkdf-sha256+aes-256-gcm/private-order-v1";
@@ -99,6 +97,7 @@ const RECOVERY_ARTIFACT_ALGORITHM_V2: &str = "aes-256-gcm/recovery-v2";
 const WALLET_HKDF_SALT: &[u8] = b"zylith/wallet-key-separation-v2";
 const ORDER_INGRESS_RECEIPT_VERSION: u32 = 1;
 const STATEMENT_TYPE_NOTE_CONSOLIDATION_HEX: &str = "0x5";
+const STATEMENT_TYPE_WITHDRAWAL_HEX: &str = "0x6";
 
 fn aes_nonce_from_slice(bytes: &[u8]) -> Result<Nonce<U12>, ProtocolError> {
     let nonce: [u8; 12] = bytes
@@ -115,7 +114,13 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct SettlementOutputWithdrawalPlanRequest<'a> {
     pub batch_id: &'a BatchId,
     pub output_note: &'a OutputNoteRecord,
+    pub output_note_preimage: &'a Note,
     pub output_proof: &'a OutputNoteMerkleProof,
+    pub prior_nullifier_root: &'a str,
+    pub nullifier_history: &'a [NullifierHistoryBatch],
+    pub nullifier_sparse_witness: Option<&'a NullifierSparseUpdateWitness>,
+    pub new_nullifier_root: &'a str,
+    pub proof_artifact_commitment: &'a str,
     pub withdraw_auth_key_felt: &'a str,
     pub recipient: &'a str,
     pub auction_verifier_address: &'a str,
@@ -1300,6 +1305,22 @@ pub fn derive_order_cancellation_tag(cancellation_secret: &str) -> String {
     tagged_sha256_hex("zylith/order-cancel-tag", cancellation_secret.as_bytes())
 }
 
+pub fn derive_order_execution_report_auth_tag(
+    batch_id: &BatchId,
+    order_commitment: &OrderCommitment,
+    cancellation_auth_tag: &str,
+) -> String {
+    let order_commitment = crate::hash::normalize_felt_hex(&order_commitment.0)
+        .unwrap_or_else(|_| order_commitment.0.trim().to_ascii_lowercase());
+    let material = format!(
+        "{}:{}:{}",
+        batch_id.0.trim(),
+        order_commitment,
+        cancellation_auth_tag.trim().to_ascii_lowercase()
+    );
+    tagged_sha256_hex("zylith/order-report-auth-tag", material.as_bytes())
+}
+
 pub fn derive_order_cancellation_auth_tag(
     order_cancellation_key_hex: &str,
     order_commitment: &OrderCommitment,
@@ -1350,18 +1371,23 @@ pub fn build_deposit_submission_plan(
 ) -> Result<DepositSubmissionPlan, ProtocolError> {
     let note = build_deposit_note(intent)?;
     let note_commitment = note.commitment()?;
+    let deposit_root = deposit_root_from_note(&note)?;
+    let funding_commitment = funding_commitment_for_deposit(&note_commitment.0, &deposit_root)?;
+    let encrypted_note_activation =
+        encrypted_note_activation_commitment(&note_commitment.0, &deposit_root)?;
     let encoded_args = DepositCallArguments {
-        asset_id: encode_starknet_felt("asset-id", &intent.asset_id.0),
-        amount: encode_u128(intent.amount),
-        deposit_nonce: encode_u64(intent.deposit_nonce),
-        note_commitment: normalize_felt_hex(&note_commitment.0)?,
-        withdraw_authority: normalize_felt_hex(&intent.recipient_withdraw_authority)?,
+        funding_commitments: vec![funding_commitment.clone()],
+        deposit_roots: vec![deposit_root.clone()],
+        encrypted_note_activations: vec![encrypted_note_activation.clone()],
     };
 
     Ok(DepositSubmissionPlan {
         funding_rail: FundingRailKind::StarknetPrivacy,
         note,
         note_commitment,
+        funding_commitment,
+        deposit_root,
+        encrypted_note_activation,
         encoded_args,
     })
 }
@@ -1373,41 +1399,70 @@ pub fn build_withdrawal_submission_plan(
     shielded_asset_adapter_address: &str,
     chain_id: &str,
 ) -> Result<WithdrawalSubmissionPlan, ProtocolError> {
-    let note_commitment = normalize_felt_hex(note_commitment)?;
-    let recipient = normalize_felt_hex(recipient)?;
-    let shielded_asset_adapter_address = normalize_felt_hex(shielded_asset_adapter_address)?;
-    let chain_id = normalize_felt_hex(chain_id)?;
-    let message = withdrawal_message_hash(
-        &note_commitment,
-        &recipient,
-        &shielded_asset_adapter_address,
-        &chain_id,
-    )?;
-    let private_key = felt_from_hex_str(withdraw_auth_key_felt)?;
-    let message = felt_from_hex_str(&message)?;
-    let k = rfc6979_generate_k(&message, &private_key, None);
-    let signature = sign(&private_key, &message, &k).map_err(|err| {
-        ProtocolError::Crypto(format!("withdrawal authorization signing failed: {err}"))
-    })?;
-    let encoded_args = WithdrawalCallArguments {
+    let _ = (
         note_commitment,
-        withdraw_authorization_r: felt_hex(&signature.r),
-        withdraw_authorization_s: felt_hex(&signature.s),
+        withdraw_auth_key_felt,
         recipient,
-    };
+        shielded_asset_adapter_address,
+        chain_id,
+    );
+    Err(ProtocolError::InvalidWithdrawal(
+        "raw adapter withdrawals are disabled; withdrawals must consume the verifier nullifier root"
+            .into(),
+    ))
+}
 
-    Ok(WithdrawalSubmissionPlan {
+pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
+    witness: &SettlementOutputWithdrawalWitness,
+    verifier_address: &str,
+    proof_artifact_commitment: &str,
+) -> Result<SettlementOutputWithdrawalSubmissionPlan, ProtocolError> {
+    let normalized_verifier_address = normalize_felt_hex(verifier_address)?;
+    if normalize_felt_hex(&witness.auction_verifier_address)? != normalized_verifier_address {
+        return Err(ProtocolError::Crypto(
+            "settlement output withdrawal verifier address does not match witness".into(),
+        ));
+    }
+    let roots = settlement_output_withdrawal_root_fields(witness)?;
+    let withdrawal_commitment = settlement_output_withdrawal_commitment(witness)?;
+    let normalized_proof_artifact_commitment = normalize_felt_hex(proof_artifact_commitment)?;
+    let encoded_args = SettlementOutputWithdrawalCallArguments {
+        batch_id: encode_starknet_felt("batch-id", &witness.batch_id.0),
+        proof_artifact_commitment: normalized_proof_artifact_commitment.clone(),
+        prior_nullifier_root: normalize_felt_hex(&witness.prior_nullifier_root)?,
+        consumed_nullifier_root: roots.consumed_nullifier_root,
+        new_nullifier_root: roots.new_nullifier_root,
+        note_commitment: normalize_felt_hex(&witness.output_note.note_commitment.0)?,
+        asset_id: encode_asset_id(&witness.output_note.asset_id.0),
+        amount: encode_u128(witness.output_note.amount),
+        withdraw_authority: normalize_felt_hex(&witness.output_note.withdraw_authority)?,
+        merkle_path: witness
+            .output_proof
+            .merkle_path
+            .iter()
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+        merkle_directions: witness
+            .output_proof
+            .merkle_directions
+            .iter()
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+        withdraw_authorization_r: normalize_felt_hex(&witness.withdraw_authorization.signature_r)?,
+        withdraw_authorization_s: normalize_felt_hex(&witness.withdraw_authorization.signature_s)?,
+        recipient: normalize_felt_hex(&witness.recipient)?,
+    };
+    let calldata = flatten_settlement_output_withdrawal_call_arguments(&encoded_args);
+    Ok(SettlementOutputWithdrawalSubmissionPlan {
         funding_rail: FundingRailKind::StarknetPrivacy,
-        note_commitment: crate::types::NoteCommitment(encoded_args.note_commitment.clone()),
+        batch_id: witness.batch_id.clone(),
+        note_commitment: witness.output_note.note_commitment.clone(),
+        withdrawal_commitment,
+        proof_artifact_commitment: normalized_proof_artifact_commitment,
         starknet_call: StarknetCall {
-            contract_address: shielded_asset_adapter_address,
-            entrypoint: "withdraw_to_l2".into(),
-            calldata: vec![
-                encoded_args.note_commitment.clone(),
-                encoded_args.withdraw_authorization_r.clone(),
-                encoded_args.withdraw_authorization_s.clone(),
-                encoded_args.recipient.clone(),
-            ],
+            contract_address: normalized_verifier_address,
+            entrypoint: "withdraw_settlement_output_with_proof_facts".into(),
+            calldata,
         },
         encoded_args,
     })
@@ -1416,85 +1471,47 @@ pub fn build_withdrawal_submission_plan(
 pub fn build_settlement_output_withdrawal_submission_plan(
     request: SettlementOutputWithdrawalPlanRequest<'_>,
 ) -> Result<SettlementOutputWithdrawalSubmissionPlan, ProtocolError> {
-    let SettlementOutputWithdrawalPlanRequest {
-        batch_id,
-        output_note,
-        output_proof,
-        withdraw_auth_key_felt,
-        recipient,
-        auction_verifier_address,
-        shielded_asset_adapter_address,
-        chain_id,
-    } = request;
-    let batch_id_felt = encode_starknet_felt("batch-id", &batch_id.0);
-    let note_commitment = normalize_felt_hex(&output_note.note_commitment.0)?;
-    let asset_id = encode_starknet_felt("asset-id", &output_note.asset_id.0);
-    let amount = encode_u128(output_note.amount);
-    let withdraw_authority = normalize_felt_hex(&output_note.withdraw_authority)?;
-    let recipient = normalize_felt_hex(recipient)?;
-    let auction_verifier_address = normalize_felt_hex(auction_verifier_address)?;
-    let shielded_asset_adapter_address = normalize_felt_hex(shielded_asset_adapter_address)?;
-    let chain_id = normalize_felt_hex(chain_id)?;
-    let merkle_path = output_proof
-        .merkle_path
-        .iter()
-        .map(|entry| normalize_felt_hex(entry))
-        .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let merkle_directions = output_proof
-        .merkle_directions
-        .iter()
-        .map(|entry| normalize_felt_hex(entry))
-        .collect::<Result<Vec<_>, ProtocolError>>()?;
-    if merkle_path.len() != merkle_directions.len() {
-        return Err(ProtocolError::Crypto(
-            "output-note merkle path and direction lengths differ".into(),
-        ));
-    }
-
-    let message = settlement_output_withdrawal_message_hash(SettlementOutputWithdrawalMessage {
-        auction_verifier_address: &auction_verifier_address,
-        shielded_asset_adapter_address: &shielded_asset_adapter_address,
-        chain_id: &chain_id,
-        batch_id: &batch_id_felt,
-        note_commitment: &note_commitment,
-        asset_id: &asset_id,
-        amount: &amount,
-        recipient: &recipient,
-    })?;
-    let private_key = felt_from_hex_str(withdraw_auth_key_felt)?;
-    let message = felt_from_hex_str(&message)?;
-    let k = rfc6979_generate_k(&message, &private_key, None);
-    let signature = sign(&private_key, &message, &k).map_err(|err| {
-        ProtocolError::Crypto(format!(
-            "settlement output withdrawal signing failed: {err}"
-        ))
-    })?;
-
-    let encoded_args = SettlementOutputWithdrawalCallArguments {
-        batch_id: batch_id_felt,
-        note_commitment: note_commitment.clone(),
-        asset_id,
-        amount,
-        withdraw_authority,
-        merkle_path,
-        merkle_directions,
-        withdraw_authorization_r: felt_hex(&signature.r),
-        withdraw_authorization_s: felt_hex(&signature.s),
-        recipient,
-    };
-    let calldata = flatten_settlement_output_withdrawal_call_arguments(&encoded_args);
-
-    Ok(SettlementOutputWithdrawalSubmissionPlan {
-        funding_rail: FundingRailKind::StarknetPrivacy,
-        batch_id: batch_id.clone(),
-        note_commitment: NoteCommitment(note_commitment),
-        starknet_call: StarknetCall {
-            contract_address: auction_verifier_address,
-            entrypoint: "withdraw_settlement_output_to_l2".into(),
-            calldata,
+    let auction_verifier_address = normalize_felt_hex(request.auction_verifier_address)?;
+    let shielded_asset_adapter_address =
+        normalize_felt_hex(request.shielded_asset_adapter_address)?;
+    let chain_id = normalize_felt_hex(request.chain_id)?;
+    let recipient = normalize_felt_hex(request.recipient)?;
+    let encoded_batch_id = encode_starknet_felt("batch-id", &request.batch_id.0);
+    let encoded_asset_id = encode_asset_id(&request.output_note.asset_id.0);
+    let encoded_amount = encode_u128(request.output_note.amount);
+    let authorization = sign_settlement_output_withdrawal_authorization(
+        request.withdraw_auth_key_felt,
+        SettlementOutputWithdrawalMessage {
+            auction_verifier_address: &auction_verifier_address,
+            shielded_asset_adapter_address: &shielded_asset_adapter_address,
+            chain_id: &chain_id,
+            batch_id: &encoded_batch_id,
+            note_commitment: &request.output_note.note_commitment.0,
+            asset_id: &encoded_asset_id,
+            amount: &encoded_amount,
+            recipient: &recipient,
         },
-        encoded_args,
-    })
+    )?;
+    let witness = SettlementOutputWithdrawalWitness {
+        batch_id: request.batch_id.clone(),
+        auction_verifier_address: auction_verifier_address.clone(),
+        shielded_asset_adapter_address: shielded_asset_adapter_address.clone(),
+        chain_id: chain_id.clone(),
+        recipient: recipient.clone(),
+        prior_nullifier_root: normalize_felt_hex(request.prior_nullifier_root)?,
+        output_note: request.output_note.clone(),
+        output_note_preimage: request.output_note_preimage.clone(),
+        output_proof: request.output_proof.clone(),
+        withdraw_authorization: authorization.clone(),
+        nullifier_history: request.nullifier_history.to_vec(),
+        nullifier_sparse_witness: request.nullifier_sparse_witness.cloned(),
+        new_nullifier_root: normalize_felt_hex(request.new_nullifier_root)?,
+    };
+    build_settlement_output_withdrawal_submission_plan_from_witness(
+        &witness,
+        &auction_verifier_address,
+        request.proof_artifact_commitment,
+    )
 }
 
 pub fn build_renewal_parent_cancel_submission_plan(
@@ -1508,6 +1525,14 @@ pub fn build_renewal_parent_cancel_submission_plan(
         renewal_parent_cancel_marker(&request.parent_secret_commitment, &cancel_authority)?;
 
     let witness = if let Some(witness) = request.renewal_cancel_sparse_witness {
+        let prior_root = renewal_sparse_root(&request.prior_renewal_entries.iter().try_fold(
+            BTreeMap::<Vec<bool>, Felt>::new(),
+            |mut entries, entry| {
+                insert_renewal_sparse_entry(&mut entries, entry)?;
+                Ok::<_, ProtocolError>(entries)
+            },
+        )?)?;
+        verify_renewal_sparse_absence_witness(&prior_root, &cancel_marker, &witness)?;
         witness
     } else {
         renewal_sparse_witness_for_parent_cancel_marker(
@@ -2468,6 +2493,109 @@ fn note_consolidation_root_fields(
     })
 }
 
+#[derive(Clone, Debug)]
+struct SettlementOutputWithdrawalRootFields {
+    nullifier: Nullifier,
+    consumed_nullifier_root: String,
+    new_nullifier_root: String,
+    sparse_witness: NullifierSparseUpdateWitness,
+}
+
+fn settlement_output_withdrawal_root_fields(
+    witness: &SettlementOutputWithdrawalWitness,
+) -> Result<SettlementOutputWithdrawalRootFields, ProtocolError> {
+    if witness.output_note.amount == 0 || witness.output_note_preimage.amount == 0 {
+        return Err(ProtocolError::Crypto(
+            "settlement output withdrawal amount must be non-zero".into(),
+        ));
+    }
+    let output_commitment = witness.output_note_preimage.commitment()?;
+    if output_commitment != witness.output_note.note_commitment {
+        return Err(ProtocolError::Crypto(
+            "settlement output withdrawal note preimage does not match output commitment".into(),
+        ));
+    }
+    if witness.output_note_preimage.asset_id != witness.output_note.asset_id
+        || witness.output_note_preimage.amount != witness.output_note.amount
+        || normalize_felt_hex(&witness.output_note_preimage.withdraw_authority)?
+            != normalize_felt_hex(&witness.output_note.withdraw_authority)?
+    {
+        return Err(ProtocolError::Crypto(
+            "settlement output withdrawal note preimage does not match output record".into(),
+        ));
+    }
+    let nullifier =
+        nullifier_from_note_secret(&output_commitment, &witness.output_note_preimage.blinding)?;
+    let consumed_inputs = vec![ConsumedInput {
+        note_commitment: output_commitment,
+        nullifier: nullifier.clone(),
+    }];
+    let consumed_nullifier_root = settlement_consumed_nullifier_root(&consumed_inputs)?;
+    let mut history_nullifiers = Vec::new();
+    for batch in &witness.nullifier_history {
+        if batch.repeat_count == 0 {
+            return Err(ProtocolError::Crypto(
+                "withdrawal nullifier history repeat_count must be non-zero".into(),
+            ));
+        }
+        if !batch.nullifiers.is_empty() && batch.repeat_count != 1 {
+            return Err(ProtocolError::Crypto(
+                "non-empty withdrawal nullifier history batches cannot be repeated".into(),
+            ));
+        }
+        history_nullifiers.extend(batch.nullifiers.iter().cloned());
+    }
+    let (computed_prior_root, computed_new_root, mut generated_witnesses): (
+        String,
+        String,
+        Vec<NullifierSparseUpdateWitness>,
+    ) = if !history_nullifiers.is_empty() || witness.nullifier_sparse_witness.is_none() {
+        nullifier_sparse_update_witnesses_for_nullifiers(
+            &history_nullifiers,
+            std::slice::from_ref(&nullifier),
+        )?
+    } else {
+        let provided = witness
+            .nullifier_sparse_witness
+            .clone()
+            .expect("checked is_some");
+        let computed_new_root = verify_nullifier_sparse_insert_witness(
+            &witness.prior_nullifier_root,
+            &nullifier,
+            &provided,
+        )?;
+        (
+            normalize_felt_hex(&witness.prior_nullifier_root)?,
+            computed_new_root,
+            vec![provided],
+        )
+    };
+    if computed_prior_root != normalize_felt_hex(&witness.prior_nullifier_root)? {
+        return Err(ProtocolError::Crypto(
+            "withdrawal nullifier history does not reconstruct prior_nullifier_root".into(),
+        ));
+    }
+    if computed_new_root != normalize_felt_hex(&witness.new_nullifier_root)? {
+        return Err(ProtocolError::Crypto(
+            "withdrawal sparse nullifier witness does not reconstruct new_nullifier_root".into(),
+        ));
+    }
+    let sparse_witness = generated_witnesses.pop().ok_or_else(|| {
+        ProtocolError::Crypto("withdrawal missing sparse nullifier witness".into())
+    })?;
+    if !generated_witnesses.is_empty() {
+        return Err(ProtocolError::Crypto(
+            "withdrawal generated more than one sparse nullifier witness".into(),
+        ));
+    }
+    Ok(SettlementOutputWithdrawalRootFields {
+        nullifier,
+        consumed_nullifier_root,
+        new_nullifier_root: computed_new_root,
+        sparse_witness,
+    })
+}
+
 pub fn note_consolidation_commitment(
     witness: &NoteConsolidationWitness,
 ) -> Result<String, ProtocolError> {
@@ -2527,6 +2655,99 @@ pub fn note_consolidation_commitment_from_roots(
         state = poseidon_hash(state, felt_from_hex_str(&normalize_felt_hex(root)?)?);
     }
     Ok(felt_hex(&state))
+}
+
+pub fn settlement_output_withdrawal_commitment(
+    witness: &SettlementOutputWithdrawalWitness,
+) -> Result<String, ProtocolError> {
+    let roots = settlement_output_withdrawal_root_fields(witness)?;
+    settlement_output_withdrawal_commitment_from_roots(
+        &witness.batch_id,
+        &witness.output_note,
+        &witness.prior_nullifier_root,
+        &roots.consumed_nullifier_root,
+        &roots.new_nullifier_root,
+    )
+}
+
+pub fn settlement_output_withdrawal_commitment_from_roots(
+    batch_id: &BatchId,
+    output_note: &OutputNoteRecord,
+    prior_nullifier_root: &str,
+    consumed_nullifier_root: &str,
+    new_nullifier_root: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(PUBLIC_NOTE_WITHDRAWAL_DOMAIN_HEX)?,
+        felt_from_hex_str(&encode_starknet_felt("batch-id", &batch_id.0))?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(&output_note.note_commitment.0)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&encode_asset_id(&output_note.asset_id.0))?,
+    );
+    state = poseidon_hash(state, Felt::from(output_note.amount));
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(&output_note.withdraw_authority)?)?,
+    );
+    for root in [
+        prior_nullifier_root,
+        consumed_nullifier_root,
+        new_nullifier_root,
+    ] {
+        state = poseidon_hash(state, felt_from_hex_str(&normalize_felt_hex(root)?)?);
+    }
+    Ok(felt_hex(&state))
+}
+
+pub fn sign_settlement_output_withdrawal_authorization(
+    withdraw_auth_key_felt: &str,
+    message: SettlementOutputWithdrawalMessage<'_>,
+) -> Result<crate::SpendAuthorization, ProtocolError> {
+    let private_key = felt_from_hex_str(withdraw_auth_key_felt)?;
+    let message = felt_from_hex_str(&settlement_output_withdrawal_message_hash(message)?)?;
+    let k = rfc6979_generate_k(&message, &private_key, None);
+    let signature = sign(&private_key, &message, &k).map_err(|err| {
+        ProtocolError::Crypto(format!(
+            "settlement output withdrawal authorization signing failed: {err}"
+        ))
+    })?;
+    Ok(crate::SpendAuthorization {
+        signature_r: felt_hex(&signature.r),
+        signature_s: felt_hex(&signature.s),
+    })
+}
+
+pub fn sign_settlement_output_withdrawal_witness(
+    withdraw_auth_key_felt: &str,
+    witness: &SettlementOutputWithdrawalWitness,
+) -> Result<crate::SpendAuthorization, ProtocolError> {
+    let auction_verifier_address = normalize_felt_hex(&witness.auction_verifier_address)?;
+    let shielded_asset_adapter_address =
+        normalize_felt_hex(&witness.shielded_asset_adapter_address)?;
+    let chain_id = normalize_felt_hex(&witness.chain_id)?;
+    let batch_id = encode_starknet_felt("batch-id", &witness.batch_id.0);
+    let asset_id = encode_asset_id(&witness.output_note.asset_id.0);
+    let amount = encode_u128(witness.output_note.amount);
+    let recipient = normalize_felt_hex(&witness.recipient)?;
+
+    sign_settlement_output_withdrawal_authorization(
+        withdraw_auth_key_felt,
+        SettlementOutputWithdrawalMessage {
+            auction_verifier_address: &auction_verifier_address,
+            shielded_asset_adapter_address: &shielded_asset_adapter_address,
+            chain_id: &chain_id,
+            batch_id: &batch_id,
+            note_commitment: &witness.output_note.note_commitment.0,
+            asset_id: &asset_id,
+            amount: &amount,
+            recipient: &recipient,
+        },
+    )
 }
 
 pub fn sign_note_consolidation_authorization(
@@ -2705,7 +2926,7 @@ pub fn verify_output_note_membership(
     Ok(())
 }
 
-fn output_note_merkle_root(
+pub fn output_note_merkle_root(
     outputs: &[OutputNoteRecord],
     output_bundle_ref: &str,
 ) -> Result<String, ProtocolError> {
@@ -2716,6 +2937,16 @@ fn output_note_merkle_root(
             felt_from_hex_str(&encode_output_bundle_ref(output_bundle_ref)?)?,
         );
         return Ok(felt_hex(&state));
+    }
+
+    let mut seen_commitments = BTreeSet::new();
+    for output in outputs {
+        let commitment = normalize_felt_hex(&output.note_commitment.0)?;
+        if !seen_commitments.insert(commitment) {
+            return Err(ProtocolError::Crypto(
+                "duplicate output note commitment in output root".into(),
+            ));
+        }
     }
 
     let mut level = outputs
@@ -2772,22 +3003,49 @@ pub fn settlement_state_transition_root(
     Ok(felt_hex(&state))
 }
 
-pub fn deposit_note_root(note_commitment: &str) -> Result<String, ProtocolError> {
-    let mut state = felt_from_hex_str(DEPOSIT_NOTE_ROOT_DOMAIN_HEX)?;
-    state = poseidon_hash(
-        state,
-        felt_from_hex_str(&normalize_felt_hex(note_commitment)?)?,
-    );
-    Ok(felt_hex(&poseidon_hash(state, Felt::ONE)))
+pub fn deposit_root_from_note(note: &Note) -> Result<String, ProtocolError> {
+    let note_commitment = note.commitment()?;
+    let record = OutputNoteRecord {
+        note_commitment,
+        asset_id: note.asset_id.clone(),
+        amount: note.amount,
+        withdraw_authority: note.withdraw_authority.clone(),
+    };
+    output_note_merkle_root(&[record], "zylith-private-funding-v1")
 }
 
-pub fn settlement_note_root_after_deposit_chain(
-    note_commitments: &[String],
+pub fn funding_commitment_for_deposit(
+    note_commitment: &str,
+    deposit_root: &str,
+) -> Result<String, ProtocolError> {
+    tagged_field_hex(
+        "zylith/private-funding-commitment-v1",
+        &serde_json::json!({
+            "note_commitment": normalize_felt_hex(note_commitment)?,
+            "deposit_root": normalize_felt_hex(deposit_root)?,
+        }),
+    )
+}
+
+pub fn encrypted_note_activation_commitment(
+    note_commitment: &str,
+    deposit_root: &str,
+) -> Result<String, ProtocolError> {
+    tagged_field_hex(
+        "zylith/encrypted-note-activation-v1",
+        &serde_json::json!({
+            "note_commitment": normalize_felt_hex(note_commitment)?,
+            "deposit_root": normalize_felt_hex(deposit_root)?,
+        }),
+    )
+}
+
+pub fn settlement_note_root_after_deposit_roots(
+    deposit_roots: &[String],
 ) -> Result<String, ProtocolError> {
     let mut root = "0x0".to_string();
-    for note_commitment in note_commitments {
-        let batch_root = deposit_note_root(note_commitment)?;
-        root = settlement_state_transition_root(&root, &batch_root)?;
+    for deposit_root in deposit_roots {
+        root = settlement_state_transition_root(&root, deposit_root)?;
     }
     Ok(root)
 }
@@ -3180,6 +3438,184 @@ fn expand_renewal_history(
     Ok(entries)
 }
 
+fn parse_sparse_direction(value: &str) -> Result<bool, ProtocolError> {
+    let direction = felt_from_hex_str(&normalize_felt_hex(value)?)?;
+    if direction == Felt::ZERO {
+        Ok(false)
+    } else if direction == Felt::ONE {
+        Ok(true)
+    } else {
+        Err(ProtocolError::Crypto(
+            "sparse witness direction must be 0 or 1".into(),
+        ))
+    }
+}
+
+fn assert_sparse_witness_key(
+    entry: &str,
+    witness: &NullifierSparseUpdateWitness,
+) -> Result<u128, ProtocolError> {
+    let normalized = normalize_felt_hex(entry)?;
+    let (expected_low, expected_high) = nullifier_key_low_high(&normalized)?;
+    if felt_from_hex_str(&normalize_felt_hex(&witness.key_low)?)? != Felt::from(expected_low) {
+        return Err(ProtocolError::Crypto(
+            "sparse witness key_low does not match entry".into(),
+        ));
+    }
+    if felt_from_hex_str(&normalize_felt_hex(&witness.key_high)?)? != Felt::from(expected_high) {
+        return Err(ProtocolError::Crypto(
+            "sparse witness key_high does not match entry".into(),
+        ));
+    }
+    Ok(expected_low)
+}
+
+fn verify_sparse_absence_witness<F>(
+    prior_root: &str,
+    entry: &str,
+    witness: &NullifierSparseUpdateWitness,
+    depth: usize,
+    node_fn: F,
+) -> Result<(), ProtocolError>
+where
+    F: Fn(Felt, Felt, usize) -> Result<Felt, ProtocolError>,
+{
+    let key_low = assert_sparse_witness_key(entry, witness)?;
+    let prior_root_felt = felt_from_hex_str(&normalize_felt_hex(prior_root)?)?;
+    if prior_root_felt == Felt::ZERO {
+        if !witness.merkle_path.is_empty() || !witness.merkle_directions.is_empty() {
+            return Err(ProtocolError::Crypto(
+                "empty sparse root requires an empty witness path".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if witness.merkle_path.len() != depth || witness.merkle_directions.len() != depth {
+        return Err(ProtocolError::Crypto(
+            "sparse witness path length does not match tree depth".into(),
+        ));
+    }
+
+    let mut reconstructed_low = 0_u128;
+    let mut empty_root = Felt::ZERO;
+    for level in 0..depth {
+        let sibling = felt_from_hex_str(&normalize_felt_hex(&witness.merkle_path[level])?)?;
+        let bit = parse_sparse_direction(&witness.merkle_directions[level])?;
+        if bit {
+            reconstructed_low |= 1_u128 << level;
+            empty_root = node_fn(sibling, empty_root, level)?;
+        } else {
+            empty_root = node_fn(empty_root, sibling, level)?;
+        }
+    }
+    if reconstructed_low != key_low {
+        return Err(ProtocolError::Crypto(
+            "sparse witness directions do not reconstruct key_low".into(),
+        ));
+    }
+    if empty_root != prior_root_felt {
+        return Err(ProtocolError::Crypto(
+            "sparse witness does not reconstruct prior root".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_sparse_insert_witness<F, G>(
+    prior_root: &str,
+    entry: &str,
+    witness: &NullifierSparseUpdateWitness,
+    depth: usize,
+    leaf_fn: F,
+    node_fn: G,
+) -> Result<String, ProtocolError>
+where
+    F: Fn(Felt) -> Result<Felt, ProtocolError>,
+    G: Fn(Felt, Felt, usize) -> Result<Felt, ProtocolError>,
+{
+    let key_low = assert_sparse_witness_key(entry, witness)?;
+    let entry_felt = felt_from_hex_str(&normalize_felt_hex(entry)?)?;
+    if entry_felt == Felt::ZERO {
+        return Err(ProtocolError::Crypto("sparse entry cannot be zero".into()));
+    }
+    let prior_root_felt = felt_from_hex_str(&normalize_felt_hex(prior_root)?)?;
+    let mut inserted_root = leaf_fn(entry_felt)?;
+    if prior_root_felt == Felt::ZERO {
+        if !witness.merkle_path.is_empty() || !witness.merkle_directions.is_empty() {
+            return Err(ProtocolError::Crypto(
+                "empty sparse root requires an empty witness path".into(),
+            ));
+        }
+        let mut empty_sibling = Felt::ZERO;
+        let mut remaining_key = key_low;
+        for level in 0..depth {
+            if remaining_key % 2 == 0 {
+                inserted_root = node_fn(inserted_root, empty_sibling, level)?;
+            } else {
+                inserted_root = node_fn(empty_sibling, inserted_root, level)?;
+            }
+            remaining_key /= 2;
+            empty_sibling = node_fn(empty_sibling, empty_sibling, level)?;
+        }
+        return Ok(felt_hex(&inserted_root));
+    }
+
+    verify_sparse_absence_witness(prior_root, entry, witness, depth, &node_fn)?;
+    for level in 0..depth {
+        let sibling = felt_from_hex_str(&normalize_felt_hex(&witness.merkle_path[level])?)?;
+        if parse_sparse_direction(&witness.merkle_directions[level])? {
+            inserted_root = node_fn(sibling, inserted_root, level)?;
+        } else {
+            inserted_root = node_fn(inserted_root, sibling, level)?;
+        }
+    }
+    Ok(felt_hex(&inserted_root))
+}
+
+fn verify_nullifier_sparse_insert_witness(
+    prior_root: &str,
+    nullifier: &Nullifier,
+    witness: &NullifierSparseUpdateWitness,
+) -> Result<String, ProtocolError> {
+    verify_sparse_insert_witness(
+        prior_root,
+        &normalize_felt_hex(&nullifier.0)?,
+        witness,
+        NULLIFIER_SPARSE_TREE_DEPTH,
+        nullifier_sparse_leaf,
+        nullifier_sparse_node,
+    )
+}
+
+fn verify_renewal_sparse_absence_witness(
+    prior_root: &str,
+    entry: &str,
+    witness: &NullifierSparseUpdateWitness,
+) -> Result<(), ProtocolError> {
+    verify_sparse_absence_witness(
+        prior_root,
+        &normalize_felt_hex(entry)?,
+        witness,
+        RENEWAL_SPARSE_TREE_DEPTH,
+        renewal_sparse_node,
+    )
+}
+
+fn verify_renewal_sparse_insert_witness(
+    prior_root: &str,
+    entry: &str,
+    witness: &NullifierSparseUpdateWitness,
+) -> Result<String, ProtocolError> {
+    verify_sparse_insert_witness(
+        prior_root,
+        &normalize_felt_hex(entry)?,
+        witness,
+        RENEWAL_SPARSE_TREE_DEPTH,
+        renewal_sparse_leaf,
+        renewal_sparse_node,
+    )
+}
+
 fn renewal_sparse_entries_from_child_uses(child_uses: &[RenewalChildUse]) -> Vec<String> {
     child_uses
         .iter()
@@ -3249,7 +3685,8 @@ pub fn renewal_sparse_witnesses_for_child_uses(
 
 pub fn deposit_note_membership_witnesses_for_chain(
     initial_root: &str,
-    activation_note_commitments: &[String],
+    activation_deposit_roots: &[String],
+    consumed_deposit_roots_by_commitment: &[(String, String)],
     consumed_note_commitments: &[String],
 ) -> Result<(String, Vec<NoteMembershipWitness>), ProtocolError> {
     let consumed_note_commitments = consumed_note_commitments
@@ -3260,47 +3697,57 @@ pub fn deposit_note_membership_witnesses_for_chain(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let activation_note_commitments = activation_note_commitments
+    let activation_deposit_roots = activation_deposit_roots
         .iter()
-        .map(|note_commitment| normalize_felt_hex(note_commitment))
+        .map(|deposit_root| normalize_felt_hex(deposit_root))
         .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let deposit_roots = activation_note_commitments
+    let consumed_deposit_roots_by_commitment = consumed_deposit_roots_by_commitment
         .iter()
-        .map(|note_commitment| deposit_note_root(note_commitment))
-        .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let mut prefix_roots = Vec::with_capacity(deposit_roots.len());
+        .map(|(commitment, deposit_root)| {
+            Ok((
+                normalize_felt_hex(commitment)?,
+                normalize_felt_hex(deposit_root)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ProtocolError>>()?;
+    let mut prefix_roots = Vec::with_capacity(activation_deposit_roots.len());
     let mut root = normalize_felt_hex(initial_root)?;
-    for deposit_root in &deposit_roots {
+    for deposit_root in &activation_deposit_roots {
         prefix_roots.push(root.clone());
         root = settlement_state_transition_root(&root, deposit_root)?;
     }
 
     let mut witnesses_by_commitment = BTreeMap::<String, NoteMembershipWitness>::new();
-    for (index, (note_commitment, batch_root)) in activation_note_commitments
-        .iter()
-        .zip(deposit_roots.iter())
-        .enumerate()
-    {
-        if !consumed_set.contains(note_commitment) {
+    for (index, batch_root) in activation_deposit_roots.iter().enumerate() {
+        let matching_commitments = consumed_deposit_roots_by_commitment
+            .iter()
+            .filter_map(|(commitment, deposit_root)| {
+                (deposit_root == batch_root && consumed_set.contains(commitment))
+                    .then_some(commitment.clone())
+            })
+            .collect::<Vec<_>>();
+        if matching_commitments.is_empty() {
             continue;
         }
-        if witnesses_by_commitment
-            .insert(
-                note_commitment.clone(),
-                NoteMembershipWitness {
-                    kind: NoteMembershipKind::Deposit,
-                    prefix_root: prefix_roots[index].clone(),
-                    batch_root: batch_root.clone(),
-                    merkle_path: Vec::new(),
-                    merkle_directions: Vec::new(),
-                    suffix_batch_roots: deposit_roots[index + 1..].to_vec(),
-                },
-            )
-            .is_some()
-        {
-            return Err(ProtocolError::Crypto(
-                "duplicate deposit note commitment in activation chain".into(),
-            ));
+        for note_commitment in matching_commitments {
+            if witnesses_by_commitment
+                .insert(
+                    note_commitment,
+                    NoteMembershipWitness {
+                        kind: NoteMembershipKind::Deposit,
+                        prefix_root: prefix_roots[index].clone(),
+                        batch_root: batch_root.clone(),
+                        merkle_path: Vec::new(),
+                        merkle_directions: Vec::new(),
+                        suffix_batch_roots: activation_deposit_roots[index + 1..].to_vec(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(ProtocolError::Crypto(
+                    "duplicate deposit note commitment in activation chain".into(),
+                ));
+            }
         }
     }
 
@@ -3321,10 +3768,27 @@ pub fn deposit_note_membership_witnesses_for_chain(
 }
 
 fn deposit_chain_membership_witnesses(
-    note_commitments: &[String],
+    notes: &[Note],
 ) -> Result<Vec<NoteMembershipWitness>, ProtocolError> {
-    let (_root, witnesses) =
-        deposit_note_membership_witnesses_for_chain("0x0", note_commitments, note_commitments)?;
+    let note_commitments = notes
+        .iter()
+        .map(|note| note.commitment().map(|commitment| commitment.0))
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
+    let deposit_roots = notes
+        .iter()
+        .map(deposit_root_from_note)
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
+    let consumed_deposit_roots_by_commitment = note_commitments
+        .iter()
+        .cloned()
+        .zip(deposit_roots.iter().cloned())
+        .collect::<Vec<_>>();
+    let (_root, witnesses) = deposit_note_membership_witnesses_for_chain(
+        "0x0",
+        &deposit_roots,
+        &consumed_deposit_roots_by_commitment,
+        &note_commitments,
+    )?;
     Ok(witnesses)
 }
 
@@ -3334,14 +3798,19 @@ fn default_note_membership_witnesses(
     if witness.consumed_inputs.is_empty() {
         return Ok(Vec::new());
     }
-    let consumed_note_commitments = witness
-        .consumed_inputs
+    let funding_notes = witness
+        .matched_order_witnesses
         .iter()
-        .map(|input| normalize_felt_hex(&input.note_commitment.0))
+        .flat_map(|entry| entry.effective_funding_notes())
+        .cloned()
+        .collect::<Vec<_>>();
+    let deposit_roots = funding_notes
+        .iter()
+        .map(deposit_root_from_note)
         .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let deposit_chain_root = settlement_note_root_after_deposit_chain(&consumed_note_commitments)?;
+    let deposit_chain_root = settlement_note_root_after_deposit_roots(&deposit_roots)?;
     if normalize_felt_hex(&witness.prior_note_root)? == deposit_chain_root {
-        return deposit_chain_membership_witnesses(&consumed_note_commitments);
+        return deposit_chain_membership_witnesses(&funding_notes);
     }
     Err(ProtocolError::Crypto(
         "settlement witness missing consumed-note membership witnesses for prior_note_root".into(),
@@ -3678,13 +4147,56 @@ pub fn note_consolidation_proof_message_hash_from_statement(
     Ok(crate::hash::poseidon_hash_hex(&fields))
 }
 
+pub fn native_settlement_output_withdrawal_message_hash(
+    auction_verifier_address: &str,
+    withdrawal_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(WITHDRAWAL_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(&normalize_felt_hex(auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(withdrawal_commitment)?)?,
+    );
+    Ok(felt_hex(&state))
+}
+
+pub fn settlement_output_withdrawal_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    withdrawal_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash = native_settlement_output_withdrawal_message_hash(
+        auction_verifier_address,
+        withdrawal_commitment,
+    )?;
+    settlement_output_withdrawal_proof_message_hash_from_statement(
+        proof_program_address,
+        &statement_message_hash,
+    )
+}
+
+pub fn settlement_output_withdrawal_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    let fields = [
+        felt_from_hex_str(proof_program_address)?,
+        Felt::ZERO,
+        Felt::from(2_u64),
+        felt_from_hex_str(WITHDRAWAL_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(statement_message_hash)?,
+    ];
+    Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
 pub fn native_auction_result_message_hash(
     auction_verifier_address: &str,
     batch_id: &str,
     order_commitment_root: &str,
     admission_root: &str,
     transcript_commitment: &str,
-    privacy_gate_config_commitment: &str,
 ) -> Result<String, ProtocolError> {
     let mut state = poseidon_hash(
         felt_from_hex_str(AUCTION_RESULT_MESSAGE_DOMAIN_HEX)?,
@@ -3703,10 +4215,6 @@ pub fn native_auction_result_message_hash(
         state,
         felt_from_hex_str(&normalize_felt_hex(transcript_commitment)?)?,
     );
-    state = poseidon_hash(
-        state,
-        felt_from_hex_str(&normalize_felt_hex(privacy_gate_config_commitment)?)?,
-    );
     Ok(felt_hex(&state))
 }
 
@@ -3717,7 +4225,6 @@ pub fn auction_result_proof_message_hash_for_program(
     order_commitment_root: &str,
     admission_root: &str,
     transcript_commitment: &str,
-    privacy_gate_config_commitment: &str,
 ) -> Result<String, ProtocolError> {
     let statement_message_hash = native_auction_result_message_hash(
         auction_verifier_address,
@@ -3725,25 +4232,8 @@ pub fn auction_result_proof_message_hash_for_program(
         order_commitment_root,
         admission_root,
         transcript_commitment,
-        privacy_gate_config_commitment,
     )?;
     auction_result_proof_message_hash_from_statement(proof_program_address, &statement_message_hash)
-}
-
-pub fn auction_privacy_gate_config_commitment(
-    gate: &AuctionPrivacyGateWitness,
-) -> Result<String, ProtocolError> {
-    let mut state = poseidon_hash(
-        felt_from_hex_str(PRIVACY_GATE_CONFIG_DOMAIN_HEX)?,
-        Felt::from(gate.min_batch_base_liquidity),
-    );
-    state = poseidon_hash(state, Felt::from(gate.min_batch_participants));
-    state = poseidon_hash(state, Felt::from(gate.min_eligible_orders));
-    state = poseidon_hash(state, Felt::from(gate.max_single_order_fill_bps));
-    state = poseidon_hash(state, Felt::from(gate.max_single_owner_fill_bps));
-    state = poseidon_hash(state, Felt::from(gate.min_maker_participants));
-    state = poseidon_hash(state, Felt::from(gate.max_maker_fill_bps));
-    Ok(felt_hex(&state))
 }
 
 pub fn auction_result_proof_message_hash_from_statement(
@@ -3869,7 +4359,6 @@ pub fn build_settlement_witness(
         renewal_history: Vec::new(),
         renewal_child_sparse_witnesses: Vec::new(),
         renewal_cancel_sparse_witnesses: Vec::new(),
-        privacy_gate: Default::default(),
         renewal_child_uses,
         fees: transcript.fees.clone(),
         output_notes: transcript.output_notes.clone(),
@@ -3981,6 +4470,19 @@ pub fn build_stwo_serialized_input(
         }
         generated_witnesses
     } else {
+        let mut running_root = normalize_felt_hex(&witness.prior_nullifier_root)?;
+        for (nullifier, sparse_witness) in current_nullifiers
+            .iter()
+            .zip(witness.nullifier_sparse_witnesses.iter())
+        {
+            running_root =
+                verify_nullifier_sparse_insert_witness(&running_root, nullifier, sparse_witness)?;
+        }
+        if running_root != normalize_felt_hex(&witness.new_nullifier_root)? {
+            return Err(ProtocolError::Crypto(
+                "provided sparse nullifier witnesses do not reconstruct new_nullifier_root".into(),
+            ));
+        }
         witness.nullifier_sparse_witnesses.clone()
     };
     if nullifier_sparse_witnesses.len() != witness.consumed_inputs.len() {
@@ -3992,40 +4494,61 @@ pub fn build_stwo_serialized_input(
     let renewal_child_entries = renewal_sparse_entries_from_child_uses(&witness.renewal_child_uses);
     let renewal_cancel_markers =
         renewal_cancel_markers_from_matched_witnesses(&witness.matched_order_witnesses)?;
-    let (renewal_child_sparse_witnesses, renewal_cancel_sparse_witnesses) =
-        if renewal_child_entries.is_empty() {
-            (Vec::new(), Vec::new())
-        } else if !renewal_history_entries.is_empty()
-            || witness.renewal_child_sparse_witnesses.is_empty()
-            || witness.renewal_cancel_sparse_witnesses.is_empty()
-        {
-            let (
-                computed_prior_renewal_root,
-                computed_new_renewal_root,
-                generated_child_witnesses,
-                generated_cancel_witnesses,
-            ) = renewal_sparse_witnesses_for_child_uses(
-                &renewal_history_entries,
-                &witness.renewal_child_uses,
-                &witness.matched_order_witnesses,
-            )?;
-            if computed_prior_renewal_root != normalize_felt_hex(&witness.prior_renewal_root)? {
-                return Err(ProtocolError::Crypto(
-                    "renewal history does not reconstruct prior_renewal_root".into(),
-                ));
-            }
-            if computed_new_renewal_root != normalize_felt_hex(&witness.new_renewal_root)? {
-                return Err(ProtocolError::Crypto(
-                    "sparse renewal witness does not reconstruct new_renewal_root".into(),
-                ));
-            }
-            (generated_child_witnesses, generated_cancel_witnesses)
-        } else {
-            (
-                witness.renewal_child_sparse_witnesses.clone(),
-                witness.renewal_cancel_sparse_witnesses.clone(),
+    let (renewal_child_sparse_witnesses, renewal_cancel_sparse_witnesses) = if renewal_child_entries
+        .is_empty()
+    {
+        (Vec::new(), Vec::new())
+    } else if !renewal_history_entries.is_empty()
+        || witness.renewal_child_sparse_witnesses.is_empty()
+        || witness.renewal_cancel_sparse_witnesses.is_empty()
+    {
+        let (
+            computed_prior_renewal_root,
+            computed_new_renewal_root,
+            generated_child_witnesses,
+            generated_cancel_witnesses,
+        ) = renewal_sparse_witnesses_for_child_uses(
+            &renewal_history_entries,
+            &witness.renewal_child_uses,
+            &witness.matched_order_witnesses,
+        )?;
+        if computed_prior_renewal_root != normalize_felt_hex(&witness.prior_renewal_root)? {
+            return Err(ProtocolError::Crypto(
+                "renewal history does not reconstruct prior_renewal_root".into(),
+            ));
+        }
+        if computed_new_renewal_root != normalize_felt_hex(&witness.new_renewal_root)? {
+            return Err(ProtocolError::Crypto(
+                "sparse renewal witness does not reconstruct new_renewal_root".into(),
+            ));
+        }
+        (generated_child_witnesses, generated_cancel_witnesses)
+    } else {
+        let mut running_root = normalize_felt_hex(&witness.prior_renewal_root)?;
+        for ((child_entry, cancel_marker), (child_witness, cancel_witness)) in renewal_child_entries
+            .iter()
+            .zip(renewal_cancel_markers.iter())
+            .zip(
+                witness
+                    .renewal_child_sparse_witnesses
+                    .iter()
+                    .zip(witness.renewal_cancel_sparse_witnesses.iter()),
             )
-        };
+        {
+            verify_renewal_sparse_absence_witness(&running_root, cancel_marker, cancel_witness)?;
+            running_root =
+                verify_renewal_sparse_insert_witness(&running_root, child_entry, child_witness)?;
+        }
+        if running_root != normalize_felt_hex(&witness.new_renewal_root)? {
+            return Err(ProtocolError::Crypto(
+                "provided sparse renewal witnesses do not reconstruct new_renewal_root".into(),
+            ));
+        }
+        (
+            witness.renewal_child_sparse_witnesses.clone(),
+            witness.renewal_cancel_sparse_witnesses.clone(),
+        )
+    };
     if renewal_child_sparse_witnesses.len() != renewal_child_entries.len() {
         return Err(ProtocolError::Crypto(
             "renewal child sparse witness count does not match renewal children".into(),
@@ -4934,14 +5457,28 @@ fn note_consolidation_membership_witnesses_for_serialization(
     consumed_inputs: &[ConsumedInput],
 ) -> Result<Vec<NoteMembershipWitness>, ProtocolError> {
     if witness.note_membership_witnesses.is_empty() {
-        let consumed_note_commitments = consumed_inputs
+        let consumed_set = consumed_inputs
             .iter()
             .map(|input| normalize_felt_hex(&input.note_commitment.0))
-            .collect::<Result<Vec<_>, ProtocolError>>()?;
-        let deposit_chain_root =
-            settlement_note_root_after_deposit_chain(&consumed_note_commitments)?;
+            .collect::<Result<BTreeSet<_>, ProtocolError>>()?;
+        let input_notes = witness
+            .input_notes
+            .iter()
+            .filter(|note| {
+                note.commitment()
+                    .map(|commitment| consumed_set.contains(&commitment.0))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let deposit_chain_root = settlement_note_root_after_deposit_roots(
+            &input_notes
+                .iter()
+                .map(deposit_root_from_note)
+                .collect::<Result<Vec<_>, ProtocolError>>()?,
+        )?;
         if normalize_felt_hex(&witness.prior_note_root)? == deposit_chain_root {
-            return deposit_chain_membership_witnesses(&consumed_note_commitments);
+            return deposit_chain_membership_witnesses(&input_notes);
         }
         return Err(ProtocolError::Crypto(
             "note consolidation missing consumed-note membership witnesses for prior_note_root"
@@ -5008,6 +5545,23 @@ fn note_consolidation_nullifier_witnesses_for_serialization(
     if witness.nullifier_sparse_witnesses.len() != consumed_inputs.len() {
         return Err(ProtocolError::Crypto(
             "note consolidation sparse nullifier witness count does not match input count".into(),
+        ));
+    }
+    let mut running_root = normalize_felt_hex(&witness.prior_nullifier_root)?;
+    for (input, sparse_witness) in consumed_inputs
+        .iter()
+        .zip(witness.nullifier_sparse_witnesses.iter())
+    {
+        running_root = verify_nullifier_sparse_insert_witness(
+            &running_root,
+            &input.nullifier,
+            sparse_witness,
+        )?;
+    }
+    if running_root != normalize_felt_hex(&witness.new_nullifier_root)? {
+        return Err(ProtocolError::Crypto(
+            "provided note consolidation sparse witnesses do not reconstruct new_nullifier_root"
+                .into(),
         ));
     }
     Ok(witness.nullifier_sparse_witnesses.clone())
@@ -5343,6 +5897,60 @@ pub fn build_note_consolidation_serialized_input(
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
     payload.push(roots.new_nullifier_root);
+    let mut serialized = vec![encode_usize(payload.len())];
+    serialized.extend(payload);
+    Ok(serialized)
+}
+
+pub fn build_settlement_output_withdrawal_serialized_input(
+    witness: &SettlementOutputWithdrawalWitness,
+) -> Result<Vec<String>, ProtocolError> {
+    let roots = settlement_output_withdrawal_root_fields(witness)?;
+    let withdrawal_commitment = settlement_output_withdrawal_commitment(witness)?;
+    let mut payload = vec![
+        normalize_felt_hex(STATEMENT_TYPE_WITHDRAWAL_HEX)?,
+        domain_felt_hex("zylith/note"),
+        domain_felt_hex("zylith/nullifier"),
+        normalize_felt_hex(PUBLIC_NOTE_WITHDRAWAL_DOMAIN_HEX)?,
+        encode_starknet_felt("batch-id", &witness.batch_id.0),
+        normalize_felt_hex(&withdrawal_commitment)?,
+        normalize_felt_hex(&witness.output_note.note_commitment.0)?,
+        encode_asset_id(&witness.output_note.asset_id.0),
+        encode_u128(witness.output_note.amount),
+        normalize_felt_hex(&witness.output_note.withdraw_authority)?,
+        normalize_felt_hex(&witness.prior_nullifier_root)?,
+        domain_felt_hex("zylith/root/consumed-nullifiers-v1"),
+        normalize_felt_hex(NULLIFIER_SPARSE_LEAF_DOMAIN_HEX)?,
+        normalize_felt_hex(NULLIFIER_SPARSE_NODE_DOMAIN_HEX)?,
+        encode_owner_public_key(&witness.output_note_preimage.owner_public_key),
+        normalize_felt_hex(&witness.output_note_preimage.spend_authority)?,
+        normalize_felt_hex(&witness.output_note_preimage.blinding)?,
+        encode_u64(witness.output_note_preimage.nonce),
+        normalize_felt_hex(&witness.output_note_preimage.metadata_commitment)?,
+        normalize_felt_hex(&roots.nullifier.0)?,
+        normalize_felt_hex(&roots.sparse_witness.key_low)?,
+        normalize_felt_hex(&roots.sparse_witness.key_high)?,
+        encode_usize(roots.sparse_witness.merkle_path.len()),
+    ];
+    push_span(
+        &mut payload,
+        &roots
+            .sparse_witness
+            .merkle_path
+            .iter()
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &roots
+            .sparse_witness
+            .merkle_directions
+            .iter()
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    payload.push(normalize_felt_hex(&roots.new_nullifier_root)?);
     let mut serialized = vec![encode_usize(payload.len())];
     serialized.extend(payload);
     Ok(serialized)
@@ -5746,20 +6354,6 @@ fn auction_proof_vectors(
             .map(|entry| normalize_felt_hex(&entry.order.recipient_residual_withdraw_authority))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
         allocation_fill_amounts,
-        privacy_gate_fields: vec![
-            if witness.privacy_gate.enforced {
-                "0x1".into()
-            } else {
-                "0x0".into()
-            },
-            encode_u128(witness.privacy_gate.min_batch_base_liquidity),
-            encode_u64(witness.privacy_gate.min_batch_participants),
-            encode_u64(witness.privacy_gate.min_eligible_orders),
-            encode_u64(witness.privacy_gate.max_single_order_fill_bps),
-            encode_u64(witness.privacy_gate.max_single_owner_fill_bps),
-            encode_u64(witness.privacy_gate.min_maker_participants),
-            encode_u64(witness.privacy_gate.max_maker_fill_bps),
-        ],
     })
 }
 
@@ -5807,7 +6401,6 @@ struct AuctionProofVectors {
     recipient_withdraw_authorities: Vec<String>,
     recipient_residual_withdraw_authorities: Vec<String>,
     allocation_fill_amounts: Vec<String>,
-    privacy_gate_fields: Vec<String>,
 }
 
 pub fn auction_admission_root(
@@ -5855,7 +6448,6 @@ pub fn build_auction_result_serialized_input(
     push_span(&mut payload, &vectors.funding_note_amounts);
     push_span(&mut payload, &vectors.funding_note_owner_keys);
     push_span(&mut payload, &vectors.allocation_fill_amounts);
-    payload.extend(vectors.privacy_gate_fields);
     let mut serialized = vec![encode_usize(payload.len())];
     serialized.extend(payload);
     Ok(serialized)
@@ -6425,6 +7017,10 @@ fn flatten_settlement_output_withdrawal_call_arguments(
 ) -> Vec<String> {
     let mut calldata = vec![
         args.batch_id.clone(),
+        args.proof_artifact_commitment.clone(),
+        args.prior_nullifier_root.clone(),
+        args.consumed_nullifier_root.clone(),
+        args.new_nullifier_root.clone(),
         args.note_commitment.clone(),
         args.asset_id.clone(),
         args.amount.clone(),
@@ -6484,9 +7080,10 @@ mod tests {
     use rand_core::OsRng;
 
     use super::{
-        SettlementOutputWithdrawalMessage, SettlementOutputWithdrawalPlanRequest,
-        auction_admission_root, build_admission_serialized_input,
-        build_auction_result_serialized_input, build_deposit_note, build_deposit_submission_plan,
+        FeeOutputNoteInput, SettlementOutputWithdrawalMessage,
+        SettlementOutputWithdrawalPlanRequest, auction_admission_root,
+        build_admission_serialized_input, build_auction_result_serialized_input,
+        build_deposit_note, build_deposit_submission_plan, build_fee_output_note,
         build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
         build_order_submission, build_output_note, build_renewal_parent_cancel_submission_plan,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
@@ -6494,19 +7091,21 @@ mod tests {
         create_maker_attribution_artifact, create_order_ingress_receipt, create_recovery_artifact,
         decrypt_maker_attribution_artifact, decrypt_note_for_owner, decrypt_order_bundle,
         decrypt_order_share, decrypt_output_recovery_record, decrypt_recovery_artifact_payload,
-        derive_account_id, derive_order_cancellation_secret, derive_order_cancellation_tag,
-        derive_user_keys, encode_u64, encode_u128, encrypt_note_for_owner,
-        encrypt_output_recovery_record, native_note_consolidation_message_hash, normalize_felt_hex,
+        deposit_root_from_note, derive_account_id, derive_order_cancellation_secret,
+        derive_order_cancellation_tag, derive_user_keys, encrypt_note_for_owner,
+        encrypt_output_recovery_record, encrypted_note_activation_commitment,
+        funding_commitment_for_deposit, native_note_consolidation_message_hash,
         note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
-        output_note_merkle_proof, output_note_merkle_root,
-        private_execution_key_registry_fingerprint, proof_artifact_commitment,
-        reconstruct_order_from_shares, renewal_child_nullifier, renewal_parent_cancel_marker,
-        renewal_sparse_witness_for_parent_cancel_marker, root_only_settlement_commitments,
-        sanitize_order_submission_for_coordinator, settlement_note_root_after_deposit_chain,
-        settlement_nullifier_root_after_history, settlement_output_withdrawal_message_hash,
-        settlement_transcript_commitment, sign_note_consolidation_authorization,
-        sign_order_authorization, sign_renewal_relay_package_authorization,
-        validate_maker_attribution_receipt, validate_order_ingress_receipt_for_manifest,
+        nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
+        output_note_merkle_root, private_execution_key_registry_fingerprint,
+        proof_artifact_commitment, reconstruct_order_from_shares, renewal_child_nullifier,
+        renewal_parent_cancel_marker, renewal_sparse_witness_for_parent_cancel_marker,
+        root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
+        settlement_note_root_after_deposit_roots, settlement_nullifier_root_after_history,
+        settlement_output_withdrawal_message_hash, settlement_transcript_commitment,
+        sign_note_consolidation_authorization, sign_order_authorization,
+        sign_renewal_relay_package_authorization, validate_maker_attribution_receipt,
+        validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
@@ -6517,19 +7116,30 @@ mod tests {
         MakerBandFillAttribution, MakerCurvePoint, output_bundle_bucket_size,
         output_recovery_bundle_root,
     };
-    use crate::{
-        AuctionPrivacyGateWitness, FundingRailKind, RelayMode, RenewalParentCancelPlanRequest,
-    };
+    use crate::{FundingRailKind, RelayMode, RenewalParentCancelPlanRequest};
 
-    fn with_deposit_prior_note_root(mut transcript: SettlementTranscript) -> SettlementTranscript {
+    fn with_deposit_prior_note_root(
+        mut transcript: SettlementTranscript,
+        funding_notes: &[Note],
+    ) -> SettlementTranscript {
         if !transcript.consumed_inputs.is_empty() {
-            let commitments = transcript
-                .consumed_inputs
+            let commitments = funding_notes
                 .iter()
-                .map(|input| input.note_commitment.0.clone())
-                .collect::<Vec<_>>();
-            transcript.prior_note_root =
-                settlement_note_root_after_deposit_chain(&commitments).expect("deposit note root");
+                .map(|note| note.commitment().expect("funding note commitment").0)
+                .collect::<std::collections::BTreeSet<_>>();
+            for input in &transcript.consumed_inputs {
+                assert!(
+                    commitments.contains(&input.note_commitment.0),
+                    "funding note preimage missing for consumed input"
+                );
+            }
+            let deposit_roots = funding_notes
+                .iter()
+                .map(deposit_root_from_note)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("deposit roots");
+            transcript.prior_note_root = settlement_note_root_after_deposit_roots(&deposit_roots)
+                .expect("deposit note root");
         }
         if transcript.new_nullifier_root == "0x0" {
             if transcript.consumed_inputs.is_empty() {
@@ -6612,46 +7222,51 @@ mod tests {
     ) -> SettlementWitness {
         let order_commitment = OrderCommitment("0xabc123".into());
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: BatchId(batch_id.into()),
-                pair_id: PairId("STRK/USDC".into()),
-                batch_epoch: 12,
-                order_commitment_root: "0x111".into(),
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 321,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "zylith-protocol-treasury".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![crate::MatchedOrder {
-                    order_commitment: order_commitment.clone(),
-                    filled_amount: 111,
-                }],
-                consumed_inputs: vec![ConsumedInput {
-                    note_commitment: funding_note.commitment().expect("funding note commitment"),
-                    nullifier: funding_nullifier.clone(),
-                }],
-                renewal_child_uses: vec![],
-                fees: vec![],
-                output_notes: vec![OutputNoteRecord {
-                    note_commitment: output_note.commitment().expect("output note commitment"),
-                    asset_id: AssetId("STRK".into()),
-                    amount: 104,
-                    withdraw_authority: output_note.withdraw_authority.clone(),
-                }],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: format!("{batch_id}-bundle"),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: BatchId(batch_id.into()),
+                    pair_id: PairId("STRK/USDC".into()),
+                    batch_epoch: 12,
+                    order_commitment_root: "0x111".into(),
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 321,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: order_commitment.clone(),
+                        filled_amount: 111,
+                    }],
+                    consumed_inputs: vec![ConsumedInput {
+                        note_commitment: funding_note
+                            .commitment()
+                            .expect("funding note commitment"),
+                        nullifier: funding_nullifier.clone(),
+                    }],
+                    renewal_child_uses: vec![],
+                    fees: vec![],
+                    output_notes: vec![OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 104,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    }],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: format!("{batch_id}-bundle"),
+                },
+                std::slice::from_ref(&funding_note),
+            ),
             vec![output_note.clone()],
         );
         build_settlement_witness(
@@ -7189,46 +7804,48 @@ mod tests {
 
         let plan = build_deposit_submission_plan(&intent, "0xabc", "0xdef", "0x456").expect("plan");
         assert_eq!(plan.funding_rail, FundingRailKind::StarknetPrivacy);
+        let note_commitment = note_a.commitment().unwrap();
+        let deposit_root = deposit_root_from_note(&note_a).unwrap();
+        let funding_commitment =
+            funding_commitment_for_deposit(&note_commitment.0, &deposit_root).unwrap();
+        let activation =
+            encrypted_note_activation_commitment(&note_commitment.0, &deposit_root).unwrap();
+        assert_eq!(plan.note_commitment, note_commitment);
+        assert_eq!(plan.deposit_root, deposit_root);
+        assert_eq!(plan.funding_commitment, funding_commitment);
+        assert_eq!(plan.encrypted_note_activation, activation);
         assert_eq!(
-            plan.encoded_args.asset_id,
-            encode_starknet_felt("asset-id", "USDC")
+            plan.encoded_args.funding_commitments,
+            vec![plan.funding_commitment]
         );
-        assert_eq!(plan.encoded_args.amount, encode_u128(intent.amount));
+        assert_eq!(plan.encoded_args.deposit_roots, vec![plan.deposit_root]);
         assert_eq!(
-            plan.encoded_args.deposit_nonce,
-            encode_u64(intent.deposit_nonce)
+            plan.encoded_args.encrypted_note_activations,
+            vec![plan.encrypted_note_activation]
         );
-        assert_eq!(
-            plan.encoded_args.note_commitment,
-            note_a.commitment().unwrap().0
-        );
-        assert_eq!(
-            plan.encoded_args.withdraw_authority,
-            normalize_felt_hex("0x1234").unwrap()
-        );
-        assert_eq!(plan.note_commitment, note_a.commitment().unwrap());
+        let encoded_args_json = serde_json::to_string(&plan.encoded_args).unwrap();
+        assert!(!encoded_args_json.contains("asset_id"));
+        assert!(!encoded_args_json.contains("amount"));
+        assert!(!encoded_args_json.contains("deposit_nonce"));
+        assert!(!encoded_args_json.contains("note_commitment"));
+        assert!(!encoded_args_json.contains("withdraw_authority"));
     }
 
     #[test]
-    fn withdrawal_plan_normalizes_note_commitment_and_recipient() {
-        let plan = build_withdrawal_submission_plan(
+    fn withdrawal_plan_rejects_raw_adapter_withdrawals() {
+        let err = build_withdrawal_submission_plan(
             "abc",
             "456",
             "def",
             "0x123",
             "0x534e5f5345504f4c4941",
         )
-        .expect("plan");
+        .expect_err("raw adapter withdrawal plans must be disabled");
 
-        assert_eq!(plan.starknet_call.contract_address, "0x123");
-        assert_eq!(plan.starknet_call.entrypoint, "withdraw_to_l2");
-        assert_eq!(plan.starknet_call.calldata.len(), 4);
-        assert_eq!(plan.starknet_call.calldata[0], "0xabc");
-        assert_eq!(plan.starknet_call.calldata[3], "0xdef");
-        assert_eq!(plan.note_commitment.0, "0xabc");
-        assert_ne!(plan.encoded_args.withdraw_authorization_r, "0x0");
-        assert_ne!(plan.encoded_args.withdraw_authorization_s, "0x0");
-        assert_eq!(plan.encoded_args.recipient, "0xdef");
+        assert!(
+            err.to_string()
+                .contains("raw adapter withdrawals are disabled")
+        );
     }
 
     #[test]
@@ -7246,11 +7863,24 @@ mod tests {
     }
 
     #[test]
-    fn settlement_output_withdrawal_plan_targets_verifier_and_includes_merkle_path() {
+    fn settlement_output_withdrawal_plan_consumes_nullifier_root() {
         let withdraw_key = "11".repeat(32);
         let withdraw_auth_key_felt = crate::withdraw_auth_key_felt_from_raw_key_hex(&withdraw_key);
         let withdraw_authority =
             crate::withdraw_authority_from_raw_key_hex(&withdraw_key).expect("withdraw authority");
+        let output_note_preimage = Note {
+            asset_id: AssetId("USDC".into()),
+            amount: 200,
+            owner_public_key: "ab".repeat(32),
+            spend_authority: sample_spend_authority(),
+            withdraw_authority: withdraw_authority.clone(),
+            blinding: "0x777".into(),
+            nonce: 7,
+            metadata_commitment: "0x888".into(),
+        };
+        let output_note_commitment = output_note_preimage
+            .commitment()
+            .expect("output commitment");
         let outputs = vec![
             OutputNoteRecord {
                 note_commitment: NoteCommitment("0x101".into()),
@@ -7259,7 +7889,7 @@ mod tests {
                 withdraw_authority: withdraw_authority.clone(),
             },
             OutputNoteRecord {
-                note_commitment: NoteCommitment("0x202".into()),
+                note_commitment: output_note_commitment.clone(),
                 asset_id: AssetId("USDC".into()),
                 amount: 200,
                 withdraw_authority: withdraw_authority.clone(),
@@ -7276,11 +7906,30 @@ mod tests {
             .expect_err("wrong output root must fail");
 
         let batch_id = BatchId("batch-strk-usdc-7".into());
+        let consumed_input = ConsumedInput {
+            note_commitment: output_note_commitment,
+            nullifier: nullifier_from_note_secret(
+                &outputs[1].note_commitment,
+                &output_note_preimage.blinding,
+            )
+            .expect("output nullifier"),
+        };
+        let (prior_nullifier_root, new_nullifier_root, mut sparse_witnesses) =
+            nullifier_sparse_update_witnesses_for_consumed_inputs(&[], &[consumed_input])
+                .expect("sparse witness");
         let plan = build_settlement_output_withdrawal_submission_plan(
             SettlementOutputWithdrawalPlanRequest {
                 batch_id: &batch_id,
                 output_note: &outputs[1],
+                output_note_preimage: &output_note_preimage,
                 output_proof: &proof,
+                prior_nullifier_root: &prior_nullifier_root,
+                nullifier_history: &[],
+                nullifier_sparse_witness: Some(
+                    &sparse_witnesses.pop().expect("one sparse witness"),
+                ),
+                new_nullifier_root: &new_nullifier_root,
+                proof_artifact_commitment: "0x999",
                 withdraw_auth_key_felt: &withdraw_auth_key_felt,
                 recipient: "0x444",
                 auction_verifier_address: "0x123",
@@ -7288,18 +7937,15 @@ mod tests {
                 chain_id: "0x534e5f5345504f4c4941",
             },
         )
-        .expect("settlement output withdrawal plan");
+        .expect("nullifier-consuming settlement output withdrawal plan");
 
         assert_eq!(
             plan.starknet_call.entrypoint,
-            "withdraw_settlement_output_to_l2"
+            "withdraw_settlement_output_with_proof_facts"
         );
-        assert_eq!(plan.starknet_call.contract_address, "0x123");
-        assert_eq!(plan.encoded_args.note_commitment, "0x202");
-        assert_eq!(plan.encoded_args.amount, "0xc8");
-        assert_eq!(plan.encoded_args.merkle_path.len(), 1);
-        assert_eq!(plan.encoded_args.merkle_directions, vec!["0x1"]);
-        assert_eq!(plan.starknet_call.calldata.len(), 12);
+        assert_eq!(plan.encoded_args.prior_nullifier_root, prior_nullifier_root);
+        assert_eq!(plan.encoded_args.new_nullifier_root, new_nullifier_root);
+        assert_eq!(plan.encoded_args.proof_artifact_commitment, "0x999");
     }
 
     #[test]
@@ -7345,50 +7991,55 @@ mod tests {
 
     #[test]
     fn settlement_submission_plan_flattens_proof_facts_call_arguments() {
-        let transcript = with_deposit_prior_note_root(SettlementTranscript {
-            batch_id: crate::BatchId("batch-1".into()),
-            pair_id: PairId("STRK/USDC".into()),
-            batch_epoch: 1,
-            order_commitment_root: "0x111".into(),
-            encrypted_order_set_commitment: "0x222".into(),
-            prior_note_root: "0x0".into(),
-            prior_nullifier_root: "0x0".into(),
-            prior_renewal_root: "0x0".into(),
-            prior_fee_root: "0x0".into(),
-            new_nullifier_root: "0x0".into(),
-            new_renewal_root: "0x0".into(),
-            clearing_price: 145,
-            price_base_scale: 1,
-            taker_fee_bps: 4,
-            maker_fee_bps: 0,
-            relay_fee_bps: 0,
-            protocol_fee_recipient: "fee-recipient".into(),
-            relay_fee_recipient: "zylith-renewal-relay".into(),
-            matched_orders: vec![crate::MatchedOrder {
-                order_commitment: crate::OrderCommitment("order-1".into()),
-                filled_amount: 500,
-            }],
-            consumed_inputs: vec![ConsumedInput {
-                note_commitment: NoteCommitment("0x123".into()),
-                nullifier: Nullifier("0x456".into()),
-            }],
-            renewal_child_uses: vec![],
-            fees: vec![FeeEntry {
-                asset_id: AssetId("USDC".into()),
-                amount: 10,
-                recipient: "fee-recipient".into(),
-            }],
-            output_notes: vec![OutputNoteRecord {
-                note_commitment: NoteCommitment("0x789".into()),
-                asset_id: AssetId("STRK".into()),
-                amount: 490,
-                withdraw_authority: "0xaaa".into(),
-            }],
-            output_note_preimages: vec![],
-            output_recovery_records: vec![],
-            output_recovery_dummy_commitments: vec![],
-            output_ciphertext_bundle_ref: "bundle-1".into(),
-        });
+        let funding_note = sample_note("STRK", 500, 901);
+        let funding_nullifier = sample_nullifier(&funding_note);
+        let transcript = with_deposit_prior_note_root(
+            SettlementTranscript {
+                batch_id: crate::BatchId("batch-1".into()),
+                pair_id: PairId("STRK/USDC".into()),
+                batch_epoch: 1,
+                order_commitment_root: "0x111".into(),
+                encrypted_order_set_commitment: "0x222".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
+                clearing_price: 145,
+                price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                relay_fee_bps: 0,
+                protocol_fee_recipient: "fee-recipient".into(),
+                relay_fee_recipient: "zylith-renewal-relay".into(),
+                matched_orders: vec![crate::MatchedOrder {
+                    order_commitment: crate::OrderCommitment("order-1".into()),
+                    filled_amount: 500,
+                }],
+                consumed_inputs: vec![ConsumedInput {
+                    note_commitment: funding_note.commitment().expect("funding note commitment"),
+                    nullifier: funding_nullifier,
+                }],
+                renewal_child_uses: vec![],
+                fees: vec![FeeEntry {
+                    asset_id: AssetId("USDC".into()),
+                    amount: 10,
+                    recipient: "fee-recipient".into(),
+                }],
+                output_notes: vec![OutputNoteRecord {
+                    note_commitment: NoteCommitment("0x789".into()),
+                    asset_id: AssetId("STRK".into()),
+                    amount: 490,
+                    withdraw_authority: "0xaaa".into(),
+                }],
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments: vec![],
+                output_ciphertext_bundle_ref: "bundle-1".into(),
+            },
+            std::slice::from_ref(&funding_note),
+        );
 
         let proof_commitment =
             proof_artifact_commitment("proof-sha", "public-inputs-sha").expect("proof");
@@ -7412,35 +8063,38 @@ mod tests {
 
     #[test]
     fn settlement_submission_plan_targets_native_proof_facts_entrypoint() {
-        let transcript = with_deposit_prior_note_root(SettlementTranscript {
-            batch_id: crate::BatchId("batch-1".into()),
-            pair_id: PairId("STRK/USDC".into()),
-            batch_epoch: 1,
-            order_commitment_root: "0x111".into(),
-            encrypted_order_set_commitment: "0x222".into(),
-            prior_note_root: "0x0".into(),
-            prior_nullifier_root: "0x0".into(),
-            prior_renewal_root: "0x0".into(),
-            prior_fee_root: "0x0".into(),
-            new_nullifier_root: "0x0".into(),
-            new_renewal_root: "0x0".into(),
-            clearing_price: 145,
-            price_base_scale: 1,
-            taker_fee_bps: 4,
-            maker_fee_bps: 0,
-            relay_fee_bps: 0,
-            protocol_fee_recipient: "zylith-protocol-fee".into(),
-            relay_fee_recipient: "zylith-renewal-relay".into(),
-            matched_orders: vec![],
-            consumed_inputs: vec![],
-            renewal_child_uses: vec![],
-            fees: vec![],
-            output_notes: vec![],
-            output_note_preimages: vec![],
-            output_recovery_records: vec![],
-            output_recovery_dummy_commitments: vec![],
-            output_ciphertext_bundle_ref: "bundle-1".into(),
-        });
+        let transcript = with_deposit_prior_note_root(
+            SettlementTranscript {
+                batch_id: crate::BatchId("batch-1".into()),
+                pair_id: PairId("STRK/USDC".into()),
+                batch_epoch: 1,
+                order_commitment_root: "0x111".into(),
+                encrypted_order_set_commitment: "0x222".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
+                clearing_price: 145,
+                price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                relay_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-fee".into(),
+                relay_fee_recipient: "zylith-renewal-relay".into(),
+                matched_orders: vec![],
+                consumed_inputs: vec![],
+                renewal_child_uses: vec![],
+                fees: vec![],
+                output_notes: vec![],
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments: vec![],
+                output_ciphertext_bundle_ref: "bundle-1".into(),
+            },
+            &[],
+        );
 
         let proof_commitment =
             proof_artifact_commitment("proof-sha", "public-inputs-sha").expect("proof");
@@ -7463,93 +8117,282 @@ mod tests {
 
     #[test]
     fn settlement_transcript_commitment_matches_cairo_contract_formula() {
-        let transcript = with_deposit_prior_note_root(SettlementTranscript {
-            batch_id: crate::BatchId("batch-strk-usdc-1".into()),
-            pair_id: PairId("STRK/USDC".into()),
-            batch_epoch: 1,
-            order_commitment_root: "0x111".into(),
-            encrypted_order_set_commitment: "0x222".into(),
-            prior_note_root: "0x0".into(),
-            prior_nullifier_root: "0x0".into(),
-            prior_renewal_root: "0x0".into(),
-            prior_fee_root: "0x0".into(),
-            new_nullifier_root: "0x0".into(),
-            new_renewal_root: "0x0".into(),
-            clearing_price: 300,
-            price_base_scale: 1,
-            taker_fee_bps: 4,
-            maker_fee_bps: 0,
-            relay_fee_bps: 0,
-            protocol_fee_recipient: "zylith-protocol-fee".into(),
-            relay_fee_recipient: "zylith-renewal-relay".into(),
-            matched_orders: vec![
-                crate::MatchedOrder {
-                    order_commitment: crate::OrderCommitment(
-                        "0x4b292dd88ea26e4bb36a2b96aa3a5ab8989528e1cc8820ed601b593d652e6e3".into(),
-                    ),
-                    filled_amount: 100,
-                },
-                crate::MatchedOrder {
-                    order_commitment: crate::OrderCommitment(
-                        "0x29ce97d838b12ca71cb08896fd7a17507c1349a3306180167c22787005dca0d".into(),
-                    ),
-                    filled_amount: 100,
-                },
-            ],
-            consumed_inputs: vec![
-                ConsumedInput {
-                    note_commitment: NoteCommitment(
-                        "0x2ac19e1535f0c09faf01e2fc6553af0805e4c729aef2b334170eacfe9acde37".into(),
-                    ),
-                    nullifier: Nullifier(
-                        "0x7dbd3c7c2fe8baa75ef2bc40b202170de6302e979147b0891c85153286ad4d5".into(),
-                    ),
-                },
-                ConsumedInput {
-                    note_commitment: NoteCommitment(
-                        "0x7a72976550f4e23619ace1ea4dd5d1a9ab69f2e1eed70ddf29f850d26cfe02f".into(),
-                    ),
-                    nullifier: Nullifier(
-                        "0x44802cf244cbe3834896c577766d307936fbc62646e9d6b135b42987a38a3c1".into(),
-                    ),
-                },
-            ],
-            renewal_child_uses: vec![],
-            fees: vec![FeeEntry {
-                asset_id: AssetId("USDC".into()),
-                amount: 30,
-                recipient: "zylith-protocol-fee".into(),
-            }],
-            output_notes: vec![
-                OutputNoteRecord {
-                    note_commitment: NoteCommitment(
-                        "0x78bebb5dd3299517a9eb30c046dad25e9cc638ecc86982392ee5a4a6f7a7418".into(),
-                    ),
+        let funding_note_a = sample_note("USDC", 10_000, 902);
+        let funding_note_b = sample_note("STRK", 20_000, 903);
+        let funding_nullifier_a = sample_nullifier(&funding_note_a);
+        let funding_nullifier_b = sample_nullifier(&funding_note_b);
+        let transcript = with_deposit_prior_note_root(
+            SettlementTranscript {
+                batch_id: crate::BatchId("batch-strk-usdc-1".into()),
+                pair_id: PairId("STRK/USDC".into()),
+                batch_epoch: 1,
+                order_commitment_root: "0x111".into(),
+                encrypted_order_set_commitment: "0x222".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
+                clearing_price: 300,
+                price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                relay_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-fee".into(),
+                relay_fee_recipient: "zylith-renewal-relay".into(),
+                matched_orders: vec![
+                    crate::MatchedOrder {
+                        order_commitment: crate::OrderCommitment(
+                            "0x4b292dd88ea26e4bb36a2b96aa3a5ab8989528e1cc8820ed601b593d652e6e3"
+                                .into(),
+                        ),
+                        filled_amount: 100,
+                    },
+                    crate::MatchedOrder {
+                        order_commitment: crate::OrderCommitment(
+                            "0x29ce97d838b12ca71cb08896fd7a17507c1349a3306180167c22787005dca0d"
+                                .into(),
+                        ),
+                        filled_amount: 100,
+                    },
+                ],
+                consumed_inputs: vec![
+                    ConsumedInput {
+                        note_commitment: funding_note_a.commitment().expect("funding a commitment"),
+                        nullifier: funding_nullifier_a,
+                    },
+                    ConsumedInput {
+                        note_commitment: funding_note_b.commitment().expect("funding b commitment"),
+                        nullifier: funding_nullifier_b,
+                    },
+                ],
+                renewal_child_uses: vec![],
+                fees: vec![FeeEntry {
                     asset_id: AssetId("USDC".into()),
-                    amount: 29970,
-                    withdraw_authority: "0x2065".into(),
-                },
-                OutputNoteRecord {
-                    note_commitment: NoteCommitment(
-                        "0x4d8df0f876f2b996b107dec093de913dbca4e46adf95416dff638cc5c30b567".into(),
-                    ),
-                    asset_id: AssetId("STRK".into()),
-                    amount: 100,
-                    withdraw_authority: "0x1001".into(),
-                },
-            ],
-            output_note_preimages: vec![],
-            output_recovery_records: vec![],
-            output_recovery_dummy_commitments: vec![],
-            output_ciphertext_bundle_ref:
-                "a9bfa0d37d7a84cc26c1fec3e7dd0e00d463a93f886e6e62ada07470b1a4ea4a".into(),
-        });
+                    amount: 30,
+                    recipient: "zylith-protocol-fee".into(),
+                }],
+                output_notes: vec![
+                    OutputNoteRecord {
+                        note_commitment: NoteCommitment(
+                            "0x78bebb5dd3299517a9eb30c046dad25e9cc638ecc86982392ee5a4a6f7a7418"
+                                .into(),
+                        ),
+                        asset_id: AssetId("USDC".into()),
+                        amount: 29970,
+                        withdraw_authority: "0x2065".into(),
+                    },
+                    OutputNoteRecord {
+                        note_commitment: NoteCommitment(
+                            "0x4d8df0f876f2b996b107dec093de913dbca4e46adf95416dff638cc5c30b567"
+                                .into(),
+                        ),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 100,
+                        withdraw_authority: "0x1001".into(),
+                    },
+                ],
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments: vec![],
+                output_ciphertext_bundle_ref:
+                    "a9bfa0d37d7a84cc26c1fec3e7dd0e00d463a93f886e6e62ada07470b1a4ea4a".into(),
+            },
+            &[funding_note_a, funding_note_b],
+        );
 
         let commitment =
             settlement_transcript_commitment(&transcript).expect("transcript commitment");
         let plan = build_settlement_submission_plan(&transcript, "0x123", "0x456").expect("plan");
         assert_eq!(commitment, plan.encoded_args.transcript_commitment);
         assert_eq!(plan.settlement_call.calldata.len(), 26);
+    }
+
+    fn settlement_binding_transcript() -> SettlementTranscript {
+        SettlementTranscript {
+            batch_id: crate::BatchId("batch-binding".into()),
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 7,
+            order_commitment_root: "0x111".into(),
+            encrypted_order_set_commitment: "0x222".into(),
+            prior_note_root: "0x333".into(),
+            prior_nullifier_root: "0x444".into(),
+            prior_renewal_root: "0x555".into(),
+            prior_fee_root: "0x666".into(),
+            new_nullifier_root: "0x777".into(),
+            new_renewal_root: "0x888".into(),
+            clearing_price: 123,
+            price_base_scale: 10,
+            taker_fee_bps: 4,
+            maker_fee_bps: 1,
+            relay_fee_bps: 2,
+            protocol_fee_recipient:
+                "0x02478731e01081aa57abe958afa8c29dfa83032c10d647a63b0394c23beb6192".into(),
+            relay_fee_recipient:
+                "0x02c79e77ef9014bbed5e612f86f8e011b05450aa9b7821d97c281cb2ac6d29a".into(),
+            matched_orders: vec![crate::MatchedOrder {
+                order_commitment: crate::OrderCommitment("0x999".into()),
+                filled_amount: 50,
+            }],
+            consumed_inputs: vec![ConsumedInput {
+                note_commitment: NoteCommitment("0xaaa".into()),
+                nullifier: Nullifier("0xbbb".into()),
+            }],
+            renewal_child_uses: vec![crate::RenewalChildUse {
+                parent_order_commitment: "0xccc".into(),
+                child_nullifier: "0xddd".into(),
+            }],
+            fees: vec![
+                FeeEntry {
+                    asset_id: AssetId("USDC".into()),
+                    amount: 3,
+                    recipient: "0x02478731e01081aa57abe958afa8c29dfa83032c10d647a63b0394c23beb6192"
+                        .into(),
+                },
+                FeeEntry {
+                    asset_id: AssetId("STRK".into()),
+                    amount: 2,
+                    recipient: "0x02c79e77ef9014bbed5e612f86f8e011b05450aa9b7821d97c281cb2ac6d29a"
+                        .into(),
+                },
+            ],
+            output_notes: vec![OutputNoteRecord {
+                note_commitment: NoteCommitment("0xeee".into()),
+                asset_id: AssetId("STRK".into()),
+                amount: 47,
+                withdraw_authority: "0xfff".into(),
+            }],
+            output_note_preimages: vec![],
+            output_recovery_records: vec![],
+            output_recovery_dummy_commitments: vec![],
+            output_ciphertext_bundle_ref: "0x1234".into(),
+        }
+    }
+
+    #[test]
+    fn settlement_transcript_commitment_binds_every_public_field() {
+        let base = settlement_binding_transcript();
+        let base_commitment =
+            settlement_transcript_commitment(&base).expect("base transcript commitment");
+        let base_roots = root_only_settlement_commitments(&base).expect("base roots");
+
+        type TranscriptMutation = (&'static str, Box<dyn Fn(&mut SettlementTranscript)>);
+
+        let mutations: Vec<TranscriptMutation> = vec![
+            (
+                "batch_id",
+                Box::new(|tx| tx.batch_id = crate::BatchId("batch-other".into())),
+            ),
+            (
+                "pair_id",
+                Box::new(|tx| tx.pair_id = PairId("STRK/ETH".into())),
+            ),
+            ("epoch_id", Box::new(|tx| tx.batch_epoch += 1)),
+            (
+                "order_root",
+                Box::new(|tx| tx.order_commitment_root = "0x112".into()),
+            ),
+            (
+                "encrypted_order_set",
+                Box::new(|tx| tx.encrypted_order_set_commitment = "0x223".into()),
+            ),
+            (
+                "old_note_root",
+                Box::new(|tx| tx.prior_note_root = "0x334".into()),
+            ),
+            (
+                "old_nullifier_root",
+                Box::new(|tx| tx.prior_nullifier_root = "0x445".into()),
+            ),
+            (
+                "old_renewal_root",
+                Box::new(|tx| tx.prior_renewal_root = "0x556".into()),
+            ),
+            (
+                "old_fee_root",
+                Box::new(|tx| tx.prior_fee_root = "0x667".into()),
+            ),
+            (
+                "new_nullifier_root",
+                Box::new(|tx| tx.new_nullifier_root = "0x778".into()),
+            ),
+            (
+                "new_renewal_root",
+                Box::new(|tx| tx.new_renewal_root = "0x889".into()),
+            ),
+            ("clearing_price", Box::new(|tx| tx.clearing_price += 1)),
+            ("price_base_scale", Box::new(|tx| tx.price_base_scale += 1)),
+            ("taker_fee_bps", Box::new(|tx| tx.taker_fee_bps += 1)),
+            ("maker_fee_bps", Box::new(|tx| tx.maker_fee_bps += 1)),
+            ("relay_fee_bps", Box::new(|tx| tx.relay_fee_bps += 1)),
+            (
+                "protocol_fee_recipient",
+                Box::new(|tx| {
+                    tx.protocol_fee_recipient =
+                        "0x02478731e01081aa57abe958afa8c29dfa83032c10d647a63b0394c23beb6193".into();
+                    tx.fees[0].recipient = tx.protocol_fee_recipient.clone();
+                }),
+            ),
+            (
+                "relay_fee_recipient",
+                Box::new(|tx| {
+                    tx.relay_fee_recipient =
+                        "0x02c79e77ef9014bbed5e612f86f8e011b05450aa9b7821d97c281cb2ac6d29b".into();
+                    tx.fees[1].recipient = tx.relay_fee_recipient.clone();
+                }),
+            ),
+            (
+                "output_bundle_ref",
+                Box::new(|tx| tx.output_ciphertext_bundle_ref = "0x1235".into()),
+            ),
+            (
+                "consumed_note_root",
+                Box::new(|tx| {
+                    tx.consumed_inputs[0].note_commitment = NoteCommitment("0xaab".into())
+                }),
+            ),
+            (
+                "consumed_nullifier_root",
+                Box::new(|tx| tx.consumed_inputs[0].nullifier = Nullifier("0xbbc".into())),
+            ),
+            (
+                "renewal_child_root",
+                Box::new(|tx| tx.renewal_child_uses[0].child_nullifier = "0xdde".into()),
+            ),
+            (
+                "output_note_root",
+                Box::new(|tx| tx.output_notes[0].note_commitment = NoteCommitment("0xeef".into())),
+            ),
+            ("fee_root", Box::new(|tx| tx.fees[0].amount += 1)),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            let changed_commitment =
+                settlement_transcript_commitment(&changed).expect("changed transcript commitment");
+            assert_ne!(
+                base_commitment, changed_commitment,
+                "settlement transcript commitment did not bind {field}"
+            );
+        }
+
+        let verifier_a = crate::native_settlement_message_hash("0x123", &base_commitment)
+            .expect("native settlement hash");
+        let verifier_b = crate::native_settlement_message_hash("0x124", &base_commitment)
+            .expect("native settlement hash");
+        assert_ne!(
+            verifier_a, verifier_b,
+            "verifier address must bind proof message"
+        );
+
+        let mut fee_changed = base.clone();
+        fee_changed.fees[0].amount += 1;
+        let changed_roots =
+            root_only_settlement_commitments(&fee_changed).expect("changed fee roots");
+        assert_ne!(base_roots.fee_root, changed_roots.fee_root);
+        assert_ne!(base_roots.new_fee_root, changed_roots.new_fee_root);
     }
 
     #[test]
@@ -7572,46 +8415,49 @@ mod tests {
         let funding_note = sample_note("STRK", 700, 2);
         let output_note = sample_note("ETH", 700, 3);
         let funding_nullifier = sample_nullifier(&funding_note);
-        let transcript = with_deposit_prior_note_root(SettlementTranscript {
-            batch_id: crate::BatchId("batch-2".into()),
-            pair_id: PairId("STRK/ETH".into()),
-            batch_epoch: 9,
-            order_commitment_root: "0x111".into(),
-            encrypted_order_set_commitment: "0x222".into(),
-            prior_note_root: "0x0".into(),
-            prior_nullifier_root: "0x0".into(),
-            prior_renewal_root: "0x0".into(),
-            prior_fee_root: "0x0".into(),
-            new_nullifier_root: "0x0".into(),
-            new_renewal_root: "0x0".into(),
-            clearing_price: 200,
-            price_base_scale: 1,
-            taker_fee_bps: 4,
-            maker_fee_bps: 0,
-            relay_fee_bps: 0,
-            protocol_fee_recipient: "zylith-protocol-treasury".into(),
-            relay_fee_recipient: "zylith-renewal-relay".into(),
-            matched_orders: vec![crate::MatchedOrder {
-                order_commitment: crate::OrderCommitment("order-2".into()),
-                filled_amount: 700,
-            }],
-            consumed_inputs: vec![ConsumedInput {
-                note_commitment: funding_note.commitment().expect("funding note commitment"),
-                nullifier: funding_nullifier.clone(),
-            }],
-            renewal_child_uses: vec![],
-            fees: vec![],
-            output_notes: vec![OutputNoteRecord {
-                note_commitment: output_note.commitment().expect("output note commitment"),
-                asset_id: AssetId("ETH".into()),
-                amount: 700,
-                withdraw_authority: output_note.withdraw_authority.clone(),
-            }],
-            output_note_preimages: vec![],
-            output_recovery_records: vec![],
-            output_recovery_dummy_commitments: vec![],
-            output_ciphertext_bundle_ref: "bundle-2".into(),
-        });
+        let transcript = with_deposit_prior_note_root(
+            SettlementTranscript {
+                batch_id: crate::BatchId("batch-2".into()),
+                pair_id: PairId("STRK/ETH".into()),
+                batch_epoch: 9,
+                order_commitment_root: "0x111".into(),
+                encrypted_order_set_commitment: "0x222".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
+                clearing_price: 200,
+                price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                relay_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                relay_fee_recipient: "zylith-renewal-relay".into(),
+                matched_orders: vec![crate::MatchedOrder {
+                    order_commitment: crate::OrderCommitment("order-2".into()),
+                    filled_amount: 700,
+                }],
+                consumed_inputs: vec![ConsumedInput {
+                    note_commitment: funding_note.commitment().expect("funding note commitment"),
+                    nullifier: funding_nullifier.clone(),
+                }],
+                renewal_child_uses: vec![],
+                fees: vec![],
+                output_notes: vec![OutputNoteRecord {
+                    note_commitment: output_note.commitment().expect("output note commitment"),
+                    asset_id: AssetId("ETH".into()),
+                    amount: 700,
+                    withdraw_authority: output_note.withdraw_authority.clone(),
+                }],
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments: vec![],
+                output_ciphertext_bundle_ref: "bundle-2".into(),
+            },
+            std::slice::from_ref(&funding_note),
+        );
 
         let witness = build_settlement_witness(
             &transcript,
@@ -7672,50 +8518,55 @@ mod tests {
         let output_note = sample_note("STRK", 104, 5);
         let funding_nullifier = sample_nullifier(&funding_note);
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: crate::BatchId("batch-3".into()),
-                pair_id: PairId("STRK/USDC".into()),
-                batch_epoch: 12,
-                order_commitment_root: "0x111".into(),
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 321,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "recipient-3".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![crate::MatchedOrder {
-                    order_commitment: crate::OrderCommitment("order-3".into()),
-                    filled_amount: 111,
-                }],
-                consumed_inputs: vec![ConsumedInput {
-                    note_commitment: funding_note.commitment().expect("funding note commitment"),
-                    nullifier: funding_nullifier.clone(),
-                }],
-                renewal_child_uses: vec![],
-                fees: vec![FeeEntry {
-                    asset_id: AssetId("USDC".into()),
-                    amount: 7,
-                    recipient: "recipient-3".into(),
-                }],
-                output_notes: vec![OutputNoteRecord {
-                    note_commitment: output_note.commitment().expect("output note commitment"),
-                    asset_id: AssetId("STRK".into()),
-                    amount: 104,
-                    withdraw_authority: output_note.withdraw_authority.clone(),
-                }],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "bundle-3".into(),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: crate::BatchId("batch-3".into()),
+                    pair_id: PairId("STRK/USDC".into()),
+                    batch_epoch: 12,
+                    order_commitment_root: "0x111".into(),
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 321,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "recipient-3".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: crate::OrderCommitment("order-3".into()),
+                        filled_amount: 111,
+                    }],
+                    consumed_inputs: vec![ConsumedInput {
+                        note_commitment: funding_note
+                            .commitment()
+                            .expect("funding note commitment"),
+                        nullifier: funding_nullifier.clone(),
+                    }],
+                    renewal_child_uses: vec![],
+                    fees: vec![FeeEntry {
+                        asset_id: AssetId("USDC".into()),
+                        amount: 7,
+                        recipient: "recipient-3".into(),
+                    }],
+                    output_notes: vec![OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 104,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    }],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "bundle-3".into(),
+                },
+                std::slice::from_ref(&funding_note),
+            ),
             vec![output_note.clone()],
         );
 
@@ -7795,62 +8646,67 @@ mod tests {
         .expect("funding nullifier set");
         let order_commitment = crate::OrderCommitment("order-multi-input".into());
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: crate::BatchId("batch-multi-input".into()),
-                pair_id: PairId("STRK/USDC".into()),
-                batch_epoch: 12,
-                order_commitment_root: "0x111".into(),
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 145,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "recipient-asset-owner".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![crate::MatchedOrder {
-                    order_commitment: order_commitment.clone(),
-                    filled_amount: 1000,
-                }],
-                consumed_inputs: vec![
-                    ConsumedInput {
-                        note_commitment: funding_commitment_a.clone(),
-                        nullifier: funding_nullifier_a.clone(),
-                    },
-                    ConsumedInput {
-                        note_commitment: funding_commitment_b.clone(),
-                        nullifier: funding_nullifier_b.clone(),
-                    },
-                ],
-                renewal_child_uses: vec![],
-                fees: vec![],
-                output_notes: vec![
-                    OutputNoteRecord {
-                        note_commitment: output_note.commitment().expect("output note commitment"),
-                        asset_id: AssetId("STRK".into()),
-                        amount: 997,
-                        withdraw_authority: output_note.withdraw_authority.clone(),
-                    },
-                    OutputNoteRecord {
-                        note_commitment: residual_note
-                            .commitment()
-                            .expect("residual note commitment"),
-                        asset_id: AssetId("USDC".into()),
-                        amount: 55_000,
-                        withdraw_authority: residual_note.withdraw_authority.clone(),
-                    },
-                ],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "bundle-multi-input".into(),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: crate::BatchId("batch-multi-input".into()),
+                    pair_id: PairId("STRK/USDC".into()),
+                    batch_epoch: 12,
+                    order_commitment_root: "0x111".into(),
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 145,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "recipient-asset-owner".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: order_commitment.clone(),
+                        filled_amount: 1000,
+                    }],
+                    consumed_inputs: vec![
+                        ConsumedInput {
+                            note_commitment: funding_commitment_a.clone(),
+                            nullifier: funding_nullifier_a.clone(),
+                        },
+                        ConsumedInput {
+                            note_commitment: funding_commitment_b.clone(),
+                            nullifier: funding_nullifier_b.clone(),
+                        },
+                    ],
+                    renewal_child_uses: vec![],
+                    fees: vec![],
+                    output_notes: vec![
+                        OutputNoteRecord {
+                            note_commitment: output_note
+                                .commitment()
+                                .expect("output note commitment"),
+                            asset_id: AssetId("STRK".into()),
+                            amount: 997,
+                            withdraw_authority: output_note.withdraw_authority.clone(),
+                        },
+                        OutputNoteRecord {
+                            note_commitment: residual_note
+                                .commitment()
+                                .expect("residual note commitment"),
+                            asset_id: AssetId("USDC".into()),
+                            amount: 55_000,
+                            withdraw_authority: residual_note.withdraw_authority.clone(),
+                        },
+                    ],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "bundle-multi-input".into(),
+                },
+                &[funding_note_a.clone(), funding_note_b.clone()],
+            ),
             vec![output_note.clone(), residual_note.clone()],
         );
         let witness = build_settlement_witness(
@@ -7955,43 +8811,46 @@ mod tests {
     #[test]
     fn stwo_serialized_input_rejects_mismatched_witness_count() {
         let output_note = sample_note("STRK", 104, 5);
-        let transcript = with_deposit_prior_note_root(SettlementTranscript {
-            batch_id: crate::BatchId("batch-mismatched-witnesses".into()),
-            pair_id: PairId("STRK/USDC".into()),
-            batch_epoch: 1,
-            order_commitment_root: "0x111".into(),
-            encrypted_order_set_commitment: "0x222".into(),
-            prior_note_root: "0x0".into(),
-            prior_nullifier_root: "0x0".into(),
-            prior_renewal_root: "0x0".into(),
-            prior_fee_root: "0x0".into(),
-            new_nullifier_root: "0x0".into(),
-            new_renewal_root: "0x0".into(),
-            clearing_price: 321,
-            price_base_scale: 1,
-            taker_fee_bps: 4,
-            maker_fee_bps: 0,
-            relay_fee_bps: 0,
-            protocol_fee_recipient: "zylith-protocol-treasury".into(),
-            relay_fee_recipient: "zylith-renewal-relay".into(),
-            matched_orders: vec![crate::MatchedOrder {
-                order_commitment: crate::OrderCommitment("order-mismatched-witness".into()),
-                filled_amount: 111,
-            }],
-            consumed_inputs: vec![],
-            renewal_child_uses: vec![],
-            fees: vec![],
-            output_notes: vec![OutputNoteRecord {
-                note_commitment: output_note.commitment().expect("output note commitment"),
-                asset_id: AssetId("STRK".into()),
-                amount: 104,
-                withdraw_authority: output_note.withdraw_authority.clone(),
-            }],
-            output_note_preimages: vec![],
-            output_recovery_records: vec![],
-            output_recovery_dummy_commitments: vec![],
-            output_ciphertext_bundle_ref: "bundle-ref-mismatch".into(),
-        });
+        let transcript = with_deposit_prior_note_root(
+            SettlementTranscript {
+                batch_id: crate::BatchId("batch-mismatched-witnesses".into()),
+                pair_id: PairId("STRK/USDC".into()),
+                batch_epoch: 1,
+                order_commitment_root: "0x111".into(),
+                encrypted_order_set_commitment: "0x222".into(),
+                prior_note_root: "0x0".into(),
+                prior_nullifier_root: "0x0".into(),
+                prior_renewal_root: "0x0".into(),
+                prior_fee_root: "0x0".into(),
+                new_nullifier_root: "0x0".into(),
+                new_renewal_root: "0x0".into(),
+                clearing_price: 321,
+                price_base_scale: 1,
+                taker_fee_bps: 4,
+                maker_fee_bps: 0,
+                relay_fee_bps: 0,
+                protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                relay_fee_recipient: "zylith-renewal-relay".into(),
+                matched_orders: vec![crate::MatchedOrder {
+                    order_commitment: crate::OrderCommitment("order-mismatched-witness".into()),
+                    filled_amount: 111,
+                }],
+                consumed_inputs: vec![],
+                renewal_child_uses: vec![],
+                fees: vec![],
+                output_notes: vec![OutputNoteRecord {
+                    note_commitment: output_note.commitment().expect("output note commitment"),
+                    asset_id: AssetId("STRK".into()),
+                    amount: 104,
+                    withdraw_authority: output_note.withdraw_authority.clone(),
+                }],
+                output_note_preimages: vec![],
+                output_recovery_records: vec![],
+                output_recovery_dummy_commitments: vec![],
+                output_ciphertext_bundle_ref: "bundle-ref-mismatch".into(),
+            },
+            &[],
+        );
         let witness = build_settlement_witness(
             &transcript,
             PairId("STRK/USDC".into()),
@@ -8186,6 +9045,31 @@ mod tests {
     }
 
     #[test]
+    fn stwo_serialized_input_rejects_mismatched_supplied_sparse_nullifier_witness() {
+        let funding_note = sample_note("USDC", 44_400, 53);
+        let output_note = sample_note("STRK", 104, 54);
+        let funding_nullifier = sample_nullifier(&funding_note);
+        let mut witness = sample_single_match_witness(
+            "batch-bad-supplied-nullifier-witness",
+            funding_note,
+            funding_nullifier,
+            output_note,
+        );
+        let (_prior_root, new_root, mut sparse_witnesses) =
+            super::nullifier_sparse_update_witnesses_for_consumed_inputs(
+                &[],
+                &witness.consumed_inputs,
+            )
+            .expect("sparse witnesses");
+        sparse_witnesses[0].key_low = "0xffffffffffffffffffffffffffffffff".into();
+        witness.new_nullifier_root = new_root;
+        witness.nullifier_sparse_witnesses = sparse_witnesses;
+
+        let error = build_stwo_serialized_input(&witness).expect_err("bad sparse witness rejected");
+        assert!(matches!(error, ProtocolError::Crypto(message) if message.contains("key_low")));
+    }
+
+    #[test]
     fn sparse_nullifier_witness_uses_empty_path_for_empty_root_only() {
         let first = sample_nullifier(&sample_note("USDC", 1_000, 500));
         let second = sample_nullifier(&sample_note("STRK", 2_000, 501));
@@ -8253,12 +9137,12 @@ mod tests {
         let input_b = sample_note("STRK", 85, 502);
         let output_note = sample_note("STRK", 125, 601);
         let consolidation_id = BatchId("consolidation-test-1".into());
-        let input_commitments = vec![
-            input_a.commitment().expect("input a commitment").0,
-            input_b.commitment().expect("input b commitment").0,
+        let input_deposit_roots = vec![
+            deposit_root_from_note(&input_a).expect("input a deposit root"),
+            deposit_root_from_note(&input_b).expect("input b deposit root"),
         ];
-        let prior_note_root =
-            settlement_note_root_after_deposit_chain(&input_commitments).expect("prior note root");
+        let prior_note_root = settlement_note_root_after_deposit_roots(&input_deposit_roots)
+            .expect("prior note root");
         let input_nullifiers = vec![sample_nullifier(&input_a), sample_nullifier(&input_b)];
         let (prior_nullifier_root, new_nullifier_root, nullifier_sparse_witnesses) =
             super::nullifier_sparse_update_witnesses_for_nullifiers(&[], &input_nullifiers)
@@ -8428,50 +9312,55 @@ mod tests {
             .expect("funding note commitment")
             .0;
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: crate::BatchId("batch-asset-owner".into()),
-                pair_id: PairId("STRK/USDC".into()),
-                batch_epoch: 22,
-                order_commitment_root: "0x111".into(),
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 321,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "recipient-asset-owner".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![crate::MatchedOrder {
-                    order_commitment: crate::OrderCommitment("order-asset-owner".into()),
-                    filled_amount: 111,
-                }],
-                consumed_inputs: vec![ConsumedInput {
-                    note_commitment: funding_note.commitment().expect("funding note commitment"),
-                    nullifier: funding_nullifier.clone(),
-                }],
-                renewal_child_uses: vec![],
-                fees: vec![FeeEntry {
-                    asset_id: AssetId("STRK".into()),
-                    amount: 7,
-                    recipient: "recipient-asset-owner".into(),
-                }],
-                output_notes: vec![OutputNoteRecord {
-                    note_commitment: output_note.commitment().expect("output note commitment"),
-                    asset_id: AssetId("STRK".into()),
-                    amount: 104,
-                    withdraw_authority: output_note.withdraw_authority.clone(),
-                }],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "bundle-asset-owner".into(),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: crate::BatchId("batch-asset-owner".into()),
+                    pair_id: PairId("STRK/USDC".into()),
+                    batch_epoch: 22,
+                    order_commitment_root: "0x111".into(),
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 321,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "recipient-asset-owner".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: crate::OrderCommitment("order-asset-owner".into()),
+                        filled_amount: 111,
+                    }],
+                    consumed_inputs: vec![ConsumedInput {
+                        note_commitment: funding_note
+                            .commitment()
+                            .expect("funding note commitment"),
+                        nullifier: funding_nullifier.clone(),
+                    }],
+                    renewal_child_uses: vec![],
+                    fees: vec![FeeEntry {
+                        asset_id: AssetId("STRK".into()),
+                        amount: 7,
+                        recipient: "recipient-asset-owner".into(),
+                    }],
+                    output_notes: vec![OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 104,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    }],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "bundle-asset-owner".into(),
+                },
+                std::slice::from_ref(&funding_note),
+            ),
             vec![output_note.clone()],
         );
 
@@ -8714,50 +9603,53 @@ mod tests {
         .expect("order root");
         let output_note = sample_note("STRK", 997, 8);
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: crate::BatchId("batch-auction-bind".into()),
-                pair_id: private_order.order.pair_id.clone(),
-                batch_epoch: private_order.order.expiry_epoch,
-                order_commitment_root: order_root,
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 145,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "zylith-protocol-treasury".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![crate::MatchedOrder {
-                    order_commitment: order_commitment.clone(),
-                    filled_amount: 1000,
-                }],
-                consumed_inputs: vec![ConsumedInput {
-                    note_commitment: funding_note_commitment.clone(),
-                    nullifier: private_order.order.funding_nullifier.clone(),
-                }],
-                renewal_child_uses: vec![],
-                fees: vec![FeeEntry {
-                    asset_id: AssetId("STRK".into()),
-                    amount: 3,
-                    recipient: "zylith-protocol-treasury".into(),
-                }],
-                output_notes: vec![OutputNoteRecord {
-                    note_commitment: output_note.commitment().expect("output note commitment"),
-                    asset_id: AssetId("STRK".into()),
-                    amount: 997,
-                    withdraw_authority: output_note.withdraw_authority.clone(),
-                }],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "bundle-auction-bind".into(),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: crate::BatchId("batch-auction-bind".into()),
+                    pair_id: private_order.order.pair_id.clone(),
+                    batch_epoch: private_order.order.expiry_epoch,
+                    order_commitment_root: order_root,
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 145,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: order_commitment.clone(),
+                        filled_amount: 1000,
+                    }],
+                    consumed_inputs: vec![ConsumedInput {
+                        note_commitment: funding_note_commitment.clone(),
+                        nullifier: private_order.order.funding_nullifier.clone(),
+                    }],
+                    renewal_child_uses: vec![],
+                    fees: vec![FeeEntry {
+                        asset_id: AssetId("STRK".into()),
+                        amount: 3,
+                        recipient: "zylith-protocol-treasury".into(),
+                    }],
+                    output_notes: vec![OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 997,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    }],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "bundle-auction-bind".into(),
+                },
+                std::slice::from_ref(&private_order.funding_note),
+            ),
             vec![output_note.clone()],
         );
         let witness = build_settlement_witness(
@@ -8951,53 +9843,56 @@ mod tests {
         .expect("order root");
         let output_note = sample_note("STRK", 997, 8);
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: crate::BatchId("batch-auction-bind".into()),
-                pair_id: private_order.order.pair_id.clone(),
-                batch_epoch: private_order.order.expiry_epoch,
-                order_commitment_root: order_root,
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 145,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "zylith-protocol-treasury".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![crate::MatchedOrder {
-                    order_commitment: order_commitment.clone(),
-                    filled_amount: 1000,
-                }],
-                consumed_inputs: vec![ConsumedInput {
-                    note_commitment: funding_note_commitment.clone(),
-                    nullifier: private_order.order.funding_nullifier.clone(),
-                }],
-                renewal_child_uses: vec![],
-                fees: vec![FeeEntry {
-                    asset_id: AssetId("STRK".into()),
-                    amount: 3,
-                    recipient: "zylith-protocol-treasury".into(),
-                }],
-                output_notes: vec![OutputNoteRecord {
-                    note_commitment: output_note.commitment().expect("output note commitment"),
-                    asset_id: AssetId("STRK".into()),
-                    amount: 997,
-                    withdraw_authority: output_note.withdraw_authority.clone(),
-                }],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "bundle-auction-bind".into(),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: crate::BatchId("batch-auction-bind".into()),
+                    pair_id: private_order.order.pair_id.clone(),
+                    batch_epoch: private_order.order.expiry_epoch,
+                    order_commitment_root: order_root,
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 145,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: order_commitment.clone(),
+                        filled_amount: 1000,
+                    }],
+                    consumed_inputs: vec![ConsumedInput {
+                        note_commitment: funding_note_commitment.clone(),
+                        nullifier: private_order.order.funding_nullifier.clone(),
+                    }],
+                    renewal_child_uses: vec![],
+                    fees: vec![FeeEntry {
+                        asset_id: AssetId("STRK".into()),
+                        amount: 3,
+                        recipient: "zylith-protocol-treasury".into(),
+                    }],
+                    output_notes: vec![OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 997,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    }],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "bundle-auction-bind".into(),
+                },
+                std::slice::from_ref(&private_order.funding_note),
+            ),
             vec![output_note.clone()],
         );
-        let mut witness = build_settlement_witness(
+        let witness = build_settlement_witness(
             &transcript,
             PairId("STRK/USDC".into()),
             "0x999",
@@ -9047,16 +9942,6 @@ mod tests {
             }],
         )
         .expect("witness");
-        witness.privacy_gate = AuctionPrivacyGateWitness {
-            enforced: true,
-            min_batch_base_liquidity: 100,
-            min_batch_participants: 1,
-            min_eligible_orders: 1,
-            max_single_order_fill_bps: 10_000,
-            max_single_owner_fill_bps: 10_000,
-            min_maker_participants: 0,
-            max_maker_fill_bps: 0,
-        };
         let orders = [AuctionOrderWitness {
             order_commitment,
             order: private_order.order,
@@ -9085,10 +9970,6 @@ mod tests {
         result_index += 1;
         let _result_settlement_payload = read_serialized_span(&result, &mut result_index);
         assert_eq!(result[result_index], admission_root);
-        assert_eq!(result[result.len() - 8], "0x1");
-        assert_eq!(result[result.len() - 7], "0x64");
-        assert_eq!(result[result.len() - 6], "0x1");
-        assert_eq!(result[result.len() - 5], "0x1");
     }
 
     #[test]
@@ -9096,35 +9977,38 @@ mod tests {
         let order_root =
             ordered_felt_list_commitment("zylith/batch-order-root", &[]).expect("empty root");
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: BatchId("batch-strk-usdc-empty".into()),
-                pair_id: PairId("STRK/USDC".into()),
-                batch_epoch: 42,
-                order_commitment_root: order_root,
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 0,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "zylith-protocol-treasury".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![],
-                consumed_inputs: vec![],
-                renewal_child_uses: vec![],
-                fees: vec![],
-                output_notes: vec![],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "noop-output-bundle".into(),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: BatchId("batch-strk-usdc-empty".into()),
+                    pair_id: PairId("STRK/USDC".into()),
+                    batch_epoch: 42,
+                    order_commitment_root: order_root,
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 0,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![],
+                    consumed_inputs: vec![],
+                    renewal_child_uses: vec![],
+                    fees: vec![],
+                    output_notes: vec![],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "noop-output-bundle".into(),
+                },
+                &[],
+            ),
             vec![],
         );
         let witness = build_settlement_witness(
@@ -9200,6 +10084,80 @@ mod tests {
     }
 
     #[test]
+    fn output_note_commitments_are_domain_separated_by_generation_context() {
+        let payload = sample_private_order();
+        let order_commitment = payload.order.commitment().expect("order commitment");
+        let first = build_output_note(
+            "batch-output-domain",
+            0,
+            &order_commitment,
+            &payload.order,
+            AssetId("STRK".into()),
+            1_000,
+            &payload.order.recipient_withdraw_authority,
+        )
+        .expect("first output note");
+        let second = build_output_note(
+            "batch-output-domain",
+            1,
+            &order_commitment,
+            &payload.order,
+            AssetId("STRK".into()),
+            1_000,
+            &payload.order.recipient_withdraw_authority,
+        )
+        .expect("second output note");
+        let fee = build_fee_output_note(FeeOutputNoteInput {
+            batch_id: "batch-output-domain",
+            output_index: 0,
+            fee_slot: "protocol-base",
+            asset_id: AssetId("STRK".into()),
+            amount: 1_000,
+            owner_public_key: &payload.order.recipient_owner_public_key,
+            spend_authority: &payload.order.recipient_spend_authority,
+            withdraw_authority: &payload.order.recipient_withdraw_authority,
+        })
+        .expect("fee output note");
+
+        assert_ne!(first.blinding, second.blinding);
+        assert_ne!(
+            first.commitment().expect("first commitment"),
+            second.commitment().expect("second commitment")
+        );
+        assert_ne!(first.blinding, fee.blinding);
+        assert_ne!(
+            first.commitment().expect("first commitment"),
+            fee.commitment().expect("fee commitment")
+        );
+    }
+
+    #[test]
+    fn output_note_root_rejects_duplicate_commitments() {
+        let payload = sample_private_order();
+        let order_commitment = payload.order.commitment().expect("order commitment");
+        let note = build_output_note(
+            "batch-duplicate-output",
+            0,
+            &order_commitment,
+            &payload.order,
+            AssetId("STRK".into()),
+            1_000,
+            &payload.order.recipient_withdraw_authority,
+        )
+        .expect("output note");
+        let record = OutputNoteRecord {
+            note_commitment: note.commitment().expect("note commitment"),
+            asset_id: note.asset_id.clone(),
+            amount: note.amount,
+            withdraw_authority: note.withdraw_authority.clone(),
+        };
+
+        let error = output_note_merkle_root(&[record.clone(), record], "bundle-ref")
+            .expect_err("duplicate output commitments must fail");
+        assert!(format!("{error}").contains("duplicate output note commitment"));
+    }
+
+    #[test]
     fn starknet_fee_recipient_addresses_are_not_domain_hashed() {
         let recipient = "0x07e53a0f246423910af93ce1dbb2c0ba4cc032b5fb6f0170e6a4a72704e915f6";
 
@@ -9229,50 +10187,53 @@ mod tests {
         .expect("order root");
         let output_note = sample_note("STRK", 997, 8);
         let transcript = with_proof_bound_output_recovery(
-            with_deposit_prior_note_root(SettlementTranscript {
-                batch_id: crate::BatchId("batch-auction-bind".into()),
-                pair_id: private_order.order.pair_id.clone(),
-                batch_epoch: private_order.order.expiry_epoch,
-                order_commitment_root: order_root,
-                encrypted_order_set_commitment: "0x222".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 145,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                maker_fee_bps: 0,
-                relay_fee_bps: 0,
-                protocol_fee_recipient: "zylith-protocol-treasury".into(),
-                relay_fee_recipient: "zylith-renewal-relay".into(),
-                matched_orders: vec![crate::MatchedOrder {
-                    order_commitment: order_commitment.clone(),
-                    filled_amount: 1000,
-                }],
-                consumed_inputs: vec![ConsumedInput {
-                    note_commitment: funding_note_commitment.clone(),
-                    nullifier: private_order.order.funding_nullifier.clone(),
-                }],
-                renewal_child_uses: vec![],
-                fees: vec![FeeEntry {
-                    asset_id: AssetId("STRK".into()),
-                    amount: 3,
-                    recipient: "zylith-protocol-treasury".into(),
-                }],
-                output_notes: vec![OutputNoteRecord {
-                    note_commitment: output_note.commitment().expect("output note commitment"),
-                    asset_id: AssetId("STRK".into()),
-                    amount: 997,
-                    withdraw_authority: output_note.withdraw_authority.clone(),
-                }],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "bundle-auction-bind".into(),
-            }),
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: crate::BatchId("batch-auction-bind".into()),
+                    pair_id: private_order.order.pair_id.clone(),
+                    batch_epoch: private_order.order.expiry_epoch,
+                    order_commitment_root: order_root,
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    clearing_price: 145,
+                    price_base_scale: 1,
+                    taker_fee_bps: 4,
+                    maker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: order_commitment.clone(),
+                        filled_amount: 1000,
+                    }],
+                    consumed_inputs: vec![ConsumedInput {
+                        note_commitment: funding_note_commitment.clone(),
+                        nullifier: private_order.order.funding_nullifier.clone(),
+                    }],
+                    renewal_child_uses: vec![],
+                    fees: vec![FeeEntry {
+                        asset_id: AssetId("STRK".into()),
+                        amount: 3,
+                        recipient: "zylith-protocol-treasury".into(),
+                    }],
+                    output_notes: vec![OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 997,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    }],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "bundle-auction-bind".into(),
+                },
+                std::slice::from_ref(&private_order.funding_note),
+            ),
             vec![output_note.clone()],
         );
         let witness = build_settlement_witness(
@@ -9529,11 +10490,50 @@ mod tests {
                 .expect("cancel marker");
         let prior_entry =
             renewal_child_nullifier("0xabc", 2, "0xdef").expect("prior renewal child nullifier");
+        let witness = renewal_sparse_witness_for_parent_cancel_marker(
+            std::slice::from_ref(&prior_entry),
+            &cancel_marker,
+        )
+        .expect("cancel witness");
+
+        let plan = build_renewal_parent_cancel_submission_plan(RenewalParentCancelPlanRequest {
+            chain_id: "0x534e5f5345504f4c4941".into(),
+            auction_verifier_address: "0x1234".into(),
+            parent_secret_commitment,
+            parent_cancel_authority,
+            renewal_cancel_auth_key: crate::renewal_cancel_auth_key_felt_from_raw_key_hex(
+                &order_cancel_key_hex,
+            ),
+            prior_renewal_entries: vec![prior_entry],
+            renewal_cancel_sparse_witness: Some(witness),
+        })
+        .expect("renewal parent cancel plan");
+
+        assert_eq!(
+            plan.encoded_args.merkle_path.len(),
+            super::RENEWAL_SPARSE_TREE_DEPTH
+        );
+        assert_eq!(plan.starknet_call.calldata[4], "0x80");
+    }
+
+    #[test]
+    fn renewal_parent_cancel_submission_plan_rejects_mismatched_precomputed_sparse_witness() {
+        let order_cancel_key_hex = "47".repeat(32);
+        let parent_secret_commitment =
+            crate::renewal_parent_secret_commitment("0x56789").expect("parent secret commitment");
+        let parent_cancel_authority =
+            crate::renewal_cancel_authority_from_raw_key_hex(&order_cancel_key_hex)
+                .expect("cancel authority");
+        let cancel_marker =
+            renewal_parent_cancel_marker(&parent_secret_commitment, &parent_cancel_authority)
+                .expect("cancel marker");
+        let prior_entry =
+            renewal_child_nullifier("0xabc", 2, "0xdef").expect("prior renewal child nullifier");
         let witness =
             renewal_sparse_witness_for_parent_cancel_marker(&[prior_entry], &cancel_marker)
                 .expect("cancel witness");
 
-        let plan = build_renewal_parent_cancel_submission_plan(RenewalParentCancelPlanRequest {
+        let error = build_renewal_parent_cancel_submission_plan(RenewalParentCancelPlanRequest {
             chain_id: "0x534e5f5345504f4c4941".into(),
             auction_verifier_address: "0x1234".into(),
             parent_secret_commitment,
@@ -9544,13 +10544,9 @@ mod tests {
             prior_renewal_entries: vec![],
             renewal_cancel_sparse_witness: Some(witness),
         })
-        .expect("renewal parent cancel plan");
+        .expect_err("mismatched sparse witness rejected");
 
-        assert_eq!(
-            plan.encoded_args.merkle_path.len(),
-            super::RENEWAL_SPARSE_TREE_DEPTH
-        );
-        assert_eq!(plan.starknet_call.calldata[4], "0x80");
+        assert!(error.to_string().contains("empty sparse root"));
     }
 
     #[test]

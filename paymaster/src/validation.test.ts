@@ -87,7 +87,7 @@ describe("validateExecuteOutsideRequest", () => {
     );
   });
 
-  it("allows plain relayed withdrawals while enforcing amount buckets", () => {
+  it("rejects relayed withdrawals while exits are not nullifier-consuming", () => {
     const request = baseRequest();
     request.call.entrypoint = "withdraw_settlement_output_to_l2";
     request.call.calldata = ["0x1", "0x2", "0x3", "0x64"];
@@ -104,19 +104,12 @@ describe("validateExecuteOutsideRequest", () => {
       withdrawalAmountBuckets: new Set(["100"]),
       allowDirectWithdrawalRelays: true
     };
-    const validated = validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000);
-
-    expect(validated.proof).toBeUndefined();
-    expect(validated.call.entrypoint).toBe("withdraw_settlement_output_to_l2");
-
-    request.call.calldata = ["0x1", "0x2", "0x3", "0x65"];
-    request.outside_transaction.outsideExecution.calls[0]!.calldata = request.call.calldata;
     expect(() =>
       validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
-    ).toThrow("withdrawal amount is not in an allowed privacy bucket");
+    ).toThrow("withdrawals are paused until nullifier-consuming exits are available");
   });
 
-  it("accepts direct embedded-wallet withdrawal relays without SNIP-9 outside execution", () => {
+  it("rejects direct embedded-wallet withdrawal relays without SNIP-9 outside execution", () => {
     const request = baseRequest();
     request.call.entrypoint = "withdraw_settlement_output_to_l2";
     request.call.calldata = ["0x1", "0x2", "0x3", "0x64"];
@@ -132,10 +125,9 @@ describe("validateExecuteOutsideRequest", () => {
       withdrawalAmountBuckets: new Set(["100"]),
       allowDirectWithdrawalRelays: true
     };
-    const validated = validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000);
-
-    expect(validated.outside_transaction).toBeUndefined();
-    expect(validated.relay_nonce).toBe("0x456");
+    expect(() =>
+      validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
+    ).toThrow("withdrawals are paused until nullifier-consuming exits are available");
   });
 
   it("rejects direct adapter note withdrawals by default", () => {
@@ -147,10 +139,11 @@ describe("validateExecuteOutsideRequest", () => {
     const withdrawalConfig = {
       ...config,
       allowedEntrypoints: new Set(["withdraw_to_l2"]),
-      proofRequiredEntrypoints: new Set<string>()
+      proofRequiredEntrypoints: new Set<string>(),
+      allowDirectWithdrawalRelays: true
     };
     expect(() => validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)).toThrow(
-      "direct withdrawal relay sponsorship is disabled"
+      "withdrawals are paused until nullifier-consuming exits are available"
     );
   });
 
@@ -164,19 +157,47 @@ describe("validateExecuteOutsideRequest", () => {
     expect(validated.outside_transaction).toBeUndefined();
   });
 
+  it("accepts direct proof-bearing nullifier-consuming withdrawal relays", () => {
+    const request = baseRequest();
+    request.call.entrypoint = "withdraw_settlement_output_with_proof_facts";
+    request.call.calldata = ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7", "0x64"];
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+
+    const withdrawalConfig = {
+      ...config,
+      allowedEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
+      proofRequiredEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
+      withdrawalAmountBuckets: new Set(["100"]),
+      allowDirectWithdrawalRelays: true
+    };
+    const validated = validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000);
+
+    expect(validated.call.entrypoint).toBe("withdraw_settlement_output_with_proof_facts");
+    expect(validated.outside_transaction).toBeUndefined();
+  });
+
+  it("rejects direct proof-bearing withdrawal relays when sponsorship is disabled", () => {
+    const request = baseRequest();
+    request.call.entrypoint = "withdraw_settlement_output_with_proof_facts";
+    request.call.calldata = ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7", "0x64"];
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+
+    const withdrawalConfig = {
+      ...config,
+      allowedEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
+      proofRequiredEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
+      withdrawalAmountBuckets: new Set(["100"]),
+      allowDirectWithdrawalRelays: false
+    };
+    expect(() =>
+      validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
+    ).toThrow("direct withdrawal relay sponsorship is disabled");
+  });
+
   it("accepts direct renewal parent cancellation relays", () => {
     const request = baseRequest();
     request.call.entrypoint = "cancel_renewal_parent_marker";
-    request.call.calldata = [
-      "0x111",
-      "0x222",
-      "0x111",
-      "0x0",
-      "0x0",
-      "0x0",
-      "0x333",
-      "0x444"
-    ];
+    request.call.calldata = validRenewalCancelCalldata();
     delete (request as { outside_transaction?: unknown }).outside_transaction;
     delete (request as { proof?: unknown }).proof;
     delete (request as { proof_facts?: unknown }).proof_facts;
@@ -190,6 +211,83 @@ describe("validateExecuteOutsideRequest", () => {
 
     expect(validated.call.entrypoint).toBe("cancel_renewal_parent_marker");
     expect(validated.outside_transaction).toBeUndefined();
+  });
+
+  it("rejects malformed direct renewal parent cancellation relays", () => {
+    const request = baseRequest();
+    request.call.entrypoint = "cancel_renewal_parent_marker";
+    request.call.calldata = ["0x111", "0x222"];
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+    delete (request as { proof?: unknown }).proof;
+    delete (request as { proof_facts?: unknown }).proof_facts;
+
+    const cancelConfig = {
+      ...config,
+      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
+      proofRequiredEntrypoints: new Set<string>()
+    };
+    expect(() => validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000)).toThrow(
+      "renewal cancellation calldata is invalid"
+    );
+  });
+
+  it("rejects direct renewal cancellations with bad sparse proof shape", () => {
+    const request = baseRequest();
+    request.call.entrypoint = "cancel_renewal_parent_marker";
+    request.call.calldata = [
+      "0x111",
+      "0x222",
+      "0x111",
+      "0x0",
+      "0x1",
+      "0x999",
+      "0x0",
+      "0x333",
+      "0x444"
+    ];
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+    delete (request as { proof?: unknown }).proof;
+    delete (request as { proof_facts?: unknown }).proof_facts;
+
+    const cancelConfig = {
+      ...config,
+      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
+      proofRequiredEntrypoints: new Set<string>()
+    };
+    expect(() => validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000)).toThrow(
+      "renewal cancellation merkle path length is invalid"
+    );
+  });
+
+  it("rejects direct renewal cancellations with zero marker or signature", () => {
+    const request = baseRequest();
+    request.call.entrypoint = "cancel_renewal_parent_marker";
+    request.call.calldata = validRenewalCancelCalldata();
+    request.call.calldata[0] = "0x0";
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+    delete (request as { proof?: unknown }).proof;
+    delete (request as { proof_facts?: unknown }).proof_facts;
+
+    const cancelConfig = {
+      ...config,
+      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
+      proofRequiredEntrypoints: new Set<string>()
+    };
+    expect(() => validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000)).toThrow(
+      "renewal cancellation marker cannot be zero"
+    );
+
+    const zeroSig = baseRequest();
+    zeroSig.call.entrypoint = "cancel_renewal_parent_marker";
+    zeroSig.call.calldata = validRenewalCancelCalldata();
+    zeroSig.call.calldata[7] = "0x0";
+    delete (zeroSig as { outside_transaction?: unknown }).outside_transaction;
+    delete (zeroSig as { proof?: unknown }).proof;
+    delete (zeroSig as { proof_facts?: unknown }).proof_facts;
+
+    expect(() => validateExecuteOutsideRequest(zeroSig, cancelConfig, 1_700_000_000)).toThrow(
+      "renewal cancellation signature cannot be zero"
+    );
   });
 
   it("rejects direct relays for non-withdrawal entrypoints", () => {
@@ -251,6 +349,51 @@ describe("validateRelayPrivacySignerRequest", () => {
       )
     ).toThrow("token approve spender is not allowlisted");
   });
+
+  it("rejects privacy signer multicall bundles", () => {
+    expect(() =>
+      validateRelayPrivacySignerRequest(
+        {
+          account_address: "0x777",
+          calls: [
+            {
+              contract_address: "0x456",
+              entrypoint: "approve",
+              calldata: ["0x123", "0x64", "0x0"]
+            },
+            {
+              contract_address: "0x456",
+              entrypoint: "approve",
+              calldata: ["0x123", "0x64", "0x0"]
+            }
+          ],
+          nonce: "0x999",
+          signature_r: "0xa",
+          signature_s: "0xb"
+        },
+        { allowedContracts: new Set(["0x123", "0x456"]) }
+      )
+    ).toThrow("privacy signer relay requires exactly one call");
+  });
+
+  it("rejects privacy signer relays for non-approve entrypoints", () => {
+    expect(() =>
+      validateRelayPrivacySignerRequest(
+        {
+          account_address: "0x777",
+          calls: [{
+            contract_address: "0x456",
+            entrypoint: "transfer",
+            calldata: ["0x123", "0x64", "0x0"]
+          }],
+          nonce: "0x999",
+          signature_r: "0xa",
+          signature_s: "0xb"
+        },
+        { allowedContracts: new Set(["0x123", "0x456"]) }
+      )
+    ).toThrow("privacy signer relay only supports token approve");
+  });
 });
 
 function baseRequest() {
@@ -284,4 +427,17 @@ function baseRequest() {
     proof: "proof-bytes",
     proof_facts: ["0x1"]
   };
+}
+
+function validRenewalCancelCalldata(): string[] {
+  return [
+    "0x111",
+    "0x222",
+    "0x111",
+    "0x0",
+    "0x0",
+    "0x0",
+    "0x333",
+    "0x444"
+  ];
 }

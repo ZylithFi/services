@@ -1,35 +1,63 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
     env, fs,
+    net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION},
+    body::Body,
+    extract::{ConnectInfo, FromRequestParts, Path, Query, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION, request::Parts},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, post},
 };
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use starknet_rust_core::utils::get_selector_from_name;
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{
     ARTIFACT_AGGREGATION_POLICY_VERSION, ArtifactAggregationPolicy, AssetId,
-    CONTROL_PLANE_TOKEN_ENV, ClaimWindowPolicy, DeploymentManifest, DepositConfirmationList,
-    DepositConfirmationRequest, DepositRecord, DepositRecordList, DepositSyncStatus,
-    MakerAttributionArtifactList, MultiPairArtifactBundleList, MultiPairArtifactBundleSummary,
-    NoteCommitment, OutputCiphertextBundle, PublicSettlementTranscript, PublishedBatchArtifactList,
-    PublishedBatchArtifactSummary, PublishedBatchArtifacts, SettlementRootHistoryArchive,
-    SettlementRootHistoryBatch, SettlementTimestampUpdate, SettlementTranscript,
-    WithdrawalAmountBucketPolicy, WithdrawalRecord, WithdrawalRecordList,
-    artifact_bundle_padded_count, artifact_epoch_bucket_end, artifact_epoch_bucket_start,
-    count_bucket_label, extract_bearer_token,
+    CONTROL_PLANE_TOKEN_ENV, ClaimWindowPolicy, DeploymentManifest, DepositActivationRecord,
+    DepositActivationRecordList, DepositConfirmationList, DepositConfirmationRequest,
+    DepositSyncStatus, MakerAttributionArtifactList, MultiPairArtifactBundleList,
+    MultiPairArtifactBundleSummary, NoteCommitment, OutputCiphertextBundle,
+    PublicSettlementTranscript, PublishedBatchArtifactList, PublishedBatchArtifactSummary,
+    PublishedBatchArtifacts, SettlementRootHistoryArchive, SettlementRootHistoryBatch,
+    SettlementTimestampUpdate, SettlementTranscript, WithdrawalAmountBucketPolicy,
+    WithdrawalRecord, WithdrawalRecordList, artifact_bundle_padded_count,
+    artifact_epoch_bucket_end, artifact_epoch_bucket_start, count_bucket_label,
+    extract_bearer_token,
     hash::{encode_starknet_felt, normalize_felt_hex},
     root_only_settlement_commitments, settlement_transcript_commitment, transcript_shape_metadata,
 };
+
+#[derive(Clone, Copy)]
+struct PeerAddress(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for PeerAddress
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let address = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|connect_info| connect_info.0);
+        async move { Ok(Self(address)) }
+    }
+}
 
 const DEFAULT_RPC_URL: &str = "http://127.0.0.1:5050/rpc/v0_8";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3300";
@@ -38,6 +66,7 @@ const DEFAULT_DEPLOYMENT_MANIFEST_PATH: &str = concat!(
     "/../client/public/deployment.json"
 );
 const DEFAULT_SHIELDED_ASSET_ADAPTER_ADDRESS: &str = "";
+const DEFAULT_COMMITMENT_REGISTRY_ADDRESS: &str = "";
 const DEFAULT_ARTIFACT_ARCHIVE_PATH: &str = "indexer/published_batch_artifacts.dev.json";
 const DEFAULT_BATCH_WINDOW_MS: u64 = 90_000;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS: u64 = 3;
@@ -47,20 +76,29 @@ const ARTIFACT_DELAY_MIN_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MIN_EPOCHS";
 const ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MAX_EPOCHS";
 const INDEXER_ALLOWED_ORIGINS_ENV: &str = "ZYLITH_INDEXER_ALLOWED_ORIGINS";
 const INDEXER_SYNC_INTERVAL_MS_ENV: &str = "ZYLITH_INDEXER_SYNC_INTERVAL_MS";
+const AUCTION_VERIFIER_ADDRESS_ENV: &str = "ZYLITH_AUCTION_VERIFIER_ADDRESS";
 const REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV: &str =
     "ZYLITH_REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION";
+const INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE_ENV: &str =
+    "ZYLITH_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE";
+const INDEXER_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS_ENV: &str =
+    "ZYLITH_INDEXER_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS";
 const DEFAULT_INDEXER_SYNC_INTERVAL_MS: u64 = 15_000;
+const MAX_PUBLIC_HISTORY_RANGE_SPAN: u64 = 10_000;
+const DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE: u64 = 120;
+const DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS: u64 = 128;
 
 #[derive(Clone)]
 struct AppState {
     rpc_url: String,
     shielded_asset_adapter_address: String,
-    deposit_count_selector: String,
-    deposit_record_selector: String,
+    commitment_registry_address: String,
+    funding_activation_count_selector: String,
+    funding_activation_record_selector: String,
     withdrawal_count_selector: String,
     withdrawal_record_selector: String,
     http_client: reqwest::Client,
-    confirmed_deposits: Arc<RwLock<BTreeMap<String, DepositRecord>>>,
+    confirmed_deposits: Arc<RwLock<BTreeMap<String, DepositActivationRecord>>>,
     confirmed_withdrawals: Arc<RwLock<BTreeMap<String, WithdrawalRecord>>>,
     synced_deposit_count: Arc<RwLock<u64>>,
     synced_withdrawal_count: Arc<RwLock<u64>>,
@@ -74,14 +112,29 @@ struct AppState {
     artifact_epoch_bucket_size: u64,
     require_artifact_onchain_verification: bool,
     output_note_root_selector: String,
+    verified_auction_transcript_selector: String,
+    auction_verifier_address: Option<Arc<String>>,
+    rate_limiter: RateLimiter,
+    public_rate_limit_per_minute: u64,
+    max_deposit_confirmation_commitments: usize,
+}
+
+#[derive(Clone, Default)]
+struct RateLimiter {
+    buckets: Arc<Mutex<BTreeMap<String, RateLimitBucket>>>,
+}
+
+struct RateLimitBucket {
+    window_started_unix_ms: u64,
+    count: u64,
 }
 
 #[derive(Serialize)]
-struct StarknetRpcRequest<'a> {
+struct StarknetRpcRequest {
     jsonrpc: &'static str,
     id: u64,
     method: &'static str,
-    params: (&'a StarknetCallRequest<'a>, &'static str),
+    params: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -93,7 +146,32 @@ struct StarknetCallRequest<'a> {
 
 #[derive(Deserialize)]
 struct StarknetRpcResponse {
-    result: Vec<String>,
+    result: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct StarknetTransactionReceiptResponse {
+    result: Option<StarknetTransactionReceipt>,
+}
+
+#[derive(Deserialize)]
+struct StarknetTransactionReceipt {
+    block_hash: Option<String>,
+}
+
+struct StarknetTransactionBlockRef {
+    block_id: serde_json::Value,
+    timestamp_unix_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct StarknetBlockResponse {
+    result: Option<StarknetBlock>,
+}
+
+#[derive(Deserialize)]
+struct StarknetBlock {
+    timestamp: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -118,11 +196,37 @@ async fn main() -> Result<(), String> {
         public_artifact_delay_min_epochs,
     )
     .max(public_artifact_delay_min_epochs);
+    let require_artifact_onchain_verification =
+        env_bool_or_default(REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV, true);
+    if indexer_production_mode() && !require_artifact_onchain_verification {
+        return Err(format!(
+            "{REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV}=false is not allowed when ZYLITH_ENV=production or ZYLITH_INDEXER_STRICT=true"
+        ));
+    }
+    if indexer_production_mode() && allowed_origins_from_env(INDEXER_ALLOWED_ORIGINS_ENV).is_none()
+    {
+        return Err(format!(
+            "{INDEXER_ALLOWED_ORIGINS_ENV} is required when ZYLITH_ENV=production or ZYLITH_INDEXER_STRICT=true"
+        ));
+    }
+    let auction_verifier_address = load_auction_verifier_address();
+    if require_artifact_onchain_verification {
+        let configured = auction_verifier_address
+            .as_deref()
+            .and_then(|address| normalize_felt_hex(address).ok())
+            .filter(|address| address != "0x0");
+        if configured.is_none() {
+            return Err(format!(
+                "{REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV}=true requires a nonzero ZYLITH_AUCTION_VERIFIER_ADDRESS"
+            ));
+        }
+    }
     let state = AppState {
         rpc_url: load_rpc_url(),
         shielded_asset_adapter_address: load_shielded_asset_adapter_address(),
-        deposit_count_selector: selector_hex("deposit_count"),
-        deposit_record_selector: selector_hex("deposit_record"),
+        commitment_registry_address: load_commitment_registry_address(),
+        funding_activation_count_selector: selector_hex("funding_activation_count"),
+        funding_activation_record_selector: selector_hex("funding_activation_record"),
         withdrawal_count_selector: selector_hex("withdrawal_count"),
         withdrawal_record_selector: selector_hex("withdrawal_record"),
         http_client: reqwest::Client::new(),
@@ -150,11 +254,21 @@ async fn main() -> Result<(), String> {
             DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE,
             1,
         ),
-        require_artifact_onchain_verification: env_bool_or_default(
-            REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION_ENV,
-            true,
-        ),
+        require_artifact_onchain_verification,
         output_note_root_selector: selector_hex("output_note_root"),
+        verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
+        auction_verifier_address: auction_verifier_address.map(Arc::new),
+        rate_limiter: RateLimiter::default(),
+        public_rate_limit_per_minute: load_u64_env(
+            INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE_ENV,
+            DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+            0,
+        ),
+        max_deposit_confirmation_commitments: load_u64_env(
+            INDEXER_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS_ENV,
+            DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS,
+            1,
+        ) as usize,
     };
 
     if let Err(status) = sync_deposits(&state).await {
@@ -180,9 +294,12 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("failed to bind indexer on {bind_addr}: {error}"))?;
 
     println!("Zylith indexer listening on http://{bind_addr}");
-    axum::serve(listener, app)
-        .await
-        .map_err(|error| format!("indexer service failed: {error}"))
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|error| format!("indexer service failed: {error}"))
 }
 
 fn build_app_with_state(state: AppState) -> Router {
@@ -198,7 +315,7 @@ fn build_app_with_state(state: AppState) -> Router {
             get(list_confirmed_deposits_range),
         )
         .route(
-            "/api/deposits/{note_commitment}",
+            "/api/deposits/{funding_commitment}",
             get(get_confirmed_deposit),
         )
         .route("/api/batches/artifacts", get(list_archived_batch_artifacts))
@@ -268,8 +385,23 @@ fn build_app_with_state(state: AppState) -> Router {
             get(get_confirmed_withdrawal),
         )
         .route("/api/deposits/confirmations", post(confirm_deposits))
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state,
+            internal_route_auth_middleware,
+        ))
         .layer(service_cors_layer(INDEXER_ALLOWED_ORIGINS_ENV))
+}
+
+async fn internal_route_auth_middleware(
+    State(state): State<AppState>,
+    request: axum::http::Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if request.uri().path().starts_with("/api/internal/") {
+        require_internal_auth(&state, request.headers())?;
+    }
+    Ok(next.run(request).await)
 }
 
 fn spawn_background_sync(state: AppState, interval_ms: u64) {
@@ -377,6 +509,18 @@ fn load_shielded_asset_adapter_address() -> String {
     )
 }
 
+fn load_commitment_registry_address() -> String {
+    let manifest_address =
+        load_deployment_manifest().map(|manifest| manifest.contracts.commitment_registry);
+    nonempty_string(
+        env::var("ZYLITH_COMMITMENT_REGISTRY_ADDRESS")
+            .ok()
+            .as_deref(),
+    )
+    .or_else(|| manifest_address.and_then(|address| nonempty_string(Some(&address))))
+    .unwrap_or_else(|| DEFAULT_COMMITMENT_REGISTRY_ADDRESS.into())
+}
+
 fn selected_shielded_asset_adapter_address(manifest: &DeploymentManifest) -> String {
     manifest
         .funding
@@ -390,9 +534,17 @@ fn select_shielded_asset_adapter_address(
     manifest_address: Option<&str>,
     env_address: Option<&str>,
 ) -> String {
-    nonempty_string(manifest_address)
-        .or_else(|| nonempty_string(env_address))
+    nonempty_string(env_address)
+        .or_else(|| nonempty_string(manifest_address))
         .unwrap_or_else(|| DEFAULT_SHIELDED_ASSET_ADAPTER_ADDRESS.into())
+}
+
+fn load_auction_verifier_address() -> Option<String> {
+    let manifest_address = load_deployment_manifest()
+        .and_then(|manifest| nonempty_string(Some(&manifest.contracts.auction_verifier)));
+    nonempty_string(env::var(AUCTION_VERIFIER_ADDRESS_ENV).ok().as_deref())
+        .or(manifest_address)
+        .filter(|address| is_configured_felt(address))
 }
 
 fn nonempty_string(value: Option<&str>) -> Option<String> {
@@ -415,6 +567,15 @@ fn env_bool_or_default(name: &str, default_value: bool) -> bool {
         .ok()
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(default_value)
+}
+
+fn indexer_production_mode() -> bool {
+    env::var("ZYLITH_INDEXER_STRICT")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        || env::var("ZYLITH_ENV")
+            .ok()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("production"))
 }
 
 fn now_unix_ms() -> u64 {
@@ -646,6 +807,50 @@ fn public_artifact_summaries_for_epoch_range(
     summaries
 }
 
+fn public_artifact_complete_through_epoch(
+    artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
+    min_delay_epochs: u64,
+    max_delay_epochs: u64,
+    artifact_epoch_bucket_size: u64,
+    start_epoch: u64,
+    end_epoch: u64,
+) -> Option<u64> {
+    if start_epoch > end_epoch {
+        return None;
+    }
+    let visible_cutoff = public_visible_epoch_cutoff(artifacts)?;
+    let mut epoch = start_epoch;
+    let mut complete_through = None;
+    loop {
+        let bucket_start = artifact_epoch_bucket_start(epoch, artifact_epoch_bucket_size).ok()?;
+        let bucket_end =
+            artifact_epoch_bucket_end(bucket_start, artifact_epoch_bucket_size).ok()?;
+        let bucket_has_artifact = artifacts.values().any(|published| {
+            let artifact_epoch = published.transcript.batch_epoch;
+            artifact_epoch >= bucket_start && artifact_epoch <= bucket_end
+        });
+        if !bucket_has_artifact {
+            break;
+        }
+        let delay_subject = format!("{bucket_start}:{bucket_end}");
+        let delay_epochs = effective_public_artifact_delay_epochs(
+            &delay_subject,
+            min_delay_epochs,
+            max_delay_epochs,
+        );
+        let release_epoch = bucket_end.saturating_add(delay_epochs);
+        if visible_cutoff < release_epoch {
+            break;
+        }
+        complete_through = Some(bucket_end.min(end_epoch));
+        if bucket_end >= end_epoch {
+            break;
+        }
+        epoch = bucket_end.saturating_add(1);
+    }
+    complete_through
+}
+
 fn multi_pair_artifact_bundles_for_epoch_range(
     policy: &ArtifactAggregationPolicy,
     summaries: Vec<PublishedBatchArtifactSummary>,
@@ -798,11 +1003,11 @@ async fn sync_withdrawals_endpoint(
 
 async fn get_confirmed_deposit(
     State(state): State<AppState>,
-    Path(note_commitment): Path<String>,
-) -> Result<Json<DepositRecord>, StatusCode> {
+    Path(funding_commitment): Path<String>,
+) -> Result<Json<DepositActivationRecord>, StatusCode> {
     let deposits = state.confirmed_deposits.read().await;
     deposits
-        .get(&normalize_hex(&note_commitment))
+        .get(&normalize_hex(&funding_commitment))
         .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
@@ -811,18 +1016,18 @@ async fn get_confirmed_deposit(
 async fn list_confirmed_deposits_range(
     State(state): State<AppState>,
     Path((start, end)): Path<(u64, u64)>,
-) -> Result<Json<DepositRecordList>, StatusCode> {
-    if start > end {
+) -> Result<Json<DepositActivationRecordList>, StatusCode> {
+    if start > end || end.saturating_sub(start) >= MAX_PUBLIC_HISTORY_RANGE_SPAN {
         return Err(StatusCode::BAD_REQUEST);
     }
     let deposits = state.confirmed_deposits.read().await;
     let mut records = deposits
         .values()
-        .filter(|record| record.deposit_id >= start && record.deposit_id <= end)
+        .filter(|record| record.activation_id >= start && record.activation_id <= end)
         .cloned()
         .collect::<Vec<_>>();
-    records.sort_by_key(|record| record.deposit_id);
-    Ok(Json(DepositRecordList {
+    records.sort_by_key(|record| record.activation_id);
+    Ok(Json(DepositActivationRecordList {
         start,
         end,
         count_bucket: count_bucket_label(records.len() as u64),
@@ -843,7 +1048,20 @@ async fn list_archived_batch_artifacts(
         0,
         u64::MAX,
     );
-    Json(PublishedBatchArtifactList { batches })
+    let complete_through_epoch = public_visible_epoch_cutoff(&artifacts).and_then(|end_epoch| {
+        public_artifact_complete_through_epoch(
+            &artifacts,
+            state.public_artifact_delay_min_epochs,
+            state.public_artifact_delay_max_epochs,
+            state.artifact_epoch_bucket_size,
+            0,
+            end_epoch,
+        )
+    });
+    Json(PublishedBatchArtifactList {
+        batches,
+        complete_through_epoch,
+    })
 }
 
 async fn list_archived_batch_artifacts_by_epoch_range(
@@ -863,7 +1081,18 @@ async fn list_archived_batch_artifacts_by_epoch_range(
         start_epoch,
         end_epoch,
     );
-    Ok(Json(PublishedBatchArtifactList { batches }))
+    let complete_through_epoch = public_artifact_complete_through_epoch(
+        &artifacts,
+        state.public_artifact_delay_min_epochs,
+        state.public_artifact_delay_max_epochs,
+        state.artifact_epoch_bucket_size,
+        start_epoch,
+        end_epoch,
+    );
+    Ok(Json(PublishedBatchArtifactList {
+        batches,
+        complete_through_epoch,
+    }))
 }
 
 async fn list_multi_pair_artifact_bundles(
@@ -1086,6 +1315,12 @@ fn root_history_batch(
         new_nullifier_root: roots.new_nullifier_root,
         new_renewal_root: roots.new_renewal_root,
         consumed_inputs: published.transcript.consumed_inputs.clone(),
+        renewal_entries: published
+            .transcript
+            .renewal_child_uses
+            .iter()
+            .map(|renewal| renewal.child_nullifier.clone())
+            .collect(),
         output_notes: published.transcript.output_notes.clone(),
     })
 }
@@ -1134,6 +1369,54 @@ fn public_settlement_transcript(
     })
 }
 
+fn published_artifact_fingerprint(
+    published: &PublishedBatchArtifacts,
+) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(published)?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("published_at_unix_ms");
+        object.remove("settled_at_unix_ms");
+        object.remove("settlement_transaction_hash");
+        object.remove("settlement_contract_address");
+    }
+    serde_json::to_string(&value)
+}
+
+fn settlement_timestamp_update_from_published(
+    published: &PublishedBatchArtifacts,
+) -> Result<SettlementTimestampUpdate, StatusCode> {
+    let roots = root_only_settlement_commitments(&published.transcript)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let transcript_commitment = settlement_transcript_commitment(&published.transcript)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let transaction_hash = published
+        .settlement_transaction_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    Ok(SettlementTimestampUpdate {
+        settled_at_unix_ms: published.settled_at_unix_ms.unwrap_or(1),
+        transaction_hash,
+        settlement_contract_address: published.settlement_contract_address.clone(),
+        output_note_root: Some(roots.output_note_root),
+        transcript_commitment: Some(transcript_commitment),
+    })
+}
+
+async fn verify_published_batch_artifact(
+    state: &AppState,
+    published: &PublishedBatchArtifacts,
+) -> Result<u64, StatusCode> {
+    let update = settlement_timestamp_update_from_published(published)?;
+    if state.require_artifact_onchain_verification {
+        verify_settlement_timestamp_update(state, published, &update).await
+    } else {
+        // Explicit dev/test bypass: even unverified stores must not accept pre-settlement artifacts.
+        published.settled_at_unix_ms.ok_or(StatusCode::BAD_REQUEST)
+    }
+}
+
 async fn publish_batch_artifacts(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1165,8 +1448,33 @@ async fn publish_batch_artifacts(
     if request.published_at_unix_ms == 0 {
         request.published_at_unix_ms = now_unix_ms();
     }
+    let settled_at_unix_ms = verify_published_batch_artifact(&state, &request).await?;
+    request.settled_at_unix_ms = Some(settled_at_unix_ms);
 
     let mut artifacts = state.published_batch_artifacts.write().await;
+    if let Some(existing) = artifacts.get(&batch_id) {
+        if published_artifact_fingerprint(existing).map_err(|_| StatusCode::BAD_REQUEST)?
+            != published_artifact_fingerprint(&request).map_err(|_| StatusCode::BAD_REQUEST)?
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        if let Some(existing_settled_at) = existing.settled_at_unix_ms
+            && existing_settled_at != settled_at_unix_ms
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        let existing = artifacts.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+        if existing.settled_at_unix_ms.is_none() {
+            existing.settled_at_unix_ms = Some(settled_at_unix_ms);
+            existing.settlement_transaction_hash = request.settlement_transaction_hash.clone();
+            existing.settlement_contract_address = request.settlement_contract_address.clone();
+        }
+        let response = existing.clone();
+        if let Some(path) = state.artifact_archive_path.as_deref() {
+            persist_published_batch_artifacts_store(path, &artifacts)?;
+        }
+        return Ok(Json(response));
+    }
     artifacts.insert(batch_id, request.clone());
 
     if let Some(path) = state.artifact_archive_path.as_deref() {
@@ -1194,11 +1502,28 @@ async fn mark_published_batch_settled(
             .cloned()
             .ok_or(StatusCode::NOT_FOUND)?
     };
-    verify_settlement_timestamp_update(&state, &published_snapshot, &request).await?;
+    if let Some(existing_settled_at) = published_snapshot.settled_at_unix_ms {
+        let settled_at_unix_ms =
+            verify_settlement_timestamp_update(&state, &published_snapshot, &request).await?;
+        if existing_settled_at != settled_at_unix_ms {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Ok(Json(published_snapshot));
+    }
+    let settled_at_unix_ms =
+        verify_settlement_timestamp_update(&state, &published_snapshot, &request).await?;
 
     let mut artifacts = state.published_batch_artifacts.write().await;
     let published = artifacts.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
-    published.settled_at_unix_ms = Some(request.settled_at_unix_ms);
+    published.settled_at_unix_ms = Some(settled_at_unix_ms);
+    published.settlement_transaction_hash = request
+        .transaction_hash
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    published.settlement_contract_address = request
+        .settlement_contract_address
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
     let response = published.clone();
 
     if let Some(path) = state.artifact_archive_path.as_deref() {
@@ -1212,28 +1537,36 @@ async fn verify_settlement_timestamp_update(
     state: &AppState,
     published: &PublishedBatchArtifacts,
     request: &SettlementTimestampUpdate,
-) -> Result<(), StatusCode> {
+) -> Result<u64, StatusCode> {
     let roots = root_only_settlement_commitments(&published.transcript)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    if let Some(output_note_root) = request.output_note_root.as_deref() {
-        let provided = normalize_required_felt(output_note_root)?;
-        let expected = normalize_required_felt(&roots.output_note_root)?;
-        if provided != expected {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+    let output_note_root = request
+        .output_note_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let provided = normalize_required_felt(output_note_root)?;
+    let expected = normalize_required_felt(&roots.output_note_root)?;
+    if provided != expected {
+        return Err(StatusCode::BAD_REQUEST);
     }
-    if let Some(transcript_commitment) = request.transcript_commitment.as_deref() {
-        let provided = normalize_required_felt(transcript_commitment)?;
-        let expected = normalize_required_felt(
-            &settlement_transcript_commitment(&published.transcript)
-                .map_err(|_| StatusCode::BAD_REQUEST)?,
-        )?;
-        if provided != expected {
-            return Err(StatusCode::BAD_REQUEST);
-        }
+    let transcript_commitment = request
+        .transcript_commitment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let provided = normalize_required_felt(transcript_commitment)?;
+    let expected = normalize_required_felt(
+        &settlement_transcript_commitment(&published.transcript)
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    )?;
+    if provided != expected {
+        return Err(StatusCode::BAD_REQUEST);
     }
     if !state.require_artifact_onchain_verification {
-        return Ok(());
+        return Ok(request.settled_at_unix_ms);
     }
     if request
         .transaction_hash
@@ -1244,19 +1577,48 @@ async fn verify_settlement_timestamp_update(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let contract_address = request
+    let contract_address = configured_auction_verifier_address(state)?;
+    if let Some(request_address) = request
         .settlement_contract_address
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or(&published.settlement_witness.auction_verifier_address);
-    let chain_root =
-        fetch_onchain_output_note_root(state, contract_address, &published.transcript.batch_id.0)
-            .await?;
+    {
+        let request_address = normalize_required_felt(request_address)?;
+        if request_address != contract_address {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    let transaction_hash = request
+        .transaction_hash
+        .as_deref()
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let block_ref = fetch_transaction_block_ref(state, transaction_hash).await?;
+    let chain_root = fetch_onchain_output_note_root(
+        state,
+        &contract_address,
+        &published.transcript.batch_id.0,
+        block_ref.block_id.clone(),
+    )
+    .await?;
     let expected = normalize_required_felt(&roots.output_note_root)?;
     if chain_root != expected {
         return Err(StatusCode::BAD_GATEWAY);
     }
-    Ok(())
+    let chain_transcript = fetch_onchain_verified_auction_transcript(
+        state,
+        &contract_address,
+        &published.transcript.batch_id.0,
+        block_ref.block_id,
+    )
+    .await?;
+    let expected_transcript = normalize_required_felt(
+        &settlement_transcript_commitment(&published.transcript)
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
+    )?;
+    if chain_transcript != expected_transcript {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(block_ref.timestamp_unix_ms)
 }
 
 async fn get_confirmed_withdrawal(
@@ -1275,7 +1637,7 @@ async fn list_confirmed_withdrawals_range(
     State(state): State<AppState>,
     Path((start, end)): Path<(u64, u64)>,
 ) -> Result<Json<WithdrawalRecordList>, StatusCode> {
-    if start > end {
+    if start > end || end.saturating_sub(start) >= MAX_PUBLIC_HISTORY_RANGE_SPAN {
         return Err(StatusCode::BAD_REQUEST);
     }
     let withdrawals = state.confirmed_withdrawals.read().await;
@@ -1295,16 +1657,32 @@ async fn list_confirmed_withdrawals_range(
 
 async fn confirm_deposits(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
     Json(request): Json<DepositConfirmationRequest>,
 ) -> Result<Json<DepositConfirmationList>, StatusCode> {
-    sync_deposits(&state).await?;
+    enforce_rate_limit(
+        &state.rate_limiter,
+        &headers,
+        peer,
+        "deposit-confirmations",
+        state.public_rate_limit_per_minute,
+    )?;
+    if request.funding_commitments.len() > state.max_deposit_confirmation_commitments {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     let deposits = state.confirmed_deposits.read().await;
     let confirmed = request
-        .note_commitments
+        .funding_commitments
         .iter()
-        .filter_map(|commitment| deposits.get(&normalize_hex(&commitment.0)).cloned())
+        .filter_map(|commitment| deposits.get(&normalize_hex(commitment)).cloned())
         .collect();
-    Ok(Json(DepositConfirmationList { confirmed }))
+    let status = current_status(&state).await;
+    Ok(Json(DepositConfirmationList {
+        confirmed,
+        last_successful_sync_unix_ms: status.last_successful_sync_unix_ms,
+        sync_lag_ms: status.sync_lag_ms,
+    }))
 }
 
 async fn current_status(state: &AppState) -> DepositSyncStatus {
@@ -1333,9 +1711,9 @@ async fn current_status(state: &AppState) -> DepositSyncStatus {
 }
 
 async fn sync_deposits(state: &AppState) -> Result<(), StatusCode> {
-    if !is_configured_felt(&state.shielded_asset_adapter_address)
-        || !is_configured_felt(&state.deposit_count_selector)
-        || !is_configured_felt(&state.deposit_record_selector)
+    if !is_configured_felt(&state.commitment_registry_address)
+        || !is_configured_felt(&state.funding_activation_count_selector)
+        || !is_configured_felt(&state.funding_activation_record_selector)
     {
         return Err(StatusCode::FAILED_DEPENDENCY);
     }
@@ -1343,13 +1721,13 @@ async fn sync_deposits(state: &AppState) -> Result<(), StatusCode> {
     let remote_count = fetch_deposit_count(state).await?;
     let start_index = *state.synced_deposit_count.read().await;
 
-    for deposit_id in start_index..remote_count {
-        let record = fetch_deposit_record(state, deposit_id).await?;
+    for activation_id in start_index..remote_count {
+        let record = fetch_deposit_activation_record(state, activation_id).await?;
         state
             .confirmed_deposits
             .write()
             .await
-            .insert(normalize_hex(&record.note_commitment.0), record);
+            .insert(normalize_hex(&record.funding_commitment), record);
     }
 
     *state.synced_deposit_count.write().await = remote_count;
@@ -1383,27 +1761,38 @@ async fn sync_withdrawals(state: &AppState) -> Result<(), StatusCode> {
 }
 
 async fn fetch_deposit_count(state: &AppState) -> Result<u64, StatusCode> {
-    let result = starknet_call(state, &state.deposit_count_selector, &[]).await?;
+    let result = starknet_call_contract(
+        state,
+        &state.commitment_registry_address,
+        &state.funding_activation_count_selector,
+        &[],
+    )
+    .await?;
     let value = result.first().ok_or(StatusCode::BAD_GATEWAY)?;
     parse_hex_u64(value).ok_or(StatusCode::BAD_GATEWAY)
 }
 
-async fn fetch_deposit_record(
+async fn fetch_deposit_activation_record(
     state: &AppState,
-    deposit_id: u64,
-) -> Result<DepositRecord, StatusCode> {
-    let calldata = [format!("0x{deposit_id:x}")];
-    let result = starknet_call(state, &state.deposit_record_selector, &calldata).await?;
-    if result.len() < 5 {
+    activation_id: u64,
+) -> Result<DepositActivationRecord, StatusCode> {
+    let calldata = [format!("0x{activation_id:x}")];
+    let result = starknet_call_contract(
+        state,
+        &state.commitment_registry_address,
+        &state.funding_activation_record_selector,
+        &calldata,
+    )
+    .await?;
+    if result.len() < 4 {
         return Err(StatusCode::BAD_GATEWAY);
     }
 
-    Ok(DepositRecord {
-        deposit_id: parse_hex_u64(&result[0]).ok_or(StatusCode::BAD_GATEWAY)?,
-        asset_id: AssetId(normalize_hex(&result[1])),
-        amount: parse_hex_u128(&result[2]).ok_or(StatusCode::BAD_GATEWAY)?,
-        deposit_nonce: parse_hex_u64(&result[3]).ok_or(StatusCode::BAD_GATEWAY)?,
-        note_commitment: NoteCommitment(normalize_hex(&result[4])),
+    Ok(DepositActivationRecord {
+        activation_id: parse_hex_u64(&result[0]).ok_or(StatusCode::BAD_GATEWAY)?,
+        funding_commitment: normalize_hex(&result[1]),
+        deposit_root: normalize_hex(&result[2]),
+        encrypted_note_activation: normalize_hex(&result[3]),
     })
 }
 
@@ -1450,21 +1839,121 @@ async fn fetch_onchain_output_note_root(
     state: &AppState,
     contract_address: &str,
     batch_id: &str,
+    block_id: serde_json::Value,
 ) -> Result<String, StatusCode> {
     let contract_address = normalize_required_felt(contract_address)?;
     if contract_address == "0x0" {
         return Err(StatusCode::BAD_REQUEST);
     }
     let batch_id_felt = encode_starknet_felt("batch-id", batch_id);
-    let result = starknet_call_contract(
+    let result = starknet_call_contract_at_block(
         state,
         &contract_address,
         &state.output_note_root_selector,
         &[batch_id_felt],
+        block_id,
     )
     .await?;
     let root = result.into_iter().next().ok_or(StatusCode::BAD_GATEWAY)?;
     normalize_required_felt(&root)
+}
+
+async fn fetch_onchain_verified_auction_transcript(
+    state: &AppState,
+    contract_address: &str,
+    batch_id: &str,
+    block_id: serde_json::Value,
+) -> Result<String, StatusCode> {
+    let contract_address = normalize_required_felt(contract_address)?;
+    if contract_address == "0x0" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let batch_id_felt = encode_starknet_felt("batch-id", batch_id);
+    let result = starknet_call_contract_at_block(
+        state,
+        &contract_address,
+        &state.verified_auction_transcript_selector,
+        &[batch_id_felt],
+        block_id,
+    )
+    .await?;
+    let transcript = result.into_iter().next().ok_or(StatusCode::BAD_GATEWAY)?;
+    normalize_required_felt(&transcript)
+}
+
+fn configured_auction_verifier_address(state: &AppState) -> Result<String, StatusCode> {
+    let address = state
+        .auction_verifier_address
+        .as_deref()
+        .ok_or(StatusCode::BAD_GATEWAY)?;
+    let normalized = normalize_required_felt(address)?;
+    if normalized == "0x0" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(normalized)
+}
+
+async fn fetch_transaction_block_ref(
+    state: &AppState,
+    transaction_hash: &str,
+) -> Result<StarknetTransactionBlockRef, StatusCode> {
+    let transaction_hash = normalize_required_felt(transaction_hash)?;
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "starknet_getTransactionReceipt",
+        "params": [transaction_hash],
+    });
+    let response = state
+        .http_client
+        .post(state.rpc_url.as_str())
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .error_for_status()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let body = response
+        .json::<StarknetTransactionReceiptResponse>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let block_hash = body
+        .result
+        .and_then(|receipt| receipt.block_hash)
+        .ok_or(StatusCode::BAD_GATEWAY)?;
+    let block_id = serde_json::json!({ "block_hash": normalize_required_felt(&block_hash)? });
+    let timestamp_unix_ms = fetch_block_timestamp_unix_ms(state, block_id.clone()).await?;
+    Ok(StarknetTransactionBlockRef {
+        block_id,
+        timestamp_unix_ms,
+    })
+}
+
+async fn fetch_block_timestamp_unix_ms(
+    state: &AppState,
+    block_id: serde_json::Value,
+) -> Result<u64, StatusCode> {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "starknet_getBlockWithTxHashes",
+        "params": [block_id],
+    });
+    let response = state
+        .http_client
+        .post(state.rpc_url.as_str())
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .error_for_status()
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let body = response
+        .json::<StarknetBlockResponse>()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let timestamp = body.result.ok_or(StatusCode::BAD_GATEWAY)?.timestamp;
+    timestamp.checked_mul(1000).ok_or(StatusCode::BAD_GATEWAY)
 }
 
 async fn starknet_call_contract(
@@ -1472,6 +1961,23 @@ async fn starknet_call_contract(
     contract_address: &str,
     entry_point_selector: &str,
     calldata: &[String],
+) -> Result<Vec<String>, StatusCode> {
+    starknet_call_contract_at_block(
+        state,
+        contract_address,
+        entry_point_selector,
+        calldata,
+        serde_json::json!("latest"),
+    )
+    .await
+}
+
+async fn starknet_call_contract_at_block(
+    state: &AppState,
+    contract_address: &str,
+    entry_point_selector: &str,
+    calldata: &[String],
+    block_id: serde_json::Value,
 ) -> Result<Vec<String>, StatusCode> {
     let call = StarknetCallRequest {
         contract_address,
@@ -1482,7 +1988,7 @@ async fn starknet_call_contract(
         jsonrpc: "2.0",
         id: 1,
         method: "starknet_call",
-        params: (&call, "latest"),
+        params: serde_json::json!([call, block_id]),
     };
 
     let response = state
@@ -1501,9 +2007,91 @@ async fn starknet_call_contract(
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
     Ok(body
         .result
+        .ok_or(StatusCode::BAD_GATEWAY)?
         .into_iter()
         .map(|felt| normalize_hex(&felt))
         .collect())
+}
+
+fn enforce_rate_limit(
+    limiter: &RateLimiter,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    scope: &str,
+    limit_per_minute: u64,
+) -> Result<(), StatusCode> {
+    if limit_per_minute == 0 {
+        return Ok(());
+    }
+
+    let now = now_unix_ms();
+    let window_started_unix_ms = now - (now % 60_000);
+    let key = format!("{scope}:{}", rate_limit_subject(headers, peer));
+    let mut buckets = limiter
+        .buckets
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    buckets.retain(|_, bucket| bucket.window_started_unix_ms + 120_000 >= window_started_unix_ms);
+    let bucket = buckets.entry(key).or_insert(RateLimitBucket {
+        window_started_unix_ms,
+        count: 0,
+    });
+    if bucket.window_started_unix_ms != window_started_unix_ms {
+        bucket.window_started_unix_ms = window_started_unix_ms;
+        bucket.count = 0;
+    }
+    if bucket.count >= limit_per_minute {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    bucket.count += 1;
+    Ok(())
+}
+
+fn rate_limit_subject(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    if trusted_proxy_headers_enabled_for_peer(peer.map(|address| address.ip())) {
+        for header in ["x-forwarded-for", "x-real-ip"] {
+            if let Some(value) = headers
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return value.chars().take(96).collect();
+            }
+        }
+    }
+    if let Some(address) = peer {
+        return address.ip().to_string();
+    }
+    "anonymous".into()
+}
+
+fn trusted_proxy_headers_enabled_for_peer(peer_ip: Option<IpAddr>) -> bool {
+    let enabled = matches!(
+        env::var("ZYLITH_INDEXER_TRUST_PROXY_HEADERS")
+            .or_else(|_| env::var("ZYLITH_TRUST_PROXY_HEADERS"))
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    );
+    if !enabled {
+        return false;
+    }
+    let Some(peer_ip) = peer_ip else {
+        return false;
+    };
+    let cidrs = env::var("ZYLITH_INDEXER_TRUSTED_PROXY_CIDRS")
+        .or_else(|_| env::var("ZYLITH_TRUSTED_PROXY_CIDRS"))
+        .unwrap_or_default();
+    cidrs
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| value.parse::<IpNet>().ok())
+        .any(|network| network.contains(&peer_ip))
 }
 
 fn parse_hex_u64(value: &str) -> Option<u64> {
@@ -1530,28 +2118,117 @@ fn normalize_required_felt(value: &str) -> Result<String, StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DEFAULT_BATCH_WINDOW_MS, build_app_with_state,
+        AppState, DEFAULT_BATCH_WINDOW_MS, DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+        DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS, RateLimiter, build_app_with_state,
         effective_public_artifact_delay_epochs, normalize_hex, now_unix_ms,
-        parse_deployment_manifest, parse_hex_u64, parse_hex_u128,
+        parse_deployment_manifest, parse_hex_u64, parse_hex_u128, rate_limit_subject,
         select_shielded_asset_adapter_address, selector_hex,
     };
     use axum::{
         body::{Body, to_bytes},
-        http::{Method, Request, StatusCode},
+        http::{HeaderMap, Method, Request, StatusCode},
     };
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        env,
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+    };
     use tokio::sync::RwLock;
     use tower::util::ServiceExt;
     use zylith_core::{
-        AssetId, BatchId, ConsumedInput, NoteCommitment, Nullifier, NullifierHistoryBatch,
-        OutputCiphertextBundle, OutputNoteRecord, PairId, PublishedBatchArtifacts,
-        SettlementTranscript, SettlementWitness, settlement_nullifier_root_after_history,
+        AssetId, BatchId, ConsumedInput, DepositActivationRecord, NoteCommitment, Nullifier,
+        NullifierHistoryBatch, OutputCiphertextBundle, OutputNoteRecord, PairId,
+        PublishedBatchArtifacts, SettlementTranscript, SettlementWitness,
+        settlement_nullifier_root_after_history,
     };
 
     const TEST_INTERNAL_TOKEN: &str = "indexer-test-token";
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn sample_published_artifact(batch_id: &str, batch_epoch: u64) -> PublishedBatchArtifacts {
         sample_published_artifact_for_pair(batch_id, batch_epoch, "STRK/USDC")
+    }
+
+    #[test]
+    fn rate_limit_subject_uses_peer_ip_without_trusted_proxy_cidr() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::set_var("ZYLITH_INDEXER_TRUST_PROXY_HEADERS", "true");
+            env::remove_var("ZYLITH_INDEXER_TRUSTED_PROXY_CIDRS");
+            env::remove_var("ZYLITH_TRUSTED_PROXY_CIDRS");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().expect("header"));
+        let peer: SocketAddr = "198.51.100.7:9443".parse().expect("peer");
+
+        assert_eq!(rate_limit_subject(&headers, Some(peer)), "198.51.100.7");
+
+        unsafe {
+            env::remove_var("ZYLITH_INDEXER_TRUST_PROXY_HEADERS");
+        }
+    }
+
+    #[test]
+    fn rate_limit_subject_uses_forwarded_ip_only_from_trusted_cidr() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::set_var("ZYLITH_INDEXER_TRUST_PROXY_HEADERS", "true");
+            env::set_var("ZYLITH_INDEXER_TRUSTED_PROXY_CIDRS", "198.51.100.0/24");
+            env::remove_var("ZYLITH_TRUSTED_PROXY_CIDRS");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().expect("header"));
+        let peer: SocketAddr = "198.51.100.7:9443".parse().expect("peer");
+
+        assert_eq!(rate_limit_subject(&headers, Some(peer)), "203.0.113.9");
+
+        unsafe {
+            env::remove_var("ZYLITH_INDEXER_TRUST_PROXY_HEADERS");
+            env::remove_var("ZYLITH_INDEXER_TRUSTED_PROXY_CIDRS");
+        }
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_does_not_allow_disallowed_origin() {
+        let router = {
+            let _guard = ENV_LOCK.lock().expect("env lock");
+            unsafe {
+                env::set_var(
+                    "ZYLITH_TEST_INDEXER_ALLOWED_ORIGINS",
+                    "https://app.zylith.fi",
+                );
+            }
+            let router = axum::Router::new()
+                .route("/probe", axum::routing::get(|| async { "ok" }))
+                .layer(super::service_cors_layer(
+                    "ZYLITH_TEST_INDEXER_ALLOWED_ORIGINS",
+                ));
+            unsafe {
+                env::remove_var("ZYLITH_TEST_INDEXER_ALLOWED_ORIGINS");
+            }
+            router
+        };
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/probe")
+                    .header("origin", "https://evil.example")
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
     }
 
     fn sample_published_artifact_for_pair(
@@ -1657,7 +2334,6 @@ mod tests {
                 renewal_history: vec![],
                 renewal_child_sparse_witnesses: vec![],
                 renewal_cancel_sparse_witnesses: vec![],
-                privacy_gate: Default::default(),
                 renewal_child_uses: vec![],
                 fees: vec![],
                 output_notes,
@@ -1668,9 +2344,28 @@ mod tests {
             },
             published_at_unix_ms: now_unix_ms(),
             settled_at_unix_ms: None,
+            settlement_transaction_hash: None,
+            settlement_contract_address: None,
             order_execution_reports: vec![],
             transcript_shape: None,
         }
+    }
+
+    fn settlement_update_json(
+        published: &PublishedBatchArtifacts,
+        settled_at_unix_ms: u64,
+    ) -> String {
+        let roots = zylith_core::root_only_settlement_commitments(&published.transcript)
+            .expect("settlement roots");
+        let transcript_commitment =
+            zylith_core::settlement_transcript_commitment(&published.transcript)
+                .expect("transcript commitment");
+        serde_json::json!({
+            "settled_at_unix_ms": settled_at_unix_ms,
+            "output_note_root": roots.output_note_root,
+            "transcript_commitment": transcript_commitment,
+        })
+        .to_string()
     }
 
     #[test]
@@ -1694,7 +2389,6 @@ mod tests {
             "contracts": {
                 "commitment_registry": "0x1",
                 "batch_registry": "0x2",
-                "fee_ledger": "0x3",
                 "shielded_asset_adapter": "0x4",
                 "privacy_deposit_bridge": "0x6",
                 "auction_verifier": "0x7"
@@ -1720,10 +2414,10 @@ mod tests {
     }
 
     #[test]
-    fn deployment_manifest_adapter_wins_over_stale_env_adapter() {
+    fn env_adapter_override_wins_over_manifest_adapter() {
         assert_eq!(
             select_shielded_asset_adapter_address(Some("0xcurrent"), Some("0xstale")),
-            "0xcurrent"
+            "0xstale"
         );
         assert_eq!(
             select_shielded_asset_adapter_address(None, Some("0xenv")),
@@ -1739,13 +2433,15 @@ mod tests {
     async fn archived_transcript_is_root_only_public_and_root_history_is_internal() {
         let batch_id = "batch-strk-usdc-11";
         let mut artifacts = BTreeMap::new();
-        artifacts.insert(batch_id.into(), sample_published_artifact(batch_id, 11));
+        let published = sample_published_artifact(batch_id, 11);
+        artifacts.insert(batch_id.into(), published.clone());
 
         let app = build_app_with_state(AppState {
             rpc_url: "http://127.0.0.1:5050/rpc/v0_8".into(),
             shielded_asset_adapter_address: "0x1".into(),
-            deposit_count_selector: "0x1".into(),
-            deposit_record_selector: "0x2".into(),
+            commitment_registry_address: "0x5".into(),
+            funding_activation_count_selector: "0x1".into(),
+            funding_activation_record_selector: "0x2".into(),
             withdrawal_count_selector: "0x3".into(),
             withdrawal_record_selector: "0x4".into(),
             http_client: reqwest::Client::new(),
@@ -1763,6 +2459,12 @@ mod tests {
             artifact_epoch_bucket_size: 8,
             require_artifact_onchain_verification: false,
             output_note_root_selector: selector_hex("output_note_root"),
+            verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
+            auction_verifier_address: None,
+            rate_limiter: RateLimiter::default(),
+            public_rate_limit_per_minute: DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+            max_deposit_confirmation_commitments: DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS
+                as usize,
         });
 
         let settled_response = app
@@ -1773,7 +2475,10 @@ mod tests {
                     .method(Method::POST)
                     .header("authorization", format!("Bearer {TEST_INTERNAL_TOKEN}"))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"settled_at_unix_ms":1778661520000}"#))
+                    .body(Body::from(settlement_update_json(
+                        &published,
+                        1_778_661_520_000,
+                    )))
                     .expect("request"),
             )
             .await
@@ -1803,6 +2508,30 @@ mod tests {
         assert!(public_json.get("consumed_inputs").is_none());
         assert!(public_json.get("output_notes").is_none());
         assert!(public_json.get("fees").is_none());
+
+        let public_list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/batches/transcripts?batch_ids={batch_id}"))
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(public_list_response.status(), StatusCode::OK);
+        let public_list_body = to_bytes(public_list_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let public_list_json =
+            serde_json::from_slice::<serde_json::Value>(&public_list_body).expect("json");
+        let listed_transcript = &public_list_json.as_array().expect("public transcript list")[0];
+        assert_eq!(listed_transcript["batch_id"], batch_id);
+        assert!(listed_transcript.get("matched_orders").is_none());
+        assert!(listed_transcript.get("consumed_inputs").is_none());
+        assert!(listed_transcript.get("output_notes").is_none());
+        assert!(listed_transcript.get("fees").is_none());
 
         let internal_transcript = app
             .clone()
@@ -1879,14 +2608,10 @@ mod tests {
     #[tokio::test]
     async fn public_artifact_bundles_delay_and_aggregate_pair_membership() {
         let mut artifacts = BTreeMap::new();
-        artifacts.insert(
-            "batch-strk-usdc-10".into(),
-            sample_published_artifact_for_pair("batch-strk-usdc-10", 10, "STRK/USDC"),
-        );
-        artifacts.insert(
-            "batch-strk-eth-10".into(),
-            sample_published_artifact_for_pair("batch-strk-eth-10", 10, "STRK/ETH"),
-        );
+        let usdc_10 = sample_published_artifact_for_pair("batch-strk-usdc-10", 10, "STRK/USDC");
+        let eth_10 = sample_published_artifact_for_pair("batch-strk-eth-10", 10, "STRK/ETH");
+        artifacts.insert("batch-strk-usdc-10".into(), usdc_10.clone());
+        artifacts.insert("batch-strk-eth-10".into(), eth_10.clone());
         artifacts.insert(
             "batch-strk-usdc-11".into(),
             sample_published_artifact_for_pair("batch-strk-usdc-11", 11, "STRK/USDC"),
@@ -1899,8 +2624,9 @@ mod tests {
         let app = build_app_with_state(AppState {
             rpc_url: "http://127.0.0.1:5050/rpc/v0_8".into(),
             shielded_asset_adapter_address: "0x1".into(),
-            deposit_count_selector: "0x1".into(),
-            deposit_record_selector: "0x2".into(),
+            commitment_registry_address: "0x5".into(),
+            funding_activation_count_selector: "0x1".into(),
+            funding_activation_record_selector: "0x2".into(),
             withdrawal_count_selector: "0x3".into(),
             withdrawal_record_selector: "0x4".into(),
             http_client: reqwest::Client::new(),
@@ -1918,9 +2644,18 @@ mod tests {
             artifact_epoch_bucket_size: 8,
             require_artifact_onchain_verification: false,
             output_note_root_selector: selector_hex("output_note_root"),
+            verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
+            auction_verifier_address: None,
+            rate_limiter: RateLimiter::default(),
+            public_rate_limit_per_minute: DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+            max_deposit_confirmation_commitments: DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS
+                as usize,
         });
 
-        for batch_id in ["batch-strk-usdc-10", "batch-strk-eth-10"] {
+        for (batch_id, published) in [
+            ("batch-strk-usdc-10", &usdc_10),
+            ("batch-strk-eth-10", &eth_10),
+        ] {
             let settled_response = app
                 .clone()
                 .oneshot(
@@ -1929,7 +2664,10 @@ mod tests {
                         .method(Method::POST)
                         .header("authorization", format!("Bearer {TEST_INTERNAL_TOKEN}"))
                         .header("content-type", "application/json")
-                        .body(Body::from(r#"{"settled_at_unix_ms":1778661520000}"#))
+                        .body(Body::from(settlement_update_json(
+                            published,
+                            1_778_661_520_000,
+                        )))
                         .expect("request"),
                 )
                 .await
@@ -2033,8 +2771,9 @@ mod tests {
         let app = build_app_with_state(AppState {
             rpc_url: "http://127.0.0.1:5050/rpc/v0_8".into(),
             shielded_asset_adapter_address: "0x1".into(),
-            deposit_count_selector: "0x1".into(),
-            deposit_record_selector: "0x2".into(),
+            commitment_registry_address: "0x5".into(),
+            funding_activation_count_selector: "0x1".into(),
+            funding_activation_record_selector: "0x2".into(),
             withdrawal_count_selector: "0x3".into(),
             withdrawal_record_selector: "0x4".into(),
             http_client: reqwest::Client::new(),
@@ -2052,20 +2791,69 @@ mod tests {
             artifact_epoch_bucket_size: 8,
             require_artifact_onchain_verification: false,
             output_note_root_selector: selector_hex("output_note_root"),
+            verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
+            auction_verifier_address: None,
+            rate_limiter: RateLimiter::default(),
+            public_rate_limit_per_minute: DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+            max_deposit_confirmation_commitments: DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS
+                as usize,
         });
 
-        let unauthorized = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/internal/sync/deposits")
-                    .method(Method::POST)
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let routes = [
+            (Method::POST, "/api/internal/sync/deposits"),
+            (Method::POST, "/api/internal/sync/withdrawals"),
+            (
+                Method::GET,
+                "/api/internal/batches/root-history/epochs/0/12",
+            ),
+            (
+                Method::GET,
+                "/api/internal/batches/batch-strk-usdc-1/transcript",
+            ),
+            (
+                Method::POST,
+                "/api/internal/batches/batch-strk-usdc-1/artifacts",
+            ),
+            (
+                Method::POST,
+                "/api/internal/batches/batch-strk-usdc-1/settled-at",
+            ),
+        ];
+
+        for (method, uri) in routes {
+            let unauthorized = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .method(method.clone())
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(
+                unauthorized.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+
+            let wrong_auth = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .method(method)
+                        .header("authorization", "Bearer wrong-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(wrong_auth.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
 
         let authorized = app
             .oneshot(
@@ -2079,5 +2867,85 @@ mod tests {
             .await
             .expect("response");
         assert_ne!(authorized.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn deposit_confirmations_are_cache_only_and_request_capped() {
+        let mut cached_deposits = BTreeMap::new();
+        cached_deposits.insert(
+            "0xabc".into(),
+            DepositActivationRecord {
+                activation_id: 7,
+                funding_commitment: "0xabc".into(),
+                deposit_root: "0xdef".into(),
+                encrypted_note_activation: "0x123".into(),
+            },
+        );
+        let app = build_app_with_state(AppState {
+            rpc_url: "http://127.0.0.1:1/rpc/v0_8".into(),
+            shielded_asset_adapter_address: "0x1".into(),
+            commitment_registry_address: "0x5".into(),
+            funding_activation_count_selector: "0x1".into(),
+            funding_activation_record_selector: "0x2".into(),
+            withdrawal_count_selector: "0x3".into(),
+            withdrawal_record_selector: "0x4".into(),
+            http_client: reqwest::Client::new(),
+            confirmed_deposits: Arc::new(RwLock::new(cached_deposits)),
+            confirmed_withdrawals: Arc::new(RwLock::new(BTreeMap::new())),
+            synced_deposit_count: Arc::new(RwLock::new(0)),
+            synced_withdrawal_count: Arc::new(RwLock::new(0)),
+            last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
+            published_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
+            artifact_archive_path: None,
+            internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
+            batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
+            public_artifact_delay_min_epochs: 1,
+            public_artifact_delay_max_epochs: 1,
+            artifact_epoch_bucket_size: 8,
+            require_artifact_onchain_verification: false,
+            output_note_root_selector: selector_hex("output_note_root"),
+            verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
+            auction_verifier_address: None,
+            rate_limiter: RateLimiter::default(),
+            public_rate_limit_per_minute: DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+            max_deposit_confirmation_commitments: 1,
+        });
+
+        let cached_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/deposits/confirmations")
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"funding_commitments":["0xabc"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(cached_response.status(), StatusCode::OK);
+        let body = to_bytes(cached_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert_eq!(json["confirmed"].as_array().unwrap().len(), 1);
+        let serialized = serde_json::to_string(&json).expect("serialized response");
+        assert!(!serialized.contains("asset_id"));
+        assert!(!serialized.contains("amount"));
+        assert!(!serialized.contains("deposit_nonce"));
+        assert!(!serialized.contains("note_commitment"));
+
+        let capped_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/deposits/confirmations")
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"funding_commitments":["0xabc","0xdef"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(capped_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

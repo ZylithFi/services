@@ -3709,6 +3709,7 @@ name = "zylith-indexer"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ipnet",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3726,6 +3727,7 @@ dependencies = [
  "axum",
  "bhttp",
  "hex",
+ "ipnet",
  "ohttp",
  "p256",
  "rand_core 0.6.4",
@@ -3738,6 +3740,7 @@ dependencies = [
  "starknet-rust-providers",
  "starknet-rust-signers",
  "tokio",
+ "tower",
  "tower-http",
  "url",
  "zylith-core",
@@ -3748,6 +3751,7 @@ name = "zylith-renewal-relayer"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "ipnet",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -3756,6 +3760,7 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "url",
  "zylith-core",
 ]
 
@@ -3769,6 +3774,7 @@ dependencies = [
  "p256",
  "serde",
  "serde_json",
+ "sha2",
  "wasm-bindgen",
  "zylith-core",
 ]

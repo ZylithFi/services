@@ -120,17 +120,17 @@ export class SubmissionStore {
 }
 
 export function submissionKey(request: ExecuteOutsideRequest): string {
-  const signerAddress = normalizeFelt(request.signer_address);
-  const nonce = submissionNonce(request);
-  return `${signerAddress}:${nonce}`;
+  if (request.outside_transaction) {
+    const signerAddress = normalizeFelt(request.signer_address);
+    const nonce = submissionNonce(request);
+    return `${signerAddress}:${nonce}`;
+  }
+  return submissionNonce(request);
 }
 
 function submissionNonce(request: ExecuteOutsideRequest): string {
   if (request.outside_transaction) {
     return normalizeFelt(String(request.outside_transaction.outsideExecution.nonce));
-  }
-  if (request.relay_nonce) {
-    return normalizeFelt(request.relay_nonce);
   }
   return `direct:${createHash("sha256")
     .update(JSON.stringify({
