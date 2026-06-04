@@ -31,3 +31,11 @@
 /.deploy
 /.external
 /.DS_Store
+.vercel
+/*.zip
+/data.md
+/demo.md
+/changes.md
+/decisions.md
+/CODEBASE_REVIEW_FINDINGS.md
+/client/vendor/

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
 const args = new Set(process.argv.slice(2));
@@ -18,6 +19,14 @@ expectNot("ZYLITH_COORDINATOR_EMERGENCY_PAUSED", "true", "coordinator is current
 expectNot("ZYLITH_PROVER_EMERGENCY_PAUSED", "true", "prover is currently paused");
 
 checkBoolDefault("ZYLITH_REQUIRE_TRUSTED_ORDER_INGRESS", true);
+expectValue("ZYLITH_REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION", "true", "artifact publication must verify on-chain output root and transcript commitment");
+expectValue(
+  "ZYLITH_AUDITED_ERC20_ALLOWLIST_ACK",
+  "true",
+  "supported assets must be restricted to audited vanilla ERC20s with exact balance-delta behavior",
+);
+checkHostedWithdrawalDisclosure();
+checkHostedConsolidationDisclosure();
 
 checkCsv("ZYLITH_COORDINATOR_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_PROVER_ALLOWED_ORIGINS");
@@ -56,22 +65,28 @@ checkRequired("VITE_ZYLITH_INGRESS_KEY_REGISTRY_PIN");
 checkRequired("ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_PROOF_PROGRAM_HASH");
 checkRequired("ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS");
+checkRequired("ZYLITH_NATIVE_TX_PROVER_URL");
 checkRequired("ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_RENEWAL_STATEMENT_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_NOTE_CONSOLIDATION_STATEMENT_PROGRAM_ADDRESS");
+checkRequired("ZYLITH_NATIVE_WITHDRAWAL_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_STARKNET_OS_CONFIG_HASH");
+checkFelt("ZYLITH_STARKNET_CHAIN_ID");
 
 checkFelt("ZYLITH_PROTOCOL_ADMIN_ADDRESS");
 checkFelt("ZYLITH_PAUSE_GUARDIAN_ADDRESS");
 checkFelt("ZYLITH_PROTOCOL_TREASURY_ADDRESS");
 checkFelt("ZYLITH_PROTOCOL_FEE_RECIPIENT");
-checkFelt("ZYLITH_FEE_CLAIM_AUTHORITY_ADDRESS");
+checkFeeKey("ZYLITH_PROTOCOL_FEE_OWNER_KEY_HEX", "7171717171717171717171717171717171717171717171717171717171717171");
+checkFeeKey("ZYLITH_PROTOCOL_FEE_WITHDRAW_KEY_HEX", "7373737373737373737373737373737373737373737373737373737373737373");
+checkFeeKey("ZYLITH_RELAY_FEE_OWNER_KEY_HEX", "8181818181818181818181818181818181818181818181818181818181818181");
+checkFeeKey("ZYLITH_RELAY_FEE_WITHDRAW_KEY_HEX", "8383838383838383838383838383838383838383838383838383838383838383");
 checkFelt("ZYLITH_SETTLEMENT_ACCOUNT_ADDRESS");
 checkFelt("ZYLITH_BATCH_REGISTRAR_ACCOUNT_ADDRESS");
 checkDistinctRoles([
   "ZYLITH_PROTOCOL_ADMIN_ADDRESS",
   "ZYLITH_PROTOCOL_TREASURY_ADDRESS",
-  "ZYLITH_FEE_CLAIM_AUTHORITY_ADDRESS",
   "ZYLITH_SETTLEMENT_ACCOUNT_ADDRESS",
   "ZYLITH_BATCH_REGISTRAR_ACCOUNT_ADDRESS",
   "ZYLITH_PAYMASTER_ACCOUNT_ADDRESS",
@@ -81,23 +96,35 @@ checkRequired("ZYLITH_PAYMASTER_RPC_URL");
 checkFelt("ZYLITH_PAYMASTER_CHAIN_ID");
 checkFelt("ZYLITH_PAYMASTER_ACCOUNT_ADDRESS");
 checkRequired("ZYLITH_PAYMASTER_PRIVATE_KEY");
+checkFelt("ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_CONTRACTS");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS");
 checkCsv("ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS");
-checkCsv("ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS");
+if ((value("ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS") || "").toLowerCase() === "true") {
+  checkCsv("ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS");
+}
 
 checkRequired("ZYLITH_RENEWAL_RELAY_STRICT");
 expectValue("ZYLITH_RENEWAL_RELAY_STRICT", "true", "renewal relay strict mode must be enabled in production");
 checkRequired("ZYLITH_RENEWAL_RELAY_STORE_PATH");
-checkSecret("ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN", 32);
-checkSecret("ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN", 32);
+checkRecommended("ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN", "renewal relay package read/delete access token is unset; status/results/delete endpoints will be inaccessible to clients");
+if (relayAcceptsManagedMode()) {
+  checkSecret("ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN", 32);
+}
+checkSecret("ZYLITH_RENEWAL_RELAY_PROVER_CONTROL_TOKEN", 32);
 checkRequired("ZYLITH_RENEWAL_RELAY_COORDINATOR_URL");
 checkRequired("ZYLITH_RENEWAL_RELAY_PROVER_URL");
 
 checkRecommended("ZYLITH_ALERT_WEBHOOK_URL", "monitoring alerts have no destination");
 checkRecommended("ZYLITH_MONITORING_ENV", "monitoring environment label is unset");
-checkRecommended("ZYLITH_INCIDENT_RUNBOOK_URL", "incident response runbook URL is unset");
 checkRecommended("ZYLITH_CRASH_DUMP_POLICY", "crash dump policy is unset");
+expectValue(
+  "ZYLITH_ACK_FIRST_SET_CONFIG_NO_TIMELOCK_RISK",
+  "true",
+  "first-set fee/config values are not timelocked on-chain and require explicit launch acknowledgement",
+);
+checkExternalAuditSignals();
+checkKeyCustodySignals();
 checkDeploymentManifest();
 
 if (failures.length > 0) {
@@ -136,6 +163,78 @@ function checkSecret(name, minLength) {
   if (current.length < minLength) {
     failures.push(`${name} must be at least ${minLength} characters`);
   }
+}
+
+function checkFeeKey(name, defaultValue) {
+  const current = value(name);
+  if (!current) {
+    failures.push(`${name} is required`);
+    return;
+  }
+  if (!/^[0-9a-fA-F]{64}$/.test(current)) {
+    failures.push(`${name} must be a 32-byte hex string without 0x prefix`);
+    return;
+  }
+  if (current.toLowerCase() === defaultValue.toLowerCase()) {
+    failures.push(`${name} must not use the development default`);
+  }
+}
+
+function checkHostedConsolidationDisclosure() {
+  const hosted =
+    (value("ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION") || "").toLowerCase() === "true" ||
+    (value("VITE_ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION") || "").toLowerCase() === "true";
+  if (!hosted) return;
+  expectValue(
+    "ZYLITH_ACK_HOSTED_NOTE_CONSOLIDATION_PRIVACY_SINK",
+    "true",
+    "hosted consolidation receives note preimages and requires explicit operator acknowledgement",
+  );
+}
+
+function checkHostedWithdrawalDisclosure() {
+  const hosted =
+    (value("ZYLITH_ENABLE_HOSTED_WITHDRAWALS") || "").toLowerCase() === "true" ||
+    (value("VITE_ZYLITH_ENABLE_HOSTED_WITHDRAWALS") || "").toLowerCase() === "true";
+  if (!hosted) return;
+  expectValue(
+    "ZYLITH_ACK_HOSTED_WITHDRAWAL_PRIVACY_SINK",
+    "true",
+    "hosted withdrawals receive output-note preimages and require explicit operator acknowledgement",
+  );
+}
+
+function checkExternalAuditSignals() {
+  const required = (value("ZYLITH_EXTERNAL_AUDIT_REQUIRED") || "").toLowerCase() === "true";
+  if (!required) {
+    warnings.push("ZYLITH_EXTERNAL_AUDIT_REQUIRED is not true; external audit is not enforced by this environment");
+    return;
+  }
+  expectValue("ZYLITH_EXTERNAL_AUDIT_COMPLETE", "true", "external audit must be complete when required");
+  checkExactInt("ZYLITH_EXTERNAL_AUDIT_CRITICAL_OPEN", 0);
+  checkExactInt("ZYLITH_EXTERNAL_AUDIT_HIGH_OPEN", 0);
+  const reportHash = value("ZYLITH_EXTERNAL_AUDIT_REPORT_SHA256");
+  if (!reportHash) {
+    failures.push("ZYLITH_EXTERNAL_AUDIT_REPORT_SHA256 is required when external audit is required");
+  } else if (!/^[0-9a-fA-F]{64}$/.test(reportHash)) {
+    failures.push("ZYLITH_EXTERNAL_AUDIT_REPORT_SHA256 must be a 64-character hex digest");
+  }
+}
+
+function checkKeyCustodySignals() {
+  const mode = (value("ZYLITH_KEY_CUSTODY_MODE") || "").toLowerCase();
+  if (!mode) {
+    warnings.push("ZYLITH_KEY_CUSTODY_MODE is unset; key custody is not described in deploy env");
+    return;
+  }
+  if (!["hsm", "multisig", "hardware-multisig", "hardware"].includes(mode)) {
+    failures.push("ZYLITH_KEY_CUSTODY_MODE must be hsm, multisig, hardware-multisig, or hardware");
+  }
+}
+
+function relayAcceptsManagedMode() {
+  const mode = (value("ZYLITH_RENEWAL_RELAY_ACCEPT_RELAY_MODE") || "ZylithRelay").toLowerCase();
+  return ["", "zylith", "zylithrelay", "managed", "any", "both"].includes(mode);
 }
 
 function checkOptionalSecretList(name, minLength) {
@@ -255,13 +354,41 @@ function checkDeploymentManifest() {
     return;
   }
 
+  const manifestBytes = readFileSync(manifestPath);
+  const expectedManifestHash = value("ZYLITH_EXPECTED_DEPLOYMENT_MANIFEST_SHA256");
+  if (!expectedManifestHash) {
+    failures.push("ZYLITH_EXPECTED_DEPLOYMENT_MANIFEST_SHA256 is required");
+  } else if (!/^[0-9a-fA-F]{64}$/.test(expectedManifestHash)) {
+    failures.push("ZYLITH_EXPECTED_DEPLOYMENT_MANIFEST_SHA256 must be a 64-character hex digest");
+  } else {
+    const actualManifestHash = createHash("sha256").update(manifestBytes).digest("hex");
+    if (actualManifestHash !== expectedManifestHash.toLowerCase()) {
+      failures.push("deployment manifest sha256 does not match ZYLITH_EXPECTED_DEPLOYMENT_MANIFEST_SHA256");
+    }
+  }
+
   let manifest;
   try {
-    const data = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const data = JSON.parse(manifestBytes.toString("utf8"));
     manifest = data.manifest || data;
   } catch (error) {
     failures.push(`deployment manifest at ${manifestPath} is not valid JSON: ${error.message}`);
     return;
+  }
+
+  const releaseCommit = value("ZYLITH_DEPLOYMENT_RELEASE_COMMIT");
+  if (!releaseCommit || !/^[0-9a-fA-F]{40}$/.test(releaseCommit)) {
+    failures.push("ZYLITH_DEPLOYMENT_RELEASE_COMMIT must be a 40-character git commit");
+  } else if ((manifest.deployment?.release_commit || manifest.release_commit) !== releaseCommit.toLowerCase()) {
+    failures.push("deployment manifest release commit does not match ZYLITH_DEPLOYMENT_RELEASE_COMMIT");
+  }
+  if (manifest.deployment?.finalized !== true) {
+    failures.push("deployment manifest deployment.finalized must be true");
+  }
+  const envChainId = normalizeFeltText(value("ZYLITH_STARKNET_CHAIN_ID"));
+  const manifestChainId = normalizeFeltText(manifest.chain_id || manifest.network?.chain_id);
+  if (envChainId && manifestChainId && envChainId !== manifestChainId) {
+    failures.push("deployment manifest chain_id must match ZYLITH_STARKNET_CHAIN_ID");
   }
 
   const requiredAssets = ["STRK", "ETH", "USDC", "strkBTC", "WBTC", "USDT"];
@@ -279,6 +406,12 @@ function checkDeploymentManifest() {
     checkManifestNonZero(manifest.token_addresses?.[asset], `token_addresses.${asset}`);
     const assetConfig = manifest.product?.assets?.[asset];
     if (!assetConfig?.enabled) failures.push(`product.assets.${asset} must be enabled`);
+    if (assetConfig?.erc20_behavior !== "vanilla-exact-delta") {
+      failures.push(`product.assets.${asset}.erc20_behavior must be vanilla-exact-delta`);
+    }
+    if (assetConfig?.audit_status !== "approved") {
+      failures.push(`product.assets.${asset}.audit_status must be approved`);
+    }
   }
 
   for (const [pair, [taker, maker]] of Object.entries(requiredPairs)) {
@@ -295,6 +428,9 @@ function checkDeploymentManifest() {
     }
   }
 
+  if (manifest.contracts?.privacy_funding_verifier || manifest.funding?.starknet_privacy?.funding_verifier) {
+    failures.push("privacy_funding_verifier/funding_verifier must be absent; PrivacyDepositBridge uses custody-checked privacy-pool activation");
+  }
   for (const [key, current] of Object.entries(manifest.contracts || {})) {
     checkManifestNonZero(current, `contracts.${key}`);
   }
@@ -305,10 +441,16 @@ function checkDeploymentManifest() {
     "nullifier_statement_program_address",
     "renewal_statement_program_address",
     "note_consolidation_statement_program_address",
+    "withdrawal_statement_program_address",
     "proof_account_address",
     "settlement_account_address",
   ]) {
     checkManifestNonZero(manifest.proof?.[key], `proof.${key}`);
+  }
+  for (const key of ["proof_program_locked_after_deploy", "operational_config_locked_after_deploy"]) {
+    if (manifest.proof?.[key] !== true) {
+      failures.push(`proof.${key} must be true for production readiness`);
+    }
   }
 
   if (JSON.stringify(manifest).includes("example.invalid")) {
@@ -316,15 +458,43 @@ function checkDeploymentManifest() {
   }
 }
 
+function normalizeFeltText(current) {
+  if (typeof current !== "string" || current.trim() === "") return null;
+  const trimmed = current.trim();
+  try {
+    if (/^0x[0-9a-fA-F]+$/.test(trimmed)) return `0x${BigInt(trimmed).toString(16)}`;
+    if (/^[0-9]+$/.test(trimmed)) return `0x${BigInt(trimmed).toString(16)}`;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function parseManifestNonNegativeInteger(current) {
+  if (typeof current === "number") {
+    if (!Number.isSafeInteger(current) || current < 0) return null;
+    return BigInt(current);
+  }
+  if (typeof current === "string" && /^[0-9]+$/.test(current)) {
+    return BigInt(current);
+  }
+  return null;
+}
+
 function checkManifestNonZero(current, label) {
   if (typeof current !== "string" || current.trim() === "") {
     failures.push(`${label} must be configured`);
     return;
   }
+  if (isZeroFelt(current)) {
+    failures.push(`${label} must be non-zero`);
+  }
+}
+
+function isZeroFelt(current) {
+  if (typeof current !== "string" || current.trim() === "") return false;
   const normalized = current.startsWith("0x") || current.startsWith("0X")
     ? current.slice(2)
     : current;
-  if (/^0*$/i.test(normalized)) {
-    failures.push(`${label} must be non-zero`);
-  }
+  return /^0*$/i.test(normalized);
 }
