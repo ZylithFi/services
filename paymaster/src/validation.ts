@@ -301,10 +301,7 @@ function assertRenewalCancelMarkerCalldata(call: StarknetCallPayload): void {
 }
 
 function isPausedWithdrawalEntrypoint(entrypoint: string): boolean {
-  return (
-    entrypoint === "withdraw_settlement_output_to_l2" ||
-    entrypoint === "withdraw_to_l2"
-  );
+  return entrypoint === "withdraw_settlement_output_to_l2";
 }
 
 function validateCall(value: unknown): StarknetCallPayload {

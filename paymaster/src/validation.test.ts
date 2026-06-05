@@ -130,23 +130,6 @@ describe("validateExecuteOutsideRequest", () => {
     ).toThrow("withdrawals are paused until nullifier-consuming exits are available");
   });
 
-  it("rejects direct adapter note withdrawals by default", () => {
-    const request = baseRequest();
-    request.call.entrypoint = "withdraw_to_l2";
-    request.call.calldata = ["0xabc", "0x11", "0x22", "0x1234"];
-    delete (request as { outside_transaction?: unknown }).outside_transaction;
-
-    const withdrawalConfig = {
-      ...config,
-      allowedEntrypoints: new Set(["withdraw_to_l2"]),
-      proofRequiredEntrypoints: new Set<string>(),
-      allowDirectWithdrawalRelays: true
-    };
-    expect(() => validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)).toThrow(
-      "withdrawals are paused until nullifier-consuming exits are available"
-    );
-  });
-
   it("accepts direct proof-bearing apply_actions relays", () => {
     const request = baseRequest();
     delete (request as { outside_transaction?: unknown }).outside_transaction;
