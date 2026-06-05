@@ -1710,6 +1710,10 @@ pub fn strk20_exit_claim_message_hash(
     chain_id: &str,
     bridge_address: &str,
     privacy_pool_address: &str,
+    auction_verifier_address: &str,
+    asset_id: &str,
+    token_address: &str,
+    amount: &str,
     exit_commitment: &str,
     open_note_id: &str,
 ) -> Result<String, ProtocolError> {
@@ -1719,6 +1723,10 @@ pub fn strk20_exit_claim_message_hash(
             felt_from_hex_str(chain_id)?,
             felt_from_hex_str(bridge_address)?,
             felt_from_hex_str(privacy_pool_address)?,
+            felt_from_hex_str(auction_verifier_address)?,
+            felt_from_hex_str(asset_id)?,
+            felt_from_hex_str(token_address)?,
+            felt_from_hex_str(amount)?,
             felt_from_hex_str(exit_commitment)?,
             felt_from_hex_str(open_note_id)?,
         ],
@@ -2812,6 +2820,10 @@ pub fn sign_strk20_exit_claim_authorization(
     chain_id: &str,
     bridge_address: &str,
     privacy_pool_address: &str,
+    auction_verifier_address: &str,
+    asset_id: &str,
+    token_address: &str,
+    amount: &str,
     exit_commitment: &str,
     open_note_id: &str,
 ) -> Result<crate::SpendAuthorization, ProtocolError> {
@@ -2820,6 +2832,10 @@ pub fn sign_strk20_exit_claim_authorization(
         chain_id,
         bridge_address,
         privacy_pool_address,
+        auction_verifier_address,
+        asset_id,
+        token_address,
+        amount,
         exit_commitment,
         open_note_id,
     )?)?;
@@ -8288,11 +8304,15 @@ mod tests {
     }
 
     #[test]
-    fn strk20_exit_claim_hash_binds_chain_bridge_pool_exit_and_open_note() {
+    fn strk20_exit_claim_hash_binds_deployment_value_exit_and_open_note() {
         let base = strk20_exit_claim_message_hash(
             "0x534e5f5345504f4c4941",
             "0x456",
             "0x789",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "200",
             "0xabc123",
             "0xdef456",
         )
@@ -8301,6 +8321,10 @@ mod tests {
             "0x534e5f4d41494e",
             "0x456",
             "0x789",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "200",
             "0xabc123",
             "0xdef456",
         )
@@ -8309,6 +8333,10 @@ mod tests {
             "0x534e5f5345504f4c4941",
             "0x457",
             "0x789",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "200",
             "0xabc123",
             "0xdef456",
         )
@@ -8317,14 +8345,70 @@ mod tests {
             "0x534e5f5345504f4c4941",
             "0x456",
             "0x790",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "200",
             "0xabc123",
             "0xdef456",
         )
         .expect("pool claim hash");
+        let wrong_verifier = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabd",
+            "0x1",
+            "0xdef",
+            "200",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("verifier claim hash");
+        let wrong_asset = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc",
+            "0x2",
+            "0xdef",
+            "200",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("asset claim hash");
+        let wrong_token = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc",
+            "0x1",
+            "0xdf0",
+            "200",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("token claim hash");
+        let wrong_amount = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "201",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("amount claim hash");
         let wrong_exit = strk20_exit_claim_message_hash(
             "0x534e5f5345504f4c4941",
             "0x456",
             "0x789",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "200",
             "0xabc124",
             "0xdef456",
         )
@@ -8333,6 +8417,10 @@ mod tests {
             "0x534e5f5345504f4c4941",
             "0x456",
             "0x789",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "200",
             "0xabc123",
             "0xdef457",
         )
@@ -8341,6 +8429,10 @@ mod tests {
         assert_ne!(base, wrong_chain);
         assert_ne!(base, wrong_bridge);
         assert_ne!(base, wrong_pool);
+        assert_ne!(base, wrong_verifier);
+        assert_ne!(base, wrong_asset);
+        assert_ne!(base, wrong_token);
+        assert_ne!(base, wrong_amount);
         assert_ne!(base, wrong_exit);
         assert_ne!(base, wrong_open_note);
     }
