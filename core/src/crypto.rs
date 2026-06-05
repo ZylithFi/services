@@ -7225,8 +7225,8 @@ mod tests {
         settlement_note_root_after_deposit_roots, settlement_nullifier_root_after_history,
         settlement_output_withdrawal_message_hash, settlement_transcript_commitment,
         sign_note_consolidation_authorization, sign_order_authorization,
-        sign_renewal_relay_package_authorization, validate_maker_attribution_receipt,
-        validate_order_ingress_receipt_for_manifest,
+        sign_renewal_relay_package_authorization, strk20_exit_claim_message_hash,
+        validate_maker_attribution_receipt, validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
@@ -8285,6 +8285,64 @@ mod tests {
             .expect("other exit hash");
         assert_ne!(legacy, strk20);
         assert_ne!(strk20, other_exit);
+    }
+
+    #[test]
+    fn strk20_exit_claim_hash_binds_chain_bridge_pool_exit_and_open_note() {
+        let base = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("base claim hash");
+        let wrong_chain = strk20_exit_claim_message_hash(
+            "0x534e5f4d41494e",
+            "0x456",
+            "0x789",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("chain claim hash");
+        let wrong_bridge = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x457",
+            "0x789",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("bridge claim hash");
+        let wrong_pool = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x790",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("pool claim hash");
+        let wrong_exit = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc124",
+            "0xdef456",
+        )
+        .expect("exit claim hash");
+        let wrong_open_note = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc123",
+            "0xdef457",
+        )
+        .expect("open-note claim hash");
+
+        assert_ne!(base, wrong_chain);
+        assert_ne!(base, wrong_bridge);
+        assert_ne!(base, wrong_pool);
+        assert_ne!(base, wrong_exit);
+        assert_ne!(base, wrong_open_note);
     }
 
     #[test]

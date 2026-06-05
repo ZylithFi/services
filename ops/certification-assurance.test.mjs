@@ -726,7 +726,7 @@ test("DEP-001 Zylith funding bridge and adapter do not expose raw public deposit
   assert.doesNotMatch(bridge, /\bverify_funding_activation\b/);
   assert.match(
     bridge,
-    /fn\s+privacy_invoke[\s\S]*?->\s*Span<super::OpenNoteDeposit>[\s\S]*?\[\]\.span\(\)/,
+    /fn\s+privacy_invoke[\s\S]*?->\s*Span<super::OpenNoteDeposit>[\s\S]*?(?:\[\]\.span\(\)|let\s+empty:\s+Array<super::OpenNoteDeposit>\s*=\s*array!\[\];[\s\S]*?empty\.span\(\))/,
     "STRK20-compatible privacy_invoke return must not emit raw open deposit records",
   );
 
