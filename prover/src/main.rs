@@ -158,6 +158,7 @@ const NATIVE_PROOF_FACTS_SUBMIT_RETRY_INTERVAL_MS_ENV: &str =
     "ZYLITH_NATIVE_PROOF_FACTS_SUBMIT_RETRY_INTERVAL_MS";
 const NATIVE_SIGNATURE_BINDS_PROOF_FACTS_ENV: &str = "ZYLITH_NATIVE_SIGNATURE_BINDS_PROOF_FACTS";
 const NATIVE_PROOF_ACCOUNT_ADDRESS_ENV: &str = "ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS";
+const NATIVE_PROOF_PRIVATE_KEY_ENV: &str = "ZYLITH_NATIVE_PROOF_PRIVATE_KEY";
 const NATIVE_PROOF_PROGRAM_ADDRESS_ENV: &str = "ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS";
 const NATIVE_PROOF_ENTRYPOINT_ENV: &str = "ZYLITH_NATIVE_PROOF_ENTRYPOINT";
 const NATIVE_PROOF_AGGREGATE_ENTRYPOINT_ENV: &str = "ZYLITH_NATIVE_PROOF_AGGREGATE_ENTRYPOINT";
@@ -312,6 +313,7 @@ struct StarknetExecutorConfig {
     private_key: String,
     chain_id: String,
     proof_account_address: String,
+    proof_private_key: Option<String>,
 }
 
 impl StarknetExecutorConfig {
@@ -319,6 +321,16 @@ impl StarknetExecutorConfig {
         match mode {
             NativeTransactionMode::ProofOnly => &self.proof_account_address,
             NativeTransactionMode::SubmitOnchain => &self.account_address,
+        }
+    }
+
+    fn request_private_key(&self, mode: NativeTransactionMode) -> &str {
+        match mode {
+            NativeTransactionMode::ProofOnly => self
+                .proof_private_key
+                .as_deref()
+                .unwrap_or(self.private_key.as_str()),
+            NativeTransactionMode::SubmitOnchain => &self.private_key,
         }
     }
 }
@@ -1809,6 +1821,7 @@ async fn prepare_note_consolidation(
     let note_membership_witnesses = derive_note_membership_witnesses(
         &prior_roots.note_root,
         &consumed_inputs,
+        &request.input_notes,
         &[],
         &deposit_activations,
         &note_root_transitions,
@@ -2378,13 +2391,25 @@ async fn submit_settlement_output_withdrawal_inner(
         expected_message_hashes: &[expected_message_hash],
     })
     .await
-    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    .map_err(|error| {
+        eprintln!(
+            "settlement output withdrawal proof generation failed key={} batch={} error={error}",
+            withdrawal_key, witness.batch_id.0,
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
     let (proof_body, proof_facts) = read_native_proof_bundle(
         &proof.proof_path,
         &proof.proof_facts_path,
         "settlement-output-withdrawal",
     )
-    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    .map_err(|error| {
+        eprintln!(
+            "settlement output withdrawal proof bundle read failed key={} batch={} error={error}",
+            withdrawal_key, witness.batch_id.0,
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
     let tx_hash = submit_native_invoke_with_typed_sdk_retry(
         state,
         &executor,
@@ -2393,7 +2418,13 @@ async fn submit_settlement_output_withdrawal_inner(
         &proof_facts,
     )
     .await
-    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    .map_err(|error| {
+        eprintln!(
+            "settlement output withdrawal onchain submit failed key={} batch={} error={error}",
+            withdrawal_key, witness.batch_id.0,
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let provider = JsonRpcClient::new(HttpTransport::new(
         Url::parse(&executor.rpc_url).map_err(|_| StatusCode::BAD_GATEWAY)?,
@@ -2424,6 +2455,10 @@ async fn submit_settlement_output_withdrawal_inner(
         .await,
     );
     if matches!(submission.execution_status.as_deref(), Some("REVERTED")) {
+        eprintln!(
+            "settlement output withdrawal reverted key={} batch={} tx={} reason={:?}",
+            withdrawal_key, witness.batch_id.0, tx_hash, submission.revert_reason,
+        );
         return Err(StatusCode::BAD_GATEWAY);
     }
     if let Some(block_number) = submission.block_number
@@ -7324,6 +7359,7 @@ fn derive_note_membership_witnesses_from_note_root_transitions(
 fn derive_note_membership_witnesses(
     prior_note_root: &str,
     consumed_inputs: &[ConsumedInput],
+    direct_input_notes: &[Note],
     matched_order_witnesses: &[MatchedOrderWitness],
     deposit_activations: &[DepositActivationRecord],
     note_root_transitions: &[NoteRootTransitionRecord],
@@ -7339,22 +7375,31 @@ fn derive_note_membership_witnesses(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut deposit_roots_by_commitment = BTreeMap::<String, String>::new();
-    let mut funding_notes = matched_order_witnesses
+    let mut funding_note_results = direct_input_notes
         .iter()
-        .flat_map(|witness| {
-            witness
-                .effective_funding_notes()
-                .into_iter()
-                .map(|note| {
-                    Ok((
-                        note.nonce,
-                        note_commitment_from_note(note)?,
-                        deposit_root_from_note(note)
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-                    ))
-                })
-                .collect::<Vec<Result<(u64, String, String), StatusCode>>>()
+        .map(|note| {
+            Ok((
+                note.nonce,
+                note_commitment_from_note(note)?,
+                deposit_root_from_note(note).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            ))
         })
+        .collect::<Vec<Result<(u64, String, String), StatusCode>>>();
+    funding_note_results.extend(matched_order_witnesses.iter().flat_map(|witness| {
+        witness
+            .effective_funding_notes()
+            .into_iter()
+            .map(|note| {
+                Ok((
+                    note.nonce,
+                    note_commitment_from_note(note)?,
+                    deposit_root_from_note(note).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                ))
+            })
+            .collect::<Vec<Result<(u64, String, String), StatusCode>>>()
+    }));
+    let mut funding_notes = funding_note_results
+        .into_iter()
         .collect::<Result<Vec<_>, StatusCode>>()?;
     funding_notes.sort_by_key(|(nonce, commitment, _root)| (*nonce, commitment.clone()));
     for (_nonce, commitment, deposit_root) in &funding_notes {
@@ -7985,6 +8030,7 @@ fn build_settlement_artifacts(
     let note_membership_witnesses = derive_note_membership_witnesses(
         &prior_note_root,
         &consumed_inputs,
+        &[],
         &matched_order_witnesses,
         deposit_activations,
         note_root_transitions,
@@ -8686,6 +8732,9 @@ fn load_starknet_executor_from_env(
             })
         })
         .unwrap_or_else(|| account_address.clone());
+    let proof_private_key = env::var(NATIVE_PROOF_PRIVATE_KEY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
     Some(StarknetExecutorConfig {
         rpc_url,
@@ -8693,6 +8742,7 @@ fn load_starknet_executor_from_env(
         private_key,
         chain_id,
         proof_account_address,
+        proof_private_key,
     })
 }
 
@@ -8776,8 +8826,8 @@ async fn build_native_execution_request(
         .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?;
     let provider = JsonRpcClient::new(HttpTransport::new(rpc_url));
     let signer = LocalWallet::from(SigningKey::from_secret_scalar(parse_felt(
-        &executor.private_key,
-        "ZYLITH_STARKNET_PRIVATE_KEY",
+        executor.request_private_key(mode),
+        "native proof transaction private key",
     )?));
     let request_account_address = executor.request_account_address(mode);
     let account = SingleOwnerAccount::new(
@@ -8823,8 +8873,8 @@ async fn prepare_native_execution_fields(
         .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?;
     let provider = JsonRpcClient::new(HttpTransport::new(rpc_url));
     let signer = LocalWallet::from(SigningKey::from_secret_scalar(parse_felt(
-        &executor.private_key,
-        "ZYLITH_STARKNET_PRIVATE_KEY",
+        executor.request_private_key(mode),
+        "native proof transaction private key",
     )?));
     let mut account = SingleOwnerAccount::new(
         provider,
@@ -9986,9 +10036,10 @@ mod tests {
     use super::{
         AppConfig, DEFAULT_PROTOCOL_FEE_RECIPIENT, DEFAULT_RELAY_FEE_RECIPIENT,
         DecryptedOrderRecord, FeeNoteRecipientConfig, NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND,
-        NativeBlockId, NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
-        NativeTransactionMode, NoteConsolidationHistoryRecord, NoteRootTransitionRecord,
-        OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots, artifact_id_for,
+        NOTE_ROOT_TRANSITION_DEPOSIT_KIND, NativeBlockId, NativeExecutionRequestRecord,
+        NativeProverParams, NativeProverRpcRequest, NativeTransactionMode,
+        NoteConsolidationHistoryRecord, NoteRootTransitionRecord, OnchainSubmissionRecord,
+        SettlementBuildContext, SettlementRoots, StarknetExecutorConfig, artifact_id_for,
         build_app_with_config, build_batch_liquidity_report, build_native_proof_program_calldata,
         build_settlement_artifacts, compute_candidate_clearing_price, decode_bhttp_response,
         derive_note_membership_witnesses, deterministic_settlement_submission_jitter_ms,
@@ -10641,6 +10692,7 @@ mod tests {
         let witnesses = derive_note_membership_witnesses(
             &target_note_root,
             &consumed_inputs,
+            &[],
             &matched_order_witnesses,
             &[],
             &transitions,
@@ -10732,6 +10784,7 @@ mod tests {
         let witnesses = derive_note_membership_witnesses(
             &target_note_root,
             &consumed_inputs,
+            &[],
             &matched_order_witnesses,
             &[],
             &transitions,
@@ -10746,6 +10799,43 @@ mod tests {
             witnesses[0].batch_root,
             consolidation_roots.output_note_root
         );
+        assert!(witnesses[0].suffix_batch_roots.is_empty());
+    }
+
+    #[test]
+    fn note_membership_derivation_supports_direct_deposit_consolidation_input() {
+        let deposit_note = test_note("STRK", 10, 101);
+        let deposit_commitment = deposit_note.commitment().expect("deposit commitment").0;
+        let deposit_root = deposit_root_from_note(&deposit_note).expect("deposit root");
+        let root_after_deposit =
+            settlement_state_transition_root("0x0", &deposit_root).expect("deposit note root");
+        let transitions = vec![NoteRootTransitionRecord {
+            kind: NOTE_ROOT_TRANSITION_DEPOSIT_KIND,
+            _key: deposit_commitment.clone(),
+            batch_root: deposit_root.clone(),
+            new_root: root_after_deposit.clone(),
+        }];
+        let consumed_inputs = vec![ConsumedInput {
+            note_commitment: NoteCommitment(deposit_commitment),
+            nullifier: Nullifier("0x900".into()),
+        }];
+
+        let witnesses = derive_note_membership_witnesses(
+            &root_after_deposit,
+            &consumed_inputs,
+            std::slice::from_ref(&deposit_note),
+            &[],
+            &[],
+            &transitions,
+            &[],
+            &[],
+        )
+        .expect("note membership witnesses");
+
+        assert_eq!(witnesses.len(), 1);
+        assert_eq!(witnesses[0].kind, NoteMembershipKind::Deposit);
+        assert_eq!(witnesses[0].batch_root, deposit_root);
+        assert!(witnesses[0].merkle_path.is_empty());
         assert!(witnesses[0].suffix_batch_roots.is_empty());
     }
 
@@ -10932,6 +11022,35 @@ mod tests {
             NativeBlockId::Tag(tag) => assert_eq!(tag, "latest"),
             other => panic!("submit context must use latest tag, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_proof_request_uses_separate_proof_private_key_when_configured() {
+        let executor = StarknetExecutorConfig {
+            rpc_url: "http://127.0.0.1:5050".into(),
+            account_address: "0x111".into(),
+            private_key: "0xaaa".into(),
+            chain_id: "0x534e5f5345504f4c4941".into(),
+            proof_account_address: "0x222".into(),
+            proof_private_key: Some("0xbbb".into()),
+        };
+
+        assert_eq!(
+            executor.request_account_address(NativeTransactionMode::ProofOnly),
+            "0x222"
+        );
+        assert_eq!(
+            executor.request_private_key(NativeTransactionMode::ProofOnly),
+            "0xbbb"
+        );
+        assert_eq!(
+            executor.request_account_address(NativeTransactionMode::SubmitOnchain),
+            "0x111"
+        );
+        assert_eq!(
+            executor.request_private_key(NativeTransactionMode::SubmitOnchain),
+            "0xaaa"
+        );
     }
 
     #[test]

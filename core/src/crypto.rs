@@ -1717,6 +1717,8 @@ pub fn strk20_exit_claim_message_hash(
     exit_commitment: &str,
     open_note_id: &str,
 ) -> Result<String, ProtocolError> {
+    let normalized_asset_id = normalize_asset_id_for_public_hash(asset_id)?;
+    let normalized_amount = normalize_u128_for_public_hash(amount)?;
     Ok(poseidon_chain_hex(
         felt_from_hex_str(STRK20_EXIT_CLAIM_DOMAIN_HEX)?,
         &[
@@ -1724,9 +1726,9 @@ pub fn strk20_exit_claim_message_hash(
             felt_from_hex_str(bridge_address)?,
             felt_from_hex_str(privacy_pool_address)?,
             felt_from_hex_str(auction_verifier_address)?,
-            felt_from_hex_str(asset_id)?,
+            felt_from_hex_str(&normalized_asset_id)?,
             felt_from_hex_str(token_address)?,
-            felt_from_hex_str(amount)?,
+            felt_from_hex_str(&normalized_amount)?,
             felt_from_hex_str(exit_commitment)?,
             felt_from_hex_str(open_note_id)?,
         ],
@@ -6734,6 +6736,27 @@ fn encode_asset_id(asset_id: &str) -> String {
     encode_starknet_felt("asset-id", asset_id)
 }
 
+fn normalize_asset_id_for_public_hash(asset_id: &str) -> Result<String, ProtocolError> {
+    let trimmed = asset_id.trim();
+    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+        normalize_felt_hex(trimmed)
+    } else {
+        Ok(encode_asset_id(trimmed))
+    }
+}
+
+fn normalize_u128_for_public_hash(value: &str) -> Result<String, ProtocolError> {
+    let trimmed = value.trim();
+    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+        normalize_felt_hex(trimmed)
+    } else {
+        let parsed = trimmed.parse::<u128>().map_err(|err| {
+            ProtocolError::Crypto(format!("invalid u128 amount {trimmed}: {err}"))
+        })?;
+        Ok(encode_u128(parsed))
+    }
+}
+
 fn encode_fee_recipient(recipient: &str) -> String {
     if recipient.trim_start().starts_with("0x")
         && let Ok(normalized) = normalize_felt_hex(recipient)
@@ -7228,7 +7251,7 @@ mod tests {
         decrypt_maker_attribution_artifact, decrypt_note_for_owner, decrypt_order_bundle,
         decrypt_order_share, decrypt_output_recovery_record, decrypt_recovery_artifact_payload,
         deposit_root_from_note, derive_account_id, derive_order_cancellation_secret,
-        derive_order_cancellation_tag, derive_user_keys, encode_output_root_id,
+        derive_order_cancellation_tag, derive_user_keys, encode_asset_id, encode_output_root_id,
         encrypt_note_for_owner, encrypt_output_recovery_record,
         encrypted_note_activation_commitment, funding_commitment_for_deposit,
         native_note_consolidation_message_hash, note_consolidation_commitment,
@@ -8317,6 +8340,43 @@ mod tests {
             "0xdef456",
         )
         .expect("base claim hash");
+        let encoded_strk_asset = encode_asset_id("STRK");
+        let symbolic_asset = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc",
+            "STRK",
+            "0xdef",
+            "200",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("symbolic asset claim hash");
+        let encoded_asset = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc",
+            &encoded_strk_asset,
+            "0xdef",
+            "200",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("encoded asset claim hash");
+        let hex_amount = strk20_exit_claim_message_hash(
+            "0x534e5f5345504f4c4941",
+            "0x456",
+            "0x789",
+            "0xabc",
+            "0x1",
+            "0xdef",
+            "0xc8",
+            "0xabc123",
+            "0xdef456",
+        )
+        .expect("hex amount claim hash");
         let wrong_chain = strk20_exit_claim_message_hash(
             "0x534e5f4d41494e",
             "0x456",
@@ -8426,6 +8486,8 @@ mod tests {
         )
         .expect("open-note claim hash");
 
+        assert_eq!(symbolic_asset, encoded_asset);
+        assert_eq!(base, hex_amount);
         assert_ne!(base, wrong_chain);
         assert_ne!(base, wrong_bridge);
         assert_ne!(base, wrong_pool);

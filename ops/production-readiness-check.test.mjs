@@ -31,10 +31,41 @@ test("production readiness rejects hosted note proof paths without acknowledgeme
   const { env } = fixtureEnv();
   env.ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION = "true";
   env.ZYLITH_ENABLE_HOSTED_WITHDRAWALS = "true";
+  delete env.ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY;
+  delete env.VITE_ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY;
+  delete env.ZYLITH_ACK_HOSTED_NOTE_CONSOLIDATION_PRIVACY_SINK;
+  delete env.ZYLITH_ACK_HOSTED_WITHDRAWAL_PRIVACY_SINK;
 
   const result = runReadiness(env);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY/);
+});
+
+test("production readiness accepts separate native proof account with explicit private key", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS = "0x999";
+  env.ZYLITH_NATIVE_PROOF_PRIVATE_KEY = "16".repeat(32);
+  const result = runReadiness(env);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("production readiness rejects separate native proof account without private key", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS = "0x999";
+  delete env.ZYLITH_NATIVE_PROOF_PRIVATE_KEY;
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_NATIVE_PROOF_PRIVATE_KEY/);
+});
+
+test("production readiness rejects missing base Starknet executor signer", () => {
+  const { env } = fixtureEnv();
+  delete env.ZYLITH_STARKNET_ACCOUNT_ADDRESS;
+  delete env.ZYLITH_STARKNET_PRIVATE_KEY;
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_STARKNET_ACCOUNT_ADDRESS/);
+  assert.match(result.stderr, /ZYLITH_STARKNET_PRIVATE_KEY/);
 });
 
 test("production readiness rejects missing audited ERC20 allowlist acknowledgement", () => {
@@ -186,7 +217,7 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     VITE_ZYLITH_INGRESS_KEY_REGISTRY_PIN: "pin",
     ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS: "0x101",
     ZYLITH_NATIVE_PROOF_PROGRAM_HASH: "0x102",
-    ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS: "0x103",
+    ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS: "0x205",
     ZYLITH_NATIVE_TX_PROVER_URL: "https://prover.zylith.fi",
     ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS: "0x104",
     ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS: "0x105",
@@ -195,6 +226,8 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     ZYLITH_NATIVE_WITHDRAWAL_STATEMENT_PROGRAM_ADDRESS: "0x108",
     ZYLITH_STARKNET_OS_CONFIG_HASH: "0x109",
     ZYLITH_STARKNET_CHAIN_ID: "0x534e5f5345504f4c4941",
+    ZYLITH_STARKNET_ACCOUNT_ADDRESS: "0x205",
+    ZYLITH_STARKNET_PRIVATE_KEY: "16".repeat(32),
     ZYLITH_PROTOCOL_ADMIN_ADDRESS: "0x201",
     ZYLITH_PAUSE_GUARDIAN_ADDRESS: "0x202",
     ZYLITH_PROTOCOL_TREASURY_ADDRESS: "0x203",

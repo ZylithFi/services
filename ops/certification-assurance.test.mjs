@@ -724,10 +724,20 @@ test("DEP-001 Zylith funding bridge and adapter do not expose raw public deposit
   assert.doesNotMatch(bridge, /\bIPrivacyFundingVerifier\b/);
   assert.doesNotMatch(bridge, /\bfunding_verifier\b/);
   assert.doesNotMatch(bridge, /\bverify_funding_activation\b/);
+  assert.doesNotMatch(
+    bridge,
+    /\bdeposit_to_open_note\b/,
+    "bridge must not call stale STRK20 pool entrypoints absent from the live pool",
+  );
   assert.match(
     bridge,
-    /fn\s+privacy_invoke[\s\S]*?->\s*Span<super::OpenNoteDeposit>[\s\S]*?(?:\[\]\.span\(\)|let\s+empty:\s+Array<super::OpenNoteDeposit>\s*=\s*array!\[\];[\s\S]*?empty\.span\(\))/,
-    "STRK20-compatible privacy_invoke return must not emit raw open deposit records",
+    /if\s+funding_commitments\.len\(\)\s*==\s*0\s*\{[\s\S]*open_note_deposits\s*\.\s*append\(/,
+    "STRK20 exit claims must return one OpenNoteDeposit through privacy_invoke",
+  );
+  assert.match(
+    bridge,
+    /register_funding_activation_internal\([\s\S]*funding_commitments[\s\S]*deposit_roots[\s\S]*encrypted_note_activations[\s\S]*\);[\s\S]*open_note_deposits\.span\(\)/,
+    "funding activation must still return no open deposits",
   );
 
   for (const removed of [

@@ -65,6 +65,7 @@ checkRequired("VITE_ZYLITH_INGRESS_KEY_REGISTRY_PIN");
 checkRequired("ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_PROOF_PROGRAM_HASH");
 checkRequired("ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS");
+checkNativeProofAccountSigner();
 checkRequired("ZYLITH_NATIVE_TX_PROVER_URL");
 checkRequired("ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS");
@@ -73,6 +74,8 @@ checkRequired("ZYLITH_NATIVE_NOTE_CONSOLIDATION_STATEMENT_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_WITHDRAWAL_STATEMENT_PROGRAM_ADDRESS");
 checkFelt("ZYLITH_STARKNET_OS_CONFIG_HASH");
 checkFelt("ZYLITH_STARKNET_CHAIN_ID");
+checkFelt("ZYLITH_STARKNET_ACCOUNT_ADDRESS");
+checkPrivateKeyHex("ZYLITH_STARKNET_PRIVATE_KEY");
 
 checkFelt("ZYLITH_PROTOCOL_ADMIN_ADDRESS");
 checkFelt("ZYLITH_PAUSE_GUARDIAN_ADDRESS");
@@ -178,6 +181,24 @@ function checkFeeKey(name, defaultValue) {
   if (current.toLowerCase() === defaultValue.toLowerCase()) {
     failures.push(`${name} must not use the development default`);
   }
+}
+
+function checkPrivateKeyHex(name) {
+  const current = value(name);
+  if (!current) {
+    failures.push(`${name} is required`);
+    return;
+  }
+  if (!/^0x[0-9a-fA-F]{1,64}$/.test(current) && !/^[0-9a-fA-F]{1,64}$/.test(current)) {
+    failures.push(`${name} must be a Starknet private-key felt`);
+  }
+}
+
+function checkNativeProofAccountSigner() {
+  const proofAccount = normalizeFelt(value("ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS"));
+  const submitAccount = normalizeFelt(value("ZYLITH_STARKNET_ACCOUNT_ADDRESS"));
+  if (!proofAccount || !submitAccount || proofAccount === submitAccount) return;
+  checkPrivateKeyHex("ZYLITH_NATIVE_PROOF_PRIVATE_KEY");
 }
 
 function anyTrue(names) {
