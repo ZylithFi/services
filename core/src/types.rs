@@ -2223,6 +2223,8 @@ pub struct SettlementOutputWithdrawalCallArguments {
     pub withdraw_authorization_r: String,
     pub withdraw_authorization_s: String,
     pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strk20_exit_commitment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2266,6 +2268,8 @@ pub struct SettlementOutputWithdrawalWitness {
     pub shielded_asset_adapter_address: String,
     pub chain_id: String,
     pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strk20_exit_commitment: Option<String>,
     pub prior_nullifier_root: String,
     pub output_note: OutputNoteRecord,
     pub output_note_preimage: Note,

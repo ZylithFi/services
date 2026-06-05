@@ -56,6 +56,9 @@ const PUBLIC_SETTLEMENT_DOMAIN_HEX: &str =
     "0x0283f626418aa97a073f64500f7e35dd8bf7c01ff8611917c3c38e5be92eb205";
 const PUBLIC_NOTE_CONSOLIDATION_DOMAIN_HEX: &str = "0x7a796c6974685f6e6f74655f636f6e736f6c5f7631";
 const PUBLIC_NOTE_WITHDRAWAL_DOMAIN_HEX: &str = "0x7a796c6974685f6e6f74655f77697468647261775f7631";
+const OUTPUT_WITHDRAWAL_STRK20_EXIT_DOMAIN_HEX: &str =
+    "0x7a796c6974685f7374726b32305f657869745f7631";
+const STRK20_EXIT_CLAIM_DOMAIN_HEX: &str = "0x7a796c6974685f7374726b32305f636c61696d5f7631";
 const ROOT_ONLY_STATE_TRANSITION_DOMAIN_HEX: &str =
     "0x01f14f0555b0b80fd6af9553623a021c472d8c930dfcb5b204b35b26f0d2b1b2";
 const OUTPUT_NOTE_LEAF_DOMAIN_HEX: &str =
@@ -123,6 +126,7 @@ pub struct SettlementOutputWithdrawalPlanRequest<'a> {
     pub proof_artifact_commitment: &'a str,
     pub withdraw_auth_key_felt: &'a str,
     pub recipient: &'a str,
+    pub strk20_exit_commitment: Option<&'a str>,
     pub auction_verifier_address: &'a str,
     pub shielded_asset_adapter_address: &'a str,
     pub chain_id: &'a str,
@@ -137,6 +141,7 @@ pub struct SettlementOutputWithdrawalMessage<'a> {
     pub asset_id: &'a str,
     pub amount: &'a str,
     pub recipient: &'a str,
+    pub strk20_exit_commitment: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -1434,6 +1439,16 @@ pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
     }
     let roots = settlement_output_withdrawal_root_fields(witness)?;
     let withdrawal_commitment = settlement_output_withdrawal_commitment(witness)?;
+    let strk20_exit_commitment = witness
+        .strk20_exit_commitment
+        .as_ref()
+        .map(|value| normalize_felt_hex(value))
+        .transpose()?;
+    if matches!(strk20_exit_commitment.as_deref(), Some("0x0")) {
+        return Err(ProtocolError::Crypto(
+            "settlement output STRK20 exit commitment must be non-zero".into(),
+        ));
+    }
     let normalized_proof_artifact_commitment = normalize_felt_hex(proof_artifact_commitment)?;
     let encoded_args = SettlementOutputWithdrawalCallArguments {
         batch_id: encode_output_root_id(&witness.batch_id),
@@ -1459,9 +1474,19 @@ pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
             .collect::<Result<Vec<_>, ProtocolError>>()?,
         withdraw_authorization_r: normalize_felt_hex(&witness.withdraw_authorization.signature_r)?,
         withdraw_authorization_s: normalize_felt_hex(&witness.withdraw_authorization.signature_s)?,
-        recipient: normalize_felt_hex(&witness.recipient)?,
+        recipient: if strk20_exit_commitment.is_some() {
+            "0x0".into()
+        } else {
+            normalize_felt_hex(&witness.recipient)?
+        },
+        strk20_exit_commitment,
     };
     let calldata = flatten_settlement_output_withdrawal_call_arguments(&encoded_args);
+    let entrypoint = if encoded_args.strk20_exit_commitment.is_some() {
+        "withdraw_settlement_output_to_strk20_with_proof_facts"
+    } else {
+        "withdraw_settlement_output_with_proof_facts"
+    };
     Ok(SettlementOutputWithdrawalSubmissionPlan {
         funding_rail: FundingRailKind::StarknetPrivacy,
         batch_id: witness.batch_id.clone(),
@@ -1470,7 +1495,7 @@ pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
         proof_artifact_commitment: normalized_proof_artifact_commitment,
         starknet_call: StarknetCall {
             contract_address: normalized_verifier_address,
-            entrypoint: "withdraw_settlement_output_with_proof_facts".into(),
+            entrypoint: entrypoint.into(),
             calldata,
         },
         encoded_args,
@@ -1485,6 +1510,10 @@ pub fn build_settlement_output_withdrawal_submission_plan(
         normalize_felt_hex(request.shielded_asset_adapter_address)?;
     let chain_id = normalize_felt_hex(request.chain_id)?;
     let recipient = normalize_felt_hex(request.recipient)?;
+    let strk20_exit_commitment = request
+        .strk20_exit_commitment
+        .map(normalize_felt_hex)
+        .transpose()?;
     let encoded_batch_id = encode_output_root_id(request.batch_id);
     let encoded_asset_id = encode_asset_id(&request.output_note.asset_id.0);
     let encoded_amount = encode_u128(request.output_note.amount);
@@ -1499,6 +1528,7 @@ pub fn build_settlement_output_withdrawal_submission_plan(
             asset_id: &encoded_asset_id,
             amount: &encoded_amount,
             recipient: &recipient,
+            strk20_exit_commitment: strk20_exit_commitment.as_deref(),
         },
     )?;
     let witness = SettlementOutputWithdrawalWitness {
@@ -1507,6 +1537,7 @@ pub fn build_settlement_output_withdrawal_submission_plan(
         shielded_asset_adapter_address: shielded_asset_adapter_address.clone(),
         chain_id: chain_id.clone(),
         recipient: recipient.clone(),
+        strk20_exit_commitment,
         prior_nullifier_root: normalize_felt_hex(request.prior_nullifier_root)?,
         output_note: request.output_note.clone(),
         output_note_preimage: request.output_note_preimage.clone(),
@@ -1643,7 +1674,23 @@ pub fn settlement_output_withdrawal_message_hash(
         asset_id,
         amount,
         recipient,
+        strk20_exit_commitment,
     } = message;
+    if let Some(exit_commitment) = strk20_exit_commitment {
+        return Ok(poseidon_chain_hex(
+            felt_from_hex_str(OUTPUT_WITHDRAWAL_STRK20_EXIT_DOMAIN_HEX)?,
+            &[
+                felt_from_hex_str(chain_id)?,
+                felt_from_hex_str(auction_verifier_address)?,
+                felt_from_hex_str(shielded_asset_adapter_address)?,
+                felt_from_hex_str(batch_id)?,
+                felt_from_hex_str(note_commitment)?,
+                felt_from_hex_str(asset_id)?,
+                felt_from_hex_str(amount)?,
+                felt_from_hex_str(exit_commitment)?,
+            ],
+        ));
+    }
     Ok(poseidon_chain_hex(
         felt_from_hex_str("0x031ff5b95d48149e26b5a946562ff5ea925eb8b3ea09d3b389b209b672a37b6e")?,
         &[
@@ -1655,6 +1702,25 @@ pub fn settlement_output_withdrawal_message_hash(
             felt_from_hex_str(asset_id)?,
             felt_from_hex_str(amount)?,
             felt_from_hex_str(recipient)?,
+        ],
+    ))
+}
+
+pub fn strk20_exit_claim_message_hash(
+    chain_id: &str,
+    bridge_address: &str,
+    privacy_pool_address: &str,
+    exit_commitment: &str,
+    open_note_id: &str,
+) -> Result<String, ProtocolError> {
+    Ok(poseidon_chain_hex(
+        felt_from_hex_str(STRK20_EXIT_CLAIM_DOMAIN_HEX)?,
+        &[
+            felt_from_hex_str(chain_id)?,
+            felt_from_hex_str(bridge_address)?,
+            felt_from_hex_str(privacy_pool_address)?,
+            felt_from_hex_str(exit_commitment)?,
+            felt_from_hex_str(open_note_id)?,
         ],
     ))
 }
@@ -2741,6 +2807,31 @@ pub fn sign_settlement_output_withdrawal_authorization(
     })
 }
 
+pub fn sign_strk20_exit_claim_authorization(
+    withdraw_auth_key_felt: &str,
+    chain_id: &str,
+    bridge_address: &str,
+    privacy_pool_address: &str,
+    exit_commitment: &str,
+    open_note_id: &str,
+) -> Result<crate::SpendAuthorization, ProtocolError> {
+    let private_key = felt_from_hex_str(withdraw_auth_key_felt)?;
+    let message = felt_from_hex_str(&strk20_exit_claim_message_hash(
+        chain_id,
+        bridge_address,
+        privacy_pool_address,
+        exit_commitment,
+        open_note_id,
+    )?)?;
+    let k = rfc6979_generate_k(&message, &private_key, None);
+    let signature = sign(&private_key, &message, &k)
+        .map_err(|err| ProtocolError::Crypto(format!("STRK20 exit claim signing failed: {err}")))?;
+    Ok(crate::SpendAuthorization {
+        signature_r: felt_hex(&signature.r),
+        signature_s: felt_hex(&signature.s),
+    })
+}
+
 pub fn sign_settlement_output_withdrawal_witness(
     withdraw_auth_key_felt: &str,
     witness: &SettlementOutputWithdrawalWitness,
@@ -2753,6 +2844,11 @@ pub fn sign_settlement_output_withdrawal_witness(
     let asset_id = encode_asset_id(&witness.output_note.asset_id.0);
     let amount = encode_u128(witness.output_note.amount);
     let recipient = normalize_felt_hex(&witness.recipient)?;
+    let strk20_exit_commitment = witness
+        .strk20_exit_commitment
+        .as_ref()
+        .map(|value| normalize_felt_hex(value))
+        .transpose()?;
 
     sign_settlement_output_withdrawal_authorization(
         withdraw_auth_key_felt,
@@ -2765,6 +2861,7 @@ pub fn sign_settlement_output_withdrawal_witness(
             asset_id: &asset_id,
             amount: &amount,
             recipient: &recipient,
+            strk20_exit_commitment: strk20_exit_commitment.as_deref(),
         },
     )
 }
@@ -7049,7 +7146,11 @@ fn flatten_settlement_output_withdrawal_call_arguments(
     push_span(&mut calldata, &args.merkle_directions);
     calldata.push(args.withdraw_authorization_r.clone());
     calldata.push(args.withdraw_authorization_s.clone());
-    calldata.push(args.recipient.clone());
+    calldata.push(
+        args.strk20_exit_commitment
+            .clone()
+            .unwrap_or_else(|| args.recipient.clone()),
+    );
     calldata
 }
 
@@ -7937,6 +8038,7 @@ mod tests {
         let (prior_nullifier_root, new_nullifier_root, mut sparse_witnesses) =
             nullifier_sparse_update_witnesses_for_consumed_inputs(&[], &[consumed_input])
                 .expect("sparse witness");
+        let sparse_witness = sparse_witnesses.pop().expect("one sparse witness");
         let plan = build_settlement_output_withdrawal_submission_plan(
             SettlementOutputWithdrawalPlanRequest {
                 batch_id: &batch_id,
@@ -7945,13 +8047,12 @@ mod tests {
                 output_proof: &proof,
                 prior_nullifier_root: &prior_nullifier_root,
                 nullifier_history: &[],
-                nullifier_sparse_witness: Some(
-                    &sparse_witnesses.pop().expect("one sparse witness"),
-                ),
+                nullifier_sparse_witness: Some(&sparse_witness),
                 new_nullifier_root: &new_nullifier_root,
                 proof_artifact_commitment: "0x999",
                 withdraw_auth_key_felt: &withdraw_auth_key_felt,
                 recipient: "0x444",
+                strk20_exit_commitment: None,
                 auction_verifier_address: "0x123",
                 shielded_asset_adapter_address: "0x456",
                 chain_id: "0x534e5f5345504f4c4941",
@@ -7966,6 +8067,49 @@ mod tests {
         assert_eq!(plan.encoded_args.prior_nullifier_root, prior_nullifier_root);
         assert_eq!(plan.encoded_args.new_nullifier_root, new_nullifier_root);
         assert_eq!(plan.encoded_args.proof_artifact_commitment, "0x999");
+
+        let strk20_plan = build_settlement_output_withdrawal_submission_plan(
+            SettlementOutputWithdrawalPlanRequest {
+                batch_id: &batch_id,
+                output_note: &outputs[1],
+                output_note_preimage: &output_note_preimage,
+                output_proof: &proof,
+                prior_nullifier_root: &prior_nullifier_root,
+                nullifier_history: &[],
+                nullifier_sparse_witness: Some(&sparse_witness),
+                new_nullifier_root: &new_nullifier_root,
+                proof_artifact_commitment: "0x999",
+                withdraw_auth_key_felt: &withdraw_auth_key_felt,
+                recipient: "0x444",
+                strk20_exit_commitment: Some("0xabc123"),
+                auction_verifier_address: "0x123",
+                shielded_asset_adapter_address: "0x456",
+                chain_id: "0x534e5f5345504f4c4941",
+            },
+        )
+        .expect("STRK20 open-note withdrawal plan");
+
+        assert_eq!(
+            strk20_plan.starknet_call.entrypoint,
+            "withdraw_settlement_output_to_strk20_with_proof_facts"
+        );
+        assert_eq!(strk20_plan.encoded_args.recipient, "0x0");
+        assert_eq!(
+            strk20_plan.encoded_args.strk20_exit_commitment.as_deref(),
+            Some("0xabc123")
+        );
+        assert_eq!(
+            strk20_plan
+                .starknet_call
+                .calldata
+                .last()
+                .map(String::as_str),
+            Some("0xabc123")
+        );
+        assert_ne!(
+            plan.encoded_args.withdraw_authorization_r,
+            strk20_plan.encoded_args.withdraw_authorization_r
+        );
     }
 
     #[test]
@@ -8024,6 +8168,7 @@ mod tests {
                 proof_artifact_commitment: "0x999",
                 withdraw_auth_key_felt: &withdraw_auth_key_felt,
                 recipient: "0x444",
+                strk20_exit_commitment: None,
                 auction_verifier_address: "0x123",
                 shielded_asset_adapter_address: "0x456",
                 chain_id: "0x534e5f5345504f4c4941",
@@ -8066,6 +8211,7 @@ mod tests {
             asset_id: "0x999",
             amount: "0x64",
             recipient: "0xabc",
+            strk20_exit_commitment: None,
         })
         .expect("base hash");
         let other_verifier =
@@ -8078,6 +8224,7 @@ mod tests {
                 asset_id: "0x999",
                 amount: "0x64",
                 recipient: "0xabc",
+                strk20_exit_commitment: None,
             })
             .expect("verifier hash");
         let other_adapter =
@@ -8090,10 +8237,54 @@ mod tests {
                 asset_id: "0x999",
                 amount: "0x64",
                 recipient: "0xabc",
+                strk20_exit_commitment: None,
             })
             .expect("adapter hash");
         assert_ne!(base, other_verifier);
         assert_ne!(base, other_adapter);
+    }
+
+    #[test]
+    fn settlement_output_strk20_exit_hash_is_domain_separated() {
+        let legacy = settlement_output_withdrawal_message_hash(SettlementOutputWithdrawalMessage {
+            auction_verifier_address: "0x123",
+            shielded_asset_adapter_address: "0x456",
+            chain_id: "0x534e5f5345504f4c4941",
+            batch_id: "0x777",
+            note_commitment: "0x888",
+            asset_id: "0x999",
+            amount: "0x64",
+            recipient: "0xabc",
+            strk20_exit_commitment: None,
+        })
+        .expect("legacy hash");
+        let strk20 = settlement_output_withdrawal_message_hash(SettlementOutputWithdrawalMessage {
+            auction_verifier_address: "0x123",
+            shielded_asset_adapter_address: "0x456",
+            chain_id: "0x534e5f5345504f4c4941",
+            batch_id: "0x777",
+            note_commitment: "0x888",
+            asset_id: "0x999",
+            amount: "0x64",
+            recipient: "0xabc",
+            strk20_exit_commitment: Some("0xabc"),
+        })
+        .expect("strk20 hash");
+        let other_exit =
+            settlement_output_withdrawal_message_hash(SettlementOutputWithdrawalMessage {
+                auction_verifier_address: "0x123",
+                shielded_asset_adapter_address: "0x456",
+                chain_id: "0x534e5f5345504f4c4941",
+                batch_id: "0x777",
+                note_commitment: "0x888",
+                asset_id: "0x999",
+                amount: "0x64",
+                recipient: "0xabc",
+                strk20_exit_commitment: Some("0xabd"),
+            })
+            .expect("other exit hash");
+        assert_ne!(legacy, strk20);
+        assert_ne!(strk20, other_exit);
     }
 
     #[test]

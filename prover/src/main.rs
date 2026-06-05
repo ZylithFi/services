@@ -1711,6 +1711,8 @@ struct SettlementOutputWithdrawalPrepareRequest {
     output_note_preimage: Note,
     output_proof: zylith_core::OutputNoteMerkleProof,
     recipient: String,
+    #[serde(default)]
+    strk20_exit_commitment: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1727,6 +1729,8 @@ struct SettlementOutputWithdrawalSubmitRequest {
 struct SettlementOutputWithdrawalSubmitResponse {
     batch_id: String,
     note_commitment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strk20_exit_commitment: Option<String>,
     transaction_hash: String,
     finality_status: Option<String>,
     execution_status: Option<String>,
@@ -1953,12 +1957,27 @@ async fn prepare_settlement_output_withdrawal(
     if shielded_asset_adapter_address == "0x0" {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    let strk20_exit_commitment = request
+        .strk20_exit_commitment
+        .as_ref()
+        .map(|value| normalize_felt_hex(value))
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if matches!(strk20_exit_commitment.as_deref(), Some("0x0")) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let recipient = if strk20_exit_commitment.is_some() {
+        "0x0".to_string()
+    } else {
+        normalize_felt_hex(&request.recipient).map_err(|_| StatusCode::BAD_REQUEST)?
+    };
     let witness = SettlementOutputWithdrawalWitness {
         batch_id: request.batch_id,
         auction_verifier_address: state.auction_verifier_address.clone(),
         shielded_asset_adapter_address,
         chain_id: executor.chain_id.clone(),
-        recipient: normalize_felt_hex(&request.recipient).map_err(|_| StatusCode::BAD_REQUEST)?,
+        recipient,
+        strk20_exit_commitment,
         prior_nullifier_root: prior_roots.nullifier_root,
         output_note: request.output_note,
         output_note_preimage: request.output_note_preimage,
@@ -2436,6 +2455,7 @@ async fn submit_settlement_output_withdrawal_inner(
     Ok(SettlementOutputWithdrawalSubmitResponse {
         batch_id: witness.batch_id.0,
         note_commitment: witness.output_note.note_commitment.0,
+        strk20_exit_commitment: witness.strk20_exit_commitment,
         transaction_hash: tx_hash,
         finality_status: submission.finality_status,
         execution_status: submission.execution_status,
@@ -11458,6 +11478,7 @@ mod tests {
                 proof_artifact_commitment: "0xabc",
                 withdraw_auth_key_felt: &protocol_fee_withdraw_auth_key,
                 recipient: "0x123",
+                strk20_exit_commitment: None,
                 auction_verifier_address: "0x999",
                 shielded_asset_adapter_address: "0x888",
                 chain_id: "0x534e5f5345504f4c4941",
@@ -11525,6 +11546,7 @@ mod tests {
                 proof_artifact_commitment: "0xdef",
                 withdraw_auth_key_felt: &relay_fee_withdraw_auth_key,
                 recipient: "0x456",
+                strk20_exit_commitment: None,
                 auction_verifier_address: "0x999",
                 shielded_asset_adapter_address: "0x888",
                 chain_id: "0x534e5f5345504f4c4941",

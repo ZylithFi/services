@@ -58,6 +58,7 @@ pub use crypto::{
     settlement_state_transition_root, settlement_transcript_commitment,
     sign_note_consolidation_authorization, sign_order_authorization,
     sign_renewal_relay_package_authorization, sign_settlement_output_withdrawal_witness,
+    sign_strk20_exit_claim_authorization, strk20_exit_claim_message_hash,
     validate_maker_attribution_receipt, validate_order_ingress_receipt_for_manifest,
     validate_order_ingress_receipt_for_manifest_with_secrets,
     validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
