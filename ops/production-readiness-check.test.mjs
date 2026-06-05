@@ -14,6 +14,29 @@ test("production readiness accepts a hardened minimal configuration", () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test("production readiness accepts hosted note proof paths with shared acknowledgement", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION = "true";
+  env.ZYLITH_ENABLE_HOSTED_WITHDRAWALS = "true";
+  env.VITE_ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION = "true";
+  env.VITE_ZYLITH_ENABLE_HOSTED_WITHDRAWALS = "true";
+  env.ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY = "true";
+  env.VITE_ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY = "true";
+
+  const result = runReadiness(env);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("production readiness rejects hosted note proof paths without acknowledgement", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION = "true";
+  env.ZYLITH_ENABLE_HOSTED_WITHDRAWALS = "true";
+
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY/);
+});
+
 test("production readiness rejects missing audited ERC20 allowlist acknowledgement", () => {
   const { env } = fixtureEnv();
   delete env.ZYLITH_AUDITED_ERC20_ALLOWLIST_ACK;

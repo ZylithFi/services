@@ -622,11 +622,14 @@ struct NativeProofAggregationRecord {
     member_batches: Vec<BatchId>,
     proof: String,
     proof_facts: Vec<String>,
+    #[serde(skip_serializing)]
+    prepared_members: Vec<NativeAggregationPreparedMember>,
 }
 
 #[derive(Clone, Debug)]
 struct NativeAggregationPreparedMember {
     witness: SettlementWitness,
+    transcript: SettlementTranscript,
     settlement_plan: SettlementSubmissionPlan,
     proof_message_hashes: Vec<String>,
 }
@@ -3047,10 +3050,15 @@ async fn proof_worker_should_process_batch(state: &AppState, batch_id: &str) -> 
     let Some(status) = proof_jobs.get(batch_id) else {
         return true;
     };
-    matches!(
-        status.state.as_str(),
-        "witness-prepared" | "proof-generated"
-    )
+    proof_worker_status_is_processable(status.state.as_str(), state.prover_worker_submit_onchain)
+}
+
+fn proof_worker_status_is_processable(status: &str, submit_onchain: bool) -> bool {
+    match status {
+        "witness-prepared" => true,
+        "proof-generated" => submit_onchain,
+        _ => false,
+    }
 }
 
 async fn process_proof_worker_batch(state: &AppState, batch_id: &str) -> Result<(), StatusCode> {
@@ -3339,9 +3347,9 @@ async fn submit_native_proof_aggregation(
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
     let aggregate = run_true_native_proof_aggregation(&state, start_epoch, end_epoch).await?;
-    for batch_id in &aggregate.member_batches {
-        if let Err(error) = prove_and_record_auction_result(&state, &batch_id.0, true).await {
-            set_onchain_submission_error(&state, &batch_id.0, error).await?;
+    for member in &aggregate.prepared_members {
+        if let Err(error) = prove_and_record_auction_result_for_member(&state, member, true).await {
+            set_onchain_submission_error(&state, &member.witness.batch_id.0, error).await?;
             return Err(StatusCode::BAD_GATEWAY);
         }
     }
@@ -3513,6 +3521,7 @@ async fn run_provider_proof_aggregation(
             .collect(),
         proof: provider_response.proof,
         proof_facts: provider_response.proof_facts,
+        prepared_members,
     })
 }
 
@@ -3524,11 +3533,12 @@ async fn run_true_native_proof_aggregation(
     let Some(tx_prover_url) = state.native_tx_prover_url.clone() else {
         return Err(StatusCode::NOT_IMPLEMENTED);
     };
-    let manifest = build_proof_aggregation_manifest(state, start_epoch, end_epoch).await?;
     let members = prepare_native_aggregation_members(state, start_epoch, end_epoch).await?;
     if members.is_empty() {
         return Err(StatusCode::NOT_FOUND);
     }
+    let manifest =
+        build_proof_aggregation_manifest_from_prepared(state, start_epoch, end_epoch, &members)?;
     validate_aggregate_root_chain(&members).map_err(|_| StatusCode::CONFLICT)?;
     let expected_messages = members
         .iter()
@@ -3586,6 +3596,7 @@ async fn run_true_native_proof_aggregation(
             .collect(),
         proof: result.proof,
         proof_facts: result.proof_facts,
+        prepared_members: members,
     })
 }
 
@@ -3596,6 +3607,7 @@ async fn prepare_native_aggregation_members(
 ) -> Result<Vec<NativeAggregationPreparedMember>, StatusCode> {
     let witnesses = proof_aggregation_witness_members(state, start_epoch, end_epoch).await?;
     let mut members = Vec::with_capacity(witnesses.len());
+    let mut expected_roots = fetch_current_settlement_roots(state).await?;
     for witness in witnesses {
         let transcript = fetch_transcript(state, &witness.batch_id.0).await?;
         let transcript_commitment =
@@ -3603,21 +3615,23 @@ async fn prepare_native_aggregation_members(
         if transcript_commitment != witness.transcript_commitment {
             return Err(StatusCode::CONFLICT);
         }
-        let statement_message =
-            native_settlement_message_hash(&state.auction_verifier_address, &transcript_commitment)
-                .map_err(|_| StatusCode::BAD_GATEWAY)?;
-        let roots =
-            root_only_settlement_commitments(&transcript).map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let (transcript, witness, roots) =
+            aggregate_member_for_expected_roots(transcript, witness, &expected_roots)?;
+        let statement_message = native_settlement_message_hash(
+            &state.auction_verifier_address,
+            &witness.transcript_commitment,
+        )
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
         let settlement_proof_message = settlement_proof_message_hash_for_program(
             &state.native_proof_program_address,
             &state.auction_verifier_address,
-            &transcript_commitment,
+            &witness.transcript_commitment,
         )
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
         let nullifier_proof_message = nullifier_proof_message_hash_for_program(
             &state.native_proof_program_address,
             &state.auction_verifier_address,
-            &transcript_commitment,
+            &witness.transcript_commitment,
             &roots.prior_nullifier_root,
             &roots.consumed_nullifier_root,
             &roots.new_nullifier_root,
@@ -3626,7 +3640,7 @@ async fn prepare_native_aggregation_members(
         let renewal_proof_message = renewal_proof_message_hash_for_program(
             &state.native_proof_program_address,
             &state.auction_verifier_address,
-            &transcript_commitment,
+            &witness.transcript_commitment,
             &roots.prior_renewal_root,
             &roots.renewal_child_root,
             &roots.new_renewal_root,
@@ -3640,6 +3654,7 @@ async fn prepare_native_aggregation_members(
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
         members.push(NativeAggregationPreparedMember {
             witness,
+            transcript,
             settlement_plan,
             proof_message_hashes: vec![
                 settlement_proof_message,
@@ -3647,8 +3662,73 @@ async fn prepare_native_aggregation_members(
                 renewal_proof_message,
             ],
         });
+        expected_roots = SettlementRoots {
+            note_root: roots.new_note_root,
+            nullifier_root: roots.new_nullifier_root,
+            renewal_root: roots.new_renewal_root,
+            fee_root: roots.new_fee_root,
+        };
     }
     Ok(members)
+}
+
+fn aggregate_member_for_expected_roots(
+    mut transcript: SettlementTranscript,
+    mut witness: SettlementWitness,
+    expected_roots: &SettlementRoots,
+) -> Result<
+    (
+        SettlementTranscript,
+        SettlementWitness,
+        zylith_core::RootOnlySettlementCommitments,
+    ),
+    StatusCode,
+> {
+    let roots =
+        root_only_settlement_commitments(&transcript).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let expected_note =
+        normalize_felt_hex(&expected_roots.note_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let expected_nullifier =
+        normalize_felt_hex(&expected_roots.nullifier_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let expected_renewal =
+        normalize_felt_hex(&expected_roots.renewal_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let expected_fee =
+        normalize_felt_hex(&expected_roots.fee_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if roots.prior_note_root == expected_note
+        && roots.prior_nullifier_root == expected_nullifier
+        && roots.prior_renewal_root == expected_renewal
+        && roots.prior_fee_root == expected_fee
+    {
+        return Ok((transcript, witness, roots));
+    }
+
+    if !transcript.consumed_inputs.is_empty()
+        || !transcript.renewal_child_uses.is_empty()
+        || !witness.nullifier_sparse_witnesses.is_empty()
+        || !witness.renewal_child_sparse_witnesses.is_empty()
+        || !witness.note_membership_witnesses.is_empty()
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    transcript.prior_note_root = expected_note;
+    transcript.prior_nullifier_root = expected_nullifier.clone();
+    transcript.prior_renewal_root = expected_renewal.clone();
+    transcript.prior_fee_root = expected_fee;
+    transcript.new_nullifier_root = expected_nullifier;
+    transcript.new_renewal_root = expected_renewal;
+    let rechained_roots =
+        root_only_settlement_commitments(&transcript).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let transcript_commitment =
+        settlement_transcript_commitment(&transcript).map_err(|_| StatusCode::BAD_GATEWAY)?;
+    witness.transcript_commitment = transcript_commitment;
+    witness.prior_note_root = transcript.prior_note_root.clone();
+    witness.prior_nullifier_root = transcript.prior_nullifier_root.clone();
+    witness.prior_renewal_root = transcript.prior_renewal_root.clone();
+    witness.prior_fee_root = transcript.prior_fee_root.clone();
+    witness.new_nullifier_root = transcript.new_nullifier_root.clone();
+    witness.new_renewal_root = transcript.new_renewal_root.clone();
+    Ok((transcript, witness, rechained_roots))
 }
 
 async fn build_proof_aggregation_manifest(
@@ -3656,25 +3736,34 @@ async fn build_proof_aggregation_manifest(
     start_epoch: u64,
     end_epoch: u64,
 ) -> Result<ProofAggregationManifest, StatusCode> {
-    let members = proof_aggregation_witness_members(state, start_epoch, end_epoch).await?;
+    let members = prepare_native_aggregation_members(state, start_epoch, end_epoch).await?;
+    build_proof_aggregation_manifest_from_prepared(state, start_epoch, end_epoch, &members)
+}
+
+fn build_proof_aggregation_manifest_from_prepared(
+    state: &AppState,
+    start_epoch: u64,
+    end_epoch: u64,
+    members: &[NativeAggregationPreparedMember],
+) -> Result<ProofAggregationManifest, StatusCode> {
     let pair_count = members
         .iter()
-        .map(|witness| witness.pair_id.0.clone())
+        .map(|member| member.witness.pair_id.0.clone())
         .collect::<BTreeSet<_>>()
         .len();
     let proof_artifact_commitments = members
         .iter()
-        .map(|witness| {
+        .map(|member| {
             native_settlement_message_hash(
                 &state.auction_verifier_address,
-                &witness.transcript_commitment,
+                &member.witness.transcript_commitment,
             )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
         })
         .collect::<Result<Vec<_>, StatusCode>>()?;
     let transcript_commitments = members
         .iter()
-        .map(|witness| witness.transcript_commitment.clone())
+        .map(|member| member.witness.transcript_commitment.clone())
         .collect::<Vec<_>>();
     let proof_artifact_commitment_root = zylith_core::hash::tagged_commitment_sha256(
         "zylith/proof-aggregation/artifact-root-v1",
@@ -3700,12 +3789,12 @@ async fn build_proof_aggregation_manifest(
     let binding_members = members
         .iter()
         .zip(proof_artifact_commitments.iter())
-        .map(|(witness, proof_artifact_commitment)| {
+        .map(|(member, proof_artifact_commitment)| {
             serde_json::json!({
-                "batch_id": witness.batch_id,
-                "pair_id": witness.pair_id,
-                "batch_epoch": witness.batch_epoch,
-                "transcript_commitment": witness.transcript_commitment,
+                "batch_id": member.witness.batch_id,
+                "pair_id": member.witness.pair_id,
+                "batch_epoch": member.witness.batch_epoch,
+                "transcript_commitment": member.witness.transcript_commitment,
                 "proof_artifact_commitment": proof_artifact_commitment,
                 "proof_system": "starknet-snip36",
                 "prover_backend": prover_backend_label(state.native_tx_prover_url.is_some()),
@@ -4195,12 +4284,6 @@ async fn prove_and_record_auction_result(
     batch_id: &str,
     record_onchain: bool,
 ) -> Result<Option<String>, String> {
-    let tx_prover_url = state.native_tx_prover_url.clone().ok_or_else(|| {
-        "native split auction proof requires ZYLITH_NATIVE_TX_PROVER_URL".to_string()
-    })?;
-    let executor = state.starknet_executor.clone().ok_or_else(|| {
-        "native split auction proof requires Starknet executor config".to_string()
-    })?;
     let transcript = fetch_transcript(state, batch_id)
         .await
         .map_err(|status| format!("failed to fetch transcript for auction proof: {status}"))?;
@@ -4211,6 +4294,44 @@ async fn prove_and_record_auction_result(
             .cloned()
             .ok_or_else(|| "settlement witness not prepared for auction proof".to_string())?
     };
+    prove_and_record_auction_result_with_inputs(
+        state,
+        batch_id,
+        transcript,
+        settlement_witness,
+        record_onchain,
+    )
+    .await
+}
+
+async fn prove_and_record_auction_result_for_member(
+    state: &AppState,
+    member: &NativeAggregationPreparedMember,
+    record_onchain: bool,
+) -> Result<Option<String>, String> {
+    prove_and_record_auction_result_with_inputs(
+        state,
+        &member.witness.batch_id.0,
+        member.transcript.clone(),
+        member.witness.clone(),
+        record_onchain,
+    )
+    .await
+}
+
+async fn prove_and_record_auction_result_with_inputs(
+    state: &AppState,
+    batch_id: &str,
+    transcript: SettlementTranscript,
+    settlement_witness: SettlementWitness,
+    record_onchain: bool,
+) -> Result<Option<String>, String> {
+    let tx_prover_url = state.native_tx_prover_url.clone().ok_or_else(|| {
+        "native split auction proof requires ZYLITH_NATIVE_TX_PROVER_URL".to_string()
+    })?;
+    let executor = state.starknet_executor.clone().ok_or_else(|| {
+        "native split auction proof requires Starknet executor config".to_string()
+    })?;
     let auction_order_witnesses = fetch_auction_order_witnesses(state, batch_id)
         .await
         .map_err(|status| format!("failed to fetch auction order witnesses: {status}"))?;
@@ -4560,6 +4681,26 @@ async fn prepare_private_auction_batch_inner(
         "prepare_private_auction_batch batch_id={} stage=fetch_current_roots ok prior_note_root_nonzero={}",
         batch_id, prior_note_root_nonzero
     );
+    let historical_note_consolidation_history = {
+        let note_consolidation_history = state.note_consolidation_history.read().await;
+        note_consolidation_history
+            .values()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let historical_withdrawal_nullifiers = {
+        let withdrawal_nullifiers = state.settlement_output_withdrawal_nullifiers.read().await;
+        withdrawal_nullifiers.values().cloned().collect::<Vec<_>>()
+    };
+    eprintln!(
+        "prepare_private_auction_batch batch_id={batch_id} stage=fetch_renewal_cancel_markers start"
+    );
+    let renewal_cancel_markers = fetch_indexed_renewal_cancel_markers(state).await?;
+    eprintln!(
+        "prepare_private_auction_batch batch_id={} stage=fetch_renewal_cancel_markers ok records={}",
+        batch_id,
+        renewal_cancel_markers.len()
+    );
     let historical_witnesses = {
         let settlement_witnesses = state.settlement_witnesses.read().await;
         let mut merged = indexed_history
@@ -4574,8 +4715,14 @@ async fn prepare_private_auction_batch_inner(
                 .map(|witness| (witness.batch_id.0.clone(), witness)),
         );
         let merged_witnesses = merged.into_values().collect::<Vec<_>>();
-        let confirmed_witnesses =
-            filter_root_history_witnesses_for_current_roots(state, merged_witnesses, &prior_roots)?;
+        let confirmed_witnesses = filter_root_history_witnesses_for_current_roots(
+            state,
+            merged_witnesses,
+            &prior_roots,
+            &historical_note_consolidation_history,
+            &historical_withdrawal_nullifiers,
+            &renewal_cancel_markers,
+        )?;
         if let Err(error) =
             validate_batch_nullifier_freshness(batch_id, &records, confirmed_witnesses.iter())
         {
@@ -4630,15 +4777,6 @@ async fn prepare_private_auction_batch_inner(
         "prepare_private_auction_batch batch_id={} stage=fetch_note_root_transitions ok records={}",
         batch_id,
         note_root_transitions.len()
-    );
-    eprintln!(
-        "prepare_private_auction_batch batch_id={batch_id} stage=fetch_renewal_cancel_markers start"
-    );
-    let renewal_cancel_markers = fetch_indexed_renewal_cancel_markers(state).await?;
-    eprintln!(
-        "prepare_private_auction_batch batch_id={} stage=fetch_renewal_cancel_markers ok records={}",
-        batch_id,
-        renewal_cancel_markers.len()
     );
     eprintln!("prepare_private_auction_batch batch_id={batch_id} stage=build_artifacts start");
     let artifacts = build_settlement_artifacts(
@@ -5165,19 +5303,35 @@ fn filter_root_history_witnesses_for_current_roots(
     state: &AppState,
     witnesses: Vec<SettlementWitness>,
     roots: &SettlementRoots,
+    note_consolidation_history: &[NoteConsolidationHistoryRecord],
+    settlement_output_withdrawal_nullifiers: &[ConsumedInput],
+    renewal_cancel_markers: &[String],
 ) -> Result<Vec<SettlementWitness>, StatusCode> {
     if !should_filter_root_history_against_onchain(state) {
         return Ok(witnesses);
     }
 
+    select_root_history_witnesses_for_current_roots(
+        witnesses,
+        roots,
+        note_consolidation_history,
+        settlement_output_withdrawal_nullifiers,
+        renewal_cancel_markers,
+    )
+}
+
+fn select_root_history_witnesses_for_current_roots(
+    witnesses: Vec<SettlementWitness>,
+    roots: &SettlementRoots,
+    note_consolidation_history: &[NoteConsolidationHistoryRecord],
+    settlement_output_withdrawal_nullifiers: &[ConsumedInput],
+    renewal_cancel_markers: &[String],
+) -> Result<Vec<SettlementWitness>, StatusCode> {
     let zero = normalize_felt_hex("0x0").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut cursor_nullifier =
+    let target_nullifier =
         normalize_felt_hex(&roots.nullifier_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let mut cursor_renewal =
+    let target_renewal =
         normalize_felt_hex(&roots.renewal_root).map_err(|_| StatusCode::BAD_GATEWAY)?;
-    if cursor_nullifier == zero && cursor_renewal == zero {
-        return Ok(Vec::new());
-    }
 
     let mut candidates = witnesses;
     candidates.sort_by(|left, right| {
@@ -5185,31 +5339,66 @@ fn filter_root_history_witnesses_for_current_roots(
             .cmp(&right.batch_epoch)
             .then_with(|| left.batch_id.0.cmp(&right.batch_id.0))
     });
-    let mut selected = Vec::new();
-    while cursor_nullifier != zero || cursor_renewal != zero {
-        let Some(position) = candidates.iter().rposition(|witness| {
-            normalize_felt_hex(&witness.new_nullifier_root)
-                .map(|root| root == cursor_nullifier)
-                .unwrap_or(false)
-                && normalize_felt_hex(&witness.new_renewal_root)
-                    .map(|root| root == cursor_renewal)
-                    .unwrap_or(false)
-        }) else {
-            eprintln!(
-                "filter_root_history_witnesses_for_current_roots failed missing cursor_nullifier={} cursor_renewal={}",
-                cursor_nullifier, cursor_renewal
-            );
-            return Err(StatusCode::CONFLICT);
-        };
-        let witness = candidates.remove(position);
-        cursor_nullifier =
-            normalize_felt_hex(&witness.prior_nullifier_root).map_err(|_| StatusCode::CONFLICT)?;
-        cursor_renewal =
-            normalize_felt_hex(&witness.prior_renewal_root).map_err(|_| StatusCode::CONFLICT)?;
-        selected.push(witness);
+
+    let mut maintenance_consumed_inputs = note_consolidation_history
+        .iter()
+        .flat_map(|record| record.consumed_inputs.iter().cloned())
+        .collect::<Vec<_>>();
+    maintenance_consumed_inputs.extend(settlement_output_withdrawal_nullifiers.iter().cloned());
+
+    let mut maintenance_renewal_entries = renewal_cancel_markers
+        .iter()
+        .map(|marker| normalize_felt_hex(marker).map_err(|_| StatusCode::CONFLICT))
+        .collect::<Result<Vec<_>, StatusCode>>()?;
+    maintenance_renewal_entries.sort();
+    maintenance_renewal_entries.dedup();
+
+    let mut selected_len = None;
+    for len in 0..=candidates.len() {
+        let prefix = &candidates[..len];
+        let mut consumed_inputs = prefix
+            .iter()
+            .flat_map(|witness| witness.consumed_inputs.iter().cloned())
+            .collect::<Vec<_>>();
+        consumed_inputs.extend(maintenance_consumed_inputs.iter().cloned());
+        let (_prior_nullifier_root, computed_nullifier_root, _witnesses) =
+            nullifier_sparse_update_witnesses_for_consumed_inputs(&[], &consumed_inputs)
+                .map_err(|_| StatusCode::CONFLICT)?;
+
+        let mut renewal_entries = prefix
+            .iter()
+            .flat_map(|witness| {
+                witness
+                    .renewal_child_uses
+                    .iter()
+                    .map(|renewal| renewal.child_nullifier.clone())
+            })
+            .collect::<Vec<_>>();
+        renewal_entries.extend(maintenance_renewal_entries.iter().cloned());
+        renewal_entries.sort();
+        renewal_entries.dedup();
+        let (_prior_renewal_root, computed_renewal_root, _child_witnesses, _cancel_witnesses) =
+            renewal_sparse_witnesses_for_child_uses(&renewal_entries, &[], &[])
+                .map_err(|_| StatusCode::CONFLICT)?;
+
+        if normalize_felt_hex(&computed_nullifier_root).map_err(|_| StatusCode::CONFLICT)?
+            == target_nullifier
+            && normalize_felt_hex(&computed_renewal_root).map_err(|_| StatusCode::CONFLICT)?
+                == target_renewal
+        {
+            selected_len = Some(len);
+        }
     }
-    selected.reverse();
-    Ok(selected)
+
+    if let Some(len) = selected_len {
+        return Ok(candidates.into_iter().take(len).collect());
+    }
+
+    eprintln!(
+        "filter_root_history_witnesses_for_current_roots failed missing target_nullifier={} target_renewal={} zero={}",
+        target_nullifier, target_renewal, zero
+    );
+    Err(StatusCode::CONFLICT)
 }
 
 fn should_filter_root_history_against_onchain(state: &AppState) -> bool {
@@ -9789,9 +9978,9 @@ mod tests {
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
         proof_fact_age_wait_ms, public_proof_job_status, redact_native_execution_request,
         redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
-        should_refresh_onchain_submission, storage_key, validate_batch_nullifier_freshness,
-        validate_hosted_note_proof_privacy_config, validate_native_proof_program_config,
-        validate_native_tx_prover_endpoint_config,
+        select_root_history_witnesses_for_current_roots, should_refresh_onchain_submission,
+        storage_key, validate_batch_nullifier_freshness, validate_hosted_note_proof_privacy_config,
+        validate_native_proof_program_config, validate_native_tx_prover_endpoint_config,
     };
     use axum::{
         body::Body,
@@ -9803,12 +9992,13 @@ mod tests {
         AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, HiddenMakerCurve,
         MakerCurvePoint, MatchedOrderWitness, Note, NoteCommitment, NoteMembershipKind, Nullifier,
         NullifierHistoryBatch, OrderCommitment, OrderIntent, OrderSide, OrderType,
-        OutputNoteRecord, PairId, ProductConfig, ProofJobStatus, RelayMode,
+        OutputNoteRecord, PairId, ProductConfig, ProofJobStatus, RelayMode, RenewalChildUse,
         SettlementOutputWithdrawalPlanRequest, SettlementTranscript, SettlementWitness,
         SpendAuthorization, TimeInForce, build_settlement_output_withdrawal_submission_plan,
         decrypt_output_note_for_owner, deposit_root_from_note, hash::ordered_felt_list_commitment,
         note_recognition_public_key_from_raw_key_hex, nullifier_from_note_secret,
-        nullifier_sparse_update_witnesses_for_consumed_inputs, root_only_settlement_commitments,
+        nullifier_sparse_update_witnesses_for_consumed_inputs,
+        renewal_sparse_witnesses_for_child_uses, root_only_settlement_commitments,
         settlement_nullifier_root_after_history, settlement_state_transition_root,
         withdraw_auth_key_felt_from_raw_key_hex, withdraw_authority_from_raw_key_hex,
     };
@@ -9990,6 +10180,26 @@ mod tests {
             native_prover_retry_interval_ms: 1,
             native_prover_request_timeout_seconds: 1,
         }
+    }
+
+    #[test]
+    fn proof_worker_does_not_starve_new_batches_when_onchain_submit_is_disabled() {
+        assert!(super::proof_worker_status_is_processable(
+            "witness-prepared",
+            false
+        ));
+        assert!(!super::proof_worker_status_is_processable(
+            "proof-generated",
+            false
+        ));
+        assert!(super::proof_worker_status_is_processable(
+            "proof-generated",
+            true
+        ));
+        assert!(!super::proof_worker_status_is_processable(
+            "confirmed-onchain",
+            false
+        ));
     }
 
     #[test]
@@ -11565,6 +11775,144 @@ mod tests {
     }
 
     #[test]
+    fn root_history_selection_accepts_consolidation_nullifier_transition() {
+        let settlement_input = consumed_input("0x101", "0x201");
+        let consolidation_input = consumed_input("0x102", "0x202");
+        let witness = historical_witness_with_consumed_inputs(
+            "batch-strk-usdc-0",
+            0,
+            vec![settlement_input.clone()],
+        );
+        let roots = SettlementRoots {
+            nullifier_root: nullifier_root_for_consumed_inputs(&[
+                settlement_input,
+                consolidation_input.clone(),
+            ]),
+            renewal_root: "0x0".into(),
+            note_root: "0x0".into(),
+            fee_root: "0x0".into(),
+        };
+        let consolidation_history = NoteConsolidationHistoryRecord {
+            consolidation_id: BatchId("consolidation-1".into()),
+            consumed_inputs: vec![consolidation_input],
+            output_notes: Vec::new(),
+        };
+
+        let selected = select_root_history_witnesses_for_current_roots(
+            vec![witness.clone()],
+            &roots,
+            &[consolidation_history],
+            &[],
+            &[],
+        )
+        .expect("consolidation nullifier transition is part of current root");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].batch_id, witness.batch_id);
+    }
+
+    #[test]
+    fn root_history_selection_accepts_withdrawal_nullifier_transition() {
+        let settlement_input = consumed_input("0x111", "0x211");
+        let withdrawal_input = consumed_input("0x112", "0x212");
+        let witness = historical_witness_with_consumed_inputs(
+            "batch-strk-usdc-0",
+            0,
+            vec![settlement_input.clone()],
+        );
+        let roots = SettlementRoots {
+            nullifier_root: nullifier_root_for_consumed_inputs(&[
+                settlement_input,
+                withdrawal_input.clone(),
+            ]),
+            renewal_root: "0x0".into(),
+            note_root: "0x0".into(),
+            fee_root: "0x0".into(),
+        };
+
+        let selected = select_root_history_witnesses_for_current_roots(
+            vec![witness.clone()],
+            &roots,
+            &[],
+            &[withdrawal_input],
+            &[],
+        )
+        .expect("withdrawal nullifier transition is part of current root");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].batch_id, witness.batch_id);
+    }
+
+    #[test]
+    fn root_history_selection_excludes_unconfirmed_future_witness() {
+        let confirmed_input = consumed_input("0x121", "0x221");
+        let future_input = consumed_input("0x122", "0x222");
+        let consolidation_input = consumed_input("0x123", "0x223");
+        let confirmed = historical_witness_with_consumed_inputs(
+            "batch-strk-usdc-0",
+            0,
+            vec![confirmed_input.clone()],
+        );
+        let future =
+            historical_witness_with_consumed_inputs("batch-strk-usdc-1", 1, vec![future_input]);
+        let roots = SettlementRoots {
+            nullifier_root: nullifier_root_for_consumed_inputs(&[
+                confirmed_input,
+                consolidation_input.clone(),
+            ]),
+            renewal_root: "0x0".into(),
+            note_root: "0x0".into(),
+            fee_root: "0x0".into(),
+        };
+        let consolidation_history = NoteConsolidationHistoryRecord {
+            consolidation_id: BatchId("consolidation-1".into()),
+            consumed_inputs: vec![consolidation_input],
+            output_notes: Vec::new(),
+        };
+
+        let selected = select_root_history_witnesses_for_current_roots(
+            vec![confirmed.clone(), future],
+            &roots,
+            &[consolidation_history],
+            &[],
+            &[],
+        )
+        .expect("only the settled prefix matches current roots");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].batch_id, confirmed.batch_id);
+    }
+
+    #[test]
+    fn root_history_selection_accepts_renewal_cancel_marker_transition() {
+        let mut witness =
+            historical_witness_with_consumed_inputs("batch-strk-usdc-0", 0, Vec::new());
+        witness.renewal_child_uses = vec![RenewalChildUse {
+            parent_order_commitment: "0xabc".into(),
+            child_nullifier: "0x301".into(),
+        }];
+        witness.new_renewal_root = renewal_root_for_entries(&["0x301"]);
+        let roots = SettlementRoots {
+            nullifier_root: "0x0".into(),
+            renewal_root: renewal_root_for_entries(&["0x301", "0x302"]),
+            note_root: "0x0".into(),
+            fee_root: "0x0".into(),
+        };
+
+        let selected = select_root_history_witnesses_for_current_roots(
+            vec![witness.clone()],
+            &roots,
+            &[],
+            &[],
+            &["0x302".into()],
+        )
+        .expect("renewal cancel marker is part of current root");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].batch_id, witness.batch_id);
+    }
+
+    #[test]
     fn settlement_submission_jitter_is_batch_bound_and_capped() {
         let same = deterministic_settlement_submission_jitter_ms("batch-strk-usdc-1", 1_000);
         assert_eq!(
@@ -11576,6 +11924,48 @@ mod tests {
             deterministic_settlement_submission_jitter_ms("batch-strk-usdc-1", 0),
             0
         );
+    }
+
+    fn consumed_input(note_commitment: &str, nullifier: &str) -> ConsumedInput {
+        ConsumedInput {
+            note_commitment: NoteCommitment(note_commitment.into()),
+            nullifier: Nullifier(nullifier.into()),
+        }
+    }
+
+    fn nullifier_root_for_consumed_inputs(consumed_inputs: &[ConsumedInput]) -> String {
+        let (_prior_root, root, _witnesses) =
+            nullifier_sparse_update_witnesses_for_consumed_inputs(&[], consumed_inputs)
+                .expect("nullifier root");
+        root
+    }
+
+    fn renewal_root_for_entries(entries: &[&str]) -> String {
+        let entries = entries
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect::<Vec<_>>();
+        let (_prior_root, root, _child_witnesses, _cancel_witnesses) =
+            renewal_sparse_witnesses_for_child_uses(&entries, &[], &[]).expect("renewal root");
+        root
+    }
+
+    fn historical_witness_with_consumed_inputs(
+        batch_id: &str,
+        batch_epoch: u64,
+        consumed_inputs: Vec<ConsumedInput>,
+    ) -> SettlementWitness {
+        let mut witness = historical_witness_with_nullifier(
+            batch_id,
+            consumed_inputs
+                .first()
+                .map(|input| input.nullifier.clone())
+                .unwrap_or_else(|| Nullifier("0x1".into())),
+        );
+        witness.batch_epoch = batch_epoch;
+        witness.consumed_inputs = consumed_inputs;
+        witness.new_nullifier_root = nullifier_root_for_consumed_inputs(&witness.consumed_inputs);
+        witness
     }
 
     fn historical_witness_with_nullifier(

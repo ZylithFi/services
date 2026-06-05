@@ -1412,6 +1412,15 @@ pub fn build_withdrawal_submission_plan(
     ))
 }
 
+fn encode_output_root_id(batch_id: &BatchId) -> String {
+    let domain = if batch_id.0.starts_with("consolidation-") {
+        "note-consolidation-id"
+    } else {
+        "batch-id"
+    };
+    encode_starknet_felt(domain, &batch_id.0)
+}
+
 pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
     witness: &SettlementOutputWithdrawalWitness,
     verifier_address: &str,
@@ -1427,7 +1436,7 @@ pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
     let withdrawal_commitment = settlement_output_withdrawal_commitment(witness)?;
     let normalized_proof_artifact_commitment = normalize_felt_hex(proof_artifact_commitment)?;
     let encoded_args = SettlementOutputWithdrawalCallArguments {
-        batch_id: encode_starknet_felt("batch-id", &witness.batch_id.0),
+        batch_id: encode_output_root_id(&witness.batch_id),
         proof_artifact_commitment: normalized_proof_artifact_commitment.clone(),
         prior_nullifier_root: normalize_felt_hex(&witness.prior_nullifier_root)?,
         consumed_nullifier_root: roots.consumed_nullifier_root,
@@ -1476,7 +1485,7 @@ pub fn build_settlement_output_withdrawal_submission_plan(
         normalize_felt_hex(request.shielded_asset_adapter_address)?;
     let chain_id = normalize_felt_hex(request.chain_id)?;
     let recipient = normalize_felt_hex(request.recipient)?;
-    let encoded_batch_id = encode_starknet_felt("batch-id", &request.batch_id.0);
+    let encoded_batch_id = encode_output_root_id(request.batch_id);
     let encoded_asset_id = encode_asset_id(&request.output_note.asset_id.0);
     let encoded_amount = encode_u128(request.output_note.amount);
     let authorization = sign_settlement_output_withdrawal_authorization(
@@ -2442,6 +2451,11 @@ fn note_consolidation_root_fields(
                 "note consolidation output amount must be non-zero".into(),
             ));
         }
+        if note.nonce == 0 {
+            return Err(ProtocolError::Crypto(
+                "note consolidation output nonce must be non-zero".into(),
+            ));
+        }
         if note.commitment()? != record.note_commitment {
             return Err(ProtocolError::Crypto(
                 "note consolidation output note preimage does not match output commitment".into(),
@@ -2522,6 +2536,11 @@ fn settlement_output_withdrawal_root_fields(
     {
         return Err(ProtocolError::Crypto(
             "settlement output withdrawal note preimage does not match output record".into(),
+        ));
+    }
+    if witness.output_note_preimage.nonce == 0 {
+        return Err(ProtocolError::Crypto(
+            "settlement output withdrawal note nonce must be non-zero".into(),
         ));
     }
     let nullifier =
@@ -2679,7 +2698,7 @@ pub fn settlement_output_withdrawal_commitment_from_roots(
 ) -> Result<String, ProtocolError> {
     let mut state = poseidon_hash(
         felt_from_hex_str(PUBLIC_NOTE_WITHDRAWAL_DOMAIN_HEX)?,
-        felt_from_hex_str(&encode_starknet_felt("batch-id", &batch_id.0))?,
+        felt_from_hex_str(&encode_output_root_id(batch_id))?,
     );
     state = poseidon_hash(
         state,
@@ -2730,7 +2749,7 @@ pub fn sign_settlement_output_withdrawal_witness(
     let shielded_asset_adapter_address =
         normalize_felt_hex(&witness.shielded_asset_adapter_address)?;
     let chain_id = normalize_felt_hex(&witness.chain_id)?;
-    let batch_id = encode_starknet_felt("batch-id", &witness.batch_id.0);
+    let batch_id = encode_output_root_id(&witness.batch_id);
     let asset_id = encode_asset_id(&witness.output_note.asset_id.0);
     let amount = encode_u128(witness.output_note.amount);
     let recipient = normalize_felt_hex(&witness.recipient)?;
@@ -5912,7 +5931,7 @@ pub fn build_settlement_output_withdrawal_serialized_input(
         domain_felt_hex("zylith/note"),
         domain_felt_hex("zylith/nullifier"),
         normalize_felt_hex(PUBLIC_NOTE_WITHDRAWAL_DOMAIN_HEX)?,
-        encode_starknet_felt("batch-id", &witness.batch_id.0),
+        encode_output_root_id(&witness.batch_id),
         normalize_felt_hex(&withdrawal_commitment)?,
         normalize_felt_hex(&witness.output_note.note_commitment.0)?,
         encode_asset_id(&witness.output_note.asset_id.0),
@@ -7092,10 +7111,11 @@ mod tests {
         decrypt_maker_attribution_artifact, decrypt_note_for_owner, decrypt_order_bundle,
         decrypt_order_share, decrypt_output_recovery_record, decrypt_recovery_artifact_payload,
         deposit_root_from_note, derive_account_id, derive_order_cancellation_secret,
-        derive_order_cancellation_tag, derive_user_keys, encrypt_note_for_owner,
-        encrypt_output_recovery_record, encrypted_note_activation_commitment,
-        funding_commitment_for_deposit, native_note_consolidation_message_hash,
-        note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
+        derive_order_cancellation_tag, derive_user_keys, encode_output_root_id,
+        encrypt_note_for_owner, encrypt_output_recovery_record,
+        encrypted_note_activation_commitment, funding_commitment_for_deposit,
+        native_note_consolidation_message_hash, note_consolidation_commitment,
+        note_recognition_public_key_from_raw_key_hex,
         nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
         output_note_merkle_root, private_execution_key_registry_fingerprint,
         proof_artifact_commitment, reconstruct_order_from_shares, renewal_child_nullifier,
@@ -7946,6 +7966,93 @@ mod tests {
         assert_eq!(plan.encoded_args.prior_nullifier_root, prior_nullifier_root);
         assert_eq!(plan.encoded_args.new_nullifier_root, new_nullifier_root);
         assert_eq!(plan.encoded_args.proof_artifact_commitment, "0x999");
+    }
+
+    #[test]
+    fn settlement_output_withdrawal_rejects_zero_nonce_note() {
+        let withdraw_key = "11".repeat(32);
+        let withdraw_auth_key_felt = crate::withdraw_auth_key_felt_from_raw_key_hex(&withdraw_key);
+        let withdraw_authority =
+            crate::withdraw_authority_from_raw_key_hex(&withdraw_key).expect("withdraw authority");
+        let output_note_preimage = Note {
+            asset_id: AssetId("USDC".into()),
+            amount: 200,
+            owner_public_key: "ab".repeat(32),
+            spend_authority: sample_spend_authority(),
+            withdraw_authority: withdraw_authority.clone(),
+            blinding: "0x777".into(),
+            nonce: 0,
+            metadata_commitment: "0x888".into(),
+        };
+        let output_note = OutputNoteRecord {
+            note_commitment: output_note_preimage
+                .commitment()
+                .expect("output commitment"),
+            asset_id: AssetId("USDC".into()),
+            amount: 200,
+            withdraw_authority,
+        };
+        let proof = output_note_merkle_proof(
+            std::slice::from_ref(&output_note),
+            &output_note.note_commitment,
+        )
+        .expect("output proof");
+        let consumed_input = ConsumedInput {
+            note_commitment: output_note.note_commitment.clone(),
+            nullifier: nullifier_from_note_secret(
+                &output_note.note_commitment,
+                &output_note_preimage.blinding,
+            )
+            .expect("output nullifier"),
+        };
+        let (prior_nullifier_root, new_nullifier_root, mut sparse_witnesses) =
+            nullifier_sparse_update_witnesses_for_consumed_inputs(&[], &[consumed_input])
+                .expect("sparse witness");
+
+        let error = build_settlement_output_withdrawal_submission_plan(
+            SettlementOutputWithdrawalPlanRequest {
+                batch_id: &BatchId("batch-strk-usdc-zero-nonce".into()),
+                output_note: &output_note,
+                output_note_preimage: &output_note_preimage,
+                output_proof: &proof,
+                prior_nullifier_root: &prior_nullifier_root,
+                nullifier_history: &[],
+                nullifier_sparse_witness: Some(
+                    &sparse_witnesses.pop().expect("one sparse witness"),
+                ),
+                new_nullifier_root: &new_nullifier_root,
+                proof_artifact_commitment: "0x999",
+                withdraw_auth_key_felt: &withdraw_auth_key_felt,
+                recipient: "0x444",
+                auction_verifier_address: "0x123",
+                shielded_asset_adapter_address: "0x456",
+                chain_id: "0x534e5f5345504f4c4941",
+            },
+        )
+        .expect_err("zero nonce withdrawal rejected");
+
+        assert!(
+            matches!(error, ProtocolError::Crypto(message) if message.contains("nonce must be non-zero"))
+        );
+    }
+
+    #[test]
+    fn settlement_output_withdrawal_uses_consolidation_root_id_domain() {
+        let settlement_batch = BatchId("batch-strk-usdc-7".into());
+        let consolidation_batch = BatchId("consolidation-test-7".into());
+
+        assert_eq!(
+            encode_output_root_id(&settlement_batch),
+            encode_starknet_felt("batch-id", &settlement_batch.0)
+        );
+        assert_eq!(
+            encode_output_root_id(&consolidation_batch),
+            encode_starknet_felt("note-consolidation-id", &consolidation_batch.0)
+        );
+        assert_ne!(
+            encode_output_root_id(&consolidation_batch),
+            encode_starknet_felt("batch-id", &consolidation_batch.0)
+        );
     }
 
     #[test]
@@ -9264,6 +9371,22 @@ mod tests {
             build_note_consolidation_serialized_input(&witness).expect_err("inflation rejected");
         assert!(
             matches!(error, ProtocolError::Crypto(message) if message.contains("totals must match"))
+        );
+    }
+
+    #[test]
+    fn note_consolidation_rejects_zero_nonce_output() {
+        let mut witness = sample_note_consolidation_witness();
+        witness.output_note_preimages[0].nonce = 0;
+        witness.output_notes[0].note_commitment = witness.output_note_preimages[0]
+            .commitment()
+            .expect("updated output commitment");
+
+        let error =
+            build_note_consolidation_serialized_input(&witness).expect_err("zero nonce rejected");
+
+        assert!(
+            matches!(error, ProtocolError::Crypto(message) if message.contains("nonce must be non-zero"))
         );
     }
 

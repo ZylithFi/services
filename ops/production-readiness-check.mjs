@@ -180,14 +180,26 @@ function checkFeeKey(name, defaultValue) {
   }
 }
 
+function anyTrue(names) {
+  return names.some((name) => (value(name) || "").toLowerCase() === "true");
+}
+
+function expectAnyTrue(names, message) {
+  if (anyTrue(names)) return;
+  failures.push(`${names.join(" or ")} must be true: ${message}`);
+}
+
 function checkHostedConsolidationDisclosure() {
   const hosted =
     (value("ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION") || "").toLowerCase() === "true" ||
     (value("VITE_ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION") || "").toLowerCase() === "true";
   if (!hosted) return;
-  expectValue(
-    "ZYLITH_ACK_HOSTED_NOTE_CONSOLIDATION_PRIVACY_SINK",
-    "true",
+  expectAnyTrue(
+    [
+      "ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
+      "VITE_ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
+      "ZYLITH_ACK_HOSTED_NOTE_CONSOLIDATION_PRIVACY_SINK",
+    ],
     "hosted consolidation receives note preimages and requires explicit operator acknowledgement",
   );
 }
@@ -197,9 +209,12 @@ function checkHostedWithdrawalDisclosure() {
     (value("ZYLITH_ENABLE_HOSTED_WITHDRAWALS") || "").toLowerCase() === "true" ||
     (value("VITE_ZYLITH_ENABLE_HOSTED_WITHDRAWALS") || "").toLowerCase() === "true";
   if (!hosted) return;
-  expectValue(
-    "ZYLITH_ACK_HOSTED_WITHDRAWAL_PRIVACY_SINK",
-    "true",
+  expectAnyTrue(
+    [
+      "ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
+      "VITE_ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
+      "ZYLITH_ACK_HOSTED_WITHDRAWAL_PRIVACY_SINK",
+    ],
     "hosted withdrawals receive output-note preimages and require explicit operator acknowledgement",
   );
 }
