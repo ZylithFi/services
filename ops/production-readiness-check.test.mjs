@@ -76,6 +76,14 @@ test("production readiness rejects missing audited ERC20 allowlist acknowledgeme
   assert.match(result.stderr, /ZYLITH_AUDITED_ERC20_ALLOWLIST_ACK/);
 });
 
+test("production readiness rejects missing prover strict mode", () => {
+  const { env } = fixtureEnv();
+  delete env.ZYLITH_PROVER_STRICT;
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_PROVER_STRICT/);
+});
+
 test("production readiness rejects unlocked proof or operational config manifests", () => {
   const { env, manifest } = fixtureEnv({
     proofOverrides: {
@@ -188,6 +196,7 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     ZYLITH_TRUSTED_INGRESS_RECEIPT_PREVIOUS_SECRETS: "b".repeat(32),
     ZYLITH_HEARTBEAT_COVER_SECRET: "c".repeat(32),
     ZYLITH_REQUIRE_TRUSTED_ORDER_INGRESS: "true",
+    ZYLITH_PROVER_STRICT: "true",
     ZYLITH_REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION: "true",
     ZYLITH_AUDITED_ERC20_ALLOWLIST_ACK: "true",
     ZYLITH_COORDINATOR_ALLOWED_ORIGINS: "https://app.zylith.fi",

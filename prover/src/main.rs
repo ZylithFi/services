@@ -856,6 +856,11 @@ fn build_app() -> Result<Router, String> {
     let data_dir = env::var("ZYLITH_PROVER_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROVER_DATA_DIR));
+    let data_dir = scoped_prover_data_dir(
+        data_dir,
+        &auction_verifier_address,
+        prover_production_mode(),
+    )?;
     let order_ingress_id =
         env::var(ORDER_INGRESS_ID_ENV).unwrap_or_else(|_| "zylith-prover-ingress".into());
     let order_ingress_receipt_secret = env::var(ORDER_INGRESS_RECEIPT_SECRET_ENV)
@@ -1177,6 +1182,24 @@ fn allowed_origins_from_env(env_name: &str) -> Option<Vec<HeaderValue>> {
     } else {
         Some(origins)
     }
+}
+
+fn scoped_prover_data_dir(
+    base_dir: PathBuf,
+    auction_verifier_address: &str,
+    production_scoped: bool,
+) -> Result<PathBuf, String> {
+    if !production_scoped {
+        return Ok(base_dir);
+    }
+    let scope = storage_key(
+        &normalize_felt_hex(auction_verifier_address)
+            .map_err(|_| "auction verifier address must be a felt for prover data scoping")?,
+    );
+    if base_dir.file_name().and_then(|name| name.to_str()) == Some(scope.as_str()) {
+        return Ok(base_dir);
+    }
+    Ok(base_dir.join("deployments").join(scope))
 }
 
 fn require_internal_auth(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
@@ -1827,8 +1850,17 @@ async fn prepare_note_consolidation(
         &note_root_transitions,
         &historical_settlement_witnesses,
         &prior_note_consolidation_history,
-    )?;
+    )
+    .map_err(|status| {
+        eprintln!("prepare_note_consolidation rejected stage=note_membership status={status}");
+        status
+    })?;
     if note_membership_witnesses.len() != consumed_inputs.len() {
+        eprintln!(
+            "prepare_note_consolidation rejected stage=note_membership_count consumed={} witnesses={}",
+            consumed_inputs.len(),
+            note_membership_witnesses.len()
+        );
         return Err(StatusCode::CONFLICT);
     }
     let prior_consumed_inputs = historical_consumed_inputs(
@@ -1841,10 +1873,14 @@ async fn prepare_note_consolidation(
             &prior_consumed_inputs,
             &consumed_inputs,
         )
-        .map_err(|_| StatusCode::CONFLICT)?;
+        .map_err(|error| {
+            eprintln!("prepare_note_consolidation rejected stage=nullifier_sparse error={error}");
+            StatusCode::CONFLICT
+        })?;
     if computed_prior_nullifier_root
         != normalize_felt_hex(&prior_roots.nullifier_root).map_err(|_| StatusCode::BAD_GATEWAY)?
     {
+        eprintln!("prepare_note_consolidation rejected stage=prior_nullifier_root");
         return Err(StatusCode::CONFLICT);
     }
 
@@ -1868,7 +1904,10 @@ async fn prepare_note_consolidation(
         output_ciphertext_bundle_ref: request.output_ciphertext_bundle_ref,
         new_nullifier_root,
     };
-    build_note_consolidation_serialized_input(&witness).map_err(|_| StatusCode::CONFLICT)?;
+    build_note_consolidation_serialized_input(&witness).map_err(|error| {
+        eprintln!("prepare_note_consolidation rejected stage=serialize error={error}");
+        StatusCode::CONFLICT
+    })?;
     Ok(Json(NoteConsolidationPrepareResponse { witness }))
 }
 
@@ -10280,6 +10319,32 @@ mod tests {
             "batch_2f_strk_20_usdc_3a_1"
         );
         assert_eq!(storage_key("batch-strk-usdc-1"), "batch-strk-usdc-1");
+    }
+
+    #[test]
+    fn production_prover_data_dir_is_scoped_by_verifier() {
+        let scoped = super::scoped_prover_data_dir(
+            PathBuf::from("/opt/zylith/state/prover"),
+            "0x043187860068c987357c912682cbea15f6d299a8633c238bc79c110b17480522",
+            true,
+        )
+        .expect("scoped data dir");
+        assert_eq!(
+            scoped,
+            PathBuf::from(
+                "/opt/zylith/state/prover/deployments/0x43187860068c987357c912682cbea15f6d299a8633c238bc79c110b17480522"
+            )
+        );
+        let already_scoped = super::scoped_prover_data_dir(
+            scoped.clone(),
+            "0x43187860068c987357c912682cbea15f6d299a8633c238bc79c110b17480522",
+            true,
+        )
+        .expect("already scoped data dir");
+        assert_eq!(already_scoped, scoped);
+        let dev = super::scoped_prover_data_dir(PathBuf::from("prover/data.dev"), "0x123", false)
+            .expect("dev data dir");
+        assert_eq!(dev, PathBuf::from("prover/data.dev"));
     }
 
     #[tokio::test]

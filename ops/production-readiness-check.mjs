@@ -19,6 +19,8 @@ expectNot("ZYLITH_COORDINATOR_EMERGENCY_PAUSED", "true", "coordinator is current
 expectNot("ZYLITH_PROVER_EMERGENCY_PAUSED", "true", "prover is currently paused");
 
 checkBoolDefault("ZYLITH_REQUIRE_TRUSTED_ORDER_INGRESS", true);
+checkRequired("ZYLITH_PROVER_STRICT");
+expectValue("ZYLITH_PROVER_STRICT", "true", "prover strict mode must be enabled in production");
 expectValue("ZYLITH_REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION", "true", "artifact publication must verify on-chain output root and transcript commitment");
 expectValue(
   "ZYLITH_AUDITED_ERC20_ALLOWLIST_ACK",
