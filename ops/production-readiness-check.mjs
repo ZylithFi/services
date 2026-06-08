@@ -69,6 +69,7 @@ checkRequired("ZYLITH_NATIVE_PROOF_PROGRAM_HASH");
 checkRequired("ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS");
 checkNativeProofAccountSigner();
 checkRequired("ZYLITH_NATIVE_TX_PROVER_URL");
+checkNativeProverOhttpPolicy();
 checkRequired("ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS");
 checkRequired("ZYLITH_NATIVE_RENEWAL_STATEMENT_PROGRAM_ADDRESS");
@@ -201,6 +202,13 @@ function checkNativeProofAccountSigner() {
   const submitAccount = normalizeFelt(value("ZYLITH_STARKNET_ACCOUNT_ADDRESS"));
   if (!proofAccount || !submitAccount || proofAccount === submitAccount) return;
   checkPrivateKeyHex("ZYLITH_NATIVE_PROOF_PRIVATE_KEY");
+}
+
+function checkNativeProverOhttpPolicy() {
+  const enabled = (value("ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED") || "true").toLowerCase();
+  if (["0", "false", "no"].includes(enabled)) {
+    failures.push("ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED must not be disabled in production");
+  }
 }
 
 function anyTrue(names) {

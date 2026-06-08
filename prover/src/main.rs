@@ -226,7 +226,6 @@ const MAX_MAKER_CURVE_BASE_AMOUNT_ENV: &str = "ZYLITH_MAX_MAKER_CURVE_BASE_AMOUN
 const MAX_MAKER_CURVE_QUOTE_NOTIONAL_ENV: &str = "ZYLITH_MAX_MAKER_CURVE_QUOTE_NOTIONAL";
 const SETTLEMENT_SUBMISSION_JITTER_MS_ENV: &str = "ZYLITH_SETTLEMENT_SUBMISSION_JITTER_MS";
 const NATIVE_TX_PROVER_OHTTP_ENABLED_ENV: &str = "ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED";
-const NATIVE_TX_PROVER_OHTTP_RELAY_URL_ENV: &str = "ZYLITH_NATIVE_TX_PROVER_OHTTP_RELAY_URL";
 const NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX_ENV: &str =
     "ZYLITH_NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX";
 const ACK_EXTERNAL_NATIVE_TX_PROVER_ENV: &str = "ZYLITH_ACK_EXTERNAL_NATIVE_TX_PROVER";
@@ -572,7 +571,6 @@ struct NativeProverError {
 
 #[derive(Clone, Debug)]
 struct NativeProverOhttpConfig {
-    relay_url: Option<String>,
     pinned_key_config: Option<Vec<u8>>,
 }
 
@@ -2878,18 +2876,11 @@ fn load_native_prover_ohttp_config() -> Result<Option<NativeProverOhttpConfig>, 
     if !env_bool_or_default(NATIVE_TX_PROVER_OHTTP_ENABLED_ENV, true) {
         return Ok(None);
     }
-    let relay_url = env::var(NATIVE_TX_PROVER_OHTTP_RELAY_URL_ENV)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
     let pinned_key_config = env::var(NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX_ENV)
         .ok()
         .map(|value| parse_ohttp_key_config_hex(&value))
         .transpose()?;
-    Ok(Some(NativeProverOhttpConfig {
-        relay_url,
-        pinned_key_config,
-    }))
+    Ok(Some(NativeProverOhttpConfig { pinned_key_config }))
 }
 
 fn parse_ohttp_key_config_hex(value: &str) -> Result<Vec<u8>, String> {
@@ -6412,10 +6403,9 @@ async fn request_native_proof_ohttp(
                 ohttp_client.encapsulate(&bhttp_request).map_err(|error| {
                     format!("native transaction prover OHTTP encapsulation failed: {error}")
                 })?;
-            let target_url = ohttp_config.relay_url.as_deref().unwrap_or(tx_prover_url);
             let response = state
                 .http_client
-                .post(target_url)
+                .post(tx_prover_url)
                 .header("content-type", "message/ohttp-req")
                 .body(encrypted_request)
                 .send()

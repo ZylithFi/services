@@ -84,6 +84,14 @@ test("production readiness rejects missing prover strict mode", () => {
   assert.match(result.stderr, /ZYLITH_PROVER_STRICT/);
 });
 
+test("production readiness rejects disabled native prover OHTTP", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED = "false";
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED/);
+});
+
 test("production readiness rejects unlocked proof or operational config manifests", () => {
   const { env, manifest } = fixtureEnv({
     proofOverrides: {
@@ -228,6 +236,7 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     ZYLITH_NATIVE_PROOF_PROGRAM_HASH: "0x102",
     ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS: "0x205",
     ZYLITH_NATIVE_TX_PROVER_URL: "https://prover.zylith.fi",
+    ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED: "true",
     ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS: "0x104",
     ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS: "0x105",
     ZYLITH_NATIVE_RENEWAL_STATEMENT_PROGRAM_ADDRESS: "0x106",
