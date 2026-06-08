@@ -1,18 +1,26 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_STATE_PATH = ".deploy/offline-renewal-operator.state.json";
 
-const args = parseArgs(process.argv.slice(2));
-const renewalPackage = JSON.parse(await readFile(args.packagePath, "utf8"));
-validatePackage(renewalPackage);
-const state = await readState(args.statePath);
-const results = await relayPackageOnce(renewalPackage, state, args);
-await mkdir(dirname(args.statePath), { recursive: true });
-await writeFile(args.statePath, JSON.stringify(state, null, 2));
-console.log(JSON.stringify({ package_id: renewalPackage.package_id, results }, null, 2));
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const renewalPackage = JSON.parse(await readFile(args.packagePath, "utf8"));
+  validatePackage(renewalPackage);
+  const state = await readState(args.statePath);
+  const results = await relayPackageOnce(renewalPackage, state, args);
+  await mkdir(dirname(args.statePath), { recursive: true });
+  await writeFile(args.statePath, JSON.stringify(state, null, 2));
+  console.log(JSON.stringify({ package_id: renewalPackage.package_id, results }, null, 2));
+}
 
 function parseArgs(argv) {
   let packagePath = "";
@@ -140,7 +148,7 @@ async function readState(path) {
   }
 }
 
-function validatePackage(renewalPackage) {
+export function validatePackage(renewalPackage) {
   if (renewalPackage.version !== 1) throw new Error("unsupported package version");
   if (!Array.isArray(renewalPackage.slots)) throw new Error("package slots must be an array");
   if (renewalPackage.slot_count !== renewalPackage.slots.length) {
@@ -158,6 +166,32 @@ function validatePackage(renewalPackage) {
     if (commitments.has(slot.order_commitment)) throw new Error("duplicate slot order commitment");
     commitments.add(slot.order_commitment);
   }
+  const expectedCommitment = renewalPackageCommitment(renewalPackage);
+  if (String(renewalPackage.package_commitment ?? "").toLowerCase() !== expectedCommitment) {
+    throw new Error("package commitment does not match package body");
+  }
+}
+
+export function renewalPackageCommitment(renewalPackage) {
+  const value = JSON.parse(JSON.stringify(renewalPackage));
+  delete value.package_commitment;
+  delete value.relay_authorization;
+  return `0x${createHash("sha256").update(stableJsonString(value)).digest("hex")}`;
+}
+
+function stableJsonString(value) {
+  if (value === null) return "null";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") return String(value);
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJsonString).join(",")}]`;
+  if (typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonString(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error(`unsupported package commitment value: ${typeof value}`);
 }
 
 function sampleRelayDelayMs(batch, renewalPackage) {

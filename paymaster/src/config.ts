@@ -16,6 +16,7 @@ export type PaymasterConfig = {
   allowedOriginPatterns: RegExp[];
   signerLimitPerMinute: number;
   trustProxyHeaders: boolean;
+  trustedProxyCidrs: string[];
   submissionLogPath: string | null;
 };
 
@@ -42,6 +43,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
   const withdrawalAmountBuckets = parseAmountBucketSet(env.ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS);
   const allowDirectWithdrawalRelays = parseBool(env.ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS, false);
   const allowedOriginRules = parseOriginRules(env.ZYLITH_PAYMASTER_ALLOWED_ORIGINS);
+  const trustProxyHeaders = parseBool(env.ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS, false);
+  const trustedProxyCidrs = parseCsv(
+    env.ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS ?? env.ZYLITH_TRUSTED_PROXY_CIDRS
+  );
 
   if (allowedContracts.size === 0) {
     throw new Error(
@@ -59,6 +64,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
   ) {
     throw new Error(
       "ZYLITH_PAYMASTER_ACK_DIRECT_WITHDRAWAL_SPONSORSHIP_RISK=true is required when ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS=true"
+    );
+  }
+  if (trustProxyHeaders && trustedProxyCidrs.length === 0) {
+    throw new Error(
+      "ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS or ZYLITH_TRUSTED_PROXY_CIDRS is required when ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS=true"
     );
   }
 
@@ -87,7 +97,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_SIGNER_LIMIT_PER_MINUTE,
       "ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE"
     ),
-    trustProxyHeaders: parseBool(env.ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS, false),
+    trustProxyHeaders,
+    trustedProxyCidrs,
     submissionLogPath: env.ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH?.trim() || "state/submissions.json"
   };
 }
@@ -185,6 +196,13 @@ function parseOriginRules(value: string | undefined): { exact: Set<string>; patt
     }
   }
   return { exact, patterns };
+}
+
+function parseCsv(value: string | undefined): string[] {
+  return (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function wildcardOriginPattern(value: string): RegExp {

@@ -556,7 +556,7 @@ test("FV-009/FV-010 route inventory keeps public and internal data boundaries cl
   assert(source.includes("internal_routes_require_control_plane_bearer_token"));
   assert(source.includes("strict_ops_endpoints_require_internal_token"));
   assert(source.includes("public_proof_job_status_never_exposes_exact_reuse_state_or_count"));
-  assert(source.includes("DEP-001 Zylith funding bridge and adapter do not expose raw public deposit metadata"));
+  assert(source.includes("DEP-001 Zylith funding bridge activation is custody-bound and does not expose note secrets"));
 });
 
 test("ROUTE-001 public route schema denylist rejects private response types", () => {
@@ -699,7 +699,7 @@ test("LOAD-002 trusted proxy model rejects spoofed forwarded-for subjects", () =
   assert.equal(rateLimitSubject({ peer: "203.0.113.4", forwardedFor: "10.0.0.9", trustedCidrs: ["198.51.100.0/24"] }), "203.0.113.4");
 });
 
-test("DEP-001 Zylith funding bridge and adapter do not expose raw public deposit metadata", () => {
+test("DEP-001 Zylith funding bridge activation is custody-bound and does not expose note secrets", () => {
   const bridge = readSource("contracts/src/privacy_deposit_bridge.cairo");
   const adapter = readSource("contracts/src/shielded_asset_adapter.cairo");
   const auctionVerifier = readSource("contracts/src/auction_verifier.cairo");
@@ -711,14 +711,14 @@ test("DEP-001 Zylith funding bridge and adapter do not expose raw public deposit
   assert(privacyInvokeParams.length >= 1, "privacy_invoke signatures must be scanned");
   for (const params of privacyInvokeParams) {
     assert.doesNotMatch(params, /\bdeposit_nonce\b/);
-    assert.doesNotMatch(params, /\basset_id\b/);
-    assert.doesNotMatch(params, /\bamount\b/);
-    assert.doesNotMatch(params, /\bnote_commitment\b/);
-    assert.doesNotMatch(params, /\bwithdraw_authority\b/);
     assert.doesNotMatch(params, /\btoken_address\b/);
     assert.match(params, /\bfunding_commitments\b/);
     assert.match(params, /\bdeposit_roots\b/);
     assert.match(params, /\bencrypted_note_activations\b/);
+    assert.match(params, /\bnote_commitments\b/);
+    assert.match(params, /\basset_ids\b/);
+    assert.match(params, /\bamounts\b/);
+    assert.match(params, /\bwithdraw_authorities\b/);
   }
   assert.match(bridge, /get_caller_address\(\) == self\.privacy_pool\.read\(\)/);
   assert.doesNotMatch(bridge, /\bIPrivacyFundingVerifier\b/);
@@ -736,9 +736,12 @@ test("DEP-001 Zylith funding bridge and adapter do not expose raw public deposit
   );
   assert.match(
     bridge,
-    /register_funding_activation_internal\([\s\S]*funding_commitments[\s\S]*deposit_roots[\s\S]*encrypted_note_activations[\s\S]*\);[\s\S]*open_note_deposits\.span\(\)/,
+    /register_funding_activation_internal\([\s\S]*funding_commitments[\s\S]*deposit_roots[\s\S]*encrypted_note_activations[\s\S]*note_commitments[\s\S]*asset_ids[\s\S]*amounts[\s\S]*withdraw_authorities[\s\S]*\);[\s\S]*open_note_deposits\.span\(\)/,
     "funding activation must still return no open deposits",
   );
+  assert.match(bridge, /DEPOSIT_ROOT_MISMATCH/);
+  assert.match(bridge, /TOKEN_CUSTODY_LOW/);
+  assert.match(bridge, /escrowed_asset_amounts/);
 
   for (const removed of [
     "register_erc20_deposit",
@@ -763,10 +766,10 @@ test("DEP-001 Zylith funding bridge and adapter do not expose raw public deposit
   assert.match(depositCallArguments, /\bfunding_commitments\b/);
   assert.match(depositCallArguments, /\bdeposit_roots\b/);
   assert.match(depositCallArguments, /\bencrypted_note_activations\b/);
-  assert.doesNotMatch(depositCallArguments, /\basset_id\b/);
-  assert.doesNotMatch(depositCallArguments, /\bamount\b/);
-  assert.doesNotMatch(depositCallArguments, /\bnote_commitment\b/);
-  assert.doesNotMatch(depositCallArguments, /\bwithdraw_authority\b/);
+  assert.match(depositCallArguments, /\basset_ids\b/);
+  assert.match(depositCallArguments, /\bamounts\b/);
+  assert.match(depositCallArguments, /\bnote_commitments\b/);
+  assert.match(depositCallArguments, /\bwithdraw_authorities\b/);
   assert.doesNotMatch(depositCallArguments, /\btoken_address\b/);
 
   assert.match(indexer, /DepositActivationRecordList/);

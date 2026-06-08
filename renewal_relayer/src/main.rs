@@ -1840,7 +1840,7 @@ async fn parent_cancel_marker_recorded(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Ok(false);
+        return Err("renewal package cancellation marker is missing".into());
     };
     let coordinator_urls = package_coordinator_urls(&state.config, package)?;
     let path = format!("/api/renewal/cancel-markers/{marker}");
@@ -5257,7 +5257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_due_slot_submits_reused_funding_while_prior_batch_is_pending() {
+    async fn process_due_slot_waits_on_reused_funding_while_prior_batch_is_pending() {
         let (coordinator_url, coordinator_shutdown) =
             spawn_mock_coordinator_for_batch("STRK-USDC-43", 43).await;
         let mut statuses = BTreeMap::new();
@@ -5298,6 +5298,19 @@ mod tests {
         assert_eq!(results[0].slot_id, "pkg-1:2");
         let _ = coordinator_shutdown.send(());
         let _ = prover_shutdown.send(());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn runtime_cancel_marker_guard_fails_closed_when_marker_is_missing() {
+        let path = temp_store_path("missing-cancel-marker-runtime");
+        let state = test_state(path.clone());
+        let mut package = test_package("http://coordinator".into(), "http://prover".into());
+        package.parent_cancel_marker = None;
+        let error = parent_cancel_marker_recorded(&state, &package)
+            .await
+            .expect_err("missing marker fails closed");
+        assert!(error.contains("cancellation marker is missing"));
         let _ = std::fs::remove_file(path);
     }
 

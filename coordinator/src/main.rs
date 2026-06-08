@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     env, fs,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -1735,7 +1735,7 @@ async fn list_recovery_artifacts(
         }
         account.artifacts.clone()
     } else {
-        Vec::new()
+        return Err(StatusCode::UNAUTHORIZED);
     };
 
     Ok(Json(RecoveryArtifactList {
@@ -1788,7 +1788,7 @@ async fn list_recovery_artifacts_range(
             .cloned()
             .collect::<Vec<_>>()
     } else {
-        Vec::new()
+        return Err(StatusCode::UNAUTHORIZED);
     };
 
     Ok(Json(RecoveryArtifactList {
@@ -1819,11 +1819,11 @@ async fn query_private_settlement_report(
         let recovery_artifacts = state.recovery_artifacts.read().await;
         let account = recovery_artifacts
             .get(&account_id)
-            .ok_or(StatusCode::NOT_FOUND)?;
+            .ok_or(StatusCode::UNAUTHORIZED)?;
         let expected = account
             .recovery_auth_tag
             .as_ref()
-            .ok_or(StatusCode::NOT_FOUND)?;
+            .ok_or(StatusCode::UNAUTHORIZED)?;
         if !zylith_core::constant_time_eq(expected, &provided_auth_tag) {
             return Err(StatusCode::UNAUTHORIZED);
         }
@@ -2558,7 +2558,25 @@ fn enforce_rate_limit(
 }
 
 fn rate_limit_subject(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    if trusted_proxy_headers_enabled() {
+    rate_limit_subject_with_trusted_proxy_cidrs(
+        headers,
+        peer,
+        trusted_proxy_headers_enabled(),
+        &trusted_proxy_cidrs(),
+    )
+}
+
+fn rate_limit_subject_with_trusted_proxy_cidrs(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    trust_proxy_headers: bool,
+    trusted_proxy_cidrs: &[String],
+) -> String {
+    if trust_proxy_headers
+        && peer
+            .map(|address| ip_matches_trusted_proxy(address.ip(), trusted_proxy_cidrs))
+            .unwrap_or(false)
+    {
         for header in ["x-forwarded-for", "x-real-ip"] {
             if let Some(value) = headers
                 .get(header)
@@ -2575,6 +2593,68 @@ fn rate_limit_subject(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
         return address.ip().to_string();
     }
     "anonymous".into()
+}
+
+fn trusted_proxy_cidrs() -> Vec<String> {
+    env::var("ZYLITH_COORDINATOR_TRUSTED_PROXY_CIDRS")
+        .or_else(|_| env::var("ZYLITH_TRUSTED_PROXY_CIDRS"))
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn ip_matches_trusted_proxy(peer: IpAddr, trusted_proxy_cidrs: &[String]) -> bool {
+    let peer = normalize_ip(peer);
+    trusted_proxy_cidrs.iter().any(|entry| {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return false;
+        }
+        if let Ok(exact) = entry.parse::<IpAddr>() {
+            return normalize_ip(exact) == peer;
+        }
+        let Some((base, prefix_len)) = entry.split_once('/') else {
+            return false;
+        };
+        let Ok(prefix_len) = prefix_len.parse::<u32>() else {
+            return false;
+        };
+        let Ok(base_ip) = base.parse::<IpAddr>() else {
+            return false;
+        };
+        match (normalize_ip(base_ip), peer) {
+            (IpAddr::V4(base), IpAddr::V4(peer)) if prefix_len <= 32 => {
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix_len)
+                };
+                u32::from(base) & mask == u32::from(peer) & mask
+            }
+            (IpAddr::V6(base), IpAddr::V6(peer)) if prefix_len <= 128 => {
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix_len)
+                };
+                u128::from(base) & mask == u128::from(peer) & mask
+            }
+            _ => false,
+        }
+    })
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(value) => value
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(value)),
+        value => value,
+    }
 }
 
 fn trusted_proxy_headers_enabled() -> bool {
@@ -3189,10 +3269,10 @@ mod tests {
     use axum::http::StatusCode;
     use axum::{
         body::Body,
-        http::{Method, Request},
+        http::{HeaderMap, Method, Request},
     };
     use http_body_util::BodyExt;
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, net::SocketAddr, path::PathBuf};
     use tower::ServiceExt;
     use zylith_core::types::{
         NOTE_RECOGNITION_ALGORITHM, OUTPUT_NOTE_CIPHERTEXT_LEN, OUTPUT_RECOVERY_FIELD_COUNT,
@@ -3303,6 +3383,43 @@ mod tests {
         assert!(close_expired_open_batches(&mut batches));
         let record = batches.values().next().expect("closed batch");
         assert_eq!(record.batch.status, zylith_core::BatchStatus::Closed);
+    }
+
+    #[test]
+    fn rate_limit_subject_uses_forwarded_headers_only_from_trusted_proxy_cidrs() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().expect("header"));
+        let trusted_peer: SocketAddr = "10.1.2.3:443".parse().expect("trusted peer");
+        let untrusted_peer: SocketAddr = "198.51.100.7:443".parse().expect("untrusted peer");
+        let cidrs = vec!["10.0.0.0/8".to_string()];
+
+        assert_eq!(
+            super::rate_limit_subject_with_trusted_proxy_cidrs(
+                &headers,
+                Some(trusted_peer),
+                true,
+                &cidrs,
+            ),
+            "203.0.113.9"
+        );
+        assert_eq!(
+            super::rate_limit_subject_with_trusted_proxy_cidrs(
+                &headers,
+                Some(untrusted_peer),
+                true,
+                &cidrs,
+            ),
+            "198.51.100.7"
+        );
+        assert_eq!(
+            super::rate_limit_subject_with_trusted_proxy_cidrs(
+                &headers,
+                Some(trusted_peer),
+                false,
+                &cidrs,
+            ),
+            "10.1.2.3"
+        );
     }
 
     #[tokio::test]
@@ -4257,7 +4374,7 @@ mod tests {
             .expect("response");
         assert_eq!(
             early_private_report_response.status(),
-            StatusCode::NOT_FOUND
+            StatusCode::UNAUTHORIZED
         );
 
         let recovery_artifact = RecoveryArtifact {
@@ -4718,6 +4835,34 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(wrong_range_auth.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_account_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recovery/account-missing/artifacts")
+                    .method(Method::GET)
+                    .header(zylith_core::RECOVERY_AUTH_HEADER, TEST_RECOVERY_AUTH)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_account_list.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_account_range = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recovery/account-missing/artifacts/range/0/10")
+                    .method(Method::GET)
+                    .header(zylith_core::RECOVERY_AUTH_HEADER, TEST_RECOVERY_AUTH)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_account_range.status(), StatusCode::UNAUTHORIZED);
 
         let missing_report_auth = app
             .oneshot(

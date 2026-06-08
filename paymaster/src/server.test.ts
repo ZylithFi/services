@@ -146,6 +146,53 @@ describe("paymaster server", () => {
     expect(submits).toBe(1);
   });
 
+  it("ignores forwarded IP headers from untrusted direct clients", async () => {
+    const server = createPaymasterServer(
+      {
+        ...config(),
+        signerLimitPerMinute: 1,
+        trustProxyHeaders: true,
+        trustedProxyCidrs: ["10.0.0.0/8"]
+      },
+      {
+        fetchImpl: fakeRpcFetch(),
+        runtime: fakeRuntime()
+      }
+    );
+    servers.push(server);
+    const url = await listen(server);
+
+    const responses: Response[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const signer = `0x${(0x770 + index).toString(16)}`;
+      const body = {
+        ...request,
+        signer_address: signer,
+        outside_transaction: {
+          ...request.outside_transaction,
+          signerAddress: signer,
+          outsideExecution: {
+            ...request.outside_transaction.outsideExecution,
+            nonce: `0x${(0x90 + index).toString(16)}`
+          }
+        }
+      };
+      responses.push(
+        await fetch(`${url}/execute-outside`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "https://app.example",
+            "x-forwarded-for": `203.0.113.${index + 1}`
+          },
+          body: JSON.stringify(body)
+        })
+      );
+    }
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
+  });
+
   it("rejects direct embedded-wallet withdrawal relays while exits are paused", async () => {
     const directRequest = {
       ...request,
@@ -269,6 +316,7 @@ function config(): PaymasterConfig {
     allowedOriginPatterns: [],
     signerLimitPerMinute: 20,
     trustProxyHeaders: false,
+    trustedProxyCidrs: [],
     submissionLogPath: null
   };
 }

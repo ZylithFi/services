@@ -106,6 +106,18 @@ checkFelt("ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_CONTRACTS");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS");
 checkCsv("ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS");
+if ((value("ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS") || "").toLowerCase() === "true") {
+  checkAnyCsv(
+    ["ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS", "ZYLITH_TRUSTED_PROXY_CIDRS"],
+    "paymaster trusted proxy headers require trusted proxy CIDRs",
+  );
+}
+if ((value("ZYLITH_TRUST_PROXY_HEADERS") || "").toLowerCase() === "true") {
+  checkAnyCsv(
+    ["ZYLITH_COORDINATOR_TRUSTED_PROXY_CIDRS", "ZYLITH_TRUSTED_PROXY_CIDRS"],
+    "coordinator trusted proxy headers require trusted proxy CIDRs",
+  );
+}
 if ((value("ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS") || "").toLowerCase() === "true") {
   checkCsv("ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS");
 }
@@ -303,6 +315,16 @@ function checkCsv(name) {
   const items = current.split(",").map((item) => item.trim()).filter(Boolean);
   if (items.length === 0) failures.push(`${name} must contain at least one value`);
   if (items.includes("*")) failures.push(`${name} must not use wildcard origins or values`);
+}
+
+function checkAnyCsv(names, message) {
+  if (names.some((name) => value(name))) {
+    for (const name of names) {
+      if (value(name)) checkCsv(name);
+    }
+    return;
+  }
+  failures.push(`${names.join(" or ")} must be configured: ${message}`);
 }
 
 function checkFelt(name) {

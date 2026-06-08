@@ -84,6 +84,26 @@ test("production readiness rejects missing prover strict mode", () => {
   assert.match(result.stderr, /ZYLITH_PROVER_STRICT/);
 });
 
+test("production readiness rejects paymaster proxy trust without trusted CIDRs", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS = "true";
+  delete env.ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS;
+  delete env.ZYLITH_TRUSTED_PROXY_CIDRS;
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /PAYMASTER_TRUSTED_PROXY_CIDRS/);
+});
+
+test("production readiness rejects coordinator proxy trust without trusted CIDRs", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_TRUST_PROXY_HEADERS = "true";
+  delete env.ZYLITH_COORDINATOR_TRUSTED_PROXY_CIDRS;
+  delete env.ZYLITH_TRUSTED_PROXY_CIDRS;
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /COORDINATOR_TRUSTED_PROXY_CIDRS/);
+});
+
 test("production readiness rejects disabled native prover OHTTP", () => {
   const { env } = fixtureEnv();
   env.ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED = "false";

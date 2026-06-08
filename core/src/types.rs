@@ -2164,6 +2164,10 @@ pub struct DepositCallArguments {
     pub funding_commitments: Vec<String>,
     pub deposit_roots: Vec<String>,
     pub encrypted_note_activations: Vec<String>,
+    pub note_commitments: Vec<String>,
+    pub asset_ids: Vec<String>,
+    pub amounts: Vec<String>,
+    pub withdraw_authorities: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

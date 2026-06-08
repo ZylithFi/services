@@ -1842,16 +1842,17 @@ async fn prepare_note_consolidation(
     let note_membership_witnesses = derive_note_membership_witnesses(
         &prior_roots.note_root,
         &consumed_inputs,
-        &request.input_notes,
-        &[],
-        &deposit_activations,
-        &note_root_transitions,
-        &historical_settlement_witnesses,
-        &prior_note_consolidation_history,
+        NoteMembershipSources {
+            direct_input_notes: &request.input_notes,
+            matched_order_witnesses: &[],
+            deposit_activations: &deposit_activations,
+            note_root_transitions: &note_root_transitions,
+            prior_settlement_witnesses: &historical_settlement_witnesses,
+            prior_note_consolidation_history: &prior_note_consolidation_history,
+        },
     )
-    .map_err(|status| {
+    .inspect_err(|status| {
         eprintln!("prepare_note_consolidation rejected stage=note_membership status={status}");
-        status
     })?;
     if note_membership_witnesses.len() != consumed_inputs.len() {
         eprintln!(
@@ -7385,16 +7386,28 @@ fn derive_note_membership_witnesses_from_note_root_transitions(
     Ok(Some(witnesses))
 }
 
+struct NoteMembershipSources<'a> {
+    direct_input_notes: &'a [Note],
+    matched_order_witnesses: &'a [MatchedOrderWitness],
+    deposit_activations: &'a [DepositActivationRecord],
+    note_root_transitions: &'a [NoteRootTransitionRecord],
+    prior_settlement_witnesses: &'a [SettlementWitness],
+    prior_note_consolidation_history: &'a [NoteConsolidationHistoryRecord],
+}
+
 fn derive_note_membership_witnesses(
     prior_note_root: &str,
     consumed_inputs: &[ConsumedInput],
-    direct_input_notes: &[Note],
-    matched_order_witnesses: &[MatchedOrderWitness],
-    deposit_activations: &[DepositActivationRecord],
-    note_root_transitions: &[NoteRootTransitionRecord],
-    prior_settlement_witnesses: &[SettlementWitness],
-    prior_note_consolidation_history: &[NoteConsolidationHistoryRecord],
+    sources: NoteMembershipSources<'_>,
 ) -> Result<Vec<NoteMembershipWitness>, StatusCode> {
+    let NoteMembershipSources {
+        direct_input_notes,
+        matched_order_witnesses,
+        deposit_activations,
+        note_root_transitions,
+        prior_settlement_witnesses,
+        prior_note_consolidation_history,
+    } = sources;
     if consumed_inputs.is_empty() {
         return Ok(Vec::new());
     }
@@ -8059,12 +8072,14 @@ fn build_settlement_artifacts(
     let note_membership_witnesses = derive_note_membership_witnesses(
         &prior_note_root,
         &consumed_inputs,
-        &[],
-        &matched_order_witnesses,
-        deposit_activations,
-        note_root_transitions,
-        prior_settlement_witnesses,
-        prior_note_consolidation_history,
+        NoteMembershipSources {
+            direct_input_notes: &[],
+            matched_order_witnesses: &matched_order_witnesses,
+            deposit_activations,
+            note_root_transitions,
+            prior_settlement_witnesses,
+            prior_note_consolidation_history,
+        },
     )
     .inspect_err(|status| {
         eprintln!(
@@ -10067,12 +10082,13 @@ mod tests {
         DecryptedOrderRecord, FeeNoteRecipientConfig, NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND,
         NOTE_ROOT_TRANSITION_DEPOSIT_KIND, NativeBlockId, NativeExecutionRequestRecord,
         NativeProverParams, NativeProverRpcRequest, NativeTransactionMode,
-        NoteConsolidationHistoryRecord, NoteRootTransitionRecord, OnchainSubmissionRecord,
-        SettlementBuildContext, SettlementRoots, StarknetExecutorConfig, artifact_id_for,
-        build_app_with_config, build_batch_liquidity_report, build_native_proof_program_calldata,
-        build_settlement_artifacts, compute_candidate_clearing_price, decode_bhttp_response,
-        derive_note_membership_witnesses, deterministic_settlement_submission_jitter_ms,
-        encode_bhttp_json_post, fee_note_key_from_value, native_execution_context_block_id,
+        NoteConsolidationHistoryRecord, NoteMembershipSources, NoteRootTransitionRecord,
+        OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots, StarknetExecutorConfig,
+        artifact_id_for, build_app_with_config, build_batch_liquidity_report,
+        build_native_proof_program_calldata, build_settlement_artifacts,
+        compute_candidate_clearing_price, decode_bhttp_response, derive_note_membership_witnesses,
+        deterministic_settlement_submission_jitter_ms, encode_bhttp_json_post,
+        fee_note_key_from_value, native_execution_context_block_id,
         native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission, native_invoke_error_is_retryable_nonce,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
@@ -10747,12 +10763,14 @@ mod tests {
         let witnesses = derive_note_membership_witnesses(
             &target_note_root,
             &consumed_inputs,
-            &[],
-            &matched_order_witnesses,
-            &[],
-            &transitions,
-            &[prior_witness],
-            &[],
+            NoteMembershipSources {
+                direct_input_notes: &[],
+                matched_order_witnesses: &matched_order_witnesses,
+                deposit_activations: &[],
+                note_root_transitions: &transitions,
+                prior_settlement_witnesses: &[prior_witness],
+                prior_note_consolidation_history: &[],
+            },
         )
         .expect("note membership witnesses");
 
@@ -10839,12 +10857,14 @@ mod tests {
         let witnesses = derive_note_membership_witnesses(
             &target_note_root,
             &consumed_inputs,
-            &[],
-            &matched_order_witnesses,
-            &[],
-            &transitions,
-            &[],
-            &[consolidation_history],
+            NoteMembershipSources {
+                direct_input_notes: &[],
+                matched_order_witnesses: &matched_order_witnesses,
+                deposit_activations: &[],
+                note_root_transitions: &transitions,
+                prior_settlement_witnesses: &[],
+                prior_note_consolidation_history: &[consolidation_history],
+            },
         )
         .expect("note membership witnesses");
 
@@ -10878,12 +10898,14 @@ mod tests {
         let witnesses = derive_note_membership_witnesses(
             &root_after_deposit,
             &consumed_inputs,
-            std::slice::from_ref(&deposit_note),
-            &[],
-            &[],
-            &transitions,
-            &[],
-            &[],
+            NoteMembershipSources {
+                direct_input_notes: std::slice::from_ref(&deposit_note),
+                matched_order_witnesses: &[],
+                deposit_activations: &[],
+                note_root_transitions: &transitions,
+                prior_settlement_witnesses: &[],
+                prior_note_consolidation_history: &[],
+            },
         )
         .expect("note membership witnesses");
 

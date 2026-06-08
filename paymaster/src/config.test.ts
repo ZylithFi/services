@@ -76,4 +76,17 @@ describe("paymaster config", () => {
       }),
     ).toThrow(/ACK_DIRECT_WITHDRAWAL_SPONSORSHIP_RISK/);
   });
+
+  it("rejects trusted proxy headers without trusted proxy CIDRs", () => {
+    expect(() =>
+      loadConfig({
+        ZYLITH_PAYMASTER_RPC_URL: "https://rpc.zylith.example",
+        ZYLITH_PAYMASTER_CHAIN_ID: "0x534e5f5345504f4c4941",
+        ZYLITH_PAYMASTER_ACCOUNT_ADDRESS: "0xabc",
+        ZYLITH_PAYMASTER_PRIVATE_KEY: "1".repeat(64),
+        ZYLITH_PAYMASTER_ALLOWED_CONTRACTS: "0x101",
+        ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS: "true",
+      }),
+    ).toThrow(/TRUSTED_PROXY_CIDRS/);
+  });
 });

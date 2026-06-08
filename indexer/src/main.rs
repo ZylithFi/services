@@ -2137,9 +2137,10 @@ mod tests {
     use tokio::sync::RwLock;
     use tower::util::ServiceExt;
     use zylith_core::{
-        AssetId, BatchId, ConsumedInput, DepositActivationRecord, NoteCommitment, Nullifier,
-        NullifierHistoryBatch, OutputCiphertextBundle, OutputNoteRecord, PairId,
-        PublishedBatchArtifacts, SettlementTranscript, SettlementWitness,
+        AssetId, BatchId, ConsumedInput, DepositActivationRecord,
+        EncryptedMakerAttributionArtifact, MakerAttributionBundle, MakerAttributionReceipt,
+        NoteCommitment, Nullifier, NullifierHistoryBatch, OrderCommitment, OutputCiphertextBundle,
+        OutputNoteRecord, PairId, PublishedBatchArtifacts, SettlementTranscript, SettlementWitness,
         settlement_nullifier_root_after_history,
     };
 
@@ -2603,6 +2604,150 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn public_maker_attribution_is_delayed_and_encrypted_only() {
+        let batch_id = "batch-strk-usdc-attribution-10";
+        let maker_public_key = "0xmaker";
+        let mut target = sample_published_artifact_for_pair(batch_id, 10, "STRK/USDC");
+        target.settled_at_unix_ms = Some(1_778_661_520_000);
+        target.maker_attribution_bundle = Some(MakerAttributionBundle {
+            version: 1,
+            batch_id: BatchId(batch_id.into()),
+            artifacts: vec![EncryptedMakerAttributionArtifact {
+                version: 1,
+                batch_id: BatchId(batch_id.into()),
+                pair_id: PairId("STRK/USDC".into()),
+                epoch_id: 10,
+                maker_public_key: maker_public_key.into(),
+                curve_commitment: "0xcurve".into(),
+                output_note_commitment: NoteCommitment("0x303".into()),
+                order_commitment: OrderCommitment("0x707".into()),
+                algorithm: "aes-256-gcm/maker-attribution".into(),
+                key_id: "0xkey".into(),
+                ephemeral_public_key: "04".repeat(65),
+                nonce: "11".repeat(12),
+                ciphertext: "22".repeat(32),
+                receipt: MakerAttributionReceipt {
+                    version: 1,
+                    signer_public_key: "0xsigner".into(),
+                    issued_at_unix_ms: 1_778_661_520_000,
+                    payload_commitment: "0xpayload".into(),
+                    signature_r: "0x1".into(),
+                    signature_s: "0x2".into(),
+                },
+            }],
+        });
+
+        let hidden_app = build_app_with_state(AppState {
+            rpc_url: "http://127.0.0.1:5050/rpc/v0_8".into(),
+            shielded_asset_adapter_address: "0x1".into(),
+            commitment_registry_address: "0x5".into(),
+            funding_activation_count_selector: "0x1".into(),
+            funding_activation_record_selector: "0x2".into(),
+            withdrawal_count_selector: "0x3".into(),
+            withdrawal_record_selector: "0x4".into(),
+            http_client: reqwest::Client::new(),
+            confirmed_deposits: Arc::new(RwLock::new(BTreeMap::new())),
+            confirmed_withdrawals: Arc::new(RwLock::new(BTreeMap::new())),
+            synced_deposit_count: Arc::new(RwLock::new(0)),
+            synced_withdrawal_count: Arc::new(RwLock::new(0)),
+            last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
+            published_batch_artifacts: Arc::new(RwLock::new(BTreeMap::from([(
+                batch_id.into(),
+                target.clone(),
+            )]))),
+            artifact_archive_path: None,
+            internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
+            batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
+            public_artifact_delay_min_epochs: 1,
+            public_artifact_delay_max_epochs: 1,
+            artifact_epoch_bucket_size: 1,
+            require_artifact_onchain_verification: false,
+            output_note_root_selector: selector_hex("output_note_root"),
+            verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
+            auction_verifier_address: None,
+            rate_limiter: RateLimiter::default(),
+            public_rate_limit_per_minute: DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+            max_deposit_confirmation_commitments: DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS
+                as usize,
+        });
+        let hidden_response = hidden_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/attribution/{batch_id}/{maker_public_key}"))
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(hidden_response.status(), StatusCode::NOT_FOUND);
+
+        let mut visible_artifacts = BTreeMap::new();
+        visible_artifacts.insert(batch_id.into(), target);
+        visible_artifacts.insert(
+            "batch-strk-usdc-attribution-11".into(),
+            sample_published_artifact_for_pair("batch-strk-usdc-attribution-11", 11, "STRK/USDC"),
+        );
+        let visible_app = build_app_with_state(AppState {
+            rpc_url: "http://127.0.0.1:5050/rpc/v0_8".into(),
+            shielded_asset_adapter_address: "0x1".into(),
+            commitment_registry_address: "0x5".into(),
+            funding_activation_count_selector: "0x1".into(),
+            funding_activation_record_selector: "0x2".into(),
+            withdrawal_count_selector: "0x3".into(),
+            withdrawal_record_selector: "0x4".into(),
+            http_client: reqwest::Client::new(),
+            confirmed_deposits: Arc::new(RwLock::new(BTreeMap::new())),
+            confirmed_withdrawals: Arc::new(RwLock::new(BTreeMap::new())),
+            synced_deposit_count: Arc::new(RwLock::new(0)),
+            synced_withdrawal_count: Arc::new(RwLock::new(0)),
+            last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
+            published_batch_artifacts: Arc::new(RwLock::new(visible_artifacts)),
+            artifact_archive_path: None,
+            internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
+            batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
+            public_artifact_delay_min_epochs: 1,
+            public_artifact_delay_max_epochs: 1,
+            artifact_epoch_bucket_size: 1,
+            require_artifact_onchain_verification: false,
+            output_note_root_selector: selector_hex("output_note_root"),
+            verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
+            auction_verifier_address: None,
+            rate_limiter: RateLimiter::default(),
+            public_rate_limit_per_minute: DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+            max_deposit_confirmation_commitments: DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS
+                as usize,
+        });
+        let visible_response = visible_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/attribution/{batch_id}/{maker_public_key}"))
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(visible_response.status(), StatusCode::OK);
+        let body = to_bytes(visible_response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice::<serde_json::Value>(&body).expect("json");
+        assert_eq!(json["batch_id"], batch_id);
+        assert_eq!(json["maker_public_key"], maker_public_key);
+        assert_eq!(json["artifacts"].as_array().unwrap().len(), 1);
+        assert!(json.get("transcript").is_none());
+        assert!(json.get("matched_orders").is_none());
+        assert!(json.get("consumed_inputs").is_none());
+        assert!(json.get("output_notes").is_none());
+        assert!(json.get("fees").is_none());
+        assert!(json["artifacts"][0].get("ciphertext").is_some());
+        assert!(json["artifacts"][0].get("attribution").is_none());
+        assert!(json["artifacts"][0].get("bands").is_none());
+        assert!(json["artifacts"][0].get("clearing_price").is_none());
     }
 
     #[tokio::test]

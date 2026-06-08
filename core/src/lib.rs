@@ -12,8 +12,9 @@ pub use auth::{
 pub use crypto::{
     FeeOutputNoteInput, HeartbeatCoverOrder, NoteConsolidationCommitmentRoots,
     SettlementOutputWithdrawalMessage, SettlementOutputWithdrawalPlanRequest,
-    admission_proof_message_hash_for_program, admission_proof_message_hash_from_statement,
-    auction_admission_root, auction_result_proof_message_hash_for_program,
+    Strk20ExitClaimMessage, admission_proof_message_hash_for_program,
+    admission_proof_message_hash_from_statement, auction_admission_root,
+    auction_result_proof_message_hash_for_program,
     auction_result_proof_message_hash_from_statement, build_admission_serialized_input,
     build_auction_result_serialized_input, build_deposit_note, build_deposit_submission_plan,
     build_fee_output_note, build_heartbeat_cover_orders, build_note_consolidation_serialized_input,

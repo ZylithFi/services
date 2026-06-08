@@ -1384,6 +1384,10 @@ pub fn build_deposit_submission_plan(
         funding_commitments: vec![funding_commitment.clone()],
         deposit_roots: vec![deposit_root.clone()],
         encrypted_note_activations: vec![encrypted_note_activation.clone()],
+        note_commitments: vec![note_commitment.0.clone()],
+        asset_ids: vec![encode_asset_id(&note.asset_id.0)],
+        amounts: vec![note.amount.to_string()],
+        withdraw_authorities: vec![note.withdraw_authority.clone()],
     };
 
     Ok(DepositSubmissionPlan {
@@ -1706,17 +1710,33 @@ pub fn settlement_output_withdrawal_message_hash(
     ))
 }
 
+#[derive(Clone, Copy)]
+pub struct Strk20ExitClaimMessage<'a> {
+    pub chain_id: &'a str,
+    pub bridge_address: &'a str,
+    pub privacy_pool_address: &'a str,
+    pub auction_verifier_address: &'a str,
+    pub asset_id: &'a str,
+    pub token_address: &'a str,
+    pub amount: &'a str,
+    pub exit_commitment: &'a str,
+    pub open_note_id: &'a str,
+}
+
 pub fn strk20_exit_claim_message_hash(
-    chain_id: &str,
-    bridge_address: &str,
-    privacy_pool_address: &str,
-    auction_verifier_address: &str,
-    asset_id: &str,
-    token_address: &str,
-    amount: &str,
-    exit_commitment: &str,
-    open_note_id: &str,
+    message: Strk20ExitClaimMessage<'_>,
 ) -> Result<String, ProtocolError> {
+    let Strk20ExitClaimMessage {
+        chain_id,
+        bridge_address,
+        privacy_pool_address,
+        auction_verifier_address,
+        asset_id,
+        token_address,
+        amount,
+        exit_commitment,
+        open_note_id,
+    } = message;
     let normalized_asset_id = normalize_asset_id_for_public_hash(asset_id)?;
     let normalized_amount = normalize_u128_for_public_hash(amount)?;
     Ok(poseidon_chain_hex(
@@ -2819,28 +2839,10 @@ pub fn sign_settlement_output_withdrawal_authorization(
 
 pub fn sign_strk20_exit_claim_authorization(
     withdraw_auth_key_felt: &str,
-    chain_id: &str,
-    bridge_address: &str,
-    privacy_pool_address: &str,
-    auction_verifier_address: &str,
-    asset_id: &str,
-    token_address: &str,
-    amount: &str,
-    exit_commitment: &str,
-    open_note_id: &str,
+    message: Strk20ExitClaimMessage<'_>,
 ) -> Result<crate::SpendAuthorization, ProtocolError> {
     let private_key = felt_from_hex_str(withdraw_auth_key_felt)?;
-    let message = felt_from_hex_str(&strk20_exit_claim_message_hash(
-        chain_id,
-        bridge_address,
-        privacy_pool_address,
-        auction_verifier_address,
-        asset_id,
-        token_address,
-        amount,
-        exit_commitment,
-        open_note_id,
-    )?)?;
+    let message = felt_from_hex_str(&strk20_exit_claim_message_hash(message)?)?;
     let k = rfc6979_generate_k(&message, &private_key, None);
     let signature = sign(&private_key, &message, &k)
         .map_err(|err| ProtocolError::Crypto(format!("STRK20 exit claim signing failed: {err}")))?;
@@ -7240,7 +7242,7 @@ mod tests {
 
     use super::{
         FeeOutputNoteInput, SettlementOutputWithdrawalMessage,
-        SettlementOutputWithdrawalPlanRequest, auction_admission_root,
+        SettlementOutputWithdrawalPlanRequest, Strk20ExitClaimMessage, auction_admission_root,
         build_admission_serialized_input, build_auction_result_serialized_input,
         build_deposit_note, build_deposit_submission_plan, build_fee_output_note,
         build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
@@ -7983,12 +7985,21 @@ mod tests {
             plan.encoded_args.encrypted_note_activations,
             vec![plan.encrypted_note_activation]
         );
+        assert_eq!(
+            plan.encoded_args.note_commitments,
+            vec![plan.note_commitment.0.clone()]
+        );
+        assert_eq!(
+            plan.encoded_args.asset_ids,
+            vec![encode_asset_id(&intent.asset_id.0)]
+        );
+        assert_eq!(plan.encoded_args.amounts, vec![intent.amount.to_string()]);
+        assert_eq!(
+            plan.encoded_args.withdraw_authorities,
+            vec![intent.recipient_withdraw_authority.clone()]
+        );
         let encoded_args_json = serde_json::to_string(&plan.encoded_args).unwrap();
-        assert!(!encoded_args_json.contains("asset_id"));
-        assert!(!encoded_args_json.contains("amount"));
         assert!(!encoded_args_json.contains("deposit_nonce"));
-        assert!(!encoded_args_json.contains("note_commitment"));
-        assert!(!encoded_args_json.contains("withdraw_authority"));
     }
 
     #[test]
@@ -8328,162 +8339,78 @@ mod tests {
 
     #[test]
     fn strk20_exit_claim_hash_binds_deployment_value_exit_and_open_note() {
-        let base = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
-        .expect("base claim hash");
+        let base_message = Strk20ExitClaimMessage {
+            chain_id: "0x534e5f5345504f4c4941",
+            bridge_address: "0x456",
+            privacy_pool_address: "0x789",
+            auction_verifier_address: "0xabc",
+            asset_id: "0x1",
+            token_address: "0xdef",
+            amount: "200",
+            exit_commitment: "0xabc123",
+            open_note_id: "0xdef456",
+        };
+        let base = strk20_exit_claim_message_hash(base_message).expect("base claim hash");
         let encoded_strk_asset = encode_asset_id("STRK");
-        let symbolic_asset = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "STRK",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let symbolic_asset = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            asset_id: "STRK",
+            ..base_message
+        })
         .expect("symbolic asset claim hash");
-        let encoded_asset = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            &encoded_strk_asset,
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let encoded_asset = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            asset_id: &encoded_strk_asset,
+            ..base_message
+        })
         .expect("encoded asset claim hash");
-        let hex_amount = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "0xc8",
-            "0xabc123",
-            "0xdef456",
-        )
+        let hex_amount = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            amount: "0xc8",
+            ..base_message
+        })
         .expect("hex amount claim hash");
-        let wrong_chain = strk20_exit_claim_message_hash(
-            "0x534e5f4d41494e",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let wrong_chain = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            chain_id: "0x534e5f4d41494e",
+            ..base_message
+        })
         .expect("chain claim hash");
-        let wrong_bridge = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x457",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let wrong_bridge = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            bridge_address: "0x457",
+            ..base_message
+        })
         .expect("bridge claim hash");
-        let wrong_pool = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x790",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let wrong_pool = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            privacy_pool_address: "0x790",
+            ..base_message
+        })
         .expect("pool claim hash");
-        let wrong_verifier = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabd",
-            "0x1",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let wrong_verifier = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            auction_verifier_address: "0xabd",
+            ..base_message
+        })
         .expect("verifier claim hash");
-        let wrong_asset = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x2",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let wrong_asset = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            asset_id: "0x2",
+            ..base_message
+        })
         .expect("asset claim hash");
-        let wrong_token = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdf0",
-            "200",
-            "0xabc123",
-            "0xdef456",
-        )
+        let wrong_token = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            token_address: "0xdf0",
+            ..base_message
+        })
         .expect("token claim hash");
-        let wrong_amount = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "201",
-            "0xabc123",
-            "0xdef456",
-        )
+        let wrong_amount = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            amount: "201",
+            ..base_message
+        })
         .expect("amount claim hash");
-        let wrong_exit = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "200",
-            "0xabc124",
-            "0xdef456",
-        )
+        let wrong_exit = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            exit_commitment: "0xabc124",
+            ..base_message
+        })
         .expect("exit claim hash");
-        let wrong_open_note = strk20_exit_claim_message_hash(
-            "0x534e5f5345504f4c4941",
-            "0x456",
-            "0x789",
-            "0xabc",
-            "0x1",
-            "0xdef",
-            "200",
-            "0xabc123",
-            "0xdef457",
-        )
+        let wrong_open_note = strk20_exit_claim_message_hash(Strk20ExitClaimMessage {
+            open_note_id: "0xdef457",
+            ..base_message
+        })
         .expect("open-note claim hash");
 
         assert_eq!(symbolic_asset, encoded_asset);

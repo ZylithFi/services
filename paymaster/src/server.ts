@@ -100,7 +100,8 @@ function enforceRequestLimits(
 }
 
 function clientIp(request: IncomingMessage, config: PaymasterConfig): string {
-  if (config.trustProxyHeaders) {
+  const socketIp = normalizeRemoteAddress(request.socket.remoteAddress ?? "unknown");
+  if (config.trustProxyHeaders && isTrustedProxy(socketIp, config.trustedProxyCidrs)) {
     const forwarded = request.headers["x-forwarded-for"];
     if (typeof forwarded === "string" && forwarded.trim()) {
       return forwarded.split(",")[0]?.trim() || "unknown";
@@ -110,7 +111,45 @@ function clientIp(request: IncomingMessage, config: PaymasterConfig): string {
       return realIp.trim();
     }
   }
-  return request.socket.remoteAddress ?? "unknown";
+  return socketIp;
+}
+
+function normalizeRemoteAddress(address: string): string {
+  return address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+}
+
+function isTrustedProxy(peerIp: string, cidrs: string[]): boolean {
+  return cidrs.some((cidr) => ipMatchesCidr(peerIp, cidr));
+}
+
+function ipMatchesCidr(peerIp: string, cidr: string): boolean {
+  const normalizedCidr = normalizeRemoteAddress(cidr.trim());
+  const [network, prefixText] = normalizedCidr.split("/");
+  if (!network) return false;
+  if (prefixText === undefined) {
+    return normalizeRemoteAddress(network) === peerIp;
+  }
+  const peer = ipv4ToUint(peerIp);
+  const base = ipv4ToUint(network);
+  const prefix = Number(prefixText);
+  if (peer === null || base === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+    return false;
+  }
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return (peer & mask) === (base & mask);
+}
+
+function ipv4ToUint(value: string): number | null {
+  const parts = value.split(".");
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const octet = Number(part);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    result = ((result << 8) | octet) >>> 0;
+  }
+  return result;
 }
 
 function readBody(request: IncomingMessage, maxBytes: number): Promise<string> {
