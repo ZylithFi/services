@@ -12,6 +12,12 @@ import type {
 const MAX_OUTSIDE_EXECUTION_WINDOW_SECONDS = 3_900;
 const RENEWAL_SPARSE_TREE_DEPTH = 128;
 const U128_MAX = (1n << 128n) - 1n;
+const SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS = new Set([
+  "apply_actions",
+  "submit_settlement_with_proof_facts",
+  "withdraw_settlement_output_with_proof_facts",
+  "cancel_renewal_parent_marker",
+]);
 
 export function validateExecuteOutsideRequest(
   value: unknown,
@@ -50,8 +56,8 @@ export function validateExecuteOutsideRequest(
   if (!config.allowedEntrypoints.has(call.entrypoint)) {
     throw new Error("call entrypoint is not allowlisted");
   }
-  if (isPausedWithdrawalEntrypoint(call.entrypoint)) {
-    throw new Error("withdrawals are paused until nullifier-consuming exits are available");
+  if (!SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS.has(call.entrypoint)) {
+    throw new Error("call entrypoint is not supported by paymaster");
   }
   if (config.proofRequiredEntrypoints.has(call.entrypoint)) {
     if (!proof) {
@@ -233,12 +239,7 @@ function validateDirectRelayedCall(
     assertRenewalCancelMarkerCalldata(call);
     return;
   }
-  if (!isPausedWithdrawalEntrypoint(call.entrypoint)) {
-    throw new Error("direct paymaster relay is only allowed for withdrawals");
-  }
-  if (!allowDirectWithdrawalRelays) {
-    throw new Error("direct withdrawal relay sponsorship is disabled");
-  }
+  throw new Error("direct paymaster relay requires proof facts for supported direct calls");
 }
 
 function assertRenewalCancelMarkerCalldata(call: StarknetCallPayload): void {
@@ -298,10 +299,6 @@ function assertRenewalCancelMarkerCalldata(call: StarknetCallPayload): void {
   if (signatureR === 0n || signatureS === 0n) {
     throw new Error("renewal cancellation signature cannot be zero");
   }
-}
-
-function isPausedWithdrawalEntrypoint(entrypoint: string): boolean {
-  return entrypoint === "withdraw_settlement_output_to_l2";
 }
 
 function validateCall(value: unknown): StarknetCallPayload {
@@ -418,10 +415,6 @@ function assertWithdrawalAmountBucket(
 function withdrawalAmountForEntrypoint(call: StarknetCallPayload): bigint | null {
   if (call.entrypoint === "withdraw_settlement_output_with_proof_facts") {
     const amount = call.calldata[7];
-    return amount === undefined ? null : BigInt(amount);
-  }
-  if (call.entrypoint === "withdraw_settlement_output_to_l2") {
-    const amount = call.calldata[3];
     return amount === undefined ? null : BigInt(amount);
   }
   if (call.entrypoint === "withdraw_verified_note") {

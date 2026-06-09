@@ -87,7 +87,7 @@ describe("validateExecuteOutsideRequest", () => {
     );
   });
 
-  it("rejects relayed withdrawals while exits are not nullifier-consuming", () => {
+  it("rejects deprecated membership-only withdrawal entrypoints", () => {
     const request = baseRequest();
     request.call.entrypoint = "withdraw_settlement_output_to_l2";
     request.call.calldata = ["0x1", "0x2", "0x3", "0x64"];
@@ -106,10 +106,10 @@ describe("validateExecuteOutsideRequest", () => {
     };
     expect(() =>
       validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
-    ).toThrow("withdrawals are paused until nullifier-consuming exits are available");
+    ).toThrow("call entrypoint is not supported by paymaster");
   });
 
-  it("rejects direct embedded-wallet withdrawal relays without SNIP-9 outside execution", () => {
+  it("rejects direct deprecated withdrawal relays without SNIP-9 outside execution", () => {
     const request = baseRequest();
     request.call.entrypoint = "withdraw_settlement_output_to_l2";
     request.call.calldata = ["0x1", "0x2", "0x3", "0x64"];
@@ -127,7 +127,7 @@ describe("validateExecuteOutsideRequest", () => {
     };
     expect(() =>
       validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
-    ).toThrow("withdrawals are paused until nullifier-consuming exits are available");
+    ).toThrow("call entrypoint is not supported by paymaster");
   });
 
   it("accepts direct proof-bearing apply_actions relays", () => {
@@ -273,7 +273,7 @@ describe("validateExecuteOutsideRequest", () => {
     );
   });
 
-  it("rejects direct relays for non-withdrawal entrypoints", () => {
+  it("rejects direct relays for unsupported entrypoints", () => {
     const request = baseRequest();
     request.call.entrypoint = "cancel_private_order";
     request.outside_transaction.outsideExecution.calls[0]!.selector =
@@ -288,7 +288,7 @@ describe("validateExecuteOutsideRequest", () => {
       proofRequiredEntrypoints: new Set<string>()
     };
     expect(() => validateExecuteOutsideRequest(request, directConfig, 1_700_000_000)).toThrow(
-      "direct paymaster relay is only allowed for withdrawals"
+      "call entrypoint is not supported by paymaster"
     );
   });
 });

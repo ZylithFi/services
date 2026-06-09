@@ -1812,10 +1812,7 @@ async fn prepare_note_consolidation(
     }
     let prior_roots = fetch_current_settlement_roots(&state).await?;
     let consumed_inputs = consumed_inputs_for_notes(&request.input_notes)?;
-    let historical_settlement_witnesses = {
-        let settlement_witnesses = state.settlement_witnesses.read().await;
-        settlement_witnesses.values().cloned().collect::<Vec<_>>()
-    };
+    let historical_settlement_witnesses = confirmed_settlement_witnesses(&state).await;
     let prior_note_consolidation_history = {
         let note_consolidation_history = state.note_consolidation_history.read().await;
         note_consolidation_history
@@ -1960,10 +1957,7 @@ async fn prepare_settlement_output_withdrawal(
         return Err(StatusCode::CONFLICT);
     }
     let prior_roots = fetch_current_settlement_roots(&state).await?;
-    let historical_settlement_witnesses = {
-        let settlement_witnesses = state.settlement_witnesses.read().await;
-        settlement_witnesses.values().cloned().collect::<Vec<_>>()
-    };
+    let historical_settlement_witnesses = confirmed_settlement_witnesses(&state).await;
     let prior_note_consolidation_history = {
         let note_consolidation_history = state.note_consolidation_history.read().await;
         note_consolidation_history
@@ -2098,6 +2092,36 @@ fn historical_consumed_inputs(
     }
     consumed.extend(settlement_output_withdrawal_nullifiers.iter().cloned());
     Ok(consumed)
+}
+
+fn onchain_submission_has_succeeded(submission: &OnchainSubmissionRecord) -> bool {
+    submission.execution_status.as_deref() == Some("SUCCEEDED")
+        && matches!(
+            submission.finality_status.as_deref(),
+            Some("PRE_CONFIRMED" | "ACCEPTED_ON_L2" | "ACCEPTED_ON_L1")
+        )
+}
+
+fn confirmed_settlement_witnesses_from_maps(
+    settlement_witnesses: &BTreeMap<String, SettlementWitness>,
+    onchain_submissions: &BTreeMap<String, OnchainSubmissionRecord>,
+) -> Vec<SettlementWitness> {
+    settlement_witnesses
+        .iter()
+        .filter(|(batch_id, _)| {
+            onchain_submissions
+                .get(*batch_id)
+                .map(onchain_submission_has_succeeded)
+                .unwrap_or(false)
+        })
+        .map(|(_, witness)| witness.clone())
+        .collect()
+}
+
+async fn confirmed_settlement_witnesses(state: &AppState) -> Vec<SettlementWitness> {
+    let settlement_witnesses = state.settlement_witnesses.read().await;
+    let onchain_submissions = state.onchain_submissions.read().await;
+    confirmed_settlement_witnesses_from_maps(&settlement_witnesses, &onchain_submissions)
 }
 
 fn consumed_nullifier_set(
@@ -4019,6 +4043,36 @@ async fn proof_aggregation_witness_members(
 fn validate_aggregate_root_chain(
     members: &[NativeAggregationPreparedMember],
 ) -> Result<(), String> {
+    let mut batch_ids = BTreeSet::new();
+    let mut settlement_contract_address = None::<String>;
+    for member in members {
+        let batch_id = member.witness.batch_id.0.as_str();
+        if !batch_ids.insert(batch_id.to_string()) {
+            return Err("aggregate member batch id is duplicated".into());
+        }
+        if member.transcript.batch_id.0.as_str() != batch_id
+            || member.settlement_plan.batch_id.0.as_str() != batch_id
+            || member.settlement_plan.encoded_args.batch_id.as_str() != batch_id
+        {
+            return Err("aggregate member batch ids do not agree".into());
+        }
+        let member_contract = member
+            .settlement_plan
+            .settlement_call
+            .contract_address
+            .as_str();
+        match settlement_contract_address.as_deref() {
+            Some(expected) if expected != member_contract => {
+                return Err("aggregate member settlement targets do not agree".into());
+            }
+            None => settlement_contract_address = Some(member_contract.to_string()),
+            _ => {}
+        }
+        if member.settlement_plan.settlement_call.entrypoint != "submit_settlement_with_proof_facts"
+        {
+            return Err("aggregate member settlement entrypoint is invalid".into());
+        }
+    }
     for window in members.windows(2) {
         let current = &window[0].settlement_plan.encoded_args;
         let next = &window[1].settlement_plan.encoded_args;
@@ -10080,38 +10134,41 @@ mod tests {
     use super::{
         AppConfig, DEFAULT_PROTOCOL_FEE_RECIPIENT, DEFAULT_RELAY_FEE_RECIPIENT,
         DecryptedOrderRecord, FeeNoteRecipientConfig, NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND,
-        NOTE_ROOT_TRANSITION_DEPOSIT_KIND, NativeBlockId, NativeExecutionRequestRecord,
-        NativeProverParams, NativeProverRpcRequest, NativeTransactionMode,
-        NoteConsolidationHistoryRecord, NoteMembershipSources, NoteRootTransitionRecord,
-        OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots, StarknetExecutorConfig,
-        artifact_id_for, build_app_with_config, build_batch_liquidity_report,
-        build_native_proof_program_calldata, build_settlement_artifacts,
-        compute_candidate_clearing_price, decode_bhttp_response, derive_note_membership_witnesses,
-        deterministic_settlement_submission_jitter_ms, encode_bhttp_json_post,
-        fee_note_key_from_value, native_execution_context_block_id,
+        NOTE_ROOT_TRANSITION_DEPOSIT_KIND, NativeAggregationPreparedMember, NativeBlockId,
+        NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
+        NativeTransactionMode, NoteConsolidationHistoryRecord, NoteMembershipSources,
+        NoteRootTransitionRecord, OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots,
+        StarknetExecutorConfig, artifact_id_for, build_app_with_config,
+        build_batch_liquidity_report, build_native_proof_program_calldata,
+        build_settlement_artifacts, compute_candidate_clearing_price,
+        confirmed_settlement_witnesses_from_maps, decode_bhttp_response,
+        derive_note_membership_witnesses, deterministic_settlement_submission_jitter_ms,
+        encode_bhttp_json_post, fee_note_key_from_value, native_execution_context_block_id,
         native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission, native_invoke_error_is_retryable_nonce,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
         proof_fact_age_wait_ms, public_proof_job_status, redact_native_execution_request,
         redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
         select_root_history_witnesses_for_current_roots, should_refresh_onchain_submission,
-        storage_key, validate_batch_nullifier_freshness, validate_hosted_note_proof_privacy_config,
-        validate_native_proof_program_config, validate_native_tx_prover_endpoint_config,
+        storage_key, validate_aggregate_root_chain, validate_batch_nullifier_freshness,
+        validate_hosted_note_proof_privacy_config, validate_native_proof_program_config,
+        validate_native_tx_prover_endpoint_config,
     };
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode},
     };
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
     use tower::ServiceExt;
     use zylith_core::{
         AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, HiddenMakerCurve,
         MakerCurvePoint, MatchedOrderWitness, Note, NoteCommitment, NoteMembershipKind, Nullifier,
         NullifierHistoryBatch, OrderCommitment, OrderIntent, OrderSide, OrderType,
         OutputNoteRecord, PairId, ProductConfig, ProofJobStatus, RelayMode, RenewalChildUse,
-        SettlementOutputWithdrawalPlanRequest, SettlementTranscript, SettlementWitness,
-        SpendAuthorization, TimeInForce, build_settlement_output_withdrawal_submission_plan,
-        decrypt_output_note_for_owner, deposit_root_from_note, hash::ordered_felt_list_commitment,
+        SettlementCallArguments, SettlementOutputWithdrawalPlanRequest, SettlementSubmissionPlan,
+        SettlementTranscript, SettlementWitness, SpendAuthorization, StarknetCall, TimeInForce,
+        build_settlement_output_withdrawal_submission_plan, decrypt_output_note_for_owner,
+        deposit_root_from_note, hash::ordered_felt_list_commitment,
         note_recognition_public_key_from_raw_key_hex, nullifier_from_note_secret,
         nullifier_sparse_update_witnesses_for_consumed_inputs,
         renewal_sparse_witnesses_for_child_uses, root_only_settlement_commitments,
@@ -10564,6 +10621,217 @@ mod tests {
             submission_mode: "native-proof-facts".into(),
             settlement_contract_address: "0x123".into(),
         }
+    }
+
+    #[test]
+    fn maintenance_root_history_uses_only_confirmed_onchain_settlements() {
+        let confirmed_witness =
+            historical_witness_with_nullifier("batch-confirmed", Nullifier("0x11".into()));
+        let stale_witness =
+            historical_witness_with_nullifier("batch-proving-failed", Nullifier("0x22".into()));
+        let mut confirmed_submission = sample_onchain_submission();
+        confirmed_submission.batch_id = BatchId("batch-confirmed".into());
+        confirmed_submission.execution_status = Some("SUCCEEDED".into());
+        confirmed_submission.finality_status = Some("ACCEPTED_ON_L2".into());
+        let mut failed_submission = sample_onchain_submission();
+        failed_submission.batch_id = BatchId("batch-proving-failed".into());
+        failed_submission.execution_status = Some("REVERTED".into());
+        failed_submission.finality_status = Some("ACCEPTED_ON_L2".into());
+
+        let witnesses = BTreeMap::from([
+            (
+                confirmed_witness.batch_id.0.clone(),
+                confirmed_witness.clone(),
+            ),
+            (stale_witness.batch_id.0.clone(), stale_witness),
+        ]);
+        let submissions = BTreeMap::from([
+            (
+                confirmed_submission.batch_id.0.clone(),
+                confirmed_submission,
+            ),
+            (failed_submission.batch_id.0.clone(), failed_submission),
+        ]);
+
+        let filtered = confirmed_settlement_witnesses_from_maps(&witnesses, &submissions);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].batch_id, confirmed_witness.batch_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn aggregate_test_member(
+        batch_id: &str,
+        prior_note_root: &str,
+        new_note_root: &str,
+        prior_nullifier_root: &str,
+        new_nullifier_root: &str,
+        prior_renewal_root: &str,
+        new_renewal_root: &str,
+        prior_fee_root: &str,
+        new_fee_root: &str,
+    ) -> NativeAggregationPreparedMember {
+        let witness = historical_witness_with_nullifier(batch_id, Nullifier("0x1".into()));
+        let transcript = SettlementTranscript {
+            batch_id: BatchId(batch_id.into()),
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 1,
+            order_commitment_root: "0x111".into(),
+            encrypted_order_set_commitment: "0x222".into(),
+            prior_note_root: prior_note_root.into(),
+            prior_nullifier_root: prior_nullifier_root.into(),
+            prior_renewal_root: prior_renewal_root.into(),
+            prior_fee_root: prior_fee_root.into(),
+            new_nullifier_root: new_nullifier_root.into(),
+            new_renewal_root: new_renewal_root.into(),
+            clearing_price: 1,
+            price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            relay_fee_bps: 0,
+            protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT.into(),
+            matched_orders: vec![],
+            consumed_inputs: vec![],
+            renewal_child_uses: vec![],
+            fees: vec![],
+            output_notes: vec![],
+            output_note_preimages: vec![],
+            output_recovery_records: vec![],
+            output_recovery_dummy_commitments: vec![],
+            output_ciphertext_bundle_ref: "0x777".into(),
+        };
+        let encoded_args = SettlementCallArguments {
+            batch_id: batch_id.into(),
+            order_commitment_root: "0x111".into(),
+            encrypted_order_set_commitment: "0x222".into(),
+            transcript_commitment: "0x333".into(),
+            proof_artifact_commitment: "0x444".into(),
+            clearing_price: "0x1".into(),
+            price_base_scale: "0x1".into(),
+            taker_fee_bps: "0x4".into(),
+            maker_fee_bps: "0x0".into(),
+            relay_fee_bps: "0x0".into(),
+            protocol_fee_recipient: DEFAULT_PROTOCOL_FEE_RECIPIENT.into(),
+            relay_fee_recipient: DEFAULT_RELAY_FEE_RECIPIENT.into(),
+            output_bundle_ref: "0x777".into(),
+            prior_note_root: prior_note_root.into(),
+            prior_nullifier_root: prior_nullifier_root.into(),
+            prior_renewal_root: prior_renewal_root.into(),
+            prior_fee_root: prior_fee_root.into(),
+            consumed_note_root: "0x500".into(),
+            consumed_nullifier_root: "0x501".into(),
+            renewal_child_root: "0x502".into(),
+            output_note_root: "0x503".into(),
+            fee_root: "0x504".into(),
+            new_note_root: new_note_root.into(),
+            new_nullifier_root: new_nullifier_root.into(),
+            new_renewal_root: new_renewal_root.into(),
+            new_fee_root: new_fee_root.into(),
+        };
+
+        NativeAggregationPreparedMember {
+            witness,
+            transcript,
+            settlement_plan: SettlementSubmissionPlan {
+                batch_id: BatchId(batch_id.into()),
+                transcript_commitment: "0x333".into(),
+                proof_artifact_commitment: "0x444".into(),
+                settlement_call: StarknetCall {
+                    contract_address: "0x123".into(),
+                    entrypoint: "submit_settlement_with_proof_facts".into(),
+                    calldata: vec![],
+                },
+                encoded_args,
+            },
+            proof_message_hashes: vec![],
+        }
+    }
+
+    #[test]
+    fn aggregate_root_chain_validation_rejects_any_broken_root_link() {
+        let first = aggregate_test_member(
+            "batch-a", "0x0", "0x10", "0x0", "0x20", "0x0", "0x30", "0x0", "0x40",
+        );
+        let second = aggregate_test_member(
+            "batch-b", "0x10", "0x11", "0x20", "0x21", "0x30", "0x31", "0x40", "0x41",
+        );
+
+        assert!(validate_aggregate_root_chain(&[first.clone(), second.clone()]).is_ok());
+
+        let mut broken = second.clone();
+        broken.settlement_plan.encoded_args.prior_note_root = "0xdead".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first.clone(), broken]).expect_err("note mismatch"),
+            "aggregate member note roots are not chained"
+        );
+
+        let mut broken = second.clone();
+        broken.settlement_plan.encoded_args.prior_nullifier_root = "0xdead".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first.clone(), broken])
+                .expect_err("nullifier mismatch"),
+            "aggregate member nullifier roots are not chained"
+        );
+
+        let mut broken = second.clone();
+        broken.settlement_plan.encoded_args.prior_renewal_root = "0xdead".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first.clone(), broken]).expect_err("renewal mismatch"),
+            "aggregate member renewal roots are not chained"
+        );
+
+        let mut broken = second;
+        broken.settlement_plan.encoded_args.prior_fee_root = "0xdead".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first, broken]).expect_err("fee mismatch"),
+            "aggregate member fee roots are not chained"
+        );
+    }
+
+    #[test]
+    fn aggregate_root_chain_validation_rejects_member_identity_mismatch() {
+        let first = aggregate_test_member(
+            "batch-a", "0x0", "0x10", "0x0", "0x20", "0x0", "0x30", "0x0", "0x40",
+        );
+        let second = aggregate_test_member(
+            "batch-b", "0x10", "0x11", "0x20", "0x21", "0x30", "0x31", "0x40", "0x41",
+        );
+
+        let mut duplicate = second.clone();
+        duplicate.witness.batch_id = BatchId("batch-a".into());
+        duplicate.transcript.batch_id = BatchId("batch-a".into());
+        duplicate.settlement_plan.batch_id = BatchId("batch-a".into());
+        duplicate.settlement_plan.encoded_args.batch_id = "batch-a".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first.clone(), duplicate])
+                .expect_err("duplicate batch rejected"),
+            "aggregate member batch id is duplicated"
+        );
+
+        let mut mismatched = second.clone();
+        mismatched.settlement_plan.encoded_args.batch_id = "batch-c".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first.clone(), mismatched])
+                .expect_err("batch mismatch rejected"),
+            "aggregate member batch ids do not agree"
+        );
+
+        let mut mismatched = second.clone();
+        mismatched.settlement_plan.settlement_call.contract_address = "0x456".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first.clone(), mismatched])
+                .expect_err("target mismatch rejected"),
+            "aggregate member settlement targets do not agree"
+        );
+
+        let mut mismatched = second;
+        mismatched.settlement_plan.settlement_call.entrypoint = "submit_other".into();
+        assert_eq!(
+            validate_aggregate_root_chain(&[first, mismatched])
+                .expect_err("entrypoint mismatch rejected"),
+            "aggregate member settlement entrypoint is invalid"
+        );
     }
 
     fn test_note(asset_id: &str, amount: u128, nonce: u64) -> Note {

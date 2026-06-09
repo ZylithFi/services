@@ -14,9 +14,11 @@ class ProtocolModel {
     this.escrow = 0n;
     this.depositNotes = new Map();
     this.outputNotes = new Map();
+    this.stagedStrk20Exits = new Map();
     this.feeNotes = 0n;
     this.consumedNullifiers = new Set();
     this.withdrawnOutputs = new Set();
+    this.claimedStrk20Exits = new Map();
     this.cancelMarkers = new Set();
     this.settledBatches = new Set();
     this.pendingRootBatch = null;
@@ -31,9 +33,11 @@ class ProtocolModel {
     next.escrow = this.escrow;
     next.depositNotes = new Map(this.depositNotes);
     next.outputNotes = new Map(this.outputNotes);
+    next.stagedStrk20Exits = new Map(this.stagedStrk20Exits);
     next.feeNotes = this.feeNotes;
     next.consumedNullifiers = new Set(this.consumedNullifiers);
     next.withdrawnOutputs = new Set(this.withdrawnOutputs);
+    next.claimedStrk20Exits = new Map(this.claimedStrk20Exits);
     next.cancelMarkers = new Set(this.cancelMarkers);
     next.settledBatches = new Set(this.settledBatches);
     next.pendingRootBatch = this.pendingRootBatch ? { ...this.pendingRootBatch } : null;
@@ -41,7 +45,12 @@ class ProtocolModel {
   }
 
   liveValue() {
-    return sum(this.depositNotes.values()) + sum(this.outputNotes.values()) + this.feeNotes;
+    return (
+      sum(this.depositNotes.values()) +
+      sum(this.outputNotes.values()) +
+      sum(this.stagedStrk20Exits.values()) +
+      this.feeNotes
+    );
   }
 
   assertConserved() {
@@ -156,6 +165,33 @@ class ProtocolModel {
     this.consumedNullifiers.add(nullifier);
     this.escrow -= amount;
     this.nullifierRoot += 1;
+    this.assertConserved();
+  }
+
+  stageStrk20Exit(outputId, nullifier, exitId) {
+    this.assertNoPendingRootTransition();
+    if (this.withdrawnOutputs.has(outputId)) throw new Error("output already withdrawn");
+    if (this.consumedNullifiers.has(nullifier)) throw new Error("duplicate nullifier");
+    if (this.stagedStrk20Exits.has(exitId) || this.claimedStrk20Exits.has(exitId)) {
+      throw new Error("exit already exists");
+    }
+    const amount = this.outputNotes.get(outputId);
+    if (amount === undefined) throw new Error("unknown output note");
+    this.outputNotes.delete(outputId);
+    this.withdrawnOutputs.add(outputId);
+    this.consumedNullifiers.add(nullifier);
+    this.stagedStrk20Exits.set(exitId, amount);
+    this.nullifierRoot += 1;
+    this.assertConserved();
+  }
+
+  claimStrk20Exit(exitId, openNoteId) {
+    if (this.claimedStrk20Exits.has(exitId)) throw new Error("exit already claimed");
+    const amount = this.stagedStrk20Exits.get(exitId);
+    if (amount === undefined) throw new Error("unknown exit");
+    this.stagedStrk20Exits.delete(exitId);
+    this.claimedStrk20Exits.set(exitId, openNoteId);
+    this.escrow -= amount;
     this.assertConserved();
   }
 
@@ -325,6 +361,37 @@ test("FV-002 mutation rejects duplicate nullifier inside one settlement", () => 
       nullifiers: ["duplicate-nullifier", "duplicate-nullifier"],
     })
   );
+});
+
+test("FV-003 STRK20 staged exits preserve custody and reject cross-path replay", () => {
+  const claimPath = new ProtocolModel();
+  claimPath.deposit("deposit-a", 100n);
+  claimPath.settle("batch-a", {
+    inputs: ["deposit-a"],
+    outputs: { "output-a": 100n },
+    nullifiers: ["settlement-nullifier-a"],
+  });
+  claimPath.stageStrk20Exit("output-a", "withdraw-nullifier-a", "exit-a");
+  assert.equal(claimPath.escrow, 100n);
+  assert.equal(claimPath.liveValue(), 100n);
+  assertRejects(() => claimPath.withdraw("output-a", "withdraw-nullifier-b"));
+  assertRejects(() => claimPath.stageStrk20Exit("output-a", "withdraw-nullifier-c", "exit-b"));
+  claimPath.claimStrk20Exit("exit-a", "open-note-a");
+  assert.equal(claimPath.escrow, 0n);
+  assert.equal(claimPath.liveValue(), 0n);
+  assertRejects(() => claimPath.claimStrk20Exit("exit-a", "open-note-b"));
+  claimPath.assertConserved();
+
+  const normalPath = new ProtocolModel();
+  normalPath.deposit("deposit-a", 100n);
+  normalPath.settle("batch-a", {
+    inputs: ["deposit-a"],
+    outputs: { "output-a": 100n },
+    nullifiers: ["settlement-nullifier-a"],
+  });
+  normalPath.withdraw("output-a", "withdraw-nullifier-a");
+  assertRejects(() => normalPath.stageStrk20Exit("output-a", "withdraw-nullifier-b", "exit-a"));
+  normalPath.assertConserved();
 });
 
 test("FV-004/FV-008 bounded model rejects root-transition interleaving and stale maintenance", () => {
@@ -595,6 +662,124 @@ test("ROUTE-001 public route schema denylist rejects private response types", ()
   assert(!/\basset_id\b/.test(depositRecord), "public deposit activation record must not expose asset_id");
   assert(!/\bamount\b/.test(depositRecord), "public deposit activation record must not expose amount");
   assert(!/\bnote_commitment\b/.test(depositRecord), "public deposit activation record must not expose note_commitment");
+});
+
+test("ROUTE-002 generated backend route inventory has explicit privacy classification", () => {
+  const expectedRoutes = {
+    "coordinator/src/main.rs": [
+      "/api/attribution/{batch_id}/{maker_public_key}",
+      "/api/batches",
+      "/api/batches/current",
+      "/api/batches/transcripts",
+      "/api/batches/{batch_id}",
+      "/api/batches/{batch_id}/output-bundle",
+      "/api/batches/{batch_id}/transcript",
+      "/api/internal/batches/{batch_id}/artifacts",
+      "/api/internal/batches/{batch_id}/orders",
+      "/api/internal/batches/{batch_id}/settled-at",
+      "/api/internal/batches/{batch_id}/transcript",
+      "/api/internal/batches/{batch_id}/witness",
+      "/api/internal/renewal/cancel-markers",
+      "/api/maker/batches/{batch_id}",
+      "/api/maker/orders",
+      "/api/maker/orders/cancel",
+      "/api/maker/orders/{order_commitment}",
+      "/api/orders",
+      "/api/orders/cancel",
+      "/api/pairs/{base}/{quote}/batches/current",
+      "/api/recovery/{account_id}/artifacts",
+      "/api/recovery/{account_id}/artifacts/range/{start_sequence}/{end_sequence}",
+      "/api/recovery/{account_id}/settlement-reports/{batch_id}",
+      "/api/renewal/cancel-markers",
+      "/api/renewal/cancel-markers/{cancel_marker}",
+      "/api/renewal/cancel-witness/{cancel_marker}",
+      "/api/settlement-reports/{batch_id}",
+      "/attribution/{batch_id}/{maker_public_key}",
+      "/health",
+    ],
+    "indexer/src/main.rs": [
+      "/api/attribution/{batch_id}/{maker_public_key}",
+      "/api/batches/artifact-bundles",
+      "/api/batches/artifact-bundles/epochs/{start_epoch}/{end_epoch}",
+      "/api/batches/artifacts",
+      "/api/batches/artifacts/epochs/{start_epoch}/{end_epoch}",
+      "/api/batches/transcripts",
+      "/api/batches/{batch_id}/output-bundle",
+      "/api/batches/{batch_id}/transcript",
+      "/api/deposits/confirmations",
+      "/api/deposits/range/{start}/{end}",
+      "/api/deposits/{funding_commitment}",
+      "/api/internal/batches/root-history/epochs/{start_epoch}/{end_epoch}",
+      "/api/internal/batches/{batch_id}/artifacts",
+      "/api/internal/batches/{batch_id}/settled-at",
+      "/api/internal/batches/{batch_id}/transcript",
+      "/api/internal/sync/deposits",
+      "/api/internal/sync/withdrawals",
+      "/api/privacy/artifact-aggregation-policy",
+      "/api/privacy/claim-window-policy",
+      "/api/privacy/withdrawal-amount-bucket-policy",
+      "/api/withdrawals/range/{start}/{end}",
+      "/api/withdrawals/{note_commitment}",
+      "/attribution/{batch_id}/{maker_public_key}",
+      "/health",
+    ],
+    "prover/src/main.rs": [
+      "/api/internal/batches/{batch_id}/prepare",
+      "/api/internal/health",
+      "/api/internal/onchain-submissions/{batch_id}",
+      "/api/internal/onchain-submissions/{batch_id}/refresh",
+      "/api/internal/proof-aggregation-manifests/epochs/{start_epoch}/{end_epoch}",
+      "/api/internal/proof-aggregation-manifests/epochs/{start_epoch}/{end_epoch}/submit",
+      "/api/internal/proof-artifacts/{batch_id}",
+      "/api/internal/proof-jobs/{batch_id}",
+      "/api/internal/proof-jobs/{batch_id}/prove",
+      "/api/internal/proof-jobs/{batch_id}/submit",
+      "/api/internal/settlement-plans/{batch_id}",
+      "/api/internal/settlement-witnesses/{batch_id}",
+      "/api/private/note-consolidations/prepare",
+      "/api/private/note-consolidations/submit",
+      "/api/private/orders",
+      "/api/private/withdrawals/prepare",
+      "/api/private/withdrawals/submit",
+      "/api/public/auction-keys",
+      "/api/public/auction-keys/fingerprint",
+      "/api/public/proof-jobs",
+      "/api/public/proof-jobs/{batch_id}",
+      "/health",
+    ],
+    "renewal_relayer/src/main.rs": [
+      "/api/internal/relay/tick",
+      "/health",
+      "/metrics",
+      "/ops/alerts",
+      "/ops/summary",
+      "/packages",
+      "/packages/{package_id}",
+      "/packages/{package_id}/attest-order",
+      "/packages/{package_id}/results",
+      "/packages/{package_id}/results.csv",
+      "/ready",
+    ],
+  };
+  for (const [file, routes] of Object.entries(expectedRoutes)) {
+    assert.deepEqual(extractRustRouteInventory(file), routes, `${file} route inventory changed without classification`);
+  }
+  assert.deepEqual(extractPaymasterRouteInventory(), ["/execute-outside", "/health", "/privacy-signer/ensure", "/privacy-signer/relay"]);
+
+  for (const [file, routes] of Object.entries(expectedRoutes)) {
+    const source = readSource(file);
+    for (const route of routes) {
+      assert(classifyRoute(file, route), `${file}:${route} has no explicit privacy classification`);
+    }
+    if (file !== "renewal_relayer/src/main.rs" && routes.some((route) => route.startsWith("/api/internal/"))) {
+      assert.match(source, /starts_with\("\/api\/internal\/"\)[\s\S]*require_internal_auth/);
+    }
+  }
+  assert.match(readSource("coordinator/src/main.rs"), /starts_with\("\/api\/maker\/"\)[\s\S]*require_internal_auth/);
+  assert.match(readSource("renewal_relayer/src/main.rs"), /async fn metrics\([\s\S]*require_internal_auth/);
+  assert.match(readSource("renewal_relayer/src/main.rs"), /async fn ops_summary\([\s\S]*require_internal_auth/);
+  assert.match(readSource("renewal_relayer/src/main.rs"), /async fn ops_alerts\([\s\S]*require_internal_auth/);
+  assert.match(readSource("renewal_relayer/src/main.rs"), /async fn trigger_tick\([\s\S]*require_internal_auth/);
 });
 
 test("SURFACE-001 removed privacy-gate symbols do not exist in live code or launch copy", () => {
@@ -872,6 +1057,36 @@ function rustFunctionReturnType(source, name) {
   const match = source.match(new RegExp(`async fn ${name}\\b[\\s\\S]*?\\)\\s*->\\s*([^\\{]+)\\{`));
   assert(match, `${name} return type must be discoverable from source`);
   return match[1].replace(/\s+/g, " ").trim();
+}
+
+function extractRustRouteInventory(file) {
+  const source = readSource(file).split(/\n#\[cfg\(test\)\]\s*\nmod tests/)[0];
+  return [...new Set([...source.matchAll(/\.route\(\s*"([^"]+)"/g)].map((match) => match[1]))].sort();
+}
+
+function extractPaymasterRouteInventory() {
+  const source = readSource("paymaster/src/server.ts");
+  return [...new Set([...source.matchAll(/request\.url\s*(?:===|!==)\s*"([^"]+)"/g)].map((match) => match[1]))].sort();
+}
+
+function classifyRoute(file, route) {
+  if (route === "/health" || route === "/ready") return "public-health";
+  if (route.startsWith("/api/internal/")) return "internal-control-plane";
+  if (file === "coordinator/src/main.rs" && route.startsWith("/api/maker/")) return "internal-maker";
+  if (file === "prover/src/main.rs" && route.startsWith("/api/private/")) return "hosted-private-payload";
+  if (file === "prover/src/main.rs" && route.startsWith("/api/public/")) return "public-redacted";
+  if (route.startsWith("/api/recovery/") || route.startsWith("/api/settlement-reports/")) return "recovery-authenticated";
+  if (route.startsWith("/api/renewal/cancel-")) return "public-renewal-state";
+  if (route.includes("/attribution/")) return "public-delayed-attribution";
+  if (file === "renewal_relayer/src/main.rs" && ["/metrics", "/ops/alerts", "/ops/summary"].includes(route)) {
+    return "internal-ops";
+  }
+  if (file === "renewal_relayer/src/main.rs" && route.startsWith("/packages")) return "package-authenticated";
+  if (route.startsWith("/api/privacy/")) return "public-policy";
+  if (route.startsWith("/api/batches") || route.startsWith("/api/pairs/")) return "public-artifact";
+  if (route.startsWith("/api/deposits") || route.startsWith("/api/withdrawals")) return "public-chain-index";
+  if (route.startsWith("/api/orders")) return "public-order-ingress";
+  return null;
 }
 
 function sourceFilesUnder(dir) {

@@ -4666,16 +4666,92 @@ mod tests {
             output_recovery_dummy_commitments: vec![],
             output_ciphertext_bundle_ref: bundle.bundle_commitment.clone(),
         };
-        let mut substituted_bundle = bundle;
-        substituted_bundle.ciphertexts[0].key_id = "aa".repeat(32);
+        let substitutions: Vec<(&str, Box<dyn Fn(&mut EncryptedBlob)>)> = vec![
+            (
+                "algorithm",
+                Box::new(|blob| blob.algorithm = "zylith.note_recognition.v2".into()),
+            ),
+            ("key_id", Box::new(|blob| blob.key_id = "aa".repeat(32))),
+            (
+                "ephemeral_public_key",
+                Box::new(|blob| blob.ephemeral_public_key = "04".to_string() + &"22".repeat(64)),
+            ),
+            ("nonce", Box::new(|blob| blob.nonce = "bb".repeat(12))),
+            (
+                "ciphertext",
+                Box::new(|blob| blob.ciphertext = "cc".repeat(OUTPUT_NOTE_CIPHERTEXT_LEN)),
+            ),
+        ];
 
-        let error = crate::validate_transcript_shape_policy(&transcript, &substituted_bundle)
-            .expect_err("substituted recovery-backed ciphertext envelope must fail");
+        for (field, mutate) in substitutions {
+            let mut substituted_bundle = bundle.clone();
+            mutate(&mut substituted_bundle.ciphertexts[0]);
+            let error =
+                match crate::validate_transcript_shape_policy(&transcript, &substituted_bundle) {
+                    Ok(_) => panic!("substituted recovery-backed ciphertext {field} must fail"),
+                    Err(error) => error,
+                };
+            assert!(
+                error.to_string().contains(
+                    "output bundle envelope commitment does not match ciphertext contents"
+                ) || error.to_string().contains("uses unsupported algorithm"),
+                "unexpected {field} error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_shape_policy_rejects_missing_recovery_backed_envelope_commitment() {
+        let batch_id = BatchId("batch-recovery-missing-envelope".into());
+        let mut bundle = crate::OutputCiphertextBundle::from_ciphertexts(
+            batch_id.clone(),
+            "da://bundle",
+            vec![super::dummy_output_ciphertext(&batch_id, 0).expect("dummy ciphertext")],
+        )
+        .expect("bundle");
+        let transcript = SettlementTranscript {
+            batch_id,
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 7,
+            order_commitment_root: "0x1".into(),
+            encrypted_order_set_commitment: "0x2".into(),
+            prior_note_root: "0x0".into(),
+            prior_nullifier_root: "0x0".into(),
+            prior_renewal_root: "0x0".into(),
+            prior_fee_root: "0x0".into(),
+            new_nullifier_root: "0x0".into(),
+            new_renewal_root: "0x0".into(),
+            clearing_price: 100,
+            price_base_scale: 1,
+            taker_fee_bps: 4,
+            maker_fee_bps: 0,
+            relay_fee_bps: 0,
+            protocol_fee_recipient: "0x123".into(),
+            relay_fee_recipient: "zylith-renewal-relay".into(),
+            matched_orders: vec![],
+            consumed_inputs: vec![],
+            renewal_child_uses: vec![],
+            fees: vec![],
+            output_notes: vec![OutputNoteRecord {
+                note_commitment: NoteCommitment("0x456".into()),
+                asset_id: AssetId("USDC".into()),
+                amount: 10,
+                withdraw_authority: "0x789".into(),
+            }],
+            output_note_preimages: vec![],
+            output_recovery_records: vec![],
+            output_recovery_dummy_commitments: vec![],
+            output_ciphertext_bundle_ref: bundle.bundle_commitment.clone(),
+        };
+        bundle.ciphertext_envelope_commitment = None;
+
+        let error = crate::validate_transcript_shape_policy(&transcript, &bundle)
+            .expect_err("missing envelope commitment must fail");
 
         assert!(
             error
                 .to_string()
-                .contains("output bundle envelope commitment does not match ciphertext contents")
+                .contains("output bundle envelope commitment is missing")
         );
     }
 

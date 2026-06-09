@@ -193,7 +193,7 @@ describe("paymaster server", () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
   });
 
-  it("rejects direct embedded-wallet withdrawal relays while exits are paused", async () => {
+  it("rejects direct deprecated withdrawal relays", async () => {
     const directRequest = {
       ...request,
       call: {
@@ -233,7 +233,7 @@ describe("paymaster server", () => {
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
-      error: "withdrawals are paused until nullifier-consuming exits are available"
+      error: "call entrypoint is not supported by paymaster"
     });
   });
 
