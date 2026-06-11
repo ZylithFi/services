@@ -26,13 +26,14 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{
     Batch, BatchId, BatchOrderSet, BatchStatus, BatchSummary, CONTROL_PLANE_TOKEN_ENV,
     CoordinatorStatus, MakerAttributionArtifactList, OrderCancellationAccepted,
-    OrderCancellationRequest, OrderShareBundle, OrderSubmission, OrderSubmissionAccepted, PairId,
-    PrivateSettlementOutputRecoveryRecord, PrivateSettlementReport, PrivateSettlementReportQuery,
-    ProductConfig, PublicBatchSummary, PublicSettlementTranscript, PublishedBatchArtifacts,
-    RecoveryArtifact, RecoveryArtifactList, RecoveryArtifactUpload, RenewalCancelMarkerList,
-    RenewalCancelMarkerRecord, SettlementTimestampUpdate, SubmittedOrderRecord,
-    artifact_epoch_bucket_end, artifact_epoch_bucket_start, count_bucket_label,
-    derive_order_cancellation_tag, extract_bearer_token,
+    OrderCancellationRequest, OrderIngressClientTelemetry, OrderShareBundle, OrderSubmission,
+    OrderSubmissionAccepted, PairId, PrivateSettlementOutputRecoveryRecord,
+    PrivateSettlementReport, PrivateSettlementReportQuery, ProductConfig, PublicBatchSummary,
+    PublicSettlementTranscript, PublishedBatchArtifacts, RecoveryArtifact, RecoveryArtifactList,
+    RecoveryArtifactUpload, RenewalCancelMarkerList, RenewalCancelMarkerRecord,
+    SettlementTimestampUpdate, SubmittedOrderRecord, artifact_epoch_bucket_end,
+    artifact_epoch_bucket_start, count_bucket_label, derive_order_cancellation_tag,
+    extract_bearer_token,
     hash::{
         encode_starknet_felt, normalize_felt_hex, ordered_felt_list_commitment,
         tagged_commitment_sha256, tagged_field_hex,
@@ -134,6 +135,7 @@ struct AppState {
     verified_auction_transcript_selector: String,
     renewal_cancel_marker_recorded_selector: String,
     rate_limiter: RateLimiter,
+    order_submission_metrics: IngressTelemetryMetrics,
 }
 
 #[derive(Serialize)]
@@ -256,6 +258,166 @@ struct RateLimiter {
 struct RateLimitBucket {
     window_started_unix_ms: u64,
     count: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OrderSubmissionTelemetryEnvelope {
+    #[serde(flatten)]
+    order_submission: OrderSubmission,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ingress_telemetry: Option<OrderIngressClientTelemetry>,
+}
+
+const INGRESS_LATENCY_BUCKETS_MS: &[u64] = &[
+    10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000,
+];
+const INGRESS_REMAINING_BUCKETS_MS: &[u64] =
+    &[0, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+const MAX_CLIENT_TELEMETRY_MS: u64 = 10 * 60 * 1_000;
+
+#[derive(Clone, Debug, Default)]
+struct IngressTelemetryMetrics {
+    inner: Arc<Mutex<IngressTelemetryMetricsInner>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct IngressTelemetryMetricsInner {
+    outcomes: BTreeMap<&'static str, u64>,
+    processing_ms: HistogramCounts,
+    private_ingress_roundtrip_ms: HistogramCounts,
+    client_elapsed_before_coordinator_ms: HistogramCounts,
+    batch_time_remaining_before_coordinator_ms: HistogramCounts,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistogramCounts {
+    buckets: BTreeMap<u64, u64>,
+    overflow: u64,
+    count: u64,
+    sum: u128,
+}
+
+impl HistogramCounts {
+    fn observe(&mut self, value: u64, buckets: &[u64]) {
+        if let Some(bucket) = buckets.iter().copied().find(|bucket| value <= *bucket) {
+            *self.buckets.entry(bucket).or_insert(0) += 1;
+        } else {
+            self.overflow += 1;
+        }
+        self.count += 1;
+        self.sum += value as u128;
+    }
+}
+
+impl IngressTelemetryMetrics {
+    fn record(
+        &self,
+        outcome: &'static str,
+        processing_ms: u64,
+        telemetry: Option<&OrderIngressClientTelemetry>,
+    ) {
+        let mut inner = self.inner.lock().expect("ingress metrics lock");
+        *inner.outcomes.entry(outcome).or_insert(0) += 1;
+        inner
+            .processing_ms
+            .observe(processing_ms, INGRESS_LATENCY_BUCKETS_MS);
+        if let Some(telemetry) = telemetry {
+            observe_client_ms(
+                &mut inner.private_ingress_roundtrip_ms,
+                telemetry.private_ingress_roundtrip_ms,
+                INGRESS_LATENCY_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.client_elapsed_before_coordinator_ms,
+                telemetry.client_elapsed_before_coordinator_ms,
+                INGRESS_LATENCY_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.batch_time_remaining_before_coordinator_ms,
+                telemetry.batch_time_remaining_before_coordinator_ms,
+                INGRESS_REMAINING_BUCKETS_MS,
+            );
+        }
+    }
+
+    fn render_prometheus(&self, namespace: &str) -> String {
+        let inner = self.inner.lock().expect("ingress metrics lock");
+        let mut output = String::new();
+        output.push_str(&format!(
+            "# HELP {namespace}_order_submission_requests_total Coordinator order submissions by outcome.\n\
+             # TYPE {namespace}_order_submission_requests_total counter\n"
+        ));
+        for (outcome, count) in &inner.outcomes {
+            output.push_str(&format!(
+                "{namespace}_order_submission_requests_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+        render_histogram(
+            &mut output,
+            namespace,
+            "order_submission_processing_ms",
+            "Coordinator order submission server processing latency.",
+            &inner.processing_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "order_submission_private_ingress_roundtrip_ms",
+            "Client-reported private ingress roundtrip time for coordinator submissions.",
+            &inner.private_ingress_roundtrip_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "order_submission_client_elapsed_before_coordinator_ms",
+            "Client-reported elapsed time before coordinator submission.",
+            &inner.client_elapsed_before_coordinator_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "order_submission_batch_time_remaining_before_coordinator_ms",
+            "Client-reported batch time remaining before coordinator submission.",
+            &inner.batch_time_remaining_before_coordinator_ms,
+            INGRESS_REMAINING_BUCKETS_MS,
+        );
+        output
+    }
+}
+
+fn observe_client_ms(histogram: &mut HistogramCounts, value: Option<u64>, buckets: &[u64]) {
+    if let Some(value) = value.filter(|value| *value <= MAX_CLIENT_TELEMETRY_MS) {
+        histogram.observe(value, buckets);
+    }
+}
+
+fn render_histogram(
+    output: &mut String,
+    namespace: &str,
+    metric: &str,
+    help: &str,
+    histogram: &HistogramCounts,
+    buckets: &[u64],
+) {
+    output.push_str(&format!(
+        "# HELP {namespace}_{metric} {help}\n# TYPE {namespace}_{metric} histogram\n"
+    ));
+    let mut cumulative = 0_u64;
+    for bucket in buckets {
+        cumulative += histogram.buckets.get(bucket).copied().unwrap_or_default();
+        output.push_str(&format!(
+            "{namespace}_{metric}_bucket{{le=\"{bucket}\"}} {cumulative}\n"
+        ));
+    }
+    cumulative += histogram.overflow;
+    output.push_str(&format!(
+        "{namespace}_{metric}_bucket{{le=\"+Inf\"}} {cumulative}\n"
+    ));
+    output.push_str(&format!("{namespace}_{metric}_count {}\n", histogram.count));
+    output.push_str(&format!("{namespace}_{metric}_sum {}\n", histogram.sum));
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -637,6 +799,7 @@ fn build_app_with_config(
         verified_auction_transcript_selector: selector_hex("verified_auction_transcript"),
         renewal_cancel_marker_recorded_selector: selector_hex("renewal_cancel_marker_recorded"),
         rate_limiter: RateLimiter::default(),
+        order_submission_metrics: IngressTelemetryMetrics::default(),
     };
 
     Ok(Router::new()
@@ -717,6 +880,7 @@ fn build_app_with_config(
             "/api/internal/renewal/cancel-markers",
             get(list_internal_renewal_cancel_markers),
         )
+        .route("/api/internal/metrics", get(internal_metrics))
         .route("/api/orders", post(submit_order))
         .route("/api/orders/cancel", post(cancel_order))
         .route("/api/maker/orders", post(submit_maker_order))
@@ -773,6 +937,16 @@ async fn health(State(state): State<AppState>) -> Json<CoordinatorStatus> {
         batch_window_ms: state.batch_window_ms,
         batch_close_jitter_ms: state.batch_close_jitter_ms,
     })
+}
+
+async fn internal_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<String, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    Ok(state
+        .order_submission_metrics
+        .render_prometheus("zylith_coordinator"))
 }
 
 async fn list_batches(State(state): State<AppState>) -> Json<Vec<PublicBatchSummary>> {
@@ -2038,17 +2212,28 @@ async fn submit_order(
     State(state): State<AppState>,
     PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
-    Json(request): Json<OrderSubmission>,
+    Json(request): Json<OrderSubmissionTelemetryEnvelope>,
 ) -> Result<Json<OrderSubmissionAccepted>, StatusCode> {
-    require_order_intake_enabled(&state)?;
-    enforce_rate_limit(
-        &state.rate_limiter,
-        &headers,
-        peer,
-        "submit-order",
-        state.public_rate_limit_per_minute,
-    )?;
-    submit_order_inner(state, request).await
+    let started_at_unix_ms = now_unix_ms();
+    let ingress_telemetry = request.ingress_telemetry.clone();
+    let result = async {
+        require_order_intake_enabled(&state)?;
+        enforce_rate_limit(
+            &state.rate_limiter,
+            &headers,
+            peer,
+            "submit-order",
+            state.public_rate_limit_per_minute,
+        )?;
+        submit_order_inner(state.clone(), request.order_submission).await
+    }
+    .await;
+    state.order_submission_metrics.record(
+        coordinator_order_submission_outcome_label(&result),
+        now_unix_ms().saturating_sub(started_at_unix_ms),
+        ingress_telemetry.as_ref(),
+    );
+    result
 }
 
 async fn submit_maker_order(
@@ -2059,6 +2244,17 @@ async fn submit_maker_order(
     require_internal_auth(&state, &headers)?;
     require_order_intake_enabled(&state)?;
     submit_order_inner(state, request).await
+}
+
+fn coordinator_order_submission_outcome_label<T>(result: &Result<T, StatusCode>) -> &'static str {
+    match result {
+        Ok(_) => "accepted",
+        Err(StatusCode::CONFLICT) => "conflict",
+        Err(StatusCode::TOO_MANY_REQUESTS) => "rate_limited",
+        Err(StatusCode::BAD_REQUEST) => "bad_request",
+        Err(StatusCode::SERVICE_UNAVAILABLE) => "unavailable",
+        Err(_) => "rejected",
+    }
 }
 
 async fn submit_order_inner(
@@ -3439,6 +3635,93 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_metrics_requires_auth_and_exposes_order_submission_telemetry() {
+        let app = build_app_with_paths(None, None, None, Some(TEST_INTERNAL_TOKEN.into()));
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/internal/metrics")
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let submission = serde_json::json!({
+            "order_bundle": {
+                "order_commitment": "0x1234",
+                "cancellation_auth_tag": "cancel-tag-metrics",
+                "pair_id": "STRK/USDC",
+                "batch_id": "batch-strk-usdc-1",
+                "epoch_id": 1,
+                "transport_envelope": null,
+                "ingress_receipt": null,
+                "shares": []
+            },
+            "ingress_telemetry": {
+                "version": 1,
+                "private_ingress_roundtrip_ms": 120,
+                "client_elapsed_before_coordinator_ms": 7120,
+                "batch_time_remaining_before_coordinator_ms": 24000,
+                "submission_safety_buffer_ms": 15000
+            }
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/orders")
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&submission).expect("serialize submission"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                auth_request(
+                    Request::builder()
+                        .uri("/api/internal/metrics")
+                        .method(Method::GET),
+                )
+                .body(Body::empty())
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+
+        assert!(text.contains(
+            "zylith_coordinator_order_submission_requests_total{outcome=\"accepted\"} 1"
+        ));
+        assert!(text.contains("zylith_coordinator_order_submission_processing_ms_count 1"));
+        assert!(
+            text.contains(
+                "zylith_coordinator_order_submission_private_ingress_roundtrip_ms_count 1"
+            )
+        );
+        assert!(text.contains(
+            "zylith_coordinator_order_submission_batch_time_remaining_before_coordinator_ms_bucket{le=\"30000\"} 1"
+        ));
+        assert!(!text.contains("0x1234"));
     }
 
     #[tokio::test]

@@ -992,6 +992,27 @@ fn zero_felt_string() -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderIngressClientTelemetry {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_build_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_submission_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_elapsed_before_private_ingress_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_ingress_roundtrip_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_elapsed_before_coordinator_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_time_remaining_before_private_ingress_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_time_remaining_before_coordinator_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_safety_buffer_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedOrderIngressRequest {
     pub order_submission: OrderSubmission,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1000,6 +1021,8 @@ pub struct TrustedOrderIngressRequest {
     pub renewal_package_commitment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewal_relay_mode: Option<RelayMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_telemetry: Option<OrderIngressClientTelemetry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub padding: Option<String>,
 }
@@ -3461,11 +3484,11 @@ mod tests {
         AssetId, BatchId, BatchLiquidityReport, BatchStatus, BatchSummary, ClaimWindowPolicy,
         DeploymentManifest, DepositIntent, FeeEntry, FundingRailConfig, FundingRailKind,
         HiddenMakerCurve, MAX_MAKER_CURVE_POINTS, MakerCurvePoint, NOTE_RECOGNITION_ALGORITHM,
-        Note, NoteCommitment, Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIntent, OrderShareBundle,
-        OrderSide, OrderSubmission, OutputCiphertextBundle, OutputNoteRecord, PairId,
-        ProductConfig, RelayMode, SettlementTranscript, StarknetPrivacyFundingRail,
-        TRANSCRIPT_SHAPE_POLICY_VERSION, funding_input_set_commitment,
-        funding_nullifier_set_commitment, renewal_parent_commitment,
+        Note, NoteCommitment, Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIngressClientTelemetry,
+        OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OutputCiphertextBundle,
+        OutputNoteRecord, PairId, ProductConfig, RelayMode, SettlementTranscript,
+        StarknetPrivacyFundingRail, TRANSCRIPT_SHAPE_POLICY_VERSION, TrustedOrderIngressRequest,
+        funding_input_set_commitment, funding_nullifier_set_commitment, renewal_parent_commitment,
         renewal_parent_secret_commitment,
     };
 
@@ -4847,5 +4870,46 @@ mod tests {
                 .expect("off bucket");
         assert!(!off_bucket.exact_bucket);
         assert_eq!(off_bucket.nearest_bucket_amount, 1_000_000);
+    }
+
+    #[test]
+    fn trusted_order_ingress_telemetry_is_optional_and_out_of_band() {
+        let json = serde_json::json!({
+            "order_submission": {
+                "order_bundle": {
+                    "order_commitment": "0xabc",
+                    "cancellation_auth_tag": "cancel",
+                    "pair_id": "STRK/USDC",
+                    "batch_id": "batch-strk-usdc-1",
+                    "epoch_id": 1,
+                    "transport_envelope": null,
+                    "shares": []
+                }
+            }
+        });
+        let request: TrustedOrderIngressRequest =
+            serde_json::from_value(json).expect("legacy ingress request");
+        assert!(request.ingress_telemetry.is_none());
+
+        let request = TrustedOrderIngressRequest {
+            ingress_telemetry: Some(OrderIngressClientTelemetry {
+                version: 1,
+                client_build_ms: Some(25),
+                private_submission_delay_ms: Some(7_000),
+                client_elapsed_before_private_ingress_ms: Some(7_025),
+                private_ingress_roundtrip_ms: Some(120),
+                client_elapsed_before_coordinator_ms: Some(7_145),
+                batch_time_remaining_before_private_ingress_ms: Some(25_000),
+                batch_time_remaining_before_coordinator_ms: Some(24_850),
+                submission_safety_buffer_ms: Some(15_000),
+            }),
+            ..request
+        };
+        let serialized = serde_json::to_value(&request).expect("telemetry request");
+        assert_eq!(serialized["ingress_telemetry"]["version"], 1);
+        assert_eq!(
+            serialized["order_submission"]["order_bundle"]["order_commitment"],
+            "0xabc"
+        );
     }
 }

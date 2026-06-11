@@ -679,6 +679,7 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
       "/api/internal/batches/{batch_id}/settled-at",
       "/api/internal/batches/{batch_id}/transcript",
       "/api/internal/batches/{batch_id}/witness",
+      "/api/internal/metrics",
       "/api/internal/renewal/cancel-markers",
       "/api/maker/batches/{batch_id}",
       "/api/maker/orders",
@@ -726,6 +727,7 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
     "prover/src/main.rs": [
       "/api/internal/batches/{batch_id}/prepare",
       "/api/internal/health",
+      "/api/internal/metrics",
       "/api/internal/onchain-submissions/{batch_id}",
       "/api/internal/onchain-submissions/{batch_id}/refresh",
       "/api/internal/proof-aggregation-manifests/epochs/{start_epoch}/{end_epoch}",

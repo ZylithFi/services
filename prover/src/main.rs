@@ -56,15 +56,15 @@ use zylith_core::{
     MakerAttributionPlaintext, MakerBandAttribution, MakerBandFillAttribution, MatchedOrder,
     MatchedOrderWitness, Note, NoteCommitment, NoteConsolidationWitness, NoteMembershipKind,
     NoteMembershipWitness, OnchainSubmissionRecord, OrderCommitment, OrderExecutionReport,
-    OrderIngressReceipt, OrderIngressReceiptAttestation, OrderIntent, OrderShareBundle, OrderSide,
-    OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteRecord, OutputRecoveryRecord,
-    PairId, PreparedBatchStatus, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
-    PrivateExecutionKeyRegistry, ProductConfig, ProductPairConfig, ProofArtifactRecord,
-    ProofJobStatus, PublicBatchSummary, PublishedBatchArtifacts, RelayMode,
-    RenewalCancelMarkerList, SettlementOutputWithdrawalWitness, SettlementRootHistoryArchive,
-    SettlementSubmissionPlan, SettlementTranscript, SettlementWitness, SpendAuthorization,
-    StarknetCall, TimeInForce, TrustedOrderIngressRequest, TrustedOrderIngressResponse,
-    admission_proof_message_hash_for_program, auction_admission_root,
+    OrderIngressClientTelemetry, OrderIngressReceipt, OrderIngressReceiptAttestation, OrderIntent,
+    OrderShareBundle, OrderSide, OrderSubmission, OrderType, OutputCiphertextBundle,
+    OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
+    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
+    ProductConfig, ProductPairConfig, ProofArtifactRecord, ProofJobStatus, PublicBatchSummary,
+    PublishedBatchArtifacts, RelayMode, RenewalCancelMarkerList, SettlementOutputWithdrawalWitness,
+    SettlementRootHistoryArchive, SettlementSubmissionPlan, SettlementTranscript,
+    SettlementWitness, SpendAuthorization, StarknetCall, TimeInForce, TrustedOrderIngressRequest,
+    TrustedOrderIngressResponse, admission_proof_message_hash_for_program, auction_admission_root,
     auction_result_proof_message_hash_for_program, base_amount_affordable_for_quote,
     build_admission_serialized_input, build_auction_result_serialized_input, build_fee_output_note,
     build_heartbeat_cover_orders, build_note_consolidation_serialized_input,
@@ -269,6 +269,7 @@ struct AppState {
     proof_artifacts: Arc<RwLock<BTreeMap<String, ProofArtifactRecord>>>,
     onchain_submissions: Arc<RwLock<BTreeMap<String, OnchainSubmissionRecord>>>,
     private_order_payloads: Arc<RwLock<BTreeMap<String, PrivateOrderPayloadRecord>>>,
+    private_ingress_metrics: IngressTelemetryMetrics,
     product_config: Arc<ProductConfig>,
     auction_key_registry: Arc<PrivateExecutionKeyRegistry>,
     auction_private_keys: Arc<Vec<PrivateExecutionKeyPrivateConfig>>,
@@ -430,6 +431,214 @@ struct RateLimiter {
 struct RateLimitBucket {
     window_started_unix_ms: u64,
     count: u64,
+}
+
+const INGRESS_LATENCY_BUCKETS_MS: &[u64] = &[
+    10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000,
+];
+const INGRESS_REMAINING_BUCKETS_MS: &[u64] =
+    &[0, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+const MAX_CLIENT_TELEMETRY_MS: u64 = 10 * 60 * 1_000;
+
+#[derive(Clone, Debug, Default)]
+struct IngressTelemetryMetrics {
+    inner: Arc<Mutex<IngressTelemetryMetricsInner>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct IngressTelemetryMetricsInner {
+    outcomes: BTreeMap<&'static str, u64>,
+    processing_ms: HistogramCounts,
+    client_build_ms: HistogramCounts,
+    private_submission_delay_ms: HistogramCounts,
+    client_elapsed_before_private_ingress_ms: HistogramCounts,
+    private_ingress_roundtrip_ms: HistogramCounts,
+    client_elapsed_before_coordinator_ms: HistogramCounts,
+    batch_time_remaining_before_private_ingress_ms: HistogramCounts,
+    batch_time_remaining_before_coordinator_ms: HistogramCounts,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistogramCounts {
+    buckets: BTreeMap<u64, u64>,
+    overflow: u64,
+    count: u64,
+    sum: u128,
+}
+
+impl HistogramCounts {
+    fn observe(&mut self, value: u64, buckets: &[u64]) {
+        if let Some(bucket) = buckets.iter().copied().find(|bucket| value <= *bucket) {
+            *self.buckets.entry(bucket).or_insert(0) += 1;
+        } else {
+            self.overflow += 1;
+        }
+        self.count += 1;
+        self.sum += value as u128;
+    }
+}
+
+impl IngressTelemetryMetrics {
+    fn record(
+        &self,
+        outcome: &'static str,
+        processing_ms: u64,
+        telemetry: Option<&OrderIngressClientTelemetry>,
+    ) {
+        let mut inner = self.inner.lock().expect("ingress metrics lock");
+        *inner.outcomes.entry(outcome).or_insert(0) += 1;
+        inner
+            .processing_ms
+            .observe(processing_ms, INGRESS_LATENCY_BUCKETS_MS);
+        if let Some(telemetry) = telemetry {
+            observe_client_ms(
+                &mut inner.client_build_ms,
+                telemetry.client_build_ms,
+                INGRESS_LATENCY_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.private_submission_delay_ms,
+                telemetry.private_submission_delay_ms,
+                INGRESS_LATENCY_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.client_elapsed_before_private_ingress_ms,
+                telemetry.client_elapsed_before_private_ingress_ms,
+                INGRESS_LATENCY_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.private_ingress_roundtrip_ms,
+                telemetry.private_ingress_roundtrip_ms,
+                INGRESS_LATENCY_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.client_elapsed_before_coordinator_ms,
+                telemetry.client_elapsed_before_coordinator_ms,
+                INGRESS_LATENCY_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.batch_time_remaining_before_private_ingress_ms,
+                telemetry.batch_time_remaining_before_private_ingress_ms,
+                INGRESS_REMAINING_BUCKETS_MS,
+            );
+            observe_client_ms(
+                &mut inner.batch_time_remaining_before_coordinator_ms,
+                telemetry.batch_time_remaining_before_coordinator_ms,
+                INGRESS_REMAINING_BUCKETS_MS,
+            );
+        }
+    }
+
+    fn render_prometheus(&self, namespace: &str) -> String {
+        let inner = self.inner.lock().expect("ingress metrics lock");
+        let mut output = String::new();
+        output.push_str(&format!(
+            "# HELP {namespace}_private_order_ingress_requests_total Private order ingress requests by outcome.\n\
+             # TYPE {namespace}_private_order_ingress_requests_total counter\n"
+        ));
+        for (outcome, count) in &inner.outcomes {
+            output.push_str(&format!(
+                "{namespace}_private_order_ingress_requests_total{{outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_processing_ms",
+            "Private order ingress server processing latency.",
+            &inner.processing_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_client_build_ms",
+            "Client-reported private order build time before ingress.",
+            &inner.client_build_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_submission_delay_ms",
+            "Client-reported private submission smoothing delay.",
+            &inner.private_submission_delay_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_client_elapsed_before_private_ingress_ms",
+            "Client-reported elapsed time before private ingress submission.",
+            &inner.client_elapsed_before_private_ingress_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_private_ingress_roundtrip_ms",
+            "Client-reported private ingress roundtrip time.",
+            &inner.private_ingress_roundtrip_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_client_elapsed_before_coordinator_ms",
+            "Client-reported elapsed time before coordinator submission.",
+            &inner.client_elapsed_before_coordinator_ms,
+            INGRESS_LATENCY_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_batch_time_remaining_before_private_ingress_ms",
+            "Client-reported batch time remaining before private ingress submission.",
+            &inner.batch_time_remaining_before_private_ingress_ms,
+            INGRESS_REMAINING_BUCKETS_MS,
+        );
+        render_histogram(
+            &mut output,
+            namespace,
+            "private_order_ingress_batch_time_remaining_before_coordinator_ms",
+            "Client-reported batch time remaining before coordinator submission.",
+            &inner.batch_time_remaining_before_coordinator_ms,
+            INGRESS_REMAINING_BUCKETS_MS,
+        );
+        output
+    }
+}
+
+fn observe_client_ms(histogram: &mut HistogramCounts, value: Option<u64>, buckets: &[u64]) {
+    if let Some(value) = value.filter(|value| *value <= MAX_CLIENT_TELEMETRY_MS) {
+        histogram.observe(value, buckets);
+    }
+}
+
+fn render_histogram(
+    output: &mut String,
+    namespace: &str,
+    metric: &str,
+    help: &str,
+    histogram: &HistogramCounts,
+    buckets: &[u64],
+) {
+    output.push_str(&format!(
+        "# HELP {namespace}_{metric} {help}\n# TYPE {namespace}_{metric} histogram\n"
+    ));
+    let mut cumulative = 0_u64;
+    for bucket in buckets {
+        cumulative += histogram.buckets.get(bucket).copied().unwrap_or_default();
+        output.push_str(&format!(
+            "{namespace}_{metric}_bucket{{le=\"{bucket}\"}} {cumulative}\n"
+        ));
+    }
+    cumulative += histogram.overflow;
+    output.push_str(&format!(
+        "{namespace}_{metric}_bucket{{le=\"+Inf\"}} {cumulative}\n"
+    ));
+    output.push_str(&format!("{namespace}_{metric}_count {}\n", histogram.count));
+    output.push_str(&format!("{namespace}_{metric}_sum {}\n", histogram.sum));
 }
 
 struct JobStateUpdate {
@@ -1386,6 +1595,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
             PRIVATE_ORDER_PAYLOADS_DIR,
             |record: &PrivateOrderPayloadRecord| record.order_commitment.0.clone(),
         ))),
+        private_ingress_metrics: IngressTelemetryMetrics::default(),
         product_config: Arc::new(product_config),
         auction_key_registry: Arc::new(auction_key_registry),
         auction_private_keys: Arc::new(auction_private_keys),
@@ -1434,6 +1644,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
             "/api/public/auction-keys/fingerprint",
             get(public_auction_keys_fingerprint),
         )
+        .route("/api/internal/metrics", get(internal_metrics))
         .route(
             "/api/public/proof-jobs/{batch_id}",
             get(get_public_proof_job),
@@ -1604,6 +1815,16 @@ async fn internal_health(
         "stwo_package_name": state.stwo_package_name,
         "data_dir": state.data_dir.display().to_string(),
     })))
+}
+
+async fn internal_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<String, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    Ok(state
+        .private_ingress_metrics
+        .render_prometheus("zylith_prover"))
 }
 
 async fn public_auction_keys(State(state): State<AppState>) -> Json<PrivateExecutionKeyRegistry> {
@@ -2618,178 +2839,203 @@ async fn ingest_private_order_payload(
     headers: HeaderMap,
     Json(request): Json<TrustedOrderIngressRequest>,
 ) -> Result<Json<TrustedOrderIngressResponse>, StatusCode> {
-    require_prover_not_paused(&state)?;
-    enforce_rate_limit(
-        &state.rate_limiter,
-        &headers,
-        peer,
-        "private-order-ingress",
-        state.private_ingress_rate_limit_per_minute,
-    )?;
-    prune_private_order_payloads(&state).await?;
-    let receipt_secret = state
-        .order_ingress_receipt_secret
-        .as_deref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let TrustedOrderIngressRequest {
-        order_submission: submission,
-        renewal_package_id,
-        renewal_package_commitment,
-        renewal_relay_mode,
-        padding: _padding,
-    } = request;
-    if submission.order_bundle.ingress_receipt.is_some() {
-        return Err(reject_private_ingress("client supplied an ingress receipt"));
-    }
-    let payload_commitment = private_order_payload_commitment(&submission.order_bundle)
-        .map_err(|_| reject_private_ingress("payload commitment failed"))?;
-    let order_commitment = submission.order_bundle.order_commitment.clone();
-
-    {
-        let private_order_payloads = state.private_order_payloads.read().await;
-        if let Some(existing) = private_order_payloads.get(&order_commitment.0) {
-            if existing.payload_commitment != payload_commitment {
-                return Err(StatusCode::CONFLICT);
-            }
-            let coordinator_submission = sanitize_order_submission_for_coordinator(
-                &OrderSubmission {
-                    order_bundle: existing.order_bundle.clone(),
-                },
-                existing.receipt.clone(),
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            return Ok(Json(TrustedOrderIngressResponse {
-                receipt: existing.receipt.clone(),
-                coordinator_submission,
-                padding: Some(private_ingress_response_padding()),
-            }));
-        }
-    }
-
-    let private_payload =
-        decrypt_order_bundle(&submission.order_bundle, &state.auction_private_keys)
-            .map_err(|_| reject_private_ingress("payload decryption failed"))?;
-    let reconstructed_order_commitment = private_payload
-        .order
-        .commitment()
-        .map_err(|_| reject_private_ingress("order commitment reconstruction failed"))?;
-    if reconstructed_order_commitment != order_commitment {
-        return Err(reject_private_ingress("order commitment mismatch"));
-    }
-    if submission.order_bundle.pair_id != private_payload.order.pair_id {
-        return Err(reject_private_ingress("pair mismatch"));
-    }
-    if submission.order_bundle.batch_id != private_payload.order.batch_id {
-        return Err(reject_private_ingress("batch mismatch"));
-    }
-    if submission.order_bundle.epoch_id != private_payload.order.expiry_epoch {
-        return Err(reject_private_ingress("epoch mismatch"));
-    }
-    state
-        .product_config
-        .validate_order_funding_notes(
-            &private_payload.order,
-            &private_payload
-                .effective_funding_notes()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| reject_private_ingress(&format!("funding notes are invalid: {error}")))?;
-    validate_private_order_risk_limits(&state, &private_payload.order)
-        .map_err(|_| reject_private_ingress("order risk limits rejected"))?;
-    if let Some(expected_relay_mode) = renewal_relay_mode.as_ref()
-        && expected_relay_mode != &private_payload.order.relay_mode
-    {
-        return Err(reject_private_ingress("renewal relay mode mismatch"));
-    }
-    if renewal_package_id.is_some() != renewal_package_commitment.is_some() {
-        return Err(reject_private_ingress(
-            "renewal package attestation incomplete",
-        ));
-    }
-    if renewal_package_id.is_some() && renewal_relay_mode.is_none() {
-        return Err(reject_private_ingress(
-            "renewal package attestation missing relay mode",
-        ));
-    }
-    if matches!(private_payload.order.relay_mode, RelayMode::ZylithRelay)
-        && (renewal_package_id
+    let started_at_unix_ms = now_unix_ms();
+    let ingress_telemetry = request.ingress_telemetry.clone();
+    let result = async {
+        require_prover_not_paused(&state)?;
+        enforce_rate_limit(
+            &state.rate_limiter,
+            &headers,
+            peer,
+            "private-order-ingress",
+            state.private_ingress_rate_limit_per_minute,
+        )?;
+        prune_private_order_payloads(&state).await?;
+        let receipt_secret = state
+            .order_ingress_receipt_secret
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none()
-            || renewal_package_commitment
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        let TrustedOrderIngressRequest {
+            order_submission: submission,
+            renewal_package_id,
+            renewal_package_commitment,
+            renewal_relay_mode,
+            ingress_telemetry: _,
+            padding: _padding,
+        } = request;
+        if submission.order_bundle.ingress_receipt.is_some() {
+            return Err(reject_private_ingress("client supplied an ingress receipt"));
+        }
+        let payload_commitment = private_order_payload_commitment(&submission.order_bundle)
+            .map_err(|_| reject_private_ingress("payload commitment failed"))?;
+        let order_commitment = submission.order_bundle.order_commitment.clone();
+
+        {
+            let private_order_payloads = state.private_order_payloads.read().await;
+            if let Some(existing) = private_order_payloads.get(&order_commitment.0) {
+                if existing.payload_commitment != payload_commitment {
+                    return Err(StatusCode::CONFLICT);
+                }
+                let coordinator_submission = sanitize_order_submission_for_coordinator(
+                    &OrderSubmission {
+                        order_bundle: existing.order_bundle.clone(),
+                    },
+                    existing.receipt.clone(),
+                )
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(Json(TrustedOrderIngressResponse {
+                    receipt: existing.receipt.clone(),
+                    coordinator_submission,
+                    padding: Some(private_ingress_response_padding()),
+                }));
+            }
+        }
+
+        let private_payload =
+            decrypt_order_bundle(&submission.order_bundle, &state.auction_private_keys)
+                .map_err(|_| reject_private_ingress("payload decryption failed"))?;
+        let reconstructed_order_commitment = private_payload
+            .order
+            .commitment()
+            .map_err(|_| reject_private_ingress("order commitment reconstruction failed"))?;
+        if reconstructed_order_commitment != order_commitment {
+            return Err(reject_private_ingress("order commitment mismatch"));
+        }
+        if submission.order_bundle.pair_id != private_payload.order.pair_id {
+            return Err(reject_private_ingress("pair mismatch"));
+        }
+        if submission.order_bundle.batch_id != private_payload.order.batch_id {
+            return Err(reject_private_ingress("batch mismatch"));
+        }
+        if submission.order_bundle.epoch_id != private_payload.order.expiry_epoch {
+            return Err(reject_private_ingress("epoch mismatch"));
+        }
+        state
+            .product_config
+            .validate_order_funding_notes(
+                &private_payload.order,
+                &private_payload
+                    .effective_funding_notes()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| {
+                reject_private_ingress(&format!("funding notes are invalid: {error}"))
+            })?;
+        validate_private_order_risk_limits(&state, &private_payload.order)
+            .map_err(|_| reject_private_ingress("order risk limits rejected"))?;
+        if let Some(expected_relay_mode) = renewal_relay_mode.as_ref()
+            && expected_relay_mode != &private_payload.order.relay_mode
+        {
+            return Err(reject_private_ingress("renewal relay mode mismatch"));
+        }
+        if renewal_package_id.is_some() != renewal_package_commitment.is_some() {
+            return Err(reject_private_ingress(
+                "renewal package attestation incomplete",
+            ));
+        }
+        if renewal_package_id.is_some() && renewal_relay_mode.is_none() {
+            return Err(reject_private_ingress(
+                "renewal package attestation missing relay mode",
+            ));
+        }
+        if matches!(private_payload.order.relay_mode, RelayMode::ZylithRelay)
+            && (renewal_package_id
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .is_none()
-            || renewal_relay_mode.as_ref() != Some(&RelayMode::ZylithRelay))
-    {
-        return Err(reject_private_ingress(
-            "Zylith relay orders require a renewal package attestation",
-        ));
-    }
-    if matches!(private_payload.order.relay_mode, RelayMode::ZylithRelay) {
-        verify_managed_relay_order_attestation(
-            &state,
-            renewal_package_id.as_deref().unwrap_or_default(),
-            renewal_package_commitment.as_deref().unwrap_or_default(),
-            &private_payload.order,
-            &order_commitment,
-        )
-        .await?;
-    }
-
-    let receipt = create_order_ingress_receipt(
-        &submission.order_bundle,
-        &state.order_ingress_id,
-        "zylith-prover",
-        receipt_secret,
-        now_unix_ms(),
-        OrderIngressReceiptAttestation {
-            relay_mode: Some(private_payload.order.relay_mode.clone()),
-            renewal_package_id,
-            renewal_package_commitment,
-        },
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let coordinator_submission =
-        sanitize_order_submission_for_coordinator(&submission, receipt.clone())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let record = PrivateOrderPayloadRecord {
-        order_commitment: order_commitment.clone(),
-        payload_commitment,
-        received_at_unix_ms: now_unix_ms(),
-        receipt: receipt.clone(),
-        order_bundle: submission.order_bundle,
-    };
-
-    {
-        let mut private_order_payloads = state.private_order_payloads.write().await;
-        if state.max_stored_private_payloads > 0
-            && private_order_payloads.len() >= state.max_stored_private_payloads
+                || renewal_package_commitment
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+                || renewal_relay_mode.as_ref() != Some(&RelayMode::ZylithRelay))
         {
-            return Err(StatusCode::TOO_MANY_REQUESTS);
+            return Err(reject_private_ingress(
+                "Zylith relay orders require a renewal package attestation",
+            ));
         }
-        private_order_payloads.insert(order_commitment.0.clone(), record.clone());
-        persist_record(
-            state.data_dir.as_ref(),
-            PRIVATE_ORDER_PAYLOADS_DIR,
-            &order_commitment.0,
-            &record,
-        )?;
-    }
+        if matches!(private_payload.order.relay_mode, RelayMode::ZylithRelay) {
+            verify_managed_relay_order_attestation(
+                &state,
+                renewal_package_id.as_deref().unwrap_or_default(),
+                renewal_package_commitment.as_deref().unwrap_or_default(),
+                &private_payload.order,
+                &order_commitment,
+            )
+            .await?;
+        }
 
-    Ok(Json(TrustedOrderIngressResponse {
-        receipt,
-        coordinator_submission,
-        padding: Some(private_ingress_response_padding()),
-    }))
+        let receipt = create_order_ingress_receipt(
+            &submission.order_bundle,
+            &state.order_ingress_id,
+            "zylith-prover",
+            receipt_secret,
+            now_unix_ms(),
+            OrderIngressReceiptAttestation {
+                relay_mode: Some(private_payload.order.relay_mode.clone()),
+                renewal_package_id,
+                renewal_package_commitment,
+            },
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let coordinator_submission =
+            sanitize_order_submission_for_coordinator(&submission, receipt.clone())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let record = PrivateOrderPayloadRecord {
+            order_commitment: order_commitment.clone(),
+            payload_commitment,
+            received_at_unix_ms: now_unix_ms(),
+            receipt: receipt.clone(),
+            order_bundle: submission.order_bundle,
+        };
+
+        {
+            let mut private_order_payloads = state.private_order_payloads.write().await;
+            if state.max_stored_private_payloads > 0
+                && private_order_payloads.len() >= state.max_stored_private_payloads
+            {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
+            private_order_payloads.insert(order_commitment.0.clone(), record.clone());
+            persist_record(
+                state.data_dir.as_ref(),
+                PRIVATE_ORDER_PAYLOADS_DIR,
+                &order_commitment.0,
+                &record,
+            )?;
+        }
+
+        Ok(Json(TrustedOrderIngressResponse {
+            receipt,
+            coordinator_submission,
+            padding: Some(private_ingress_response_padding()),
+        }))
+    }
+    .await;
+    state.private_ingress_metrics.record(
+        private_ingress_outcome_label(&result),
+        now_unix_ms().saturating_sub(started_at_unix_ms),
+        ingress_telemetry.as_ref(),
+    );
+    result
 }
 
 fn private_ingress_response_padding() -> String {
     "0".repeat(512)
+}
+
+fn private_ingress_outcome_label<T>(result: &Result<T, StatusCode>) -> &'static str {
+    match result {
+        Ok(_) => "accepted",
+        Err(StatusCode::CONFLICT) => "duplicate_conflict",
+        Err(StatusCode::TOO_MANY_REQUESTS) => "rate_limited",
+        Err(StatusCode::BAD_REQUEST) => "bad_request",
+        Err(StatusCode::SERVICE_UNAVAILABLE) => "unavailable",
+        Err(_) => "rejected",
+    }
 }
 
 async fn prune_private_order_payloads(state: &AppState) -> Result<(), StatusCode> {
@@ -10163,12 +10409,12 @@ mod tests {
     use zylith_core::{
         AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, HiddenMakerCurve,
         MakerCurvePoint, MatchedOrderWitness, Note, NoteCommitment, NoteMembershipKind, Nullifier,
-        NullifierHistoryBatch, OrderCommitment, OrderIntent, OrderSide, OrderType,
-        OutputNoteRecord, PairId, ProductConfig, ProofJobStatus, RelayMode, RenewalChildUse,
-        SettlementCallArguments, SettlementOutputWithdrawalPlanRequest, SettlementSubmissionPlan,
-        SettlementTranscript, SettlementWitness, SpendAuthorization, StarknetCall, TimeInForce,
-        build_settlement_output_withdrawal_submission_plan, decrypt_output_note_for_owner,
-        deposit_root_from_note, hash::ordered_felt_list_commitment,
+        NullifierHistoryBatch, OrderCommitment, OrderIngressClientTelemetry, OrderIntent,
+        OrderSide, OrderType, OutputNoteRecord, PairId, ProductConfig, ProofJobStatus, RelayMode,
+        RenewalChildUse, SettlementCallArguments, SettlementOutputWithdrawalPlanRequest,
+        SettlementSubmissionPlan, SettlementTranscript, SettlementWitness, SpendAuthorization,
+        StarknetCall, TimeInForce, build_settlement_output_withdrawal_submission_plan,
+        decrypt_output_note_for_owner, deposit_root_from_note, hash::ordered_felt_list_commitment,
         note_recognition_public_key_from_raw_key_hex, nullifier_from_note_secret,
         nullifier_sparse_update_witnesses_for_consumed_inputs,
         renewal_sparse_witnesses_for_child_uses, root_only_settlement_commitments,
@@ -10416,6 +10662,7 @@ mod tests {
         let app = build_app_with_config(test_app_config(Some(token))).expect("app");
         let routes = [
             (Method::GET, "/api/internal/health"),
+            (Method::GET, "/api/internal/metrics"),
             (
                 Method::POST,
                 "/api/internal/batches/batch-strk-usdc-1/prepare",
@@ -10494,6 +10741,112 @@ mod tests {
                 .expect("response");
             assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
+    }
+
+    #[test]
+    fn private_ingress_metrics_render_only_aggregate_buckets() {
+        let metrics = super::IngressTelemetryMetrics::default();
+        metrics.record(
+            "accepted",
+            42,
+            Some(&OrderIngressClientTelemetry {
+                version: 1,
+                client_build_ms: Some(25),
+                private_submission_delay_ms: Some(7_000),
+                client_elapsed_before_private_ingress_ms: Some(7_025),
+                private_ingress_roundtrip_ms: Some(120),
+                client_elapsed_before_coordinator_ms: Some(7_145),
+                batch_time_remaining_before_private_ingress_ms: Some(25_000),
+                batch_time_remaining_before_coordinator_ms: Some(24_850),
+                submission_safety_buffer_ms: Some(15_000),
+            }),
+        );
+        let text = metrics.render_prometheus("zylith_prover");
+
+        assert!(text.contains(
+            "zylith_prover_private_order_ingress_requests_total{outcome=\"accepted\"} 1"
+        ));
+        assert!(text.contains("zylith_prover_private_order_ingress_processing_ms_count 1"));
+        assert!(text.contains(
+            "zylith_prover_private_order_ingress_submission_delay_ms_bucket{le=\"10000\"} 1"
+        ));
+        assert!(text.contains(
+            "zylith_prover_private_order_ingress_batch_time_remaining_before_private_ingress_ms_bucket{le=\"30000\"} 1"
+        ));
+        assert!(!text.contains("order_commitment"));
+        assert!(!text.contains("note"));
+    }
+
+    #[tokio::test]
+    async fn private_order_ingress_records_rejected_route_telemetry() {
+        let token = "prover-test-internal-token";
+        let app = build_app_with_config(test_app_config(Some(token))).expect("app");
+        let request = serde_json::json!({
+            "order_submission": {
+                "order_bundle": {
+                    "order_commitment": "0x1234",
+                    "cancellation_auth_tag": "cancel-tag",
+                    "pair_id": "STRK/USDC",
+                    "batch_id": "batch-strk-usdc-1",
+                    "epoch_id": 1,
+                    "transport_envelope": null,
+                    "ingress_receipt": null,
+                    "shares": []
+                }
+            },
+            "ingress_telemetry": {
+                "version": 1,
+                "client_build_ms": 20,
+                "private_submission_delay_ms": 7000,
+                "client_elapsed_before_private_ingress_ms": 7020,
+                "batch_time_remaining_before_private_ingress_ms": 25000,
+                "submission_safety_buffer_ms": 15000
+            }
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/private/orders")
+                    .method(Method::POST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&request).expect("serialize ingress request"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/internal/metrics")
+                    .method(Method::GET)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains(
+            "zylith_prover_private_order_ingress_requests_total{outcome=\"bad_request\"} 1"
+        ));
+        assert!(text.contains(
+            "zylith_prover_private_order_ingress_submission_delay_ms_bucket{le=\"10000\"} 1"
+        ));
+        assert!(text.contains(
+            "zylith_prover_private_order_ingress_batch_time_remaining_before_private_ingress_ms_bucket{le=\"30000\"} 1"
+        ));
+        assert!(!text.contains("0x1234"));
     }
 
     #[test]
