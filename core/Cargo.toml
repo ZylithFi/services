@@ -19,3 +19,4 @@ serde_json = "1"
 sha2 = "0.10"
 starknet-crypto = "0.8.1"
 thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }

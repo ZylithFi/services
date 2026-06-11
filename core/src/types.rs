@@ -4689,7 +4689,8 @@ mod tests {
             output_recovery_dummy_commitments: vec![],
             output_ciphertext_bundle_ref: bundle.bundle_commitment.clone(),
         };
-        let substitutions: Vec<(&str, Box<dyn Fn(&mut EncryptedBlob)>)> = vec![
+        type BlobMutation = (&'static str, Box<dyn Fn(&mut EncryptedBlob)>);
+        let substitutions: Vec<BlobMutation> = vec![
             (
                 "algorithm",
                 Box::new(|blob| blob.algorithm = "zylith.note_recognition.v2".into()),

@@ -10,12 +10,12 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "starknet": "^10.0.0-beta.6"
+    "starknet": "^10.0.2"
   },
   "devDependencies": {
-    "@types/node": "^24.10.1",
-    "tsx": "^4.20.6",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "@types/node": "^24.13.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }

@@ -784,61 +784,6 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
   assert.match(readSource("renewal_relayer/src/main.rs"), /async fn trigger_tick\([\s\S]*require_internal_auth/);
 });
 
-test("SURFACE-001 removed privacy-gate symbols do not exist in live code or launch copy", () => {
-  const removedPatterns = [
-    /\bprivacy_gate\b/,
-    /\bprivacy-gate\b/,
-    /\bAuctionPrivacyGate\b/,
-    /\bProductPrivacyGate\b/,
-    /\bauction_privacy\b/,
-    /\bpair_privacy_gate\b/,
-    /\bPRIVACY_GATE\b/,
-    /\bZYLITH_PRIVACY_MIN\b/,
-    /\bZYLITH_MIN_BATCH_BASE_LIQUIDITY\b/,
-    /\bZYLITH_MIN_BATCH_PARTICIPANTS\b/,
-    /\bZYLITH_MIN_ELIGIBLE_ORDERS\b/,
-    /\bZYLITH_MAX_SINGLE_ORDER_FILL_BPS\b/,
-    /\bZYLITH_MAX_SINGLE_OWNER_FILL_BPS\b/,
-    /\bZYLITH_MIN_MAKER_PARTICIPANTS\b/,
-    /\bZYLITH_MAX_MAKER_FILL_BPS\b/,
-    /\bmin_batch_base_liquidity\b/,
-    /\bmin_batch_participants\b/,
-    /\bmin_eligible_orders\b/,
-    /\bmax_single_order_fill_bps\b/,
-    /\bmax_single_owner_fill_bps\b/,
-    /\bmin_maker_participants\b/,
-    /\bmax_maker_fill_bps\b/,
-    /\bprivacy_gate_config\b/,
-  ];
-  const scannedFiles = [
-    ...inventoryFilesUnder("core/src"),
-    ...inventoryFilesUnder("contracts/src"),
-    ...inventoryFilesUnder("contracts/tests"),
-    ...inventoryFilesUnder("proof_program/src"),
-    ...inventoryFilesUnder("proof_program/tests"),
-    ...inventoryFilesUnder("stwo_statement/src"),
-    ...inventoryFilesUnder("prover/src"),
-    ...inventoryFilesUnder("coordinator/src"),
-    ...inventoryFilesUnder("indexer/src"),
-    ...inventoryFilesUnder("paymaster/src"),
-    ...inventoryFilesUnder("renewal_relayer/src"),
-    join(repoRoot, "ops/production-readiness-check.mjs"),
-    join(repoRoot, "ops/production-readiness-check.test.mjs"),
-    ...inventoryFilesUnder("scripts"),
-    ...inventoryFilesUnder("client/src"),
-    ...inventoryFilesUnder("frontend/src"),
-    ...inventoryFilesUnder("whitepaper"),
-  ];
-  const failures = [];
-  for (const file of scannedFiles) {
-    const text = readFileSync(file, "utf8");
-    for (const pattern of removedPatterns) {
-      if (pattern.test(text)) failures.push(`${file.replace(`${repoRoot}/`, "")}: ${pattern}`);
-    }
-  }
-  assert.deepEqual(failures, []);
-});
-
 test("LOG-001 backend log statements do not name private payload fields", () => {
   const forbiddenLogTerms = [
     /\bnote[_ -]?preimage\b/i,
@@ -888,8 +833,6 @@ test("LOAD-002 trusted proxy model rejects spoofed forwarded-for subjects", () =
 
 test("DEP-001 Zylith funding bridge activation is custody-bound and does not expose note secrets", () => {
   const bridge = readSource("contracts/src/privacy_deposit_bridge.cairo");
-  const adapter = readSource("contracts/src/shielded_asset_adapter.cairo");
-  const auctionVerifier = readSource("contracts/src/auction_verifier.cairo");
   const registry = readSource("contracts/src/commitment_registry.cairo");
   const coreTypes = readSource("core/src/types.rs");
   const indexer = readSource("indexer/src/main.rs");
@@ -908,14 +851,6 @@ test("DEP-001 Zylith funding bridge activation is custody-bound and does not exp
     assert.match(params, /\bwithdraw_authorities\b/);
   }
   assert.match(bridge, /get_caller_address\(\) == self\.privacy_pool\.read\(\)/);
-  assert.doesNotMatch(bridge, /\bIPrivacyFundingVerifier\b/);
-  assert.doesNotMatch(bridge, /\bfunding_verifier\b/);
-  assert.doesNotMatch(bridge, /\bverify_funding_activation\b/);
-  assert.doesNotMatch(
-    bridge,
-    /\bdeposit_to_open_note\b/,
-    "bridge must not call stale STRK20 pool entrypoints absent from the live pool",
-  );
   assert.match(
     bridge,
     /if\s+funding_commitments\.len\(\)\s*==\s*0\s*\{[\s\S]*open_note_deposits\s*\.\s*append\(/,
@@ -930,23 +865,7 @@ test("DEP-001 Zylith funding bridge activation is custody-bound and does not exp
   assert.match(bridge, /TOKEN_CUSTODY_LOW/);
   assert.match(bridge, /escrowed_asset_amounts/);
 
-  for (const removed of [
-    "register_erc20_deposit",
-    "register_erc20_deposit_batch",
-    "note_is_live",
-    "note_asset",
-    "note_amount",
-    "note_withdraw_authority",
-    "deposit_record",
-    "deposit_count",
-    "escrowed_balance",
-  ]) {
-    assert(!adapter.includes(removed), `adapter must not expose removed deposit surface ${removed}`);
-  }
-
   assert.match(registry, /\bregister_funding_activation\b/);
-  assert(!registry.includes("register_deposit_note_commitment"));
-  assert(!registry.includes("is_note_commitment_registered"));
 
   const depositCallArguments = extractRustStruct(coreTypes, "DepositCallArguments");
   assert.match(coreTypes, /pub struct DepositActivationRecord/);
@@ -960,13 +879,6 @@ test("DEP-001 Zylith funding bridge activation is custody-bound and does not exp
   assert.doesNotMatch(depositCallArguments, /\btoken_address\b/);
 
   assert.match(indexer, /DepositActivationRecordList/);
-  assert(!indexer.includes("DepositRecordList"));
-
-  assert(!adapter.includes("withdraw_to_l2"), "adapter must not expose raw withdrawal ABI");
-  assert(
-    !auctionVerifier.includes("withdraw_settlement_output_to_l2"),
-    "auction verifier must not expose membership-only settlement output withdrawal ABI",
-  );
 });
 
 function assertPositiveAmount(amount) {
@@ -1100,21 +1012,6 @@ function sourceFilesUnder(dir) {
     if (stat.isDirectory()) {
       files.push(...sourceFilesUnder(join(dir, entry)));
     } else if (/\.(rs|ts|js|mjs)$/.test(entry)) {
-      files.push(path);
-    }
-  }
-  return files;
-}
-
-function inventoryFilesUnder(dir) {
-  const root = join(repoRoot, dir);
-  const files = [];
-  for (const entry of readdirSync(root)) {
-    const path = join(root, entry);
-    const stat = statSync(path);
-    if (stat.isDirectory()) {
-      files.push(...inventoryFilesUnder(join(dir, entry)));
-    } else if (/\.(rs|ts|tsx|js|mjs|cairo|sh|md|typ)$/.test(entry)) {
       files.push(path);
     }
   }

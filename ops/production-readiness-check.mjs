@@ -499,6 +499,42 @@ function checkDeploymentManifest() {
   if (manifest.contracts?.privacy_funding_verifier || manifest.funding?.starknet_privacy?.funding_verifier) {
     failures.push("privacy_funding_verifier/funding_verifier must be absent; PrivacyDepositBridge uses custody-checked privacy-pool activation");
   }
+  if (manifest.funding?.primary !== "starknet_privacy") {
+    failures.push("funding.primary must be starknet_privacy");
+  }
+  const privacyFunding = manifest.funding?.starknet_privacy || {};
+  checkManifestNonZero(privacyFunding.privacy_pool, "funding.starknet_privacy.privacy_pool");
+  checkManifestNonZero(privacyFunding.bridge_adapter, "funding.starknet_privacy.bridge_adapter");
+  checkManifestNonZero(privacyFunding.shielded_asset_adapter, "funding.starknet_privacy.shielded_asset_adapter");
+  checkManifestNonZero(privacyFunding.paymaster_address, "funding.starknet_privacy.paymaster_address");
+  checkManifestNonZero(privacyFunding.proof_signer_class_hash, "funding.starknet_privacy.proof_signer_class_hash");
+  checkManifestUrl(privacyFunding.discovery_url, "funding.starknet_privacy.discovery_url");
+  checkManifestUrl(privacyFunding.proving_url, "funding.starknet_privacy.proving_url");
+  checkManifestUrl(privacyFunding.paymaster_url, "funding.starknet_privacy.paymaster_url");
+  checkManifestFeltEquals(
+    privacyFunding.bridge_adapter,
+    manifest.contracts?.privacy_deposit_bridge,
+    "funding.starknet_privacy.bridge_adapter",
+    "contracts.privacy_deposit_bridge",
+  );
+  checkManifestFeltEquals(
+    privacyFunding.shielded_asset_adapter,
+    manifest.contracts?.privacy_deposit_bridge,
+    "funding.starknet_privacy.shielded_asset_adapter",
+    "contracts.privacy_deposit_bridge",
+  );
+  checkManifestFeltEquals(
+    manifest.contracts?.shielded_asset_adapter,
+    manifest.contracts?.privacy_deposit_bridge,
+    "contracts.shielded_asset_adapter",
+    "contracts.privacy_deposit_bridge",
+  );
+  checkManifestFeltEquals(
+    privacyFunding.paymaster_address,
+    value("ZYLITH_PAYMASTER_ACCOUNT_ADDRESS"),
+    "funding.starknet_privacy.paymaster_address",
+    "ZYLITH_PAYMASTER_ACCOUNT_ADDRESS",
+  );
   for (const [key, current] of Object.entries(manifest.contracts || {})) {
     checkManifestNonZero(current, `contracts.${key}`);
   }
@@ -556,6 +592,32 @@ function checkManifestNonZero(current, label) {
   }
   if (isZeroFelt(current)) {
     failures.push(`${label} must be non-zero`);
+  }
+}
+
+function checkManifestFeltEquals(current, expected, label, expectedLabel) {
+  const normalizedCurrent = normalizeFeltText(current);
+  const normalizedExpected = normalizeFeltText(expected);
+  if (!normalizedCurrent || !normalizedExpected) return;
+  if (normalizedCurrent !== normalizedExpected) {
+    failures.push(`${label} must match ${expectedLabel}`);
+  }
+}
+
+function checkManifestUrl(current, label) {
+  if (typeof current !== "string" || current.trim() === "") {
+    failures.push(`${label} must be configured`);
+    return;
+  }
+  const trimmed = current.trim();
+  if (trimmed.startsWith("/")) return;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "https:") {
+      failures.push(`${label} must use https or a same-origin path`);
+    }
+  } catch {
+    failures.push(`${label} must be a valid URL or same-origin path`);
   }
 }
 

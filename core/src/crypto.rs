@@ -7248,16 +7248,15 @@ mod tests {
         build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
         build_order_submission, build_output_note, build_renewal_parent_cancel_submission_plan,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
-        build_settlement_witness, build_stwo_serialized_input, build_withdrawal_submission_plan,
-        create_maker_attribution_artifact, create_order_ingress_receipt, create_recovery_artifact,
-        decrypt_maker_attribution_artifact, decrypt_note_for_owner, decrypt_order_bundle,
-        decrypt_order_share, decrypt_output_recovery_record, decrypt_recovery_artifact_payload,
-        deposit_root_from_note, derive_account_id, derive_order_cancellation_secret,
-        derive_order_cancellation_tag, derive_user_keys, encode_asset_id, encode_output_root_id,
-        encrypt_note_for_owner, encrypt_output_recovery_record,
-        encrypted_note_activation_commitment, funding_commitment_for_deposit,
-        native_note_consolidation_message_hash, note_consolidation_commitment,
-        note_recognition_public_key_from_raw_key_hex,
+        build_settlement_witness, build_stwo_serialized_input, create_maker_attribution_artifact,
+        create_order_ingress_receipt, create_recovery_artifact, decrypt_maker_attribution_artifact,
+        decrypt_note_for_owner, decrypt_order_bundle, decrypt_order_share,
+        decrypt_output_recovery_record, decrypt_recovery_artifact_payload, deposit_root_from_note,
+        derive_account_id, derive_order_cancellation_secret, derive_order_cancellation_tag,
+        derive_user_keys, encode_asset_id, encode_output_root_id, encrypt_note_for_owner,
+        encrypt_output_recovery_record, encrypted_note_activation_commitment,
+        funding_commitment_for_deposit, native_note_consolidation_message_hash,
+        note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
         nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
         output_note_merkle_root, private_execution_key_registry_fingerprint,
         proof_artifact_commitment, reconstruct_order_from_shares, renewal_child_nullifier,
@@ -8000,23 +7999,6 @@ mod tests {
         );
         let encoded_args_json = serde_json::to_string(&plan.encoded_args).unwrap();
         assert!(!encoded_args_json.contains("deposit_nonce"));
-    }
-
-    #[test]
-    fn withdrawal_plan_rejects_raw_adapter_withdrawals() {
-        let err = build_withdrawal_submission_plan(
-            "abc",
-            "456",
-            "def",
-            "0x123",
-            "0x534e5f5345504f4c4941",
-        )
-        .expect_err("raw adapter withdrawal plans must be disabled");
-
-        assert!(
-            err.to_string()
-                .contains("raw adapter withdrawals are disabled")
-        );
     }
 
     #[test]

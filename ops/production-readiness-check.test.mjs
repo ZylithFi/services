@@ -205,6 +205,26 @@ test("production readiness rejects stale funding verifier manifests", () => {
   assert.match(result.stderr, /funding_verifier must be absent/);
 });
 
+test("production readiness rejects stale private funding manifest drift", () => {
+  const { env, manifest } = fixtureEnv();
+  manifest.funding.starknet_privacy.discovery_url = "http://35.192.48.142:8080";
+  manifest.funding.starknet_privacy.proving_url = "http://34.29.249.119:3000";
+  manifest.funding.starknet_privacy.paymaster_address = "0x999";
+  manifest.funding.starknet_privacy.bridge_adapter = "0x406";
+  manifest.funding.starknet_privacy.shielded_asset_adapter = "0x404";
+  delete manifest.funding.starknet_privacy.proof_signer_class_hash;
+  writeManifest(env, manifest);
+
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /funding\.starknet_privacy\.discovery_url must use https/);
+  assert.match(result.stderr, /funding\.starknet_privacy\.proving_url must use https/);
+  assert.match(result.stderr, /funding\.starknet_privacy\.paymaster_address must match ZYLITH_PAYMASTER_ACCOUNT_ADDRESS/);
+  assert.match(result.stderr, /funding\.starknet_privacy\.bridge_adapter must match contracts\.privacy_deposit_bridge/);
+  assert.match(result.stderr, /funding\.starknet_privacy\.shielded_asset_adapter must match contracts\.privacy_deposit_bridge/);
+  assert.match(result.stderr, /funding\.starknet_privacy\.proof_signer_class_hash must be configured/);
+});
+
 function runReadiness(env) {
   return spawnSync(process.execPath, [script], {
     env,
@@ -323,7 +343,7 @@ function fixtureManifest(proofOverrides) {
       auction_verifier: "0x401",
       batch_registry: "0x402",
       commitment_registry: "0x403",
-      shielded_asset_adapter: "0x404",
+      shielded_asset_adapter: "0x405",
       privacy_deposit_bridge: "0x405",
     },
     token_addresses: Object.fromEntries(
@@ -360,11 +380,12 @@ function fixtureManifest(proofOverrides) {
       starknet_privacy: {
         privacy_pool: "0x300",
         bridge_adapter: "0x405",
-        shielded_asset_adapter: "0x404",
+        shielded_asset_adapter: "0x405",
         discovery_url: "https://discovery.zylith.fi",
         proving_url: "https://privacy-prover.zylith.fi",
         paymaster_address: "0x207",
         paymaster_url: "https://paymaster.zylith.fi/execute-outside",
+        proof_signer_class_hash: "0x208",
       },
     },
     proof: {

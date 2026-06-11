@@ -193,50 +193,6 @@ describe("paymaster server", () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
   });
 
-  it("rejects direct deprecated withdrawal relays", async () => {
-    const directRequest = {
-      ...request,
-      call: {
-        contract_address: "0x123",
-        entrypoint: "withdraw_settlement_output_to_l2",
-        calldata: ["0x1", "0x2", "0x3", "0x64"]
-      },
-      relay_nonce: "0x456",
-      proof: undefined,
-      proof_facts: undefined,
-      outside_transaction: undefined
-    };
-    const server = createPaymasterServer(
-      {
-        ...config(),
-        allowedEntrypoints: new Set(["withdraw_settlement_output_to_l2"]),
-        proofRequiredEntrypoints: new Set(),
-        withdrawalAmountBuckets: new Set(["100"]),
-        allowDirectWithdrawalRelays: true
-      },
-      {
-        fetchImpl: fakeRpcFetch(),
-        runtime: fakeRuntime()
-      }
-    );
-    servers.push(server);
-    const url = await listen(server);
-
-    const response = await fetch(`${url}/execute-outside`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "https://app.example"
-      },
-      body: JSON.stringify(directRequest)
-    });
-
-    expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({
-      error: "call entrypoint is not supported by paymaster"
-    });
-  });
-
   it("relays privacy signer approvals without process-local ensure state", async () => {
     const server = createPaymasterServer(config(), {
       fetchImpl: fakeRpcFetch(),

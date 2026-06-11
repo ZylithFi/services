@@ -2,13 +2,17 @@ use bip39::{Language, Mnemonic};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt;
+use zeroize::Zeroize;
 
 use crate::ProtocolError;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
 pub struct RecoverySeed(pub [u8; 32]);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
 pub struct UserKeys {
     pub spend_auth_key: [u8; 32],
     pub view_key: [u8; 32],
@@ -16,6 +20,25 @@ pub struct UserKeys {
     pub note_recognition_key: [u8; 32],
     pub order_cancellation_key: [u8; 32],
     pub withdraw_auth_key: [u8; 32],
+}
+
+impl fmt::Debug for RecoverySeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RecoverySeed").field(&"<redacted>").finish()
+    }
+}
+
+impl fmt::Debug for UserKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserKeys")
+            .field("spend_auth_key", &"<redacted>")
+            .field("view_key", &"<redacted>")
+            .field("recovery_key", &"<redacted>")
+            .field("note_recognition_key", &"<redacted>")
+            .field("order_cancellation_key", &"<redacted>")
+            .field("withdraw_auth_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RecoverySeed {

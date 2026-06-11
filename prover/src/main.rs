@@ -2266,10 +2266,10 @@ async fn submit_settlement_output_withdrawal(
     PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Json(request): Json<SettlementOutputWithdrawalSubmitRequest>,
-) -> Result<Json<SettlementOutputWithdrawalSubmitResponse>, StatusCode> {
-    require_prover_not_paused(&state)?;
+) -> Result<Json<SettlementOutputWithdrawalSubmitResponse>, (StatusCode, Json<serde_json::Value>)> {
+    require_prover_not_paused(&state).map_err(withdrawal_submit_error)?;
     if !state.hosted_withdrawals_enabled {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(withdrawal_submit_error(StatusCode::FORBIDDEN));
     }
     enforce_rate_limit(
         &state.rate_limiter,
@@ -2277,9 +2277,30 @@ async fn submit_settlement_output_withdrawal(
         peer,
         "settlement-output-withdrawal",
         state.private_ingress_rate_limit_per_minute,
-    )?;
-    let response = submit_settlement_output_withdrawal_inner(&state, request.witness).await?;
+    )
+    .map_err(withdrawal_submit_error)?;
+    let response = submit_settlement_output_withdrawal_inner(&state, request.witness)
+        .await
+        .map_err(withdrawal_submit_error)?;
     Ok(Json(response))
+}
+
+fn withdrawal_submit_error(status: StatusCode) -> (StatusCode, Json<serde_json::Value>) {
+    let error = match status {
+        StatusCode::TOO_EARLY => {
+            "Settlement output claim window is not open yet. Retry after the claim delay."
+        }
+        StatusCode::CONFLICT => {
+            "Settlement output withdrawal conflicts with current on-chain state. Refresh and retry."
+        }
+        StatusCode::FORBIDDEN => "Hosted withdrawals are not enabled for this deployment.",
+        StatusCode::SERVICE_UNAVAILABLE => "Withdrawal proving service is not configured.",
+        StatusCode::TOO_MANY_REQUESTS => "Too many withdrawal requests. Please retry later.",
+        StatusCode::BAD_REQUEST => "Withdrawal request is invalid.",
+        _ if status.is_server_error() => "Withdrawal service is unavailable. Please retry later.",
+        _ => "Withdrawal request failed.",
+    };
+    (status, Json(serde_json::json!({ "error": error })))
 }
 
 fn consumed_inputs_for_notes(notes: &[Note]) -> Result<Vec<ConsumedInput>, StatusCode> {
@@ -2601,6 +2622,21 @@ fn settlement_output_withdrawal_key(witness: &SettlementOutputWithdrawalWitness)
         .unwrap_or_else(|_| witness.output_note.note_commitment.0.clone())
 }
 
+fn settlement_output_withdrawal_revert_status(revert_reason: Option<&str>) -> StatusCode {
+    let Some(reason) = revert_reason else {
+        return StatusCode::CONFLICT;
+    };
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("claim_window_closed")
+        || normalized.contains("claim window closed")
+        || normalized.contains("claim window")
+            && (normalized.contains("closed") || normalized.contains("not open"))
+    {
+        return StatusCode::TOO_EARLY;
+    }
+    StatusCode::CONFLICT
+}
+
 async fn submit_settlement_output_withdrawal_inner(
     state: &AppState,
     witness: SettlementOutputWithdrawalWitness,
@@ -2742,7 +2778,9 @@ async fn submit_settlement_output_withdrawal_inner(
             "settlement output withdrawal reverted key={} batch={} tx={} reason={:?}",
             withdrawal_key, witness.batch_id.0, tx_hash, submission.revert_reason,
         );
-        return Err(StatusCode::BAD_GATEWAY);
+        return Err(settlement_output_withdrawal_revert_status(
+            submission.revert_reason.as_deref(),
+        ));
     }
     if let Some(block_number) = submission.block_number
         && let Ok(block_timestamp) = fetch_block_timestamp_unix_ms(&provider, block_number).await
@@ -10395,10 +10433,11 @@ mod tests {
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
         proof_fact_age_wait_ms, public_proof_job_status, redact_native_execution_request,
         redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
-        select_root_history_witnesses_for_current_roots, should_refresh_onchain_submission,
-        storage_key, validate_aggregate_root_chain, validate_batch_nullifier_freshness,
+        select_root_history_witnesses_for_current_roots,
+        settlement_output_withdrawal_revert_status, should_refresh_onchain_submission, storage_key,
+        validate_aggregate_root_chain, validate_batch_nullifier_freshness,
         validate_hosted_note_proof_privacy_config, validate_native_proof_program_config,
-        validate_native_tx_prover_endpoint_config,
+        validate_native_tx_prover_endpoint_config, withdrawal_submit_error,
     };
     use axum::{
         body::Body,
@@ -11814,6 +11853,49 @@ mod tests {
         assert!(!native_invoke_error_is_retryable_after_submission(
             "Account validation failed: Invalid proof facts: EMPTY_PROOF_FACTS"
         ));
+    }
+
+    #[test]
+    fn withdrawal_revert_status_maps_claim_window_to_too_early() {
+        assert_eq!(
+            settlement_output_withdrawal_revert_status(Some(
+                "Execution failed: CLAIM_WINDOW_CLOSED"
+            )),
+            StatusCode::TOO_EARLY
+        );
+        assert_eq!(
+            settlement_output_withdrawal_revert_status(Some(
+                "Execution failed: claim window not open yet"
+            )),
+            StatusCode::TOO_EARLY
+        );
+        assert_eq!(
+            settlement_output_withdrawal_revert_status(Some(
+                "Execution failed: NULLIFIER_ALREADY_USED"
+            )),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            settlement_output_withdrawal_revert_status(None),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn withdrawal_submit_error_returns_actionable_json_body() {
+        let (status, body) = withdrawal_submit_error(StatusCode::TOO_EARLY);
+        assert_eq!(status, StatusCode::TOO_EARLY);
+        assert_eq!(
+            body.0.get("error").and_then(serde_json::Value::as_str),
+            Some("Settlement output claim window is not open yet. Retry after the claim delay.")
+        );
+
+        let (status, body) = withdrawal_submit_error(StatusCode::BAD_GATEWAY);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            body.0.get("error").and_then(serde_json::Value::as_str),
+            Some("Withdrawal service is unavailable. Please retry later.")
+        );
     }
 
     #[test]

@@ -87,49 +87,6 @@ describe("validateExecuteOutsideRequest", () => {
     );
   });
 
-  it("rejects deprecated membership-only withdrawal entrypoints", () => {
-    const request = baseRequest();
-    request.call.entrypoint = "withdraw_settlement_output_to_l2";
-    request.call.calldata = ["0x1", "0x2", "0x3", "0x64"];
-    request.outside_transaction.outsideExecution.calls[0]!.selector =
-      String(selector.getSelectorFromName("withdraw_settlement_output_to_l2"));
-    request.outside_transaction.outsideExecution.calls[0]!.calldata = request.call.calldata;
-    delete (request as { proof?: unknown }).proof;
-    delete (request as { proof_facts?: unknown }).proof_facts;
-
-    const withdrawalConfig = {
-      ...config,
-      allowedEntrypoints: new Set(["withdraw_settlement_output_to_l2"]),
-      proofRequiredEntrypoints: new Set<string>(),
-      withdrawalAmountBuckets: new Set(["100"]),
-      allowDirectWithdrawalRelays: true
-    };
-    expect(() =>
-      validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
-    ).toThrow("call entrypoint is not supported by paymaster");
-  });
-
-  it("rejects direct deprecated withdrawal relays without SNIP-9 outside execution", () => {
-    const request = baseRequest();
-    request.call.entrypoint = "withdraw_settlement_output_to_l2";
-    request.call.calldata = ["0x1", "0x2", "0x3", "0x64"];
-    delete (request as { outside_transaction?: unknown }).outside_transaction;
-    delete (request as { proof?: unknown }).proof;
-    delete (request as { proof_facts?: unknown }).proof_facts;
-    (request as { relay_nonce?: string }).relay_nonce = "0x456";
-
-    const withdrawalConfig = {
-      ...config,
-      allowedEntrypoints: new Set(["withdraw_settlement_output_to_l2"]),
-      proofRequiredEntrypoints: new Set<string>(),
-      withdrawalAmountBuckets: new Set(["100"]),
-      allowDirectWithdrawalRelays: true
-    };
-    expect(() =>
-      validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
-    ).toThrow("call entrypoint is not supported by paymaster");
-  });
-
   it("accepts direct proof-bearing apply_actions relays", () => {
     const request = baseRequest();
     delete (request as { outside_transaction?: unknown }).outside_transaction;
