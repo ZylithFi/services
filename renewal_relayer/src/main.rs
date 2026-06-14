@@ -1670,6 +1670,12 @@ async fn process_slot_against_batch(
     slot: &OfflineRenewalSlot,
     batch: &PublicBatchSummary,
 ) -> OfflineRenewalRelayResult {
+    if batch.epoch_id < slot.epoch_id {
+        return slot_result(slot, RelaySlotStatus::NotDue, None);
+    }
+    if let Some(guarded) = prior_slot_reuse_guard(state, package, slot).await {
+        return guarded;
+    }
     if batch.epoch_id > slot.epoch_id
         || (batch.epoch_id == slot.epoch_id && batch.batch_id != slot.batch_id)
     {
@@ -1721,9 +1727,6 @@ async fn process_slot_against_batch(
                 )),
             );
         }
-    }
-    if let Some(guarded) = prior_slot_reuse_guard(state, package, slot).await {
-        return guarded;
     }
     match submit_slot(state, package, slot).await {
         Ok(accepted) => {
@@ -5353,6 +5356,52 @@ mod tests {
         let results = process_due_slots_once(&state).await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, RelaySlotStatus::AwaitingWalletRefresh);
+        let _ = coordinator_shutdown.send(());
+        let _ = prover_shutdown.send(());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn process_due_slot_does_not_mark_reused_funding_slot_missed_after_prior_match() {
+        let (coordinator_url, coordinator_shutdown) =
+            spawn_mock_coordinator_for_batch("STRK-USDC-44", 44).await;
+        let mut statuses = BTreeMap::new();
+        statuses.insert(
+            "STRK-USDC-42".into(),
+            json!({ "state": "confirmed-onchain", "reuse_state": "matched" }),
+        );
+        let (prover_url, prover_shutdown) = spawn_mock_prover_with_statuses(statuses).await;
+        let path = temp_store_path("reuse-refresh-after-window");
+        let state = test_state(path.clone());
+        let mut package = two_slot_test_package(coordinator_url, prover_url, true);
+        package.relay_mode = Some(RelayMode::SelfRelay);
+        refresh_test_package_commitment(&mut package);
+        {
+            let mut store = state.store.write().await;
+            let now = now_unix_ms();
+            let first_result = slot_result(&package.slots[0], RelaySlotStatus::Submitted, None);
+            store.packages.insert(
+                package.package_id.clone(),
+                StoredPackage {
+                    package: package.clone(),
+                    registered_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                    results: BTreeMap::from([(
+                        package.slots[0].slot_id.clone(),
+                        StoredSlotResult {
+                            result: first_result,
+                            attempts: 1,
+                            last_attempt_unix_ms: now,
+                        },
+                    )]),
+                },
+            );
+        }
+        let results = process_due_slots_once(&state).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].slot_id, "pkg-1:2");
+        assert_eq!(results[0].status, RelaySlotStatus::AwaitingWalletRefresh);
+        assert_ne!(results[0].status, RelaySlotStatus::Missed);
         let _ = coordinator_shutdown.send(());
         let _ = prover_shutdown.send(());
         let _ = std::fs::remove_file(path);
