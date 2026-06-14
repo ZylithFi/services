@@ -44,6 +44,48 @@ describe("paymaster server", () => {
     await expect(response.json()).resolves.toEqual({ transaction_hash: "0xtx" });
   });
 
+  it("protects metrics and reports paymaster route outcomes", async () => {
+    const server = createPaymasterServer(config(), {
+      fetchImpl: fakeRpcFetch(),
+      runtime: fakeRuntime()
+    });
+    servers.push(server);
+    const url = await listen(server);
+
+    const rejected = await fetch(`${url}/metrics`);
+    expect(rejected.status).toBe(401);
+
+    const success = await postRequest(url, request);
+    expect(success.status).toBe(200);
+    const badRequest = await fetch(`${url}/execute-outside`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://app.example"
+      },
+      body: JSON.stringify({
+        ...request,
+        paymaster_address: "0xdead"
+      })
+    });
+    expect(badRequest.status).toBe(403);
+
+    const metrics = await fetch(`${url}/metrics`, {
+      headers: { authorization: "Bearer test-paymaster-token" }
+    });
+    expect(metrics.status).toBe(200);
+    const body = await metrics.text();
+    expect(body).toContain(
+      'zylith_paymaster_requests_total{operation="execute_outside",outcome="success"} 1'
+    );
+    expect(body).toContain(
+      'zylith_paymaster_requests_total{operation="execute_outside",outcome="http_403"} 1'
+    );
+    expect(body).toContain("zylith_paymaster_execute_outside_latency_ms_count 2");
+    expect(body).not.toContain("proof-bytes");
+    expect(body).not.toContain("0x777");
+  });
+
   it("rejects disallowed origins before paying for work", async () => {
     const server = createPaymasterServer(config());
     servers.push(server);
@@ -273,6 +315,7 @@ function config(): PaymasterConfig {
     signerLimitPerMinute: 20,
     trustProxyHeaders: false,
     trustedProxyCidrs: [],
+    internalApiToken: "test-paymaster-token",
     submissionLogPath: null
   };
 }

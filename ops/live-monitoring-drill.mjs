@@ -15,6 +15,7 @@ const services = {
   relayer: trimUrl(process.env.ZYLITH_RENEWAL_RELAY_URL || "http://127.0.0.1:3400"),
 };
 const controlToken = process.env.ZYLITH_CONTROL_PLANE_TOKEN || "";
+const paymasterToken = process.env.ZYLITH_PAYMASTER_INTERNAL_TOKEN || controlToken;
 const relayerToken =
   process.env.ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN ||
   process.env.ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN ||
@@ -43,6 +44,54 @@ await checkJson("indexer health", `${services.indexer}/health`, (body) => {
 await checkJson("paymaster health", `${services.paymaster}/health`, (body) => {
   expectDefined(body, "paymaster health body");
 });
+
+await checkText("coordinator metrics", `${services.coordinator}/api/internal/metrics`, (body) => {
+  const metrics = parsePrometheusMetrics(body);
+  if (!body.includes("zylith_coordinator_order_submission_requests_total")) {
+    failures.push("coordinator metric zylith_coordinator_order_submission_requests_total is missing");
+  }
+  for (const metric of [
+    "zylith_coordinator_order_submission_processing_ms_count",
+    "zylith_coordinator_order_submission_private_ingress_roundtrip_ms_count",
+    "zylith_coordinator_order_submission_batch_time_remaining_before_coordinator_ms_count",
+  ]) {
+    if (!metrics.has(metric)) failures.push(`coordinator metric ${metric} is missing`);
+  }
+}, bearerOptions(controlToken));
+
+await checkText("prover metrics", `${services.prover}/api/internal/metrics`, (body) => {
+  const metrics = parsePrometheusMetrics(body);
+  for (const metric of [
+    "zylith_prover_private_order_ingress_requests_total",
+    "zylith_prover_proof_lifecycle_operations_total",
+  ]) {
+    if (!body.includes(metric)) failures.push(`prover metric ${metric} is missing`);
+  }
+  for (const metric of [
+    "zylith_prover_private_order_ingress_processing_ms_count",
+  ]) {
+    if (!metrics.has(metric)) failures.push(`prover metric ${metric} is missing`);
+  }
+  for (const requiredPrefix of [
+    "zylith_prover_proof_lifecycle_settlement_proof_generation_latency_ms",
+    "zylith_prover_proof_lifecycle_settlement_onchain_submit_latency_ms",
+    "zylith_prover_proof_lifecycle_withdrawal_submit_latency_ms",
+  ]) {
+    if (!hasMetricPrefix(metrics, requiredPrefix)) {
+      warnings.push(`prover metric ${requiredPrefix} has not been observed yet`);
+    }
+  }
+}, bearerOptions(controlToken));
+
+await checkText("paymaster metrics", `${services.paymaster}/metrics`, (body) => {
+  const metrics = parsePrometheusMetrics(body);
+  for (const metric of [
+    "zylith_paymaster_requests_total",
+    "zylith_paymaster_execute_outside_latency_ms_count",
+  ]) {
+    if (!metrics.has(metric)) failures.push(`paymaster metric ${metric} is missing`);
+  }
+}, bearerOptions(paymasterToken));
 
 await checkJson("renewal relayer health", `${services.relayer}/health`, (body) => {
   expectEqual(body.status, "ok", "renewal relayer health status");
@@ -155,9 +204,19 @@ function parsePrometheusMetrics(body) {
     if (!trimmed || trimmed.startsWith("#")) continue;
     const [name, value] = trimmed.split(/\s+/, 2);
     const parsed = Number(value);
-    if (name && Number.isFinite(parsed)) metrics.set(name, parsed);
+    if (name && Number.isFinite(parsed)) {
+      const baseName = name.split("{", 1)[0];
+      metrics.set(baseName, (metrics.get(baseName) ?? 0) + parsed);
+    }
   }
   return metrics;
+}
+
+function hasMetricPrefix(metrics, prefix) {
+  for (const name of metrics.keys()) {
+    if (name.startsWith(prefix)) return true;
+  }
+  return false;
 }
 
 function expectDefined(value, label) {

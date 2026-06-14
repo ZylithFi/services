@@ -17,6 +17,7 @@ export type PaymasterConfig = {
   signerLimitPerMinute: number;
   trustProxyHeaders: boolean;
   trustedProxyCidrs: string[];
+  internalApiToken: string | null;
   submissionLogPath: string | null;
 };
 
@@ -99,6 +100,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     ),
     trustProxyHeaders,
     trustedProxyCidrs,
+    internalApiToken: env.ZYLITH_PAYMASTER_INTERNAL_TOKEN?.trim() ||
+      env.ZYLITH_CONTROL_PLANE_TOKEN?.trim() ||
+      null,
     submissionLogPath: env.ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH?.trim() || "state/submissions.json"
   };
 }

@@ -24,6 +24,7 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
   const clientRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute * 3);
   const submissionQueues = new SubmissionQueues();
   const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
+  const metrics = new PaymasterMetrics();
 
   return createServer(async (request, response) => {
     try {
@@ -41,26 +42,36 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         return;
       }
 
+      if (request.method === "GET" && request.url === "/metrics") {
+        requireMetricsAuth(request, config);
+        sendText(request, response, 200, metrics.renderPrometheus());
+        return;
+      }
+
       if (request.method === "POST" && request.url === "/privacy-signer/ensure") {
-        const rawBody = await readBody(request, config.maxBodyBytes);
-        const body = JSON.parse(rawBody) as unknown;
-        const validated = validateEnsurePrivacySignerRequest(body, config);
-        enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
-        const result = await submissionQueues.enqueue(config.accountAddress, () =>
-          ensurePrivacyProofSignerContract(validated, config, deps)
-        );
+        const result = await measuredPaymasterRoute(metrics, "privacy_signer_ensure", async () => {
+          const rawBody = await readBody(request, config.maxBodyBytes);
+          const body = JSON.parse(rawBody) as unknown;
+          const validated = validateEnsurePrivacySignerRequest(body, config);
+          enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
+          return submissionQueues.enqueue(config.accountAddress, () =>
+            ensurePrivacyProofSignerContract(validated, config, deps)
+          );
+        });
         sendJson(request, response, 200, result);
         return;
       }
 
       if (request.method === "POST" && request.url === "/privacy-signer/relay") {
-        const rawBody = await readBody(request, config.maxBodyBytes);
-        const body = JSON.parse(rawBody) as unknown;
-        const validated = validateRelayPrivacySignerRequest(body, config);
-        enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.account_address);
-        const result = await submissionQueues.enqueue(config.accountAddress, () =>
-          relayPrivacyProofSignerCall(validated, config, deps)
-        );
+        const result = await measuredPaymasterRoute(metrics, "privacy_signer_relay", async () => {
+          const rawBody = await readBody(request, config.maxBodyBytes);
+          const body = JSON.parse(rawBody) as unknown;
+          const validated = validateRelayPrivacySignerRequest(body, config);
+          enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.account_address);
+          return submissionQueues.enqueue(config.accountAddress, () =>
+            relayPrivacyProofSignerCall(validated, config, deps)
+          );
+        });
         sendJson(request, response, 200, result);
         return;
       }
@@ -70,15 +81,17 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         return;
       }
 
-      const rawBody = await readBody(request, config.maxBodyBytes);
-      const body = JSON.parse(rawBody) as unknown;
-      const validated = validateExecuteOutsideRequest(body, config);
-      enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_address);
-      const result = await submissionStore.runOnce(validated, () =>
-        submissionQueues.enqueue(config.accountAddress, () =>
-          submitProofBearingOutsideExecution(validated, config, deps)
-        )
-      );
+      const result = await measuredPaymasterRoute(metrics, "execute_outside", async () => {
+        const rawBody = await readBody(request, config.maxBodyBytes);
+        const body = JSON.parse(rawBody) as unknown;
+        const validated = validateExecuteOutsideRequest(body, config);
+        enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_address);
+        return submissionStore.runOnce(validated, () =>
+          submissionQueues.enqueue(config.accountAddress, () =>
+            submitProofBearingOutsideExecution(validated, config, deps)
+          )
+        );
+      });
       sendJson(request, response, 200, result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -97,6 +110,33 @@ function enforceRequestLimits(
 ): void {
   signerRateLimiter.check(`signer:${signerAddress}`);
   clientRateLimiter.check(`ip:${clientIp(request, config)}`);
+}
+
+async function measuredPaymasterRoute<T>(
+  metrics: PaymasterMetrics,
+  operation: string,
+  run: () => Promise<T>
+): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    const result = await run();
+    metrics.record(operation, "success", Date.now() - startedAt);
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    metrics.record(operation, `http_${statusForError(message)}`, Date.now() - startedAt);
+    throw error;
+  }
+}
+
+function requireMetricsAuth(request: IncomingMessage, config: PaymasterConfig): void {
+  if (!config.internalApiToken) {
+    throw new Error("paymaster metrics token is not configured");
+  }
+  const expected = `Bearer ${config.internalApiToken}`;
+  if (request.headers.authorization !== expected) {
+    throw new Error("metrics authorization failed");
+  }
 }
 
 function clientIp(request: IncomingMessage, config: PaymasterConfig): string {
@@ -221,7 +261,35 @@ function sendJson(
   response.end(JSON.stringify(body));
 }
 
+function sendText(
+  request: IncomingMessage,
+  response: ServerResponse,
+  statusCode: number,
+  body: string
+): void {
+  const headers: Record<string, string> = {
+    "content-type": "text/plain; version=0.0.4",
+    "cache-control": "no-store"
+  };
+  const origin = request.headers.origin;
+  if (origin) {
+    headers["access-control-allow-origin"] = origin;
+    headers.vary = "origin";
+    headers["access-control-allow-methods"] = "POST, GET, OPTIONS";
+    headers["access-control-allow-headers"] = "content-type, authorization";
+  }
+
+  response.writeHead(statusCode, headers);
+  response.end(body);
+}
+
 function statusForError(message: string): number {
+  if (message.includes("authorization failed")) {
+    return 401;
+  }
+  if (message.includes("metrics token is not configured")) {
+    return 503;
+  }
   if (
     message.includes("not allowlisted") ||
     message.includes("does not match") ||
@@ -233,6 +301,94 @@ function statusForError(message: string): number {
     return 429;
   }
   return 400;
+}
+
+const PAYMASTER_LATENCY_BUCKETS_MS = [
+  10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000
+];
+const PAYMASTER_OPERATIONS = ["execute_outside", "privacy_signer_ensure", "privacy_signer_relay"];
+
+class PaymasterMetrics {
+  private readonly outcomes = new Map<string, number>();
+  private readonly histograms = new Map<string, HistogramCounts>();
+
+  record(operation: string, outcome: string, latencyMs: number): void {
+    const key = `${operation}|${outcome}`;
+    this.outcomes.set(key, (this.outcomes.get(key) ?? 0) + 1);
+    let histogram = this.histograms.get(operation);
+    if (!histogram) {
+      histogram = new HistogramCounts(PAYMASTER_LATENCY_BUCKETS_MS);
+      this.histograms.set(operation, histogram);
+    }
+    histogram.observe(Math.max(0, Math.trunc(latencyMs)));
+  }
+
+  renderPrometheus(): string {
+    const lines: string[] = [
+      "# HELP zylith_paymaster_requests_total Paymaster relay requests by operation and outcome.",
+      "# TYPE zylith_paymaster_requests_total counter"
+    ];
+    for (const [key, count] of this.outcomes) {
+      const [operation = "unknown", outcome = "unknown"] = key.split("|", 2);
+      lines.push(
+        `zylith_paymaster_requests_total{operation="${operation}",outcome="${outcome}"} ${count}`
+      );
+    }
+    for (const operation of PAYMASTER_OPERATIONS) {
+      if (![...this.outcomes.keys()].some((key) => key.startsWith(`${operation}|`))) {
+        lines.push(
+          `zylith_paymaster_requests_total{operation="${operation}",outcome="success"} 0`
+        );
+      }
+    }
+    for (const operation of PAYMASTER_OPERATIONS) {
+      if (!this.histograms.has(operation)) {
+        lines.push(
+          ...new HistogramCounts(PAYMASTER_LATENCY_BUCKETS_MS).render(
+            `zylith_paymaster_${operation}_latency_ms`
+          )
+        );
+      }
+    }
+    for (const [operation, histogram] of this.histograms) {
+      lines.push(...histogram.render(`zylith_paymaster_${operation}_latency_ms`));
+    }
+    return `${lines.join("\n")}\n`;
+  }
+}
+
+class HistogramCounts {
+  private readonly counts = new Map<number, number>();
+  private overflow = 0;
+  private count = 0;
+  private sum = 0;
+
+  constructor(private readonly buckets: number[]) {}
+
+  observe(value: number): void {
+    const bucket = this.buckets.find((candidate) => value <= candidate);
+    if (bucket === undefined) {
+      this.overflow += 1;
+    } else {
+      this.counts.set(bucket, (this.counts.get(bucket) ?? 0) + 1);
+    }
+    this.count += 1;
+    this.sum += value;
+  }
+
+  render(metric: string): string[] {
+    const lines = [`# HELP ${metric} Paymaster route latency.`, `# TYPE ${metric} histogram`];
+    let cumulative = 0;
+    for (const bucket of this.buckets) {
+      cumulative += this.counts.get(bucket) ?? 0;
+      lines.push(`${metric}_bucket{le="${bucket}"} ${cumulative}`);
+    }
+    cumulative += this.overflow;
+    lines.push(`${metric}_bucket{le="+Inf"} ${cumulative}`);
+    lines.push(`${metric}_count ${this.count}`);
+    lines.push(`${metric}_sum ${this.sum}`);
+    return lines;
+  }
 }
 
 class FixedWindowRateLimiter {

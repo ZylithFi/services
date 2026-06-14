@@ -270,6 +270,7 @@ struct AppState {
     onchain_submissions: Arc<RwLock<BTreeMap<String, OnchainSubmissionRecord>>>,
     private_order_payloads: Arc<RwLock<BTreeMap<String, PrivateOrderPayloadRecord>>>,
     private_ingress_metrics: IngressTelemetryMetrics,
+    proof_lifecycle_metrics: LifecycleTelemetryMetrics,
     product_config: Arc<ProductConfig>,
     auction_key_registry: Arc<PrivateExecutionKeyRegistry>,
     auction_private_keys: Arc<Vec<PrivateExecutionKeyPrivateConfig>>,
@@ -439,6 +440,20 @@ const INGRESS_LATENCY_BUCKETS_MS: &[u64] = &[
 const INGRESS_REMAINING_BUCKETS_MS: &[u64] =
     &[0, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000];
 const MAX_CLIENT_TELEMETRY_MS: u64 = 10 * 60 * 1_000;
+const LIFECYCLE_LATENCY_BUCKETS_MS: &[u64] = &[
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000,
+    1_800_000,
+];
+const LIFECYCLE_OPERATIONS: &[&str] = &[
+    "settlement_prepare",
+    "settlement_proof_job",
+    "settlement_proof_generation",
+    "settlement_onchain_submit",
+    "settlement_total",
+    "withdrawal_submit",
+    "withdrawal_proof_generation",
+    "withdrawal_onchain_submit",
+];
 
 #[derive(Clone, Debug, Default)]
 struct IngressTelemetryMetrics {
@@ -605,6 +620,80 @@ impl IngressTelemetryMetrics {
             &inner.batch_time_remaining_before_coordinator_ms,
             INGRESS_REMAINING_BUCKETS_MS,
         );
+        output
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct LifecycleTelemetryMetrics {
+    inner: Arc<Mutex<LifecycleTelemetryMetricsInner>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LifecycleTelemetryMetricsInner {
+    outcomes: BTreeMap<(&'static str, &'static str), u64>,
+    latency_ms: BTreeMap<&'static str, HistogramCounts>,
+}
+
+impl LifecycleTelemetryMetrics {
+    fn record(&self, operation: &'static str, outcome: &'static str, latency_ms: u64) {
+        let mut inner = self.inner.lock().expect("lifecycle metrics lock");
+        *inner.outcomes.entry((operation, outcome)).or_insert(0) += 1;
+        inner
+            .latency_ms
+            .entry(operation)
+            .or_default()
+            .observe(latency_ms, LIFECYCLE_LATENCY_BUCKETS_MS);
+    }
+
+    fn render_prometheus(&self, namespace: &str) -> String {
+        let inner = self.inner.lock().expect("lifecycle metrics lock");
+        let mut output = String::new();
+        output.push_str(&format!(
+            "# HELP {namespace}_proof_lifecycle_operations_total Proof, settlement, and withdrawal lifecycle operations by outcome.\n\
+             # TYPE {namespace}_proof_lifecycle_operations_total counter\n"
+        ));
+        for ((operation, outcome), count) in &inner.outcomes {
+            output.push_str(&format!(
+                "{namespace}_proof_lifecycle_operations_total{{operation=\"{operation}\",outcome=\"{outcome}\"}} {count}\n"
+            ));
+        }
+        for &operation in LIFECYCLE_OPERATIONS {
+            if !inner
+                .outcomes
+                .keys()
+                .any(|(observed_operation, _)| *observed_operation == operation)
+            {
+                output.push_str(&format!(
+                    "{namespace}_proof_lifecycle_operations_total{{operation=\"{operation}\",outcome=\"success\"}} 0\n"
+                ));
+            }
+        }
+        for &operation in LIFECYCLE_OPERATIONS {
+            let empty = HistogramCounts::default();
+            let histogram = inner.latency_ms.get(operation).unwrap_or(&empty);
+            render_histogram(
+                &mut output,
+                namespace,
+                &format!("proof_lifecycle_{operation}_latency_ms"),
+                "Proof, settlement, and withdrawal lifecycle latency.",
+                histogram,
+                LIFECYCLE_LATENCY_BUCKETS_MS,
+            );
+        }
+        for (operation, histogram) in &inner.latency_ms {
+            if LIFECYCLE_OPERATIONS.contains(operation) {
+                continue;
+            }
+            render_histogram(
+                &mut output,
+                namespace,
+                &format!("proof_lifecycle_{operation}_latency_ms"),
+                "Proof, settlement, and withdrawal lifecycle latency.",
+                histogram,
+                LIFECYCLE_LATENCY_BUCKETS_MS,
+            );
+        }
         output
     }
 }
@@ -1596,6 +1685,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
             |record: &PrivateOrderPayloadRecord| record.order_commitment.0.clone(),
         ))),
         private_ingress_metrics: IngressTelemetryMetrics::default(),
+        proof_lifecycle_metrics: LifecycleTelemetryMetrics::default(),
         product_config: Arc::new(product_config),
         auction_key_registry: Arc::new(auction_key_registry),
         auction_private_keys: Arc::new(auction_private_keys),
@@ -1822,9 +1912,15 @@ async fn internal_metrics(
     headers: HeaderMap,
 ) -> Result<String, StatusCode> {
     require_internal_auth(&state, &headers)?;
-    Ok(state
+    let mut body = state
         .private_ingress_metrics
-        .render_prometheus("zylith_prover"))
+        .render_prometheus("zylith_prover");
+    body.push_str(
+        &state
+            .proof_lifecycle_metrics
+            .render_prometheus("zylith_prover"),
+    );
+    Ok(body)
 }
 
 async fn public_auction_keys(State(state): State<AppState>) -> Json<PrivateExecutionKeyRegistry> {
@@ -2279,9 +2375,14 @@ async fn submit_settlement_output_withdrawal(
         state.private_ingress_rate_limit_per_minute,
     )
     .map_err(withdrawal_submit_error)?;
-    let response = submit_settlement_output_withdrawal_inner(&state, request.witness)
-        .await
-        .map_err(withdrawal_submit_error)?;
+    let started_at = now_unix_ms();
+    let result = submit_settlement_output_withdrawal_inner(&state, request.witness).await;
+    state.proof_lifecycle_metrics.record(
+        "withdrawal_submit",
+        if result.is_ok() { "success" } else { "error" },
+        now_unix_ms().saturating_sub(started_at),
+    );
+    let response = result.map_err(withdrawal_submit_error)?;
     Ok(Json(response))
 }
 
@@ -2699,7 +2800,8 @@ async fn submit_settlement_output_withdrawal_inner(
         .clone()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let stage_key = format!("{withdrawal_key}-withdrawal");
-    let proof = execute_native_statement_prover(NativeStatementProverRequest {
+    let proof_started_at = now_unix_ms();
+    let proof_result = execute_native_statement_prover(NativeStatementProverRequest {
         state,
         tx_prover_url: &tx_prover_url,
         executor: &executor,
@@ -2709,8 +2811,17 @@ async fn submit_settlement_output_withdrawal_inner(
         serialized_native_witness: &serialized_native_witness,
         expected_message_hashes: &[expected_message_hash],
     })
-    .await
-    .map_err(|error| {
+    .await;
+    state.proof_lifecycle_metrics.record(
+        "withdrawal_proof_generation",
+        if proof_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        },
+        now_unix_ms().saturating_sub(proof_started_at),
+    );
+    let proof = proof_result.map_err(|error| {
         eprintln!(
             "settlement output withdrawal proof generation failed key={} batch={} error={error}",
             withdrawal_key, witness.batch_id.0,
@@ -2729,15 +2840,25 @@ async fn submit_settlement_output_withdrawal_inner(
         );
         StatusCode::BAD_GATEWAY
     })?;
-    let tx_hash = submit_native_invoke_with_typed_sdk_retry(
+    let submit_started_at = now_unix_ms();
+    let submit_result = submit_native_invoke_with_typed_sdk_retry(
         state,
         &executor,
         &plan.starknet_call,
         proof_body,
         &proof_facts,
     )
-    .await
-    .map_err(|error| {
+    .await;
+    state.proof_lifecycle_metrics.record(
+        "withdrawal_onchain_submit",
+        if submit_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        },
+        now_unix_ms().saturating_sub(submit_started_at),
+    );
+    let tx_hash = submit_result.map_err(|error| {
         eprintln!(
             "settlement output withdrawal onchain submit failed key={} batch={} error={error}",
             withdrawal_key, witness.batch_id.0,
@@ -4496,7 +4617,14 @@ async fn prepare_proof_job(
 ) -> Result<Json<ProofJobStatus>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
-    let (status, _) = prepare_or_rebuild_job(&state, &batch_id).await?;
+    let started_at = now_unix_ms();
+    let result = prepare_or_rebuild_job(&state, &batch_id).await;
+    state.proof_lifecycle_metrics.record(
+        "settlement_prepare",
+        if result.is_ok() { "success" } else { "error" },
+        now_unix_ms().saturating_sub(started_at),
+    );
+    let (status, _) = result?;
     Ok(Json(status))
 }
 
@@ -4507,7 +4635,14 @@ async fn run_proof_job(
 ) -> Result<Json<ProofJobStatus>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
-    Ok(Json(run_proof_job_inner(&state, &batch_id).await?))
+    let started_at = now_unix_ms();
+    let result = run_proof_job_inner(&state, &batch_id).await;
+    state.proof_lifecycle_metrics.record(
+        "settlement_proof_job",
+        if result.is_ok() { "success" } else { "error" },
+        now_unix_ms().saturating_sub(started_at),
+    );
+    Ok(Json(result?))
 }
 
 async fn run_proof_job_inner(
@@ -4532,6 +4667,7 @@ async fn run_proof_job_inner(
     )
     .await?;
 
+    let proof_started_at = now_unix_ms();
     let proof_result = match fetch_auction_order_witnesses(state, batch_id).await {
         Ok(auction_order_witnesses) => {
             if state.native_tx_prover_url.is_some() {
@@ -4557,6 +4693,15 @@ async fn run_proof_job_inner(
             "failed to load private auction order witness set for proof: {status}"
         )),
     };
+    state.proof_lifecycle_metrics.record(
+        "settlement_proof_generation",
+        if proof_result.is_ok() {
+            "success"
+        } else {
+            "error"
+        },
+        now_unix_ms().saturating_sub(proof_started_at),
+    );
 
     match proof_result {
         Ok(artifact) => {
@@ -4630,7 +4775,14 @@ async fn submit_onchain(
 ) -> Result<Json<OnchainSubmissionRecord>, StatusCode> {
     require_internal_auth(&state, &headers)?;
     require_prover_not_paused(&state)?;
-    Ok(Json(submit_onchain_inner(&state, &batch_id).await?))
+    let started_at = now_unix_ms();
+    let result = submit_onchain_inner(&state, &batch_id).await;
+    state.proof_lifecycle_metrics.record(
+        "settlement_onchain_submit",
+        if result.is_ok() { "success" } else { "error" },
+        now_unix_ms().saturating_sub(started_at),
+    );
+    Ok(Json(result?))
 }
 
 async fn submit_onchain_inner(
@@ -4694,6 +4846,19 @@ async fn submit_onchain_inner(
         )?;
     }
     sync_job_with_onchain_submission(state, batch_id, &submission).await?;
+    if let Some(created_at_unix_ms) = state
+        .proof_jobs
+        .read()
+        .await
+        .get(batch_id)
+        .map(|status| status.created_at_unix_ms)
+    {
+        state.proof_lifecycle_metrics.record(
+            "settlement_total",
+            "success",
+            now_unix_ms().saturating_sub(created_at_unix_ms),
+        );
+    }
     if let Err(error) =
         publish_settlement_timestamp_to_artifact_stores(state, batch_id, &submission).await
     {
@@ -10814,6 +10979,32 @@ mod tests {
         ));
         assert!(!text.contains("order_commitment"));
         assert!(!text.contains("note"));
+    }
+
+    #[test]
+    fn proof_lifecycle_metrics_render_only_aggregate_buckets() {
+        let metrics = super::LifecycleTelemetryMetrics::default();
+        metrics.record("settlement_proof_generation", "success", 42_000);
+        metrics.record("withdrawal_onchain_submit", "error", 1_500);
+
+        let text = metrics.render_prometheus("zylith_prover");
+
+        assert!(text.contains(
+            "zylith_prover_proof_lifecycle_operations_total{operation=\"settlement_proof_generation\",outcome=\"success\"} 1"
+        ));
+        assert!(text.contains(
+            "zylith_prover_proof_lifecycle_operations_total{operation=\"withdrawal_onchain_submit\",outcome=\"error\"} 1"
+        ));
+        assert!(text.contains(
+            "zylith_prover_proof_lifecycle_settlement_proof_generation_latency_ms_count 1"
+        ));
+        assert!(
+            text.contains(
+                "zylith_prover_proof_lifecycle_withdrawal_onchain_submit_latency_ms_bucket{le=\"2500\"} 1"
+            )
+        );
+        assert!(!text.contains("order_commitment"));
+        assert!(!text.contains("note_preimage"));
     }
 
     #[tokio::test]
