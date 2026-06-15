@@ -207,8 +207,8 @@ test("production readiness rejects stale funding verifier manifests", () => {
 
 test("production readiness rejects stale private funding manifest drift", () => {
   const { env, manifest } = fixtureEnv();
-  manifest.funding.starknet_privacy.discovery_url = "http://35.192.48.142:8080";
-  manifest.funding.starknet_privacy.proving_url = "http://34.29.249.119:3000";
+  manifest.funding.starknet_privacy.discovery_url = "http://privacy-discovery.example";
+  manifest.funding.starknet_privacy.proving_url = "http://privacy-prover.example";
   manifest.funding.starknet_privacy.paymaster_address = "0x999";
   manifest.funding.starknet_privacy.bridge_adapter = "0x406";
   manifest.funding.starknet_privacy.shielded_asset_adapter = "0x404";
