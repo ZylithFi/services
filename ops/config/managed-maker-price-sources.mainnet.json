@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "network": "mainnet",
+  "description": "Production managed-maker reference-price policy. Last-cleared Zylith prices are intentionally not an allowed fallback.",
+  "pragma": {
+    "oracle_address": "0x2a85bd616f912537c50a49a4076db02c00b29b2cdc8a197ce92ed1837fa875b",
+    "entrypoint": "0x24b869ce68dd257b370701ca16e4aaf9c6483ff6805d04ba7661f3a0b6ce59",
+    "response_shape": {
+      "price_index": 0,
+      "decimals_index": 1,
+      "timestamp_index": 2,
+      "source_count_index": 3
+    },
+    "min_source_count": 2,
+    "assets": {
+      "BTC/USD": "0x4254432f555344",
+      "ETH/USD": "0x4554482f555344",
+      "STRK/USD": "0x5354524b2f555344",
+      "USDC/USD": "0x555344432f555344",
+      "USDT/USD": "0x555344542f555344",
+      "WBTC/USD": "0x574254432f555344",
+      "XSTRKBTC/USD": "0x585354524b4254432f555344"
+    }
+  },
+  "global_policy": {
+    "max_staleness_ms": 60000,
+    "min_sources": 3,
+    "max_divergence_bps": 75,
+    "large_move_policy": "require-confirmation-widen-size-reduce-or-halt",
+    "forbidden_fallbacks": [
+      "last-cleared-price",
+      "single-exchange-only",
+      "fixed-price"
+    ]
+  },
+  "pairs": {
+    "STRK/USDC": {
+      "primary": "pragma:STRK/USD divided by pragma:USDC/USD",
+      "confirmations": [
+        "coinbase:STRK-USD",
+        "kraken:STRKUSD"
+      ],
+      "min_independent_sources": 3
+    },
+    "ETH/USDC": {
+      "primary": "pragma:ETH/USD divided by pragma:USDC/USD",
+      "confirmations": [
+        "coinbase:ETH-USD",
+        "kraken:ETHUSD"
+      ],
+      "min_independent_sources": 3
+    },
+    "strkBTC/USDC": {
+      "primary": "pragma:XSTRKBTC/USD divided by pragma:USDC/USD",
+      "confirmations": [
+        "coinbase:BTC-USD",
+        "kraken:BTCUSD"
+      ],
+      "min_independent_sources": 3,
+      "assumption": "strkBTC pricing uses the configured Pragma XSTRKBTC feed; BTC/USD confirmations only sanity-check wrapper parity and cannot replace the primary feed."
+    },
+    "STRK/ETH": {
+      "primary": "pragma:STRK/USD divided by pragma:ETH/USD",
+      "confirmations": [
+        "coinbase:STRK-USD divided by coinbase:ETH-USD",
+        "kraken:STRKUSD divided by kraken:ETHUSD"
+      ],
+      "min_independent_sources": 3
+    },
+    "STRK/strkBTC": {
+      "primary": "pragma:STRK/USD divided by pragma:XSTRKBTC/USD",
+      "confirmations": [
+        "coinbase:STRK-USD divided by coinbase:BTC-USD",
+        "kraken:STRKUSD divided by kraken:BTCUSD"
+      ],
+      "min_independent_sources": 3,
+      "assumption": "BTC/USD confirmations only sanity-check strkBTC wrapper parity; a live XSTRKBTC primary feed is mandatory."
+    },
+    "WBTC/strkBTC": {
+      "primary": "pragma:WBTC/USD divided by pragma:XSTRKBTC/USD",
+      "confirmations": [
+        "coinbase:BTC-USD",
+        "kraken:BTCUSD"
+      ],
+      "min_independent_sources": 3,
+      "max_divergence_bps": 25,
+      "assumption": "WBTC and strkBTC should price near parity; divergence beyond policy halts quoting rather than clipping."
+    },
+    "USDC/USDT": {
+      "primary": "pragma:USDC/USD divided by pragma:USDT/USD",
+      "confirmations": [
+        "coinbase:USDT-USD",
+        "kraken:USDCUSD",
+        "kraken:USDTUSD"
+      ],
+      "min_independent_sources": 3,
+      "max_divergence_bps": 20
+    }
+  }
+}

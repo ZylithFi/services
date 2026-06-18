@@ -54,6 +54,18 @@ test("managed maker daemon exposes health and prometheus telemetry", async () =>
   }
 });
 
+test("managed maker daemon rejects production strategies without quote-only authorization", async () => {
+  buildSdk();
+  const fixture = await createFixture({ omitManagedAuthorization: true });
+  const result = await spawnNode([daemon, "--once"], {
+    env: { ...process.env, ...fixture.env },
+  });
+  await fixture.close();
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /requires managed_maker_authorization/);
+});
+
 function buildSdk() {
   const result = spawnSync("npm", ["run", "build:sdk"], {
     cwd: resolve("client"),
@@ -76,7 +88,7 @@ function spawnNode(args, options) {
   });
 }
 
-async function createFixture() {
+async function createFixture(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), "zylith-maker-daemon-"));
   const coordinator = await createCoordinator();
   const runtimeModule = join(dir, "runtime.mjs");
@@ -95,9 +107,9 @@ export async function createManagedMakerRuntime() {
     },
     getOrders() { return []; },
     getPrivateStrategies() { return []; },
-    async submitPrivateOrder(intent) {
+    async submitDelegatedPrivateOrder(intent, authorization) {
       submitted += 1;
-      return { order_id: "ord-" + submitted, strategy_id: "strategy-" + submitted, intent };
+      return { order_id: "ord-" + submitted, strategy_id: "strategy-" + submitted, intent, authorization };
     }
   };
 }
@@ -146,6 +158,7 @@ export async function createManagedMakerRuntime() {
           allowBid: true,
           allowAsk: true,
         },
+        ...(options.omitManagedAuthorization ? {} : { managed_maker_authorization: managedAuthorizationFixture() }),
       },
     ],
   }, null, 2));
@@ -157,6 +170,35 @@ export async function createManagedMakerRuntime() {
       ZYLITH_MANAGED_MAKER_STATE_PATH: statePath,
     },
     close: coordinator.close,
+  };
+}
+
+function managedAuthorizationFixture() {
+  return {
+    policy: {
+      version: 1,
+      delegate_public_key: "0x123",
+      pair_id: "ETH/USDC",
+      allow_buy: false,
+      allow_sell: true,
+      max_epoch_base: "100000000000000000",
+      min_price: "2400000000",
+      max_price: "2600000000",
+      valid_from_epoch: "1",
+      valid_until_epoch: "5",
+      relay_mode: "SelfRelay",
+      parent_order_commitment: "0x0",
+      recipient_owner_public_key: "0xabc",
+      recipient_spend_authority: "0xdef",
+      recipient_withdraw_authority: "0x456",
+      recipient_residual_withdraw_authority: "0x456",
+      auditor_view_allowed: false,
+      policy_nonce: "1",
+    },
+    owner_authorization: {
+      signature_r: "0x1",
+      signature_s: "0x2",
+    },
   };
 }
 

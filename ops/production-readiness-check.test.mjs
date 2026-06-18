@@ -1,8 +1,8 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -139,6 +139,22 @@ test("production readiness rejects stale pair fee manifest values", () => {
   assert.match(result.stderr, /product\.pairs\.STRK\/USDC\.maker_fee_bps must be 0/);
 });
 
+test("production readiness rejects incomplete managed maker price policy", () => {
+  const { env } = fixtureEnv();
+  const policyPath = join(mkdtempSync(join(tmpdir(), "zylith-price-policy-")), "policy.json");
+  const policy = JSON.parse(readFileSync("ops/config/managed-maker-price-sources.mainnet.json", "utf8"));
+  delete policy.pairs["ETH/USDC"];
+  policy.pairs["STRK/USDC"].confirmations = ["last-cleared-price"];
+  writeFileSync(policyPath, JSON.stringify(policy, null, 2));
+  env.ZYLITH_MANAGED_MAKER_PRICE_POLICY_PATH = policyPath;
+
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /managed maker price policy must include ETH\/USDC/);
+  assert.match(result.stderr, /managed maker price policy STRK\/USDC\.confirmations must include at least two independent confirmations/);
+  assert.match(result.stderr, /managed maker price policy STRK\/USDC must not include last-cleared/);
+});
+
 test("production readiness rejects unresolved high severity audit findings when audit is required", () => {
   const { env } = fixtureEnv();
   env.ZYLITH_EXTERNAL_AUDIT_REQUIRED = "true";
@@ -146,6 +162,7 @@ test("production readiness rejects unresolved high severity audit findings when 
   env.ZYLITH_EXTERNAL_AUDIT_CRITICAL_OPEN = "0";
   env.ZYLITH_EXTERNAL_AUDIT_HIGH_OPEN = "1";
   env.ZYLITH_EXTERNAL_AUDIT_REPORT_SHA256 = "b".repeat(64);
+  env.ZYLITH_EXTERNAL_AUDIT_REPORT_URI = "https://audit.example/report.pdf";
   const result = runReadiness(env);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /ZYLITH_EXTERNAL_AUDIT_HIGH_OPEN must be 0/);
@@ -176,6 +193,14 @@ test("production readiness rejects stale deployment manifest hash", () => {
   assert.match(result.stderr, /deployment manifest sha256/);
 });
 
+test("production readiness rejects invalid deployment manifest signature", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_DEPLOYMENT_MANIFEST_SIGNATURE = Buffer.from("not a valid signature").toString("base64");
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /deployment manifest signature/);
+});
+
 test("production readiness rejects manifest chain id mismatch", () => {
   const { env, manifest } = fixtureEnv();
   manifest.chain_id = "0x1234";
@@ -189,11 +214,13 @@ test("production readiness rejects unaudited or non-exact-delta asset metadata",
   const { env, manifest } = fixtureEnv();
   manifest.product.assets.STRK.erc20_behavior = "fee-on-transfer";
   manifest.product.assets.USDC.audit_status = "pending";
+  delete manifest.product.assets.ETH.audit_evidence;
   writeManifest(env, manifest);
   const result = runReadiness(env);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /product\.assets\.STRK\.erc20_behavior must be vanilla-exact-delta/);
   assert.match(result.stderr, /product\.assets\.USDC\.audit_status must be approved/);
+  assert.match(result.stderr, /product\.assets\.ETH\.audit_evidence is required/);
 });
 
 test("production readiness rejects stale funding verifier manifests", () => {
@@ -236,6 +263,7 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "zylith-readiness-"));
   const manifestPath = join(dir, "deployment.json");
   const manifest = fixtureManifest(proofOverrides);
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
 
   const env = {
     ...process.env,
@@ -315,7 +343,12 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     ZYLITH_EXTERNAL_AUDIT_REQUIRED: "false",
     ZYLITH_KEY_CUSTODY_MODE: "hardware-multisig",
     ZYLITH_DEPLOYMENT_RELEASE_COMMIT: fixtureReleaseCommit(),
+    ZYLITH_DEPLOYMENT_MANIFEST_SIGNER_PUBLIC_KEY_PEM: publicKey.export({ type: "spki", format: "pem" }),
   };
+  Object.defineProperty(env, "__manifestPrivateKeyPem", {
+    value: privateKey.export({ type: "pkcs8", format: "pem" }),
+    enumerable: false,
+  });
   env.ZYLITH_DEPLOYMENT_MANIFEST_PATH = manifestPath;
   writeManifest(env, manifest);
 
@@ -358,6 +391,12 @@ function fixtureManifest(proofOverrides) {
             enabled: true,
             erc20_behavior: "vanilla-exact-delta",
             audit_status: "approved",
+            audit_evidence: {
+              auditor: "fixture-auditor",
+              report_uri: `https://audit.example/${asset}.pdf`,
+              report_sha256: "c".repeat(64),
+              approved_at: "2026-06-18",
+            },
           },
         ]),
       ),
@@ -415,4 +454,9 @@ function writeManifest(env, manifest) {
   env.ZYLITH_EXPECTED_DEPLOYMENT_MANIFEST_SHA256 = createHash("sha256")
     .update(body)
     .digest("hex");
+  env.ZYLITH_DEPLOYMENT_MANIFEST_SIGNATURE = sign(
+    null,
+    Buffer.from(body),
+    env.__manifestPrivateKeyPem,
+  ).toString("base64");
 }

@@ -898,6 +898,8 @@ pub struct PrivateOrderPayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_notes: Vec<Note>,
     pub funding_authorization: SpendAuthorization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_maker_authorization: Option<ManagedMakerAuthorization>,
 }
 
 impl PrivateOrderPayload {
@@ -914,6 +916,173 @@ impl PrivateOrderPayload {
 pub struct SpendAuthorization {
     pub signature_r: String,
     pub signature_s: String,
+}
+
+pub const MANAGED_MAKER_POLICY_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedMakerPolicy {
+    pub version: u32,
+    pub delegate_public_key: String,
+    pub pair_id: PairId,
+    pub allow_buy: bool,
+    pub allow_sell: bool,
+    #[serde(with = "serde_u128_decimal")]
+    pub max_epoch_base: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub min_price: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub max_price: u128,
+    #[serde(with = "serde_u64_decimal")]
+    pub valid_from_epoch: u64,
+    #[serde(with = "serde_u64_decimal")]
+    pub valid_until_epoch: u64,
+    pub relay_mode: RelayMode,
+    pub parent_order_commitment: String,
+    pub recipient_owner_public_key: String,
+    pub recipient_spend_authority: String,
+    pub recipient_withdraw_authority: String,
+    pub recipient_residual_withdraw_authority: String,
+    pub auditor_view_allowed: bool,
+    #[serde(with = "serde_u64_decimal")]
+    pub policy_nonce: u64,
+}
+
+impl ManagedMakerPolicy {
+    pub fn commitment(&self) -> Result<String, ProtocolError> {
+        let pair_id = felt_from_hex_str(&encode_starknet_felt("pair-id", &self.pair_id.0))?;
+        let relay_mode = match self.relay_mode {
+            RelayMode::SelfRelay => field_from_u64(0),
+            RelayMode::ZylithRelay => field_from_u64(1),
+        };
+        let fields = [
+            field_from_u64(u64::from(self.version)),
+            felt_from_hex_str(&self.delegate_public_key)?,
+            pair_id,
+            field_from_u64(u64::from(self.allow_buy)),
+            field_from_u64(u64::from(self.allow_sell)),
+            field_from_u128(self.max_epoch_base),
+            field_from_u128(self.min_price),
+            field_from_u128(self.max_price),
+            field_from_u64(self.valid_from_epoch),
+            field_from_u64(self.valid_until_epoch),
+            relay_mode,
+            felt_from_hex_str(&self.parent_order_commitment)?,
+            felt_from_hex_str(&encode_starknet_felt(
+                "owner-public-key",
+                &self.recipient_owner_public_key,
+            ))?,
+            felt_from_hex_str(&self.recipient_spend_authority)?,
+            felt_from_hex_str(&self.recipient_withdraw_authority)?,
+            felt_from_hex_str(&self.recipient_residual_withdraw_authority)?,
+            field_from_u64(u64::from(self.auditor_view_allowed)),
+            field_from_u64(self.policy_nonce),
+        ];
+        Ok(poseidon_chain_hex(
+            domain_felt("zylith/managed-maker-policy-v1"),
+            &fields,
+        ))
+    }
+
+    pub fn validate_order(&self, order: &OrderIntent) -> Result<(), ProtocolError> {
+        if self.version != MANAGED_MAKER_POLICY_VERSION {
+            return Err(ProtocolError::InvalidOrder(
+                "unsupported managed maker policy version".into(),
+            ));
+        }
+        if felt_from_hex_str(&self.delegate_public_key)? == field_from_u64(0)
+            || self.policy_nonce == 0
+            || self.max_epoch_base == 0
+            || self.min_price == 0
+            || self.max_price < self.min_price
+            || self.valid_from_epoch == 0
+            || self.valid_until_epoch < self.valid_from_epoch
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker policy bounds are invalid".into(),
+            ));
+        }
+        if order.order_type != OrderType::MakerCurve {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker delegation only authorizes maker curves".into(),
+            ));
+        }
+        if order.time_in_force != TimeInForce::CurrentBatchOnly {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker delegation requires current-batch orders".into(),
+            ));
+        }
+        if order.pair_id != self.pair_id {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker pair is not authorized".into(),
+            ));
+        }
+        if (order.side == OrderSide::Buy && !self.allow_buy)
+            || (order.side == OrderSide::Sell && !self.allow_sell)
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker side is not authorized".into(),
+            ));
+        }
+        if order.amount == 0 || order.amount > self.max_epoch_base {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker order exceeds the authorized epoch size".into(),
+            ));
+        }
+        if order.expiry_epoch < self.valid_from_epoch || order.expiry_epoch > self.valid_until_epoch
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker order is outside the authorized epoch range".into(),
+            ));
+        }
+        if order.relay_mode != self.relay_mode {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker relay mode is not authorized".into(),
+            ));
+        }
+        if felt_from_hex_str(&order.parent_order_commitment)?
+            != felt_from_hex_str(&self.parent_order_commitment)?
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker renewal parent is not authorized".into(),
+            ));
+        }
+        if order.recipient_owner_public_key != self.recipient_owner_public_key
+            || order.recipient_spend_authority != self.recipient_spend_authority
+            || order.recipient_withdraw_authority != self.recipient_withdraw_authority
+            || order.recipient_residual_withdraw_authority
+                != self.recipient_residual_withdraw_authority
+            || order.auditor_view_allowed != self.auditor_view_allowed
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker output authority is not authorized".into(),
+            ));
+        }
+        if order.limit_price < self.min_price || order.limit_price > self.max_price {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker limit price is outside the authorized range".into(),
+            ));
+        }
+        let curve = order.maker_curve.as_ref().ok_or_else(|| {
+            ProtocolError::InvalidOrder("managed maker order is missing its curve".into())
+        })?;
+        if curve
+            .points
+            .iter()
+            .any(|point| point.price < self.min_price || point.price > self.max_price)
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "managed maker curve price is outside the authorized range".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedMakerAuthorization {
+    pub policy: ManagedMakerPolicy,
+    pub owner_authorization: SpendAuthorization,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1204,6 +1373,8 @@ pub struct MatchedOrderWitness {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_nullifiers: Vec<Nullifier>,
     pub funding_authorization: SpendAuthorization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_maker_authorization: Option<ManagedMakerAuthorization>,
     pub side: OrderSide,
     pub order_type: OrderType,
     #[serde(default)]
@@ -1268,6 +1439,8 @@ pub struct AuctionOrderWitness {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_notes: Vec<Note>,
     pub funding_authorization: SpendAuthorization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_maker_authorization: Option<ManagedMakerAuthorization>,
 }
 
 impl AuctionOrderWitness {

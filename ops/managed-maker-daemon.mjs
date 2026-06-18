@@ -21,6 +21,12 @@ async function main() {
   const sdkModule = await import(pathToFileURL(sdkDist).href);
   const config = await loadConfig();
   const runtime = await loadRuntime(config);
+  const strategies = normalizeStrategies(requiredArray(config.strategies, "strategies"));
+  const requireQuoteOnlyAuthorization = optionalBool(
+    process.env.ZYLITH_MANAGED_MAKER_REQUIRE_QUOTE_ONLY_AUTHORIZATION ?? config.require_quote_only_authorization,
+    config.read_only === true ? false : true,
+  );
+  validateQuoteOnlyRuntime({ runtime, strategies, requireQuoteOnlyAuthorization });
   const relay = config.relay_url
     ? new sdkModule.ZylithRelaySdk({ relayUrl: config.relay_url })
     : undefined;
@@ -35,7 +41,7 @@ async function main() {
     sdk: makerSdk,
     runtime,
     marketData,
-    strategies: requiredArray(config.strategies, "strategies"),
+    strategies,
     currentBatch: currentBatchLoader(config),
     store: jsonStateStore(resolve(statePath)),
     intervalMs: optionalPositiveInt(process.env.ZYLITH_MANAGED_MAKER_INTERVAL_MS ?? config.interval_ms, 30_000),
@@ -43,6 +49,7 @@ async function main() {
       process.env.ZYLITH_MANAGED_MAKER_SUBMISSION_SAFETY_BUFFER_MS ?? config.submission_safety_buffer_ms,
       15_000,
     ),
+    requireQuoteOnlyAuthorization,
     onEvent: (event) => {
       events.record(event);
       if (process.env.ZYLITH_MANAGED_MAKER_LOG_EVENTS === "true") {
@@ -77,6 +84,32 @@ async function main() {
   process.once("SIGTERM", shutdown);
 }
 
+function normalizeStrategies(strategies) {
+  return strategies.map((strategy, index) => {
+    if (!strategy || typeof strategy !== "object" || Array.isArray(strategy)) {
+      throw new Error(`strategies[${index}] must be an object`);
+    }
+    const normalized = { ...strategy };
+    if (normalized.managedMakerAuthorization === undefined && normalized.managed_maker_authorization !== undefined) {
+      normalized.managedMakerAuthorization = normalized.managed_maker_authorization;
+    }
+    return normalized;
+  });
+}
+
+function validateQuoteOnlyRuntime({ runtime, strategies, requireQuoteOnlyAuthorization }) {
+  if (!requireQuoteOnlyAuthorization) return;
+  if (typeof runtime.submitDelegatedPrivateOrder !== "function") {
+    throw new Error("production managed maker daemon requires runtime.submitDelegatedPrivateOrder()");
+  }
+  for (const strategy of strategies) {
+    if (strategy.enabled === false) continue;
+    if (!strategy.managedMakerAuthorization) {
+      throw new Error(`strategy ${strategy.id ?? "<unnamed>"} requires managed_maker_authorization`);
+    }
+  }
+}
+
 async function loadConfig() {
   const configPath = process.env.ZYLITH_MANAGED_MAKER_CONFIG;
   if (!configPath) throw new Error("ZYLITH_MANAGED_MAKER_CONFIG is required");
@@ -97,7 +130,7 @@ async function loadRuntime(config) {
     throw new Error("runtime module must export createManagedMakerRuntime, createRuntime, or default");
   }
   const runtime = await factory({ config, env: process.env });
-  for (const method of ["submitPrivateOrder", "getBalances", "getOrders"]) {
+  for (const method of ["getBalances", "getOrders"]) {
     if (typeof runtime?.[method] !== "function") throw new Error(`runtime is missing ${method}()`);
   }
   return runtime;
@@ -105,44 +138,71 @@ async function loadRuntime(config) {
 
 function buildMarketSources(config, sdkModule) {
   const sources = requiredArray(config.market_sources, "market_sources");
-  return sources.map((source, index) => {
-    const kind = requiredString(source.kind, `market_sources[${index}].kind`);
-    if (kind === "fixed") {
-      const prices = requiredObject(source.prices, `market_sources[${index}].prices`);
-      const observedAt = typeof source.observed_at_unix_ms === "number" ? source.observed_at_unix_ms : undefined;
-      return {
-        id: requiredString(source.id, `market_sources[${index}].id`),
-        async observe(pair) {
-          const price = Number(prices[pair]);
-          if (!Number.isFinite(price) || price <= 0) return null;
-          return { source: source.id, pair, price, observedAt: observedAt ?? Date.now() };
-        },
-      };
-    }
-    if (kind === "http-json") {
-      return sdkModule.createHttpJsonPriceSource({
-        id: requiredString(source.id, `market_sources[${index}].id`),
-        url: requiredString(source.url, `market_sources[${index}].url`),
-        pricePath: requiredString(source.price_path, `market_sources[${index}].price_path`),
-        observedAtPath: source.observed_at_path,
-        pairPath: source.pair_path,
-        headers: source.headers,
-        priceScale: source.price_scale,
-      });
-    }
-    if (kind === "starknet-oracle") {
-      return sdkModule.createStarknetOraclePriceSource({
-        id: requiredString(source.id, `market_sources[${index}].id`),
-        rpcUrl: requiredString(source.rpc_url, `market_sources[${index}].rpc_url`),
-        contractAddress: requiredString(source.contract_address, `market_sources[${index}].contract_address`),
-        entrypoint: requiredString(source.entrypoint, `market_sources[${index}].entrypoint`),
-        calldata: requiredArray(source.calldata, `market_sources[${index}].calldata`),
-        priceScale: Number(source.price_scale),
-        timestampIndex: source.timestamp_index,
-      });
-    }
+  return sources.map((source, index) => buildMarketSource(source, `market_sources[${index}]`, sdkModule));
+}
+
+function buildMarketSource(source, path, sdkModule) {
+  const kind = requiredString(source.kind, `${path}.kind`);
+  let built;
+  if (kind === "fixed") {
+    const prices = requiredObject(source.prices, `${path}.prices`);
+    const observedAt = typeof source.observed_at_unix_ms === "number" ? source.observed_at_unix_ms : undefined;
+    built = {
+      id: requiredString(source.id, `${path}.id`),
+      async observe(pair) {
+        const price = Number(prices[pair]);
+        if (!Number.isFinite(price) || price <= 0) return null;
+        return { source: source.id, pair, price, observedAt: observedAt ?? Date.now() };
+      },
+    };
+  } else if (kind === "http-json") {
+    built = sdkModule.createHttpJsonPriceSource({
+      id: requiredString(source.id, `${path}.id`),
+      url: requiredString(source.url, `${path}.url`),
+      pricePath: requiredString(source.price_path, `${path}.price_path`),
+      observedAtPath: source.observed_at_path,
+      pairPath: source.pair_path,
+      headers: source.headers,
+      priceScale: source.price_scale,
+    });
+  } else if (kind === "starknet-oracle") {
+    built = sdkModule.createStarknetOraclePriceSource({
+      id: requiredString(source.id, `${path}.id`),
+      rpcUrl: requiredString(source.rpc_url, `${path}.rpc_url`),
+      contractAddress: requiredString(source.contract_address, `${path}.contract_address`),
+      entrypoint: requiredString(source.entrypoint, `${path}.entrypoint`),
+      calldata: requiredArray(source.calldata, `${path}.calldata`),
+      priceScale: source.price_scale === undefined ? undefined : Number(source.price_scale),
+      decimalsIndex: source.decimals_index,
+      timestampIndex: source.timestamp_index,
+      sourceCountIndex: source.source_count_index,
+      minSourceCount: source.min_source_count,
+    });
+  } else if (kind === "ratio") {
+    built = sdkModule.createRatioPriceSource({
+      id: requiredString(source.id, `${path}.id`),
+      pair: requiredString(source.pair, `${path}.pair`),
+      numerator: buildMarketSource(
+        requiredObject(source.numerator, `${path}.numerator`),
+        `${path}.numerator`,
+        sdkModule,
+      ),
+      denominator: buildMarketSource(
+        requiredObject(source.denominator, `${path}.denominator`),
+        `${path}.denominator`,
+        sdkModule,
+      ),
+    });
+  } else {
     throw new Error(`unsupported market source kind ${kind}`);
-  });
+  }
+  if (source.pairs !== undefined) {
+    built = sdkModule.createPairScopedPriceSource(
+      built,
+      requiredArray(source.pairs, `${path}.pairs`).map((pair) => requiredString(pair, `${path}.pairs[]`)),
+    );
+  }
+  return built;
 }
 
 function currentBatchLoader(config) {
@@ -282,6 +342,13 @@ function optionalPositiveInt(value, fallback) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`expected positive integer, got ${value}`);
   return parsed;
+}
+
+function optionalBool(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  throw new Error(`expected boolean, got ${value}`);
 }
 
 function writeJson(response, body) {

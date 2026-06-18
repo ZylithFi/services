@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, verify } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
 const args = new Set(process.argv.slice(2));
@@ -144,6 +144,7 @@ expectValue(
 checkExternalAuditSignals();
 checkKeyCustodySignals();
 checkDeploymentManifest();
+checkManagedMakerPricePolicy();
 
 if (failures.length > 0) {
   console.error("production readiness failed");
@@ -276,6 +277,12 @@ function checkExternalAuditSignals() {
     failures.push("ZYLITH_EXTERNAL_AUDIT_REPORT_SHA256 is required when external audit is required");
   } else if (!/^[0-9a-fA-F]{64}$/.test(reportHash)) {
     failures.push("ZYLITH_EXTERNAL_AUDIT_REPORT_SHA256 must be a 64-character hex digest");
+  }
+  const reportUri = value("ZYLITH_EXTERNAL_AUDIT_REPORT_URI");
+  if (!reportUri) {
+    failures.push("ZYLITH_EXTERNAL_AUDIT_REPORT_URI is required when external audit is required");
+  } else if (!/^https:\/\//.test(reportUri)) {
+    failures.push("ZYLITH_EXTERNAL_AUDIT_REPORT_URI must be an https URL");
   }
 }
 
@@ -434,6 +441,24 @@ function checkDeploymentManifest() {
       failures.push("deployment manifest sha256 does not match ZYLITH_EXPECTED_DEPLOYMENT_MANIFEST_SHA256");
     }
   }
+  const manifestSignature = value("ZYLITH_DEPLOYMENT_MANIFEST_SIGNATURE");
+  const manifestSigner = value("ZYLITH_DEPLOYMENT_MANIFEST_SIGNER_PUBLIC_KEY_PEM");
+  if (!manifestSignature) {
+    failures.push("ZYLITH_DEPLOYMENT_MANIFEST_SIGNATURE is required");
+  }
+  if (!manifestSigner) {
+    failures.push("ZYLITH_DEPLOYMENT_MANIFEST_SIGNER_PUBLIC_KEY_PEM is required");
+  }
+  if (manifestSignature && manifestSigner) {
+    try {
+      const signature = Buffer.from(manifestSignature, "base64");
+      if (!verify(null, manifestBytes, manifestSigner, signature)) {
+        failures.push("deployment manifest signature does not verify");
+      }
+    } catch (error) {
+      failures.push(`deployment manifest signature verification failed: ${error.message}`);
+    }
+  }
 
   let manifest;
   try {
@@ -480,6 +505,7 @@ function checkDeploymentManifest() {
     if (assetConfig?.audit_status !== "approved") {
       failures.push(`product.assets.${asset}.audit_status must be approved`);
     }
+    checkAssetAuditEvidence(assetConfig, `product.assets.${asset}`);
   }
 
   for (const [pair, [taker, maker]] of Object.entries(requiredPairs)) {
@@ -559,6 +585,81 @@ function checkDeploymentManifest() {
 
   if (JSON.stringify(manifest).includes("example.invalid")) {
     failures.push("deployment manifest must not contain example.invalid placeholders");
+  }
+}
+
+function checkAssetAuditEvidence(assetConfig, label) {
+  const evidence = assetConfig?.audit_evidence;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    failures.push(`${label}.audit_evidence is required`);
+    return;
+  }
+  if (typeof evidence.auditor !== "string" || evidence.auditor.trim() === "") {
+    failures.push(`${label}.audit_evidence.auditor is required`);
+  }
+  if (typeof evidence.report_uri !== "string" || !/^https:\/\//.test(evidence.report_uri)) {
+    failures.push(`${label}.audit_evidence.report_uri must be an https URL`);
+  }
+  if (typeof evidence.report_sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(evidence.report_sha256)) {
+    failures.push(`${label}.audit_evidence.report_sha256 must be a 64-character hex digest`);
+  }
+  if (typeof evidence.approved_at !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(evidence.approved_at)) {
+    failures.push(`${label}.audit_evidence.approved_at must be YYYY-MM-DD`);
+  }
+}
+
+function checkManagedMakerPricePolicy() {
+  const policyPath = value("ZYLITH_MANAGED_MAKER_PRICE_POLICY_PATH") || "ops/config/managed-maker-price-sources.mainnet.json";
+  if (!existsSync(policyPath)) {
+    failures.push(`managed maker price policy is required at ${policyPath}`);
+    return;
+  }
+  let policy;
+  try {
+    policy = JSON.parse(readFileSync(policyPath, "utf8"));
+  } catch (error) {
+    failures.push(`managed maker price policy at ${policyPath} is not valid JSON: ${error.message}`);
+    return;
+  }
+  if (policy.version !== 1) failures.push("managed maker price policy version must be 1");
+  if (policy.network !== "mainnet") failures.push("managed maker price policy network must be mainnet");
+  if (policy.description && /last[- ]?cleared/i.test(policy.description) && !/intentionally not/i.test(policy.description)) {
+    failures.push("managed maker price policy must not use last-cleared prices as a fallback");
+  }
+  checkManifestNonZero(policy.pragma?.oracle_address, "managed maker price policy pragma.oracle_address");
+  checkManifestNonZero(policy.pragma?.entrypoint, "managed maker price policy pragma.entrypoint");
+  if (Number(policy.pragma?.min_source_count ?? 0) < 2) {
+    failures.push("managed maker price policy pragma.min_source_count must be at least 2");
+  }
+  const forbidden = (policy.global_policy?.forbidden_fallbacks || []).map((entry) => String(entry).toLowerCase());
+  for (const required of ["last-cleared-price", "fixed-price", "single-exchange-only"]) {
+    if (!forbidden.includes(required)) {
+      failures.push(`managed maker price policy must forbid ${required}`);
+    }
+  }
+  const requiredPairs = ["STRK/USDC", "ETH/USDC", "strkBTC/USDC", "STRK/ETH", "STRK/strkBTC", "WBTC/strkBTC", "USDC/USDT"];
+  const minSources = Number(policy.global_policy?.min_sources ?? 0);
+  if (minSources < 3) failures.push("managed maker price policy global_policy.min_sources must be at least 3");
+  for (const pair of requiredPairs) {
+    const pairPolicy = policy.pairs?.[pair];
+    if (!pairPolicy) {
+      failures.push(`managed maker price policy must include ${pair}`);
+      continue;
+    }
+    if (!String(pairPolicy.primary ?? "").startsWith("pragma:")) {
+      failures.push(`managed maker price policy ${pair}.primary must use Pragma as primary source`);
+    }
+    const confirmations = Array.isArray(pairPolicy.confirmations) ? pairPolicy.confirmations : [];
+    if (confirmations.length < 2) {
+      failures.push(`managed maker price policy ${pair}.confirmations must include at least two independent confirmations`);
+    }
+    if (Number(pairPolicy.min_independent_sources ?? 0) < minSources) {
+      failures.push(`managed maker price policy ${pair}.min_independent_sources must be >= global_policy.min_sources`);
+    }
+    const serialized = JSON.stringify(pairPolicy).toLowerCase();
+    if (serialized.includes("last-cleared") || serialized.includes("last cleared") || serialized.includes("\"fixed\"")) {
+      failures.push(`managed maker price policy ${pair} must not include last-cleared or fixed-price fallbacks`);
+    }
   }
 }
 

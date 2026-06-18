@@ -178,7 +178,7 @@ pub fn build_order_submission(
     let order_commitment = payload.order.commitment()?;
     let cancellation_auth_tag =
         derive_order_cancellation_auth_tag(order_cancellation_key_hex, &order_commitment)?;
-    validate_private_order_spend_authorization(payload)?;
+    validate_private_order_authorization(payload)?;
 
     let plaintext = serde_json::to_vec(payload)?;
     let split_shares = split_into_xor_shares(&plaintext, registry.keys.len());
@@ -570,12 +570,12 @@ pub fn reconstruct_order_from_shares(
         ));
     }
 
-    validate_private_order_spend_authorization(&payload)?;
+    validate_private_order_authorization(&payload)?;
 
     Ok(payload)
 }
 
-fn validate_private_order_spend_authorization(
+pub fn validate_private_order_authorization(
     payload: &PrivateOrderPayload,
 ) -> Result<(), ProtocolError> {
     let expected_order_commitment = payload.order.commitment()?;
@@ -621,11 +621,41 @@ fn validate_private_order_spend_authorization(
         ));
     }
 
-    let public_key = felt_from_hex_str(&first_spend_authority)?;
     let signature_r = felt_from_hex_str(&payload.funding_authorization.signature_r)?;
     let signature_s = felt_from_hex_str(&payload.funding_authorization.signature_s)?;
     let message = felt_from_hex_str(&expected_order_commitment.0)?;
-    if !verify(&public_key, &message, &signature_r, &signature_s).map_err(|err| {
+    let owner_public_key = felt_from_hex_str(&first_spend_authority)?;
+    if let Some(managed) = payload.managed_maker_authorization.as_ref() {
+        managed.policy.validate_order(&payload.order)?;
+        let policy_commitment = felt_from_hex_str(&managed.policy.commitment()?)?;
+        let owner_signature_r = felt_from_hex_str(&managed.owner_authorization.signature_r)?;
+        let owner_signature_s = felt_from_hex_str(&managed.owner_authorization.signature_s)?;
+        if !verify(
+            &owner_public_key,
+            &policy_commitment,
+            &owner_signature_r,
+            &owner_signature_s,
+        )
+        .map_err(|err| {
+            ProtocolError::Crypto(format!(
+                "managed maker owner authorization verify failed: {err}"
+            ))
+        })? {
+            return Err(ProtocolError::Crypto(
+                "managed maker policy is not authorized by the funding note owner".into(),
+            ));
+        }
+        let delegate_public_key = felt_from_hex_str(&managed.policy.delegate_public_key)?;
+        if !verify(&delegate_public_key, &message, &signature_r, &signature_s).map_err(|err| {
+            ProtocolError::Crypto(format!(
+                "managed maker delegate authorization verify failed: {err}"
+            ))
+        })? {
+            return Err(ProtocolError::Crypto(
+                "managed maker order is not signed by the authorized delegate".into(),
+            ));
+        }
+    } else if !verify(&owner_public_key, &message, &signature_r, &signature_s).map_err(|err| {
         ProtocolError::Crypto(format!("funding authorization verify failed: {err}"))
     })? {
         return Err(ProtocolError::Crypto(
@@ -765,6 +795,7 @@ pub fn build_heartbeat_cover_orders(
                 funding_note,
                 funding_notes: Vec::new(),
                 funding_authorization,
+                managed_maker_authorization: None,
             },
         });
     }
@@ -831,12 +862,34 @@ pub fn sign_order_authorization(
     spend_auth_key_felt: &str,
     order_commitment: &OrderCommitment,
 ) -> Result<crate::SpendAuthorization, ProtocolError> {
-    let private_key = felt_from_hex_str(spend_auth_key_felt)?;
-    let message = felt_from_hex_str(&order_commitment.0)?;
+    sign_felt_authorization(
+        spend_auth_key_felt,
+        &order_commitment.0,
+        "order authorization",
+    )
+}
+
+pub fn sign_managed_maker_policy_authorization(
+    spend_auth_key_felt: &str,
+    policy: &crate::ManagedMakerPolicy,
+) -> Result<crate::SpendAuthorization, ProtocolError> {
+    sign_felt_authorization(
+        spend_auth_key_felt,
+        &policy.commitment()?,
+        "managed maker policy authorization",
+    )
+}
+
+fn sign_felt_authorization(
+    private_key_felt: &str,
+    message_felt: &str,
+    label: &str,
+) -> Result<crate::SpendAuthorization, ProtocolError> {
+    let private_key = felt_from_hex_str(private_key_felt)?;
+    let message = felt_from_hex_str(message_felt)?;
     let k = rfc6979_generate_k(&message, &private_key, None);
-    let signature = sign(&private_key, &message, &k).map_err(|err| {
-        ProtocolError::Crypto(format!("order authorization signing failed: {err}"))
-    })?;
+    let signature = sign(&private_key, &message, &k)
+        .map_err(|err| ProtocolError::Crypto(format!("{label} signing failed: {err}")))?;
     Ok(crate::SpendAuthorization {
         signature_r: felt_hex(&signature.r),
         signature_s: felt_hex(&signature.s),
@@ -6244,17 +6297,13 @@ fn auction_proof_vectors(
                 "auction order funding nullifier set does not match funding_nullifier".into(),
             ));
         }
-        let public_key = felt_from_hex_str(&first_spend_authority)?;
-        let signature_r = felt_from_hex_str(&entry.funding_authorization.signature_r)?;
-        let signature_s = felt_from_hex_str(&entry.funding_authorization.signature_s)?;
-        let message = felt_from_hex_str(&entry.order_commitment.0)?;
-        if !verify(&public_key, &message, &signature_r, &signature_s).map_err(|err| {
-            ProtocolError::Crypto(format!("auction order authorization verify failed: {err}"))
-        })? {
-            return Err(ProtocolError::Crypto(
-                "auction order authorization signature does not match note spend authority".into(),
-            ));
-        }
+        validate_private_order_authorization(&PrivateOrderPayload {
+            order: entry.order.clone(),
+            funding_note: entry.funding_note.clone(),
+            funding_notes: entry.funding_notes.clone(),
+            funding_authorization: entry.funding_authorization.clone(),
+            managed_maker_authorization: entry.managed_maker_authorization.clone(),
+        })?;
     }
     for matched in &witness.matched_orders {
         if !all_orders
@@ -6368,6 +6417,10 @@ fn auction_proof_vectors(
         funding_note_amounts.push(encode_u128(total_amount));
         funding_note_owner_keys.push(encode_owner_public_key(&funding_notes[0].owner_public_key));
     }
+    let managed_maker_fields = all_orders
+        .iter()
+        .map(managed_maker_proof_fields)
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
 
     Ok(AuctionProofVectors {
         settlement_payload: settlement_payload.to_vec(),
@@ -6469,6 +6522,54 @@ fn auction_proof_vectors(
             .iter()
             .map(|entry| normalize_felt_hex(&entry.funding_authorization.signature_s))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
+        managed_authorization_modes: managed_maker_fields
+            .iter()
+            .map(|fields| fields.mode.clone())
+            .collect(),
+        managed_delegate_public_keys: managed_maker_fields
+            .iter()
+            .map(|fields| fields.delegate_public_key.clone())
+            .collect(),
+        managed_allow_buy: managed_maker_fields
+            .iter()
+            .map(|fields| fields.allow_buy.clone())
+            .collect(),
+        managed_allow_sell: managed_maker_fields
+            .iter()
+            .map(|fields| fields.allow_sell.clone())
+            .collect(),
+        managed_max_epoch_base: managed_maker_fields
+            .iter()
+            .map(|fields| fields.max_epoch_base.clone())
+            .collect(),
+        managed_min_prices: managed_maker_fields
+            .iter()
+            .map(|fields| fields.min_price.clone())
+            .collect(),
+        managed_max_prices: managed_maker_fields
+            .iter()
+            .map(|fields| fields.max_price.clone())
+            .collect(),
+        managed_valid_from_epochs: managed_maker_fields
+            .iter()
+            .map(|fields| fields.valid_from_epoch.clone())
+            .collect(),
+        managed_valid_until_epochs: managed_maker_fields
+            .iter()
+            .map(|fields| fields.valid_until_epoch.clone())
+            .collect(),
+        managed_policy_nonces: managed_maker_fields
+            .iter()
+            .map(|fields| fields.policy_nonce.clone())
+            .collect(),
+        managed_owner_authorization_rs: managed_maker_fields
+            .iter()
+            .map(|fields| fields.owner_authorization_r.clone())
+            .collect(),
+        managed_owner_authorization_ss: managed_maker_fields
+            .iter()
+            .map(|fields| fields.owner_authorization_s.clone())
+            .collect(),
         funding_nullifiers: all_orders
             .iter()
             .map(|entry| entry.order.funding_nullifier.0.clone())
@@ -6531,12 +6632,86 @@ struct AuctionProofVectors {
     funding_note_owner_keys: Vec<String>,
     funding_authorization_rs: Vec<String>,
     funding_authorization_ss: Vec<String>,
+    managed_authorization_modes: Vec<String>,
+    managed_delegate_public_keys: Vec<String>,
+    managed_allow_buy: Vec<String>,
+    managed_allow_sell: Vec<String>,
+    managed_max_epoch_base: Vec<String>,
+    managed_min_prices: Vec<String>,
+    managed_max_prices: Vec<String>,
+    managed_valid_from_epochs: Vec<String>,
+    managed_valid_until_epochs: Vec<String>,
+    managed_policy_nonces: Vec<String>,
+    managed_owner_authorization_rs: Vec<String>,
+    managed_owner_authorization_ss: Vec<String>,
     funding_nullifiers: Vec<String>,
     recipient_owner_keys: Vec<String>,
     recipient_spend_authorities: Vec<String>,
     recipient_withdraw_authorities: Vec<String>,
     recipient_residual_withdraw_authorities: Vec<String>,
     allocation_fill_amounts: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedMakerProofFields {
+    mode: String,
+    delegate_public_key: String,
+    allow_buy: String,
+    allow_sell: String,
+    max_epoch_base: String,
+    min_price: String,
+    max_price: String,
+    valid_from_epoch: String,
+    valid_until_epoch: String,
+    policy_nonce: String,
+    owner_authorization_r: String,
+    owner_authorization_s: String,
+}
+
+fn managed_maker_proof_fields(
+    entry: &AuctionOrderWitness,
+) -> Result<ManagedMakerProofFields, ProtocolError> {
+    let Some(managed) = entry.managed_maker_authorization.as_ref() else {
+        return Ok(ManagedMakerProofFields {
+            mode: "0x0".into(),
+            delegate_public_key: "0x0".into(),
+            allow_buy: "0x0".into(),
+            allow_sell: "0x0".into(),
+            max_epoch_base: "0x0".into(),
+            min_price: "0x0".into(),
+            max_price: "0x0".into(),
+            valid_from_epoch: "0x0".into(),
+            valid_until_epoch: "0x0".into(),
+            policy_nonce: "0x0".into(),
+            owner_authorization_r: "0x0".into(),
+            owner_authorization_s: "0x0".into(),
+        });
+    };
+    managed.policy.validate_order(&entry.order)?;
+    Ok(ManagedMakerProofFields {
+        mode: "0x1".into(),
+        delegate_public_key: normalize_felt_hex(&managed.policy.delegate_public_key)?,
+        allow_buy: if managed.policy.allow_buy {
+            "0x1"
+        } else {
+            "0x0"
+        }
+        .into(),
+        allow_sell: if managed.policy.allow_sell {
+            "0x1"
+        } else {
+            "0x0"
+        }
+        .into(),
+        max_epoch_base: encode_u128(managed.policy.max_epoch_base),
+        min_price: encode_u128(managed.policy.min_price),
+        max_price: encode_u128(managed.policy.max_price),
+        valid_from_epoch: encode_u64(managed.policy.valid_from_epoch),
+        valid_until_epoch: encode_u64(managed.policy.valid_until_epoch),
+        policy_nonce: encode_u64(managed.policy.policy_nonce),
+        owner_authorization_r: normalize_felt_hex(&managed.owner_authorization.signature_r)?,
+        owner_authorization_s: normalize_felt_hex(&managed.owner_authorization.signature_s)?,
+    })
 }
 
 pub fn auction_admission_root(
@@ -6625,6 +6800,18 @@ fn push_admission_order_vectors(payload: &mut Vec<String>, vectors: &AuctionProo
     push_span(payload, &vectors.funding_note_owner_keys);
     push_span(payload, &vectors.funding_authorization_rs);
     push_span(payload, &vectors.funding_authorization_ss);
+    push_span(payload, &vectors.managed_authorization_modes);
+    push_span(payload, &vectors.managed_delegate_public_keys);
+    push_span(payload, &vectors.managed_allow_buy);
+    push_span(payload, &vectors.managed_allow_sell);
+    push_span(payload, &vectors.managed_max_epoch_base);
+    push_span(payload, &vectors.managed_min_prices);
+    push_span(payload, &vectors.managed_max_prices);
+    push_span(payload, &vectors.managed_valid_from_epochs);
+    push_span(payload, &vectors.managed_valid_until_epochs);
+    push_span(payload, &vectors.managed_policy_nonces);
+    push_span(payload, &vectors.managed_owner_authorization_rs);
+    push_span(payload, &vectors.managed_owner_authorization_ss);
     push_span(payload, &vectors.funding_nullifiers);
     push_span(payload, &vectors.recipient_owner_keys);
     push_span(payload, &vectors.recipient_spend_authorities);
@@ -7239,6 +7426,7 @@ mod tests {
     use p256::SecretKey;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rand_core::OsRng;
+    use starknet_crypto::get_public_key;
 
     use super::{
         FeeOutputNoteInput, SettlementOutputWithdrawalMessage,
@@ -7264,14 +7452,17 @@ mod tests {
         root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
         settlement_note_root_after_deposit_roots, settlement_nullifier_root_after_history,
         settlement_output_withdrawal_message_hash, settlement_transcript_commitment,
-        sign_note_consolidation_authorization, sign_order_authorization,
-        sign_renewal_relay_package_authorization, strk20_exit_claim_message_hash,
-        validate_maker_attribution_receipt, validate_order_ingress_receipt_for_manifest,
+        sign_managed_maker_policy_authorization, sign_note_consolidation_authorization,
+        sign_order_authorization, sign_renewal_relay_package_authorization,
+        strk20_exit_claim_message_hash, validate_maker_attribution_receipt,
+        validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
-        validate_private_execution_key_registry_pin, verify_order_ingress_receipt,
-        verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
-        verify_renewal_relay_package_authorization, withdrawal_message_hash,
+        validate_private_execution_key_registry_pin, validate_private_order_authorization,
+        verify_order_ingress_receipt, verify_order_ingress_receipt_with_secrets,
+        verify_output_note_membership, verify_renewal_relay_package_authorization,
+        withdrawal_message_hash,
     };
+    use crate::hash::{felt_from_hex_str, felt_hex};
     use crate::types::{
         HiddenMakerCurve, MakerAttributionPlaintext, MakerBandAttribution,
         MakerBandFillAttribution, MakerCurvePoint, output_bundle_bucket_size,
@@ -7444,6 +7635,7 @@ mod tests {
                 funding_nullifier,
                 funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
+                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
@@ -8892,6 +9084,7 @@ mod tests {
                 funding_nullifier,
                 funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
+                managed_maker_authorization: None,
                 side: OrderSide::Sell,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
@@ -9003,6 +9196,7 @@ mod tests {
                 funding_nullifier,
                 funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
+                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
@@ -9142,6 +9336,7 @@ mod tests {
                 funding_nullifier: funding_nullifier.clone(),
                 funding_nullifiers: vec![funding_nullifier_a, funding_nullifier_b],
                 funding_authorization: sample_authorization_unchecked(),
+                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
@@ -9352,6 +9547,7 @@ mod tests {
                 funding_nullifier,
                 funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
+                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
@@ -9813,6 +10009,7 @@ mod tests {
                 funding_nullifier,
                 funding_nullifiers: vec![],
                 funding_authorization: sample_authorization_unchecked(),
+                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
@@ -10101,6 +10298,7 @@ mod tests {
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
                 funding_nullifiers: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
+                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
@@ -10145,6 +10343,7 @@ mod tests {
                 funding_note: private_order.funding_note.clone(),
                 funding_notes: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
+                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
             }],
         )
         .expect("admission serialized input");
@@ -10190,6 +10389,18 @@ mod tests {
         let funding_note_owner_keys = read_serialized_span(&serialized, &mut index);
         let funding_authorization_rs = read_serialized_span(&serialized, &mut index);
         let funding_authorization_ss = read_serialized_span(&serialized, &mut index);
+        let managed_authorization_modes = read_serialized_span(&serialized, &mut index);
+        let managed_delegate_public_keys = read_serialized_span(&serialized, &mut index);
+        let managed_allow_buy = read_serialized_span(&serialized, &mut index);
+        let managed_allow_sell = read_serialized_span(&serialized, &mut index);
+        let managed_max_epoch_base = read_serialized_span(&serialized, &mut index);
+        let managed_min_prices = read_serialized_span(&serialized, &mut index);
+        let managed_max_prices = read_serialized_span(&serialized, &mut index);
+        let managed_valid_from_epochs = read_serialized_span(&serialized, &mut index);
+        let managed_valid_until_epochs = read_serialized_span(&serialized, &mut index);
+        let managed_policy_nonces = read_serialized_span(&serialized, &mut index);
+        let managed_owner_authorization_rs = read_serialized_span(&serialized, &mut index);
+        let managed_owner_authorization_ss = read_serialized_span(&serialized, &mut index);
         let funding_nullifiers = read_serialized_span(&serialized, &mut index);
         let recipient_owner_keys = read_serialized_span(&serialized, &mut index);
         let recipient_spend_authorities = read_serialized_span(&serialized, &mut index);
@@ -10249,6 +10460,18 @@ mod tests {
             funding_authorization_ss,
             vec![private_order.funding_authorization.signature_s]
         );
+        assert_eq!(managed_authorization_modes, vec!["0x0".to_string()]);
+        assert_eq!(managed_delegate_public_keys, vec!["0x0".to_string()]);
+        assert_eq!(managed_allow_buy, vec!["0x0".to_string()]);
+        assert_eq!(managed_allow_sell, vec!["0x0".to_string()]);
+        assert_eq!(managed_max_epoch_base, vec!["0x0".to_string()]);
+        assert_eq!(managed_min_prices, vec!["0x0".to_string()]);
+        assert_eq!(managed_max_prices, vec!["0x0".to_string()]);
+        assert_eq!(managed_valid_from_epochs, vec!["0x0".to_string()]);
+        assert_eq!(managed_valid_until_epochs, vec!["0x0".to_string()]);
+        assert_eq!(managed_policy_nonces, vec!["0x0".to_string()]);
+        assert_eq!(managed_owner_authorization_rs, vec!["0x0".to_string()]);
+        assert_eq!(managed_owner_authorization_ss, vec!["0x0".to_string()]);
         assert_eq!(
             funding_nullifiers,
             vec![private_order.order.funding_nullifier.0]
@@ -10341,6 +10564,7 @@ mod tests {
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
                 funding_nullifiers: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
+                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
@@ -10383,6 +10607,7 @@ mod tests {
             funding_note: private_order.funding_note,
             funding_notes: vec![],
             funding_authorization: private_order.funding_authorization,
+            managed_maker_authorization: private_order.managed_maker_authorization,
         }];
         let admission_root = auction_admission_root(&witness, &orders).expect("admission root");
         let admission =
@@ -10685,6 +10910,7 @@ mod tests {
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
                 funding_nullifiers: vec![],
                 funding_authorization: private_order.funding_authorization.clone(),
+                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
@@ -10729,11 +10955,63 @@ mod tests {
                 funding_note: private_order.funding_note,
                 funding_notes: vec![],
                 funding_authorization: private_order.funding_authorization,
+                managed_maker_authorization: private_order.managed_maker_authorization,
             }],
         )
         .expect_err("wrong order batch domain rejected");
 
         assert!(matches!(error, ProtocolError::Crypto(message) if message.contains("batch_id")));
+    }
+
+    #[test]
+    fn managed_maker_authorization_accepts_a_policy_bounded_curve() {
+        let payload = sample_managed_private_order();
+        validate_private_order_authorization(&payload).expect("managed maker authorization");
+    }
+
+    #[test]
+    fn managed_maker_authorization_rejects_output_redirection() {
+        let mut payload = sample_managed_private_order();
+        payload.order.recipient_withdraw_authority = "0x9876".into();
+        let order_commitment = payload
+            .order
+            .commitment()
+            .expect("mutated order commitment");
+        payload.funding_authorization =
+            sign_order_authorization("0x123456", &order_commitment).expect("delegate signature");
+
+        let error = validate_private_order_authorization(&payload)
+            .expect_err("delegated output redirection must fail");
+        assert!(format!("{error}").contains("output authority"));
+    }
+
+    #[test]
+    fn managed_maker_authorization_rejects_an_oversized_curve() {
+        let mut payload = sample_managed_private_order();
+        payload.order.amount = 1_001;
+        payload.order.maker_curve.as_mut().unwrap().points[2].base_amount = 401;
+        let order_commitment = payload
+            .order
+            .commitment()
+            .expect("mutated order commitment");
+        payload.funding_authorization =
+            sign_order_authorization("0x123456", &order_commitment).expect("delegate signature");
+
+        let error = validate_private_order_authorization(&payload)
+            .expect_err("oversized delegated curve must fail");
+        assert!(format!("{error}").contains("epoch size"));
+    }
+
+    #[test]
+    fn managed_maker_authorization_rejects_the_wrong_delegate() {
+        let mut payload = sample_managed_private_order();
+        let order_commitment = payload.order.commitment().expect("order commitment");
+        payload.funding_authorization =
+            sign_order_authorization("0x654321", &order_commitment).expect("wrong signature");
+
+        let error = validate_private_order_authorization(&payload)
+            .expect_err("wrong delegated key must fail");
+        assert!(format!("{error}").contains("authorized delegate"));
     }
 
     fn sample_order() -> OrderIntent {
@@ -10774,9 +11052,75 @@ mod tests {
 
         PrivateOrderPayload {
             funding_authorization: sample_authorization_for_order(&order),
+            managed_maker_authorization: None,
             funding_note,
             funding_notes: Vec::new(),
             order,
+        }
+    }
+
+    fn sample_managed_private_order() -> PrivateOrderPayload {
+        let funding_note = sample_note("USDC", 200_000, 7);
+        let mut order = sample_order();
+        order.order_type = crate::OrderType::MakerCurve;
+        order.maker_curve = Some(crate::HiddenMakerCurve {
+            points: vec![
+                crate::MakerCurvePoint {
+                    price: 140,
+                    base_amount: 300,
+                },
+                crate::MakerCurvePoint {
+                    price: 145,
+                    base_amount: 300,
+                },
+                crate::MakerCurvePoint {
+                    price: 150,
+                    base_amount: 400,
+                },
+            ],
+        });
+        order.limit_price = 150;
+        order.amount = 1_000;
+        order.min_fill = 1;
+        order.funding_note_ref = funding_note.commitment().expect("funding note commitment");
+        let delegate_private_key = felt_from_hex_str("0x123456").expect("delegate key");
+        let policy = crate::ManagedMakerPolicy {
+            version: crate::types::MANAGED_MAKER_POLICY_VERSION,
+            delegate_public_key: felt_hex(&get_public_key(&delegate_private_key)),
+            pair_id: order.pair_id.clone(),
+            allow_buy: true,
+            allow_sell: false,
+            max_epoch_base: 1_000,
+            min_price: 130,
+            max_price: 160,
+            valid_from_epoch: 40,
+            valid_until_epoch: 50,
+            relay_mode: order.relay_mode.clone(),
+            parent_order_commitment: order.parent_order_commitment.clone(),
+            recipient_owner_public_key: order.recipient_owner_public_key.clone(),
+            recipient_spend_authority: order.recipient_spend_authority.clone(),
+            recipient_withdraw_authority: order.recipient_withdraw_authority.clone(),
+            recipient_residual_withdraw_authority: order
+                .recipient_residual_withdraw_authority
+                .clone(),
+            auditor_view_allowed: order.auditor_view_allowed,
+            policy_nonce: 9,
+        };
+        let owner_authorization =
+            sign_managed_maker_policy_authorization(&sample_spend_auth_key(), &policy)
+                .expect("owner policy signature");
+        let order_commitment = order.commitment().expect("order commitment");
+        let funding_authorization =
+            sign_order_authorization("0x123456", &order_commitment).expect("delegate signature");
+        PrivateOrderPayload {
+            order,
+            funding_note,
+            funding_notes: Vec::new(),
+            funding_authorization,
+            managed_maker_authorization: Some(crate::ManagedMakerAuthorization {
+                policy,
+                owner_authorization,
+            }),
         }
     }
 

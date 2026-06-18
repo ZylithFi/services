@@ -775,6 +775,7 @@ struct DecryptedOrderRecord {
     funding_note: Note,
     funding_notes: Vec<Note>,
     funding_authorization: zylith_core::SpendAuthorization,
+    managed_maker_authorization: Option<zylith_core::ManagedMakerAuthorization>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -801,6 +802,7 @@ struct OrderFillPlan {
     funding_note: Note,
     funding_notes: Vec<Note>,
     funding_authorization: zylith_core::SpendAuthorization,
+    managed_maker_authorization: Option<zylith_core::ManagedMakerAuthorization>,
     available_amount: u128,
     filled_amount: u128,
 }
@@ -5549,6 +5551,7 @@ async fn decrypt_private_auction_orders(
         let funding_note = payload.funding_note.clone();
         let order = payload.order;
         let funding_authorization = payload.funding_authorization;
+        let managed_maker_authorization = payload.managed_maker_authorization;
         records.push(DecryptedOrderRecord {
             order_commitment: record.order_bundle.order_commitment.clone(),
             cancellation_auth_tag: order_bundle.cancellation_auth_tag.clone(),
@@ -5556,6 +5559,7 @@ async fn decrypt_private_auction_orders(
             funding_note,
             funding_notes,
             funding_authorization,
+            managed_maker_authorization,
         });
     }
     let cover_orders = build_heartbeat_cover_orders(
@@ -5577,6 +5581,7 @@ async fn decrypt_private_auction_orders(
         let funding_note = cover.payload.funding_note.clone();
         let order = cover.payload.order;
         let funding_authorization = cover.payload.funding_authorization;
+        let managed_maker_authorization = cover.payload.managed_maker_authorization;
         DecryptedOrderRecord {
             order_commitment: cover.order_commitment,
             cancellation_auth_tag: String::new(),
@@ -5584,6 +5589,7 @@ async fn decrypt_private_auction_orders(
             funding_note,
             funding_notes,
             funding_authorization,
+            managed_maker_authorization,
         }
     }));
 
@@ -5667,6 +5673,7 @@ async fn fetch_auction_order_witnesses(
             funding_note: record.funding_note,
             funding_notes: record.funding_notes,
             funding_authorization: record.funding_authorization,
+            managed_maker_authorization: record.managed_maker_authorization,
         })
         .collect())
 }
@@ -8428,6 +8435,7 @@ fn build_settlement_artifacts(
             funding_nullifier: fill.order.funding_nullifier.clone(),
             funding_nullifiers,
             funding_authorization: fill.funding_authorization.clone(),
+            managed_maker_authorization: fill.managed_maker_authorization.clone(),
             side: fill.order.side.clone(),
             order_type: fill.order.order_type.clone(),
             relay_mode: fill.order.relay_mode.clone(),
@@ -9022,6 +9030,7 @@ fn compute_fill_plan(
             funding_note: record.funding_note.clone(),
             funding_notes: record.funding_notes.clone(),
             funding_authorization: record.funding_authorization.clone(),
+            managed_maker_authorization: record.managed_maker_authorization.clone(),
             available_amount: max_fill_at_price(record, clearing_price, price_base_scale),
             filled_amount: 0,
         })
@@ -11591,6 +11600,7 @@ mod tests {
                 signature_r: "0x1".into(),
                 signature_s: "0x2".into(),
             },
+            managed_maker_authorization: None,
             side: OrderSide::Buy,
             order_type: OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
@@ -13364,6 +13374,7 @@ mod tests {
                 signature_r: "0x1".into(),
                 signature_s: "0x2".into(),
             },
+            managed_maker_authorization: None,
         }
     }
 
