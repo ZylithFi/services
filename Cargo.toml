@@ -1,5 +1,5 @@
 [workspace]
-members = ["core", "coordinator", "indexer", "prover", "renewal_relayer", "wallet_wasm"]
+members = ["core", "coordinator", "indexer", "prover", "renewal_relayer"]
 resolver = "2"
 
 [workspace.package]

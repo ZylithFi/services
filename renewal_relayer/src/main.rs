@@ -68,6 +68,7 @@ const DEFAULT_PACKAGE_RETENTION_MS: u64 = 120 * 24 * 60 * 60 * 1000;
 const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 120;
 const DEFAULT_PACKAGE_EXPIRY_WARNING_EPOCHS: u64 = 960;
 const DEFAULT_ALERT_REPEAT_MS: u64 = 15 * 60 * 1000;
+const DEFAULT_ALERT_WINDOW_MS: u64 = 60 * 60 * 1000;
 const MIN_MANAGED_SUBMISSION_SAFETY_BUFFER_MS: u64 = 5_000;
 const MAX_MANAGED_SUBMISSION_SAFETY_BUFFER_MS: u64 = 60_000;
 const MIN_MANAGED_SUBMISSION_DELAY_MS: u64 = 10_000;
@@ -85,6 +86,7 @@ const PROVER_CONTROL_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_PROVER_CONTROL_TOKE
 const ALERT_WEBHOOK_URLS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALERT_WEBHOOK_URLS";
 const ALERT_WEBHOOK_TOKEN_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALERT_WEBHOOK_TOKEN";
 const ALERT_REPEAT_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALERT_REPEAT_MS";
+const ALERT_WINDOW_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_ALERT_WINDOW_MS";
 const TICK_MS_ENV: &str = "ZYLITH_RENEWAL_RELAY_TICK_MS";
 const ENABLE_WORKER_ENV: &str = "ZYLITH_RENEWAL_RELAY_ENABLE_WORKER";
 const MAX_PACKAGE_SLOTS_ENV: &str = "ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS";
@@ -120,6 +122,7 @@ struct RelayConfig {
     alert_webhook_urls: Vec<String>,
     alert_webhook_token: Option<Arc<String>>,
     alert_repeat_ms: u64,
+    alert_window_ms: u64,
     tick_interval_ms: u64,
     enable_worker: bool,
     max_package_slots: usize,
@@ -240,6 +243,7 @@ impl RelayConfig {
             alert_webhook_urls: configured_urls_from_env(ALERT_WEBHOOK_URLS_ENV, ""),
             alert_webhook_token: env::var(ALERT_WEBHOOK_TOKEN_ENV).ok().map(Arc::new),
             alert_repeat_ms: env_u64(ALERT_REPEAT_MS_ENV, DEFAULT_ALERT_REPEAT_MS),
+            alert_window_ms: env_u64(ALERT_WINDOW_MS_ENV, DEFAULT_ALERT_WINDOW_MS),
             tick_interval_ms: env_u64(TICK_MS_ENV, DEFAULT_TICK_MS),
             enable_worker,
             max_package_slots: env_usize(MAX_PACKAGE_SLOTS_ENV, DEFAULT_MAX_PACKAGE_SLOTS),
@@ -515,6 +519,7 @@ struct PackageOrderAttestation {
 #[derive(Debug, Serialize)]
 struct RelayOpsSummary {
     generated_at_unix_ms: u64,
+    alert_window_ms: u64,
     status: String,
     strict_mode: bool,
     worker_enabled: bool,
@@ -543,6 +548,8 @@ struct RelayOpsSlotCounts {
     awaiting_wallet_refresh_slots: usize,
     missed_slots: usize,
     failed_slots: usize,
+    recent_missed_slots: usize,
+    recent_failed_slots: usize,
     retryable_failed_slots: usize,
 }
 
@@ -561,6 +568,8 @@ struct RelayOpsPackageSummary {
     failed_slots: usize,
     retryable_failed_slots: usize,
     missed_slots: usize,
+    recent_missed_slots: usize,
+    recent_failed_slots: usize,
     awaiting_settlement_slots: usize,
     awaiting_wallet_refresh_slots: usize,
     oldest_unobserved_epoch: Option<u64>,
@@ -755,6 +764,12 @@ async fn metrics(
          # HELP zylith_renewal_relay_failed_slots Failed renewal slots.\n\
          # TYPE zylith_renewal_relay_failed_slots gauge\n\
          zylith_renewal_relay_failed_slots {}\n\
+         # HELP zylith_renewal_relay_recent_missed_slots Renewal slots missed inside the configured alert window.\n\
+         # TYPE zylith_renewal_relay_recent_missed_slots gauge\n\
+         zylith_renewal_relay_recent_missed_slots {}\n\
+         # HELP zylith_renewal_relay_recent_failed_slots Renewal slots failed inside the configured alert window.\n\
+         # TYPE zylith_renewal_relay_recent_failed_slots gauge\n\
+         zylith_renewal_relay_recent_failed_slots {}\n\
          # HELP zylith_renewal_relay_awaiting_wallet_refresh_slots Slots blocked because reused maker capital already settled.\n\
          # TYPE zylith_renewal_relay_awaiting_wallet_refresh_slots gauge\n\
          zylith_renewal_relay_awaiting_wallet_refresh_slots {}\n\
@@ -781,6 +796,8 @@ async fn metrics(
             + summary.counts.retryable_failed_slots,
         summary.counts.missed_slots,
         summary.counts.failed_slots,
+        summary.counts.recent_missed_slots,
+        summary.counts.recent_failed_slots,
         summary.counts.awaiting_wallet_refresh_slots,
         summary.counts.retryable_failed_slots,
         expiring_packages,
@@ -914,8 +931,13 @@ fn build_ops_summary(state: &AppState, store: &RelayStore, now: u64) -> RelayOps
         });
     }
     for stored in store.packages.values() {
-        let package_summary =
-            ops_package_summary(stored, state.config.max_attempts, last_observed_epoch);
+        let package_summary = ops_package_summary(
+            stored,
+            state.config.max_attempts,
+            last_observed_epoch,
+            now,
+            state.config.alert_window_ms,
+        );
         counts.total_slots += package_summary.slot_count;
         counts.unobserved_slots += package_summary.unobserved_slots;
         counts.submitted_slots += stored
@@ -935,6 +957,8 @@ fn build_ops_summary(state: &AppState, store: &RelayStore, now: u64) -> RelayOps
         counts.awaiting_wallet_refresh_slots += package_summary.awaiting_wallet_refresh_slots;
         counts.missed_slots += package_summary.missed_slots;
         counts.failed_slots += package_summary.failed_slots;
+        counts.recent_missed_slots += package_summary.recent_missed_slots;
+        counts.recent_failed_slots += package_summary.recent_failed_slots;
         counts.retryable_failed_slots += package_summary.retryable_failed_slots;
 
         extend_ops_alerts_for_package(
@@ -960,6 +984,7 @@ fn build_ops_summary(state: &AppState, store: &RelayStore, now: u64) -> RelayOps
     };
     RelayOpsSummary {
         generated_at_unix_ms: now,
+        alert_window_ms: state.config.alert_window_ms,
         status: status.into(),
         strict_mode: state.config.strict_mode,
         worker_enabled: state.config.enable_worker,
@@ -984,6 +1009,8 @@ fn ops_package_summary(
     stored: &StoredPackage,
     max_attempts: u32,
     last_observed_epoch: Option<u64>,
+    now: u64,
+    alert_window_ms: u64,
 ) -> RelayOpsPackageSummary {
     let submitted_slots = stored
         .results
@@ -1004,6 +1031,10 @@ fn ops_package_summary(
         })
         .count();
     let missed_slots = count_status(stored, RelaySlotStatus::Missed);
+    let recent_missed_slots =
+        count_recent_status(stored, RelaySlotStatus::Missed, now, alert_window_ms);
+    let recent_failed_slots =
+        count_recent_status(stored, RelaySlotStatus::Failed, now, alert_window_ms);
     let awaiting_settlement_slots = count_status(stored, RelaySlotStatus::AwaitingSettlement);
     let awaiting_wallet_refresh_slots =
         count_status(stored, RelaySlotStatus::AwaitingWalletRefresh);
@@ -1037,6 +1068,8 @@ fn ops_package_summary(
         failed_slots,
         retryable_failed_slots,
         missed_slots,
+        recent_missed_slots,
+        recent_failed_slots,
         awaiting_settlement_slots,
         awaiting_wallet_refresh_slots,
         oldest_unobserved_epoch: unobserved_epochs
@@ -1066,6 +1099,24 @@ fn count_status(stored: &StoredPackage, status: RelaySlotStatus) -> usize {
         .count()
 }
 
+fn count_recent_status(
+    stored: &StoredPackage,
+    status: RelaySlotStatus,
+    now: u64,
+    alert_window_ms: u64,
+) -> usize {
+    let cutoff = now.saturating_sub(alert_window_ms);
+    stored
+        .results
+        .values()
+        .filter(|entry| {
+            entry.result.status == status
+                && entry.last_attempt_unix_ms >= cutoff
+                && entry.last_attempt_unix_ms <= now
+        })
+        .count()
+}
+
 fn extend_ops_alerts_for_package(
     alerts: &mut Vec<RelayOpsAlert>,
     package: &RelayOpsPackageSummary,
@@ -1073,23 +1124,26 @@ fn extend_ops_alerts_for_package(
     last_observed_epoch: Option<u64>,
 ) {
     let package_id = Some(package.package_id.clone());
-    if package.missed_slots > 0 {
+    if package.recent_missed_slots > 0 {
         alerts.push(RelayOpsAlert {
             severity: "critical".into(),
             code: "missed_slots".into(),
             package_id: package_id.clone(),
             detail: format!(
                 "{} renewal slots missed their authorized epoch window.",
-                package.missed_slots
+                package.recent_missed_slots
             ),
         });
     }
-    if package.failed_slots > 0 {
+    if package.recent_failed_slots > 0 {
         alerts.push(RelayOpsAlert {
             severity: "warning".into(),
             code: "failed_slots".into(),
             package_id: package_id.clone(),
-            detail: format!("{} renewal slots failed submission.", package.failed_slots),
+            detail: format!(
+                "{} renewal slots failed submission inside the alert window.",
+                package.recent_failed_slots
+            ),
         });
     }
     if package.awaiting_wallet_refresh_slots > 0 {
@@ -4034,6 +4088,7 @@ mod tests {
                 alert_webhook_urls: Vec::new(),
                 alert_webhook_token: None,
                 alert_repeat_ms: DEFAULT_ALERT_REPEAT_MS,
+                alert_window_ms: DEFAULT_ALERT_WINDOW_MS,
                 tick_interval_ms: DEFAULT_TICK_MS,
                 enable_worker: false,
                 max_package_slots: DEFAULT_MAX_PACKAGE_SLOTS,
@@ -4226,6 +4281,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_exposes_alertable_operational_counters() {
         let mut state = test_state(temp_store_path("metrics"));
+        let attempt_at = now_unix_ms();
         state.config.internal_control_token = Some(Arc::new("internal-token".into()));
         let mut package = test_package("http://coordinator".into(), "http://prover".into());
         let mut missed_slot = package.slots[0].clone();
@@ -4259,7 +4315,7 @@ mod tests {
                                     None,
                                 ),
                                 attempts: 1,
-                                last_attempt_unix_ms: 1,
+                                last_attempt_unix_ms: attempt_at,
                             },
                         ),
                         (
@@ -4267,7 +4323,7 @@ mod tests {
                             StoredSlotResult {
                                 result: slot_result(&missed_slot, RelaySlotStatus::Missed, None),
                                 attempts: 1,
-                                last_attempt_unix_ms: 1,
+                                last_attempt_unix_ms: attempt_at,
                             },
                         ),
                         (
@@ -4275,7 +4331,7 @@ mod tests {
                             StoredSlotResult {
                                 result: slot_result(&failed_slot, RelaySlotStatus::Failed, None),
                                 attempts: 1,
-                                last_attempt_unix_ms: 1,
+                                last_attempt_unix_ms: attempt_at,
                             },
                         ),
                     ]),
@@ -4306,6 +4362,8 @@ mod tests {
         assert!(text.contains("zylith_renewal_relay_pending_slots 1"));
         assert!(text.contains("zylith_renewal_relay_missed_slots 1"));
         assert!(text.contains("zylith_renewal_relay_failed_slots 1"));
+        assert!(text.contains("zylith_renewal_relay_recent_missed_slots 1"));
+        assert!(text.contains("zylith_renewal_relay_recent_failed_slots 1"));
         assert!(text.contains("zylith_renewal_relay_awaiting_wallet_refresh_slots 0"));
         assert!(text.contains("zylith_renewal_relay_retryable_failed_slots 1"));
         assert!(text.contains("zylith_renewal_relay_package_expiring_soon 0"));
@@ -4356,6 +4414,7 @@ mod tests {
     #[tokio::test]
     async fn ops_summary_exposes_alertable_package_state() {
         let mut state = test_state(temp_store_path("ops-summary"));
+        let attempt_at = now_unix_ms();
         state.config.internal_control_token = Some(Arc::new("internal-token".into()));
         state.config.package_expiry_warning_epochs = 10;
         let mut package = test_package("http://coordinator".into(), "http://prover".into());
@@ -4391,7 +4450,7 @@ mod tests {
                                     None,
                                 ),
                                 attempts: 1,
-                                last_attempt_unix_ms: 1,
+                                last_attempt_unix_ms: attempt_at,
                             },
                         ),
                         (
@@ -4399,7 +4458,7 @@ mod tests {
                             StoredSlotResult {
                                 result: slot_result(&failed_slot, RelaySlotStatus::Failed, None),
                                 attempts: 2,
-                                last_attempt_unix_ms: 2,
+                                last_attempt_unix_ms: attempt_at,
                             },
                         ),
                     ]),
@@ -4428,6 +4487,7 @@ mod tests {
         assert_eq!(summary["counts"]["total_slots"], 3);
         assert_eq!(summary["counts"]["submitted_slots"], 1);
         assert_eq!(summary["counts"]["failed_slots"], 1);
+        assert_eq!(summary["counts"]["recent_failed_slots"], 1);
         assert_eq!(summary["counts"]["unobserved_slots"], 1);
         assert_eq!(summary["last_observed_epoch"], 43);
         let alert_codes = summary["alerts"]
@@ -4438,6 +4498,43 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(alert_codes.contains("failed_slots"));
         assert!(alert_codes.contains("package_expires_soon"));
+    }
+
+    #[test]
+    fn ops_summary_keeps_historical_failures_without_active_alerts() {
+        let state = test_state(temp_store_path("ops-summary-historical"));
+        let now = DEFAULT_ALERT_WINDOW_MS.saturating_add(10_000);
+        let package = test_package("http://coordinator".into(), "http://prover".into());
+        let failed_slot = package.slots[0].clone();
+        let store = RelayStore {
+            packages: BTreeMap::from([(
+                package.package_id.clone(),
+                StoredPackage {
+                    package,
+                    registered_at_unix_ms: 1,
+                    updated_at_unix_ms: 1,
+                    results: BTreeMap::from([(
+                        failed_slot.slot_id.clone(),
+                        StoredSlotResult {
+                            result: slot_result(&failed_slot, RelaySlotStatus::Failed, None),
+                            attempts: DEFAULT_MAX_ATTEMPTS,
+                            last_attempt_unix_ms: 1,
+                        },
+                    )]),
+                },
+            )]),
+            cancelled_packages: BTreeMap::new(),
+        };
+
+        let summary = build_ops_summary(&state, &store, now);
+        assert_eq!(summary.counts.failed_slots, 1);
+        assert_eq!(summary.counts.recent_failed_slots, 0);
+        assert!(
+            summary
+                .alerts
+                .iter()
+                .all(|alert| alert.code != "failed_slots")
+        );
     }
 
     #[tokio::test]
@@ -4462,6 +4559,7 @@ mod tests {
         state.config.alert_repeat_ms = 60_000;
         let package = test_package("http://coordinator".into(), "http://prover".into());
         let failed_slot = package.slots[0].clone();
+        let attempt_at = now_unix_ms();
         {
             let mut store = state.store.write().await;
             store.packages.insert(
@@ -4479,7 +4577,7 @@ mod tests {
                                 Some("coordinator unavailable".into()),
                             ),
                             attempts: 1,
-                            last_attempt_unix_ms: 1,
+                            last_attempt_unix_ms: attempt_at,
                         },
                     )]),
                 },

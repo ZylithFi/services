@@ -766,7 +766,7 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
   for (const [file, routes] of Object.entries(expectedRoutes)) {
     assert.deepEqual(extractRustRouteInventory(file), routes, `${file} route inventory changed without classification`);
   }
-  assert.deepEqual(extractPaymasterRouteInventory(), ["/execute-outside", "/health", "/privacy-signer/ensure", "/privacy-signer/relay"]);
+  assert.deepEqual(extractPaymasterRouteInventory(), ["/execute-outside", "/health", "/metrics", "/privacy-signer/ensure", "/privacy-signer/relay"]);
 
   for (const [file, routes] of Object.entries(expectedRoutes)) {
     const source = readSource(file);

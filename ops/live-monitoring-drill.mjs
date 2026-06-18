@@ -119,13 +119,15 @@ await checkText("renewal relayer metrics", `${services.relayer}/metrics`, (body)
     "zylith_renewal_relay_submitted_slots",
     "zylith_renewal_relay_missed_slots",
     "zylith_renewal_relay_failed_slots",
+    "zylith_renewal_relay_recent_missed_slots",
+    "zylith_renewal_relay_recent_failed_slots",
   ]) {
     if (!metrics.has(metric)) failures.push(`renewal relayer metric ${metric} is missing`);
   }
-  const missed = metrics.get("zylith_renewal_relay_missed_slots") ?? 0;
-  const failed = metrics.get("zylith_renewal_relay_failed_slots") ?? 0;
-  if (missed > 0) warnings.push(`renewal relayer has ${missed} missed slots`);
-  if (failed > 0) warnings.push(`renewal relayer has ${failed} failed slots`);
+  const missed = metrics.get("zylith_renewal_relay_recent_missed_slots") ?? 0;
+  const failed = metrics.get("zylith_renewal_relay_recent_failed_slots") ?? 0;
+  if (missed > 0) warnings.push(`renewal relayer has ${missed} recently missed slots`);
+  if (failed > 0) warnings.push(`renewal relayer has ${failed} recently failed slots`);
 }, bearerOptions(relayerToken));
 
 if (activeRelayTick) {
