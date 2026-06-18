@@ -238,6 +238,8 @@ const DEFAULT_SETTLEMENT_SUBMISSION_JITTER_MS: u64 = 5_000;
 const DEFAULT_MAX_PROVABLE_BATCH_ORDERS: u64 = 32;
 const DEFAULT_PROVER_WORKER_TICK_MS: u64 = 10_000;
 const DEFAULT_PROVER_WORKER_MAX_BATCHES_PER_TICK: usize = 2;
+const PROOF_WORKER_FAILURE_BACKOFF_BASE_MS: u64 = 120_000;
+const PROOF_WORKER_FAILURE_BACKOFF_MAX_MS: u64 = 30 * 60_000;
 const ENABLE_HOSTED_NOTE_CONSOLIDATION_ENV: &str = "ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION";
 const INDEXER_HISTORY_PAGE_SIZE: u64 = 10_000;
 
@@ -261,6 +263,7 @@ struct AppState {
     data_dir: Arc<PathBuf>,
     http_client: Client,
     proof_jobs: Arc<RwLock<BTreeMap<String, ProofJobStatus>>>,
+    proof_worker_failures: Arc<RwLock<BTreeMap<String, ProofWorkerBatchFailure>>>,
     settlement_plans: Arc<RwLock<BTreeMap<String, SettlementSubmissionPlan>>>,
     settlement_witnesses: Arc<RwLock<BTreeMap<String, SettlementWitness>>>,
     prepared_batch_artifacts: Arc<RwLock<BTreeMap<String, PublishedBatchArtifacts>>>,
@@ -305,6 +308,12 @@ struct AppState {
     native_prover_attempts: usize,
     native_prover_retry_interval_ms: u64,
     native_prover_request_timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ProofWorkerBatchFailure {
+    attempts: u32,
+    next_retry_unix_ms: u64,
 }
 
 #[derive(Clone)]
@@ -1644,6 +1653,7 @@ fn build_app_with_config(config: AppConfig) -> Result<Router, String> {
             PROOF_JOBS_DIR,
             |record: &ProofJobStatus| record.batch_id.0.clone(),
         ))),
+        proof_worker_failures: Arc::new(RwLock::new(BTreeMap::new())),
         settlement_plans: Arc::new(RwLock::new(load_json_records(
             &data_dir,
             SETTLEMENT_PLANS_DIR,
@@ -2738,6 +2748,14 @@ fn settlement_output_withdrawal_revert_status(revert_reason: Option<&str>) -> St
     StatusCode::CONFLICT
 }
 
+fn settlement_output_withdrawal_submit_error_status(error: &str) -> StatusCode {
+    let revert_status = settlement_output_withdrawal_revert_status(Some(error));
+    if revert_status == StatusCode::TOO_EARLY {
+        return revert_status;
+    }
+    StatusCode::BAD_GATEWAY
+}
+
 async fn submit_settlement_output_withdrawal_inner(
     state: &AppState,
     witness: SettlementOutputWithdrawalWitness,
@@ -2859,11 +2877,12 @@ async fn submit_settlement_output_withdrawal_inner(
         now_unix_ms().saturating_sub(submit_started_at),
     );
     let tx_hash = submit_result.map_err(|error| {
+        let status = settlement_output_withdrawal_submit_error_status(&error.to_string());
         eprintln!(
             "settlement output withdrawal onchain submit failed key={} batch={} error={error}",
             withdrawal_key, witness.batch_id.0,
         );
-        StatusCode::BAD_GATEWAY
+        status
     })?;
 
     let provider = JsonRpcClient::new(HttpTransport::new(
@@ -3410,12 +3429,7 @@ async fn run_proof_worker_tick(state: &AppState) -> Result<usize, String> {
         eprintln!("zylith prover worker onchain refresh failed: {error}");
     }
     let mut batches = fetch_public_batch_summaries(state).await?;
-    batches.sort_by(|left, right| {
-        left.close_time_unix_ms
-            .cmp(&right.close_time_unix_ms)
-            .then_with(|| left.epoch_id.cmp(&right.epoch_id))
-            .then_with(|| left.batch_id.0.cmp(&right.batch_id.0))
-    });
+    sort_proof_worker_batches_for_selection(&mut batches);
 
     let mut selected_pairs = BTreeSet::new();
     let mut selected_batches = Vec::new();
@@ -3470,10 +3484,12 @@ async fn run_proof_worker_tick(state: &AppState) -> Result<usize, String> {
         match joined {
             Ok((batch_id, Ok(()))) => {
                 processed += 1;
+                clear_proof_worker_batch_failure(state, &batch_id).await;
                 eprintln!("zylith prover worker batch {batch_id} processed");
             }
             Ok((batch_id, Err(status))) => {
                 processed += 1;
+                record_proof_worker_batch_failure(state, &batch_id).await;
                 eprintln!("zylith prover worker batch {batch_id} failed status={status}");
             }
             Err(error) => {
@@ -3552,7 +3568,20 @@ async fn fetch_public_batch_summaries(state: &AppState) -> Result<Vec<PublicBatc
         .map_err(|error| format!("coordinator batch list decode failed: {error}"))
 }
 
+fn sort_proof_worker_batches_for_selection(batches: &mut [PublicBatchSummary]) {
+    batches.sort_by(|left, right| {
+        right
+            .close_time_unix_ms
+            .cmp(&left.close_time_unix_ms)
+            .then_with(|| right.epoch_id.cmp(&left.epoch_id))
+            .then_with(|| right.batch_id.0.cmp(&left.batch_id.0))
+    });
+}
+
 async fn proof_worker_should_process_batch(state: &AppState, batch_id: &str) -> bool {
+    if proof_worker_batch_in_backoff(state, batch_id, now_unix_ms()).await {
+        return false;
+    }
     if state
         .onchain_submissions
         .read()
@@ -3566,6 +3595,47 @@ async fn proof_worker_should_process_batch(state: &AppState, batch_id: &str) -> 
         return true;
     };
     proof_worker_status_is_processable(status.state.as_str(), state.prover_worker_submit_onchain)
+}
+
+async fn proof_worker_batch_in_backoff(state: &AppState, batch_id: &str, now: u64) -> bool {
+    state
+        .proof_worker_failures
+        .read()
+        .await
+        .get(batch_id)
+        .is_some_and(|failure| proof_worker_failure_blocks_retry(failure, now))
+}
+
+async fn record_proof_worker_batch_failure(state: &AppState, batch_id: &str) {
+    let now = now_unix_ms();
+    let mut failures = state.proof_worker_failures.write().await;
+    let attempts = failures
+        .get(batch_id)
+        .map(|failure| failure.attempts.saturating_add(1))
+        .unwrap_or(1);
+    let next_retry_unix_ms = now.saturating_add(proof_worker_failure_backoff_ms(attempts));
+    failures.insert(
+        batch_id.to_owned(),
+        ProofWorkerBatchFailure {
+            attempts,
+            next_retry_unix_ms,
+        },
+    );
+}
+
+async fn clear_proof_worker_batch_failure(state: &AppState, batch_id: &str) {
+    state.proof_worker_failures.write().await.remove(batch_id);
+}
+
+fn proof_worker_failure_blocks_retry(failure: &ProofWorkerBatchFailure, now: u64) -> bool {
+    failure.next_retry_unix_ms > now
+}
+
+fn proof_worker_failure_backoff_ms(attempts: u32) -> u64 {
+    let multiplier = u64::from(attempts.max(1));
+    PROOF_WORKER_FAILURE_BACKOFF_BASE_MS
+        .saturating_mul(multiplier)
+        .min(PROOF_WORKER_FAILURE_BACKOFF_MAX_MS)
 }
 
 fn proof_worker_status_is_processable(status: &str, submit_onchain: bool) -> bool {
@@ -5292,15 +5362,17 @@ async fn prepare_private_auction_batch_inner(
     );
     let historical_witnesses = {
         let settlement_witnesses = state.settlement_witnesses.read().await;
+        let onchain_submissions = state.onchain_submissions.read().await;
+        let confirmed_local_witnesses =
+            confirmed_settlement_witnesses_from_maps(&settlement_witnesses, &onchain_submissions);
         let mut merged = indexed_history
             .into_iter()
             .map(|witness| (witness.batch_id.0.clone(), witness))
             .collect::<BTreeMap<_, _>>();
         merged.extend(
-            settlement_witnesses
-                .values()
+            confirmed_local_witnesses
+                .into_iter()
                 .filter(|witness| witness.batch_id.0 != batch_id)
-                .cloned()
                 .map(|witness| (witness.batch_id.0.clone(), witness)),
         );
         let merged_witnesses = merged.into_values().collect::<Vec<_>>();
@@ -5943,6 +6015,8 @@ fn select_root_history_witnesses_for_current_roots(
     maintenance_renewal_entries.dedup();
 
     let mut selected_len = None;
+    let mut last_computed_nullifier_root = None;
+    let mut last_computed_renewal_root = None;
     for len in 0..=candidates.len() {
         let prefix = &candidates[..len];
         let mut consumed_inputs = prefix
@@ -5953,6 +6027,8 @@ fn select_root_history_witnesses_for_current_roots(
         let (_prior_nullifier_root, computed_nullifier_root, _witnesses) =
             nullifier_sparse_update_witnesses_for_consumed_inputs(&[], &consumed_inputs)
                 .map_err(|_| StatusCode::CONFLICT)?;
+        last_computed_nullifier_root =
+            Some(normalize_felt_hex(&computed_nullifier_root).map_err(|_| StatusCode::CONFLICT)?);
 
         let mut renewal_entries = prefix
             .iter()
@@ -5969,11 +6045,11 @@ fn select_root_history_witnesses_for_current_roots(
         let (_prior_renewal_root, computed_renewal_root, _child_witnesses, _cancel_witnesses) =
             renewal_sparse_witnesses_for_child_uses(&renewal_entries, &[], &[])
                 .map_err(|_| StatusCode::CONFLICT)?;
+        last_computed_renewal_root =
+            Some(normalize_felt_hex(&computed_renewal_root).map_err(|_| StatusCode::CONFLICT)?);
 
-        if normalize_felt_hex(&computed_nullifier_root).map_err(|_| StatusCode::CONFLICT)?
-            == target_nullifier
-            && normalize_felt_hex(&computed_renewal_root).map_err(|_| StatusCode::CONFLICT)?
-                == target_renewal
+        if last_computed_nullifier_root.as_deref() == Some(target_nullifier.as_str())
+            && last_computed_renewal_root.as_deref() == Some(target_renewal.as_str())
         {
             selected_len = Some(len);
         }
@@ -5984,8 +6060,15 @@ fn select_root_history_witnesses_for_current_roots(
     }
 
     eprintln!(
-        "filter_root_history_witnesses_for_current_roots failed missing target_nullifier={} target_renewal={} zero={}",
-        target_nullifier, target_renewal, zero
+        "filter_root_history_witnesses_for_current_roots failed missing target_nullifier={} target_renewal={} computed_nullifier={:?} computed_renewal={:?} witnesses={} maintenance_inputs={} maintenance_renewals={} zero={}",
+        target_nullifier,
+        target_renewal,
+        last_computed_nullifier_root,
+        last_computed_renewal_root,
+        candidates.len(),
+        maintenance_consumed_inputs.len(),
+        maintenance_renewal_entries.len(),
+        zero
     );
     Err(StatusCode::CONFLICT)
 }
@@ -10599,8 +10682,9 @@ mod tests {
         proof_fact_age_wait_ms, public_proof_job_status, redact_native_execution_request,
         redact_native_prover_request, resolve_batch_registrar_private_key, same_starknet_address,
         select_root_history_witnesses_for_current_roots,
-        settlement_output_withdrawal_revert_status, should_refresh_onchain_submission, storage_key,
-        validate_aggregate_root_chain, validate_batch_nullifier_freshness,
+        settlement_output_withdrawal_revert_status,
+        settlement_output_withdrawal_submit_error_status, should_refresh_onchain_submission,
+        storage_key, validate_aggregate_root_chain, validate_batch_nullifier_freshness,
         validate_hosted_note_proof_privacy_config, validate_native_proof_program_config,
         validate_native_tx_prover_endpoint_config, withdrawal_submit_error,
     };
@@ -10614,11 +10698,12 @@ mod tests {
         AssetId, BatchId, BatchStatus, BatchSummary, ConsumedInput, HiddenMakerCurve,
         MakerCurvePoint, MatchedOrderWitness, Note, NoteCommitment, NoteMembershipKind, Nullifier,
         NullifierHistoryBatch, OrderCommitment, OrderIngressClientTelemetry, OrderIntent,
-        OrderSide, OrderType, OutputNoteRecord, PairId, ProductConfig, ProofJobStatus, RelayMode,
-        RenewalChildUse, SettlementCallArguments, SettlementOutputWithdrawalPlanRequest,
-        SettlementSubmissionPlan, SettlementTranscript, SettlementWitness, SpendAuthorization,
-        StarknetCall, TimeInForce, build_settlement_output_withdrawal_submission_plan,
-        decrypt_output_note_for_owner, deposit_root_from_note, hash::ordered_felt_list_commitment,
+        OrderSide, OrderType, OutputNoteRecord, PairId, ProductConfig, ProofJobStatus,
+        PublicBatchSummary, RelayMode, RenewalChildUse, SettlementCallArguments,
+        SettlementOutputWithdrawalPlanRequest, SettlementSubmissionPlan, SettlementTranscript,
+        SettlementWitness, SpendAuthorization, StarknetCall, TimeInForce,
+        build_settlement_output_withdrawal_submission_plan, decrypt_output_note_for_owner,
+        deposit_root_from_note, hash::ordered_felt_list_commitment,
         note_recognition_public_key_from_raw_key_hex, nullifier_from_note_secret,
         nullifier_sparse_update_witnesses_for_consumed_inputs,
         renewal_sparse_witnesses_for_child_uses, root_only_settlement_commitments,
@@ -10823,6 +10908,69 @@ mod tests {
             "confirmed-onchain",
             false
         ));
+    }
+
+    #[test]
+    fn proof_worker_failure_backoff_skips_stale_failed_batches_temporarily() {
+        assert_eq!(
+            super::proof_worker_failure_backoff_ms(1),
+            super::PROOF_WORKER_FAILURE_BACKOFF_BASE_MS
+        );
+        assert_eq!(
+            super::proof_worker_failure_backoff_ms(u32::MAX),
+            super::PROOF_WORKER_FAILURE_BACKOFF_MAX_MS
+        );
+        let failure = super::ProofWorkerBatchFailure {
+            attempts: 2,
+            next_retry_unix_ms: 10_000,
+        };
+
+        assert!(super::proof_worker_failure_blocks_retry(&failure, 9_999));
+        assert!(!super::proof_worker_failure_blocks_retry(&failure, 10_000));
+    }
+
+    #[test]
+    fn proof_worker_prioritizes_recent_batches_before_historical_failures() {
+        let mut batches = vec![
+            PublicBatchSummary {
+                batch_id: BatchId("batch-strk-eth-10".into()),
+                pair_id: PairId("STRK/ETH".into()),
+                epoch_id: 10,
+                close_time_unix_ms: 1_000,
+                status: BatchStatus::Closed,
+                order_count_bucket: "1-7".into(),
+            },
+            PublicBatchSummary {
+                batch_id: BatchId("batch-strk-eth-12".into()),
+                pair_id: PairId("STRK/ETH".into()),
+                epoch_id: 12,
+                close_time_unix_ms: 1_200,
+                status: BatchStatus::Closed,
+                order_count_bucket: "1-7".into(),
+            },
+            PublicBatchSummary {
+                batch_id: BatchId("batch-strk-eth-11".into()),
+                pair_id: PairId("STRK/ETH".into()),
+                epoch_id: 11,
+                close_time_unix_ms: 1_200,
+                status: BatchStatus::Closed,
+                order_count_bucket: "1-7".into(),
+            },
+        ];
+
+        super::sort_proof_worker_batches_for_selection(&mut batches);
+
+        assert_eq!(
+            batches
+                .into_iter()
+                .map(|batch| batch.batch_id.0)
+                .collect::<Vec<_>>(),
+            vec![
+                "batch-strk-eth-12",
+                "batch-strk-eth-11",
+                "batch-strk-eth-10"
+            ]
+        );
     }
 
     #[test]
@@ -12069,6 +12217,21 @@ mod tests {
         assert_eq!(
             settlement_output_withdrawal_revert_status(None),
             StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn withdrawal_submit_error_status_maps_preflight_claim_window_to_too_early() {
+        assert_eq!(
+            settlement_output_withdrawal_submit_error_status(
+                "failed to estimate native settlement fee: TransactionExecutionError: \
+                 Message(\"0x434c41494d5f57494e444f575f434c4f534544 ('CLAIM_WINDOW_CLOSED')\")"
+            ),
+            StatusCode::TOO_EARLY
+        );
+        assert_eq!(
+            settlement_output_withdrawal_submit_error_status("provider timeout"),
+            StatusCode::BAD_GATEWAY
         );
     }
 
