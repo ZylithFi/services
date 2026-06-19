@@ -112,6 +112,14 @@ test("production readiness rejects disabled native prover OHTTP", () => {
   assert.match(result.stderr, /ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED/);
 });
 
+test("production readiness permits plain native prover requests over loopback", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_NATIVE_TX_PROVER_URL = "http://127.0.0.1:18090";
+  env.ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED = "false";
+  const result = runReadiness(env);
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test("production readiness rejects unlocked proof or operational config manifests", () => {
   const { env, manifest } = fixtureEnv({
     proofOverrides: {

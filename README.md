@@ -1,3 +1,3 @@
 # Zylith Services
 
-Private service implementations for coordinator, indexer, prover worker, paymaster, and shared service-side core dependency.
+Service implementations for coordinator, indexer, prover worker, paymaster, and shared service-side core dependency.

@@ -826,13 +826,7 @@ struct NativeProverRpcRequest {
     jsonrpc: String,
     id: u64,
     method: String,
-    params: NativeProverParams,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct NativeProverParams {
-    block_id: NativeBlockId,
-    transaction: serde_json::Value,
+    params: (NativeBlockId, serde_json::Value),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -861,6 +855,61 @@ struct NativeStatementProofArtifact {
     stderr_path: String,
     proof_sha256: String,
     proof_facts_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeSettlementStatementKind {
+    Nullifier,
+    Renewal,
+    Settlement,
+}
+
+const NATIVE_SETTLEMENT_SUBMISSION_ORDER: [NativeSettlementStatementKind; 3] = [
+    NativeSettlementStatementKind::Nullifier,
+    NativeSettlementStatementKind::Renewal,
+    NativeSettlementStatementKind::Settlement,
+];
+
+impl NativeSettlementStatementKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nullifier => "nullifier",
+            Self::Renewal => "renewal",
+            Self::Settlement => "settlement",
+        }
+    }
+
+    fn entrypoint(self, settlement_entrypoint: &str) -> &str {
+        match self {
+            Self::Nullifier => "compile_nullifier_proof",
+            Self::Renewal => "compile_renewal_proof",
+            Self::Settlement => settlement_entrypoint,
+        }
+    }
+}
+
+struct NativeSettlementSubmissionProofContext {
+    tx_prover_url: String,
+    executor: StarknetExecutorConfig,
+    batch_id: String,
+    serialized_witness: Vec<String>,
+    settlement_message_hash: String,
+    nullifier_message_hash: String,
+    renewal_message_hash: String,
+}
+
+impl NativeSettlementSubmissionProofContext {
+    fn expected_message_hash(&self, kind: NativeSettlementStatementKind) -> &String {
+        match kind {
+            NativeSettlementStatementKind::Nullifier => &self.nullifier_message_hash,
+            NativeSettlementStatementKind::Renewal => &self.renewal_message_hash,
+            NativeSettlementStatementKind::Settlement => &self.settlement_message_hash,
+        }
+    }
+
+    fn stage_key(&self, kind: NativeSettlementStatementKind) -> String {
+        format!("{}-onchain-{}", self.batch_id, kind.label())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -963,7 +1012,7 @@ fn redact_native_execution_request(
 
 fn redact_native_prover_request(request: &NativeProverRpcRequest) -> NativeProverRpcRequest {
     let mut redacted = request.clone();
-    redact_transaction_calldata(&mut redacted.params.transaction);
+    redact_transaction_calldata(&mut redacted.params.1);
     redacted
 }
 
@@ -4147,10 +4196,10 @@ async fn run_true_native_proof_aggregation(
         jsonrpc: "2.0".into(),
         id: 1,
         method: "starknet_proveTransaction".into(),
-        params: NativeProverParams {
-            block_id: execution_request.block_id.clone(),
-            transaction: execution_request.transaction.clone(),
-        },
+        params: (
+            execution_request.block_id.clone(),
+            execution_request.transaction.clone(),
+        ),
     };
     let (result, response_value) = request_native_proof(state, &tx_prover_url, &rpc_request)
         .await
@@ -5006,6 +5055,36 @@ async fn prove_and_record_auction_result_with_inputs(
         normalize_felt_hex(&transcript.order_commitment_root).map_err(|error| error.to_string())?;
     let admission_root = auction_admission_root(&settlement_witness, &auction_order_witnesses)
         .map_err(|error| format!("failed to compute admission root: {error}"))?;
+    let (admission_already_recorded, auction_result_already_recorded) = if record_onchain {
+        let recorded_admission = fetch_verified_batch_commitment(
+            &executor,
+            &state.auction_verifier_address,
+            "verified_admission_root",
+            &batch_id_felt,
+        )
+        .await?;
+        let recorded_auction_result = fetch_verified_batch_commitment(
+            &executor,
+            &state.auction_verifier_address,
+            "verified_auction_transcript",
+            &batch_id_felt,
+        )
+        .await?;
+        let admission_root_felt = parse_felt(&admission_root, "admission root")?;
+        let transcript_commitment_felt =
+            parse_felt(&transcript_commitment, "transcript commitment")?;
+        reconcile_verified_auction_records(
+            recorded_admission,
+            admission_root_felt,
+            recorded_auction_result,
+            transcript_commitment_felt,
+        )?
+    } else {
+        (false, false)
+    };
+    if auction_result_already_recorded {
+        return Ok(None);
+    }
     let expected_admission_message_hash = admission_proof_message_hash_for_program(
         &state.native_proof_program_address,
         &state.auction_verifier_address,
@@ -5039,10 +5118,10 @@ async fn prove_and_record_auction_result_with_inputs(
         jsonrpc: "2.0".into(),
         id: 1,
         method: "starknet_proveTransaction".into(),
-        params: NativeProverParams {
-            block_id: admission_execution_request.block_id.clone(),
-            transaction: admission_execution_request.transaction.clone(),
-        },
+        params: (
+            admission_execution_request.block_id.clone(),
+            admission_execution_request.transaction.clone(),
+        ),
     };
 
     let mut final_admission_response_value = None;
@@ -5107,32 +5186,35 @@ async fn prove_and_record_auction_result_with_inputs(
         .map_err(|error| format!("failed to persist native admission stderr log: {error}"))?;
 
     let provider = if record_onchain {
-        let admission_record_call = StarknetCall {
-            contract_address: normalize_nonzero_felt(
-                &state.auction_verifier_address,
-                "auction_verifier_address",
-            )?,
-            entrypoint: "record_admission_root_with_proof_facts".into(),
-            calldata: vec![
-                batch_id_felt.clone(),
-                order_commitment_root.clone(),
-                admission_root.clone(),
-            ],
-        };
-        let admission_tx_hash = submit_native_invoke_with_typed_sdk_retry(
-            state,
-            &executor,
-            &admission_record_call,
-            admission_result.proof.clone(),
-            &admission_result.proof_facts,
-        )
-        .await
-        .map_err(|error| format!("failed to record native admission proof: {error}"))?;
         let provider = JsonRpcClient::new(HttpTransport::new(
             Url::parse(&executor.rpc_url)
                 .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?,
         ));
-        let admission_receipt = wait_for_accepted_receipt(
+        if admission_already_recorded {
+            Some(provider)
+        } else {
+            let admission_record_call = StarknetCall {
+                contract_address: normalize_nonzero_felt(
+                    &state.auction_verifier_address,
+                    "auction_verifier_address",
+                )?,
+                entrypoint: "record_admission_root_with_proof_facts".into(),
+                calldata: vec![
+                    batch_id_felt.clone(),
+                    order_commitment_root.clone(),
+                    admission_root.clone(),
+                ],
+            };
+            let admission_tx_hash = submit_native_invoke_with_typed_sdk_retry(
+                state,
+                &executor,
+                &admission_record_call,
+                admission_result.proof.clone(),
+                &admission_result.proof_facts,
+            )
+            .await
+            .map_err(|error| format!("failed to record native admission proof: {error}"))?;
+            let admission_receipt = wait_for_accepted_receipt(
             &provider,
             parse_felt(&admission_tx_hash, "admission transaction hash")?,
         )
@@ -5142,12 +5224,15 @@ async fn prove_and_record_auction_result_with_inputs(
                 "admission proof transaction {admission_tx_hash} was not accepted before settlement"
             )
         })?;
-        if let ExecutionResult::Reverted { reason } = admission_receipt.receipt.execution_result() {
-            return Err(format!(
-                "admission proof transaction {admission_tx_hash} reverted onchain: {reason}"
-            ));
+            if let ExecutionResult::Reverted { reason } =
+                admission_receipt.receipt.execution_result()
+            {
+                return Err(format!(
+                    "admission proof transaction {admission_tx_hash} reverted onchain: {reason}"
+                ));
+            }
+            Some(provider)
         }
-        Some(provider)
     } else {
         None
     };
@@ -5186,10 +5271,10 @@ async fn prove_and_record_auction_result_with_inputs(
         jsonrpc: "2.0".into(),
         id: 1,
         method: "starknet_proveTransaction".into(),
-        params: NativeProverParams {
-            block_id: execution_request.block_id.clone(),
-            transaction: execution_request.transaction.clone(),
-        },
+        params: (
+            execution_request.block_id.clone(),
+            execution_request.transaction.clone(),
+        ),
     };
 
     let mut final_response_value = None;
@@ -5721,6 +5806,57 @@ async fn fetch_current_settlement_roots(state: &AppState) -> Result<SettlementRo
         renewal_root: format!("{:#x}", result[2]),
         fee_root: format!("{:#x}", result[3]),
     })
+}
+
+async fn fetch_verified_batch_commitment(
+    executor: &StarknetExecutorConfig,
+    verifier_address: &str,
+    entrypoint: &str,
+    batch_id: &str,
+) -> Result<Felt, String> {
+    let provider = JsonRpcClient::new(HttpTransport::new(
+        Url::parse(&executor.rpc_url)
+            .map_err(|error| format!("invalid ZYLITH_STARKNET_RPC_URL: {error}"))?,
+    ));
+    let result = provider
+        .call(
+            FunctionCall {
+                contract_address: parse_felt(verifier_address, "auction verifier address")?,
+                entry_point_selector: get_selector_from_name(entrypoint)
+                    .map_err(|error| format!("failed to compute {entrypoint} selector: {error}"))?,
+                calldata: vec![parse_felt(batch_id, "batch id")?],
+            },
+            BlockId::Tag(BlockTag::Latest),
+        )
+        .await
+        .map_err(|error| format!("failed to query {entrypoint}: {error}"))?;
+    if result.len() != 1 {
+        return Err(format!(
+            "{entrypoint} returned {} values instead of one",
+            result.len()
+        ));
+    }
+    Ok(result[0])
+}
+
+fn reconcile_verified_auction_records(
+    recorded_admission: Felt,
+    expected_admission: Felt,
+    recorded_auction_result: Felt,
+    expected_transcript: Felt,
+) -> Result<(bool, bool), String> {
+    if recorded_admission != Felt::ZERO && recorded_admission != expected_admission {
+        return Err("onchain admission root does not match the prepared auction".into());
+    }
+    if recorded_auction_result != Felt::ZERO && recorded_auction_result != expected_transcript {
+        return Err("onchain auction result does not match the prepared transcript".into());
+    }
+    let admission_already_recorded = recorded_admission == expected_admission;
+    let auction_result_already_recorded = recorded_auction_result == expected_transcript;
+    if auction_result_already_recorded && !admission_already_recorded {
+        return Err("onchain auction result exists without its admission root".into());
+    }
+    Ok((admission_already_recorded, auction_result_already_recorded))
 }
 
 #[derive(Clone, Debug)]
@@ -6877,10 +7013,10 @@ async fn execute_native_statement_prover(
         jsonrpc: "2.0".into(),
         id: 1,
         method: "starknet_proveTransaction".into(),
-        params: NativeProverParams {
-            block_id: execution_request.block_id.clone(),
-            transaction: execution_request.transaction.clone(),
-        },
+        params: (
+            execution_request.block_id.clone(),
+            execution_request.transaction.clone(),
+        ),
     };
     let mut final_response_value = None;
     let mut final_result = None;
@@ -9792,48 +9928,10 @@ async fn submit_native_plan_onchain(
     settlement_plan: &SettlementSubmissionPlan,
     proof_artifact: &ProofArtifactRecord,
 ) -> Result<OnchainSubmissionRecord, String> {
-    let executor = state
-        .starknet_executor
-        .clone()
-        .ok_or_else(|| "starknet executor is not configured".to_string())?;
-    let _proof_request_path = proof_artifact
-        .native_execution_request_path
-        .as_ref()
-        .ok_or_else(|| "native execution request path missing".to_string())?;
-    let proof_path = proof_artifact
-        .native_proof_file_path
-        .as_ref()
-        .ok_or_else(|| "native proof path missing".to_string())?;
-    let proof_facts_path = proof_artifact
-        .native_proof_facts_file_path
-        .as_ref()
-        .ok_or_else(|| "native proof facts path missing".to_string())?;
-    let nullifier_proof_path = proof_artifact
-        .native_nullifier_proof_file_path
-        .as_ref()
-        .ok_or_else(|| "native nullifier proof path missing".to_string())?;
-    let nullifier_proof_facts_path = proof_artifact
-        .native_nullifier_proof_facts_file_path
-        .as_ref()
-        .ok_or_else(|| "native nullifier proof facts path missing".to_string())?;
-    let renewal_proof_path = proof_artifact
-        .native_renewal_proof_file_path
-        .as_ref()
-        .ok_or_else(|| "native renewal proof path missing".to_string())?;
-    let renewal_proof_facts_path = proof_artifact
-        .native_renewal_proof_facts_file_path
-        .as_ref()
-        .ok_or_else(|| "native renewal proof facts path missing".to_string())?;
-
-    let (nullifier_proof, nullifier_proof_facts) = read_native_proof_bundle(
-        nullifier_proof_path,
-        nullifier_proof_facts_path,
-        "nullifier",
-    )?;
-    let (renewal_proof, renewal_proof_facts) =
-        read_native_proof_bundle(renewal_proof_path, renewal_proof_facts_path, "renewal")?;
-    let (proof, proof_facts) =
-        read_native_proof_bundle(proof_path, proof_facts_path, "settlement")?;
+    let proof_context =
+        build_native_settlement_submission_proof_context(state, settlement_plan).await?;
+    let executor = &proof_context.executor;
+    let [nullifier_kind, renewal_kind, settlement_kind] = NATIVE_SETTLEMENT_SUBMISSION_ORDER;
 
     let provider = JsonRpcClient::new(HttpTransport::new(
         Url::parse(&executor.rpc_url)
@@ -9852,9 +9950,16 @@ async fn submit_native_plan_onchain(
             args.new_nullifier_root.clone(),
         ],
     };
+    let nullifier_statement =
+        prove_fresh_native_settlement_statement(state, &proof_context, nullifier_kind).await?;
+    let (nullifier_proof, nullifier_proof_facts) = read_native_proof_bundle(
+        &nullifier_statement.proof_path,
+        &nullifier_statement.proof_facts_path,
+        "nullifier",
+    )?;
     let nullifier_tx_hash = submit_native_invoke_with_typed_sdk_retry(
         state,
-        &executor,
+        executor,
         &nullifier_record_call,
         nullifier_proof,
         &nullifier_proof_facts,
@@ -9874,9 +9979,16 @@ async fn submit_native_plan_onchain(
             args.new_renewal_root.clone(),
         ],
     };
+    let renewal_statement =
+        prove_fresh_native_settlement_statement(state, &proof_context, renewal_kind).await?;
+    let (renewal_proof, renewal_proof_facts) = read_native_proof_bundle(
+        &renewal_statement.proof_path,
+        &renewal_statement.proof_facts_path,
+        "renewal",
+    )?;
     let renewal_tx_hash = submit_native_invoke_with_typed_sdk_retry(
         state,
-        &executor,
+        executor,
         &renewal_record_call,
         renewal_proof,
         &renewal_proof_facts,
@@ -9885,9 +9997,24 @@ async fn submit_native_plan_onchain(
     .map_err(|error| format!("failed to record native renewal proof: {error}"))?;
     ensure_native_statement_record_accepted(&provider, &renewal_tx_hash, "renewal").await?;
 
+    let settlement_statement =
+        prove_fresh_native_settlement_statement(state, &proof_context, settlement_kind).await?;
+    persist_refreshed_native_settlement_artifact(
+        state,
+        proof_artifact,
+        &settlement_statement,
+        &nullifier_statement,
+        &renewal_statement,
+    )
+    .await?;
+    let (proof, proof_facts) = read_native_proof_bundle(
+        &settlement_statement.proof_path,
+        &settlement_statement.proof_facts_path,
+        "settlement",
+    )?;
     let tx_hash = submit_native_invoke_with_typed_sdk_retry(
         state,
-        &executor,
+        executor,
         &settlement_plan.settlement_call,
         proof,
         &proof_facts,
@@ -9925,6 +10052,144 @@ async fn submit_native_plan_onchain(
     }
 
     Ok(submission)
+}
+
+async fn build_native_settlement_submission_proof_context(
+    state: &AppState,
+    settlement_plan: &SettlementSubmissionPlan,
+) -> Result<NativeSettlementSubmissionProofContext, String> {
+    let tx_prover_url = state
+        .native_tx_prover_url
+        .clone()
+        .ok_or_else(|| "native transaction prover is not configured".to_string())?;
+    let executor = state
+        .starknet_executor
+        .clone()
+        .ok_or_else(|| "starknet executor is not configured".to_string())?;
+    let batch_id = &settlement_plan.batch_id.0;
+    let transcript = fetch_transcript(state, batch_id)
+        .await
+        .map_err(|status| format!("failed to fetch settlement transcript: {status}"))?;
+    let settlement_witness = state
+        .settlement_witnesses
+        .read()
+        .await
+        .get(batch_id)
+        .cloned()
+        .ok_or_else(|| "settlement witness is not prepared".to_string())?;
+    let transcript_commitment =
+        settlement_transcript_commitment(&transcript).map_err(|error| error.to_string())?;
+    if settlement_witness.transcript_commitment != transcript_commitment {
+        return Err("settlement witness commitment does not match transcript".into());
+    }
+    let native_proof_reference =
+        native_settlement_message_hash(&state.auction_verifier_address, &transcript_commitment)
+            .map_err(|error| error.to_string())?;
+    let rebuilt_plan = build_settlement_submission_plan(
+        &transcript,
+        &state.auction_verifier_address,
+        &native_proof_reference,
+    )
+    .map_err(|error| error.to_string())?;
+    if rebuilt_plan != *settlement_plan {
+        return Err("stored settlement plan does not match the current transcript".into());
+    }
+    ensure_batch_registered_onchain(state, batch_id).await?;
+    let roots = root_only_settlement_commitments(&transcript).map_err(|error| error.to_string())?;
+    let settlement_message_hash = settlement_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &transcript_commitment,
+    )
+    .map_err(|error| error.to_string())?;
+    let nullifier_message_hash = nullifier_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &transcript_commitment,
+        &roots.prior_nullifier_root,
+        &roots.consumed_nullifier_root,
+        &roots.new_nullifier_root,
+    )
+    .map_err(|error| error.to_string())?;
+    let renewal_message_hash = renewal_proof_message_hash_for_program(
+        &state.native_proof_program_address,
+        &state.auction_verifier_address,
+        &transcript_commitment,
+        &roots.prior_renewal_root,
+        &roots.renewal_child_root,
+        &roots.new_renewal_root,
+    )
+    .map_err(|error| error.to_string())?;
+    let serialized_witness = zylith_core::build_stwo_serialized_input(&settlement_witness)
+        .map_err(|error| format!("failed to serialize settlement witness: {error}"))?;
+
+    Ok(NativeSettlementSubmissionProofContext {
+        tx_prover_url,
+        executor,
+        batch_id: batch_id.clone(),
+        serialized_witness,
+        settlement_message_hash,
+        nullifier_message_hash,
+        renewal_message_hash,
+    })
+}
+
+async fn prove_fresh_native_settlement_statement(
+    state: &AppState,
+    context: &NativeSettlementSubmissionProofContext,
+    kind: NativeSettlementStatementKind,
+) -> Result<NativeStatementProofArtifact, String> {
+    let stage_key = context.stage_key(kind);
+    execute_native_statement_prover(NativeStatementProverRequest {
+        state,
+        tx_prover_url: &context.tx_prover_url,
+        executor: &context.executor,
+        batch_id: &context.batch_id,
+        stage_key: &stage_key,
+        entrypoint: kind.entrypoint(&state.native_proof_entrypoint),
+        serialized_native_witness: &context.serialized_witness,
+        expected_message_hashes: std::slice::from_ref(context.expected_message_hash(kind)),
+    })
+    .await
+}
+
+async fn persist_refreshed_native_settlement_artifact(
+    state: &AppState,
+    existing: &ProofArtifactRecord,
+    settlement: &NativeStatementProofArtifact,
+    nullifier: &NativeStatementProofArtifact,
+    renewal: &NativeStatementProofArtifact,
+) -> Result<(), String> {
+    let mut refreshed = existing.clone();
+    refreshed.created_at_unix_ms = now_unix_ms();
+    refreshed.proof_path = settlement.proof_path.clone();
+    refreshed.public_inputs_path = settlement.proof_facts_path.clone();
+    refreshed.prover_stdout_path = settlement.stdout_path.clone();
+    refreshed.prover_stderr_path = settlement.stderr_path.clone();
+    refreshed.proof_sha256 = settlement.proof_sha256.clone();
+    refreshed.public_inputs_sha256 = settlement.proof_facts_sha256.clone();
+    refreshed.native_proof_file_path = Some(settlement.proof_path.clone());
+    refreshed.native_proof_facts_file_path = Some(settlement.proof_facts_path.clone());
+    refreshed.native_execution_request_path = Some(settlement.execution_request_path.clone());
+    refreshed.native_nullifier_proof_file_path = Some(nullifier.proof_path.clone());
+    refreshed.native_nullifier_proof_facts_file_path = Some(nullifier.proof_facts_path.clone());
+    refreshed.native_nullifier_execution_request_path =
+        Some(nullifier.execution_request_path.clone());
+    refreshed.native_renewal_proof_file_path = Some(renewal.proof_path.clone());
+    refreshed.native_renewal_proof_facts_file_path = Some(renewal.proof_facts_path.clone());
+    refreshed.native_renewal_execution_request_path = Some(renewal.execution_request_path.clone());
+    state
+        .proof_artifacts
+        .write()
+        .await
+        .insert(refreshed.batch_id.0.clone(), refreshed.clone());
+    persist_record(
+        state.data_dir.as_ref(),
+        PROOF_ARTIFACTS_DIR,
+        &refreshed.batch_id.0,
+        &refreshed,
+    )
+    .map_err(status_to_error)
 }
 
 fn read_native_proof_bundle(
@@ -10676,15 +10941,15 @@ mod tests {
         AppConfig, DEFAULT_PROTOCOL_FEE_RECIPIENT, DEFAULT_RELAY_FEE_RECIPIENT,
         DecryptedOrderRecord, FeeNoteRecipientConfig, NOTE_ROOT_TRANSITION_CONSOLIDATION_KIND,
         NOTE_ROOT_TRANSITION_DEPOSIT_KIND, NativeAggregationPreparedMember, NativeBlockId,
-        NativeExecutionRequestRecord, NativeProverParams, NativeProverRpcRequest,
-        NativeTransactionMode, NoteConsolidationHistoryRecord, NoteMembershipSources,
-        NoteRootTransitionRecord, OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots,
-        StarknetExecutorConfig, artifact_id_for, build_app_with_config,
-        build_batch_liquidity_report, build_native_proof_program_calldata,
-        build_settlement_artifacts, compute_candidate_clearing_price,
-        confirmed_settlement_witnesses_from_maps, decode_bhttp_response,
-        derive_note_membership_witnesses, deterministic_settlement_submission_jitter_ms,
-        encode_bhttp_json_post, fee_note_key_from_value, native_execution_context_block_id,
+        NativeExecutionRequestRecord, NativeProverRpcRequest, NativeTransactionMode,
+        NoteConsolidationHistoryRecord, NoteMembershipSources, NoteRootTransitionRecord,
+        OnchainSubmissionRecord, SettlementBuildContext, SettlementRoots, StarknetExecutorConfig,
+        artifact_id_for, build_app_with_config, build_batch_liquidity_report,
+        build_native_proof_program_calldata, build_settlement_artifacts,
+        compute_candidate_clearing_price, confirmed_settlement_witnesses_from_maps,
+        decode_bhttp_response, derive_note_membership_witnesses,
+        deterministic_settlement_submission_jitter_ms, encode_bhttp_json_post,
+        fee_note_key_from_value, native_execution_context_block_id,
         native_fee_estimate_requires_proof_facts,
         native_invoke_error_is_retryable_after_submission, native_invoke_error_is_retryable_nonce,
         native_invoke_error_is_retryable_proof_facts_delay, parse_ohttp_key_config_hex,
@@ -12042,22 +12307,27 @@ mod tests {
             jsonrpc: "2.0".into(),
             id: 1,
             method: "starknet_proveTransaction".into(),
-            params: NativeProverParams {
-                block_id: NativeBlockId::Tag("latest".into()),
-                transaction: serde_json::json!({
+            params: (
+                NativeBlockId::Tag("latest".into()),
+                serde_json::json!({
                     "calldata": ["0xabc"]
                 }),
-            },
+            ),
         };
 
         let redacted = redact_native_prover_request(&request);
+        let serialized = serde_json::to_value(&request).expect("serialize native prover request");
 
+        assert_eq!(request.params.1["calldata"], serde_json::json!(["0xabc"]));
+        assert!(serialized["params"].is_array());
+        assert_eq!(serialized["params"].as_array().map(Vec::len), Some(2));
+        assert_eq!(serialized["params"][0], serde_json::json!("latest"));
         assert_eq!(
-            request.params.transaction["calldata"],
+            serialized["params"][1]["calldata"],
             serde_json::json!(["0xabc"])
         );
-        assert_eq!(redacted.params.transaction["calldata"]["redacted"], true);
-        assert_eq!(redacted.params.transaction["calldata"]["felt_count"], 1);
+        assert_eq!(redacted.params.1["calldata"]["redacted"], true);
+        assert_eq!(redacted.params.1["calldata"]["felt_count"], 1);
     }
 
     #[test]
@@ -12108,6 +12378,72 @@ mod tests {
             NativeBlockId::Tag(tag) => assert_eq!(tag, "latest"),
             other => panic!("submit context must use latest tag, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn native_settlement_submission_proves_each_transition_in_onchain_order() {
+        let [nullifier, renewal, settlement] = super::NATIVE_SETTLEMENT_SUBMISSION_ORDER;
+
+        assert_eq!(nullifier.label(), "nullifier");
+        assert_eq!(
+            nullifier.entrypoint("compile_settlement"),
+            "compile_nullifier_proof"
+        );
+        assert_eq!(renewal.label(), "renewal");
+        assert_eq!(
+            renewal.entrypoint("compile_settlement"),
+            "compile_renewal_proof"
+        );
+        assert_eq!(settlement.label(), "settlement");
+        assert_eq!(
+            settlement.entrypoint("compile_settlement"),
+            "compile_settlement"
+        );
+    }
+
+    #[test]
+    fn native_auction_record_retries_reuse_only_matching_onchain_values() {
+        let admission = super::Felt::from_hex_unchecked("0x11");
+        let transcript = super::Felt::from_hex_unchecked("0x22");
+
+        assert_eq!(
+            super::reconcile_verified_auction_records(
+                super::Felt::ZERO,
+                admission,
+                super::Felt::ZERO,
+                transcript,
+            )
+            .expect("empty records are valid"),
+            (false, false)
+        );
+        assert_eq!(
+            super::reconcile_verified_auction_records(
+                admission,
+                admission,
+                transcript,
+                transcript,
+            )
+            .expect("matching records are reusable"),
+            (true, true)
+        );
+        assert!(
+            super::reconcile_verified_auction_records(
+                super::Felt::from_hex_unchecked("0x33"),
+                admission,
+                super::Felt::ZERO,
+                transcript,
+            )
+            .is_err()
+        );
+        assert!(
+            super::reconcile_verified_auction_records(
+                super::Felt::ZERO,
+                admission,
+                transcript,
+                transcript,
+            )
+            .is_err()
+        );
     }
 
     #[test]

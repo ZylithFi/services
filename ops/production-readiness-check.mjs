@@ -220,7 +220,17 @@ function checkNativeProofAccountSigner() {
 function checkNativeProverOhttpPolicy() {
   const enabled = (value("ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED") || "true").toLowerCase();
   if (["0", "false", "no"].includes(enabled)) {
+    if (isLoopbackUrl(value("ZYLITH_NATIVE_TX_PROVER_URL"))) return;
     failures.push("ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED must not be disabled in production");
+  }
+}
+
+function isLoopbackUrl(current) {
+  try {
+    const hostname = new URL(current).hostname.toLowerCase();
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+  } catch {
+    return false;
   }
 }
 
