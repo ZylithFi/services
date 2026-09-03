@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { StarknetRuntime } from "./starknetSubmitter.js";
 import {
@@ -100,84 +100,106 @@ describe("submitProofBearingOutsideExecution", () => {
     });
   });
 
-  it("submits plain relayed outside execution without proof fields", async () => {
-    const { proof: _proof, proof_facts: _proofFacts, ...plainRequest } = request;
-    const seen: { body?: unknown; estimateBody?: unknown } = {};
-    const result = await submitProofBearingOutsideExecution(
-      plainRequest,
+  it("uses the configured RPC URL for every Starknet provider", async () => {
+    const providerUrls: string[] = [];
+    const runtime = {
+      ...fakeRuntime,
+      RpcProvider: class {
+        constructor(options: { nodeUrl: string }) {
+          providerUrls.push(options.nodeUrl);
+        }
+
+        async getClassHashAt(contractAddress: string) {
+          if (contractAddress === "0x99") return "0xabc";
+          return null;
+        }
+      }
+    } satisfies StarknetRuntime;
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const body = JSON.parse(init?.body as string);
+      if (body.method === "starknet_estimateFee") {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            result: [
+              {
+                l1_gas_consumed: "0x2",
+                l1_gas_price: "0x4",
+                l2_gas_consumed: "0x6",
+                l2_gas_price: "0x8",
+                l1_data_gas_consumed: "0xa",
+                l1_data_gas_price: "0xc"
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { transaction_hash: "0xtx" }
+        }),
+        { status: 200 }
+      );
+    };
+
+    await ensurePrivacyProofSignerContract(
+      ensureRequest,
       {
-        rpcUrl: "https://rpc.example",
+        rpcUrl: "https://rpc.configured.example",
+        accountAddress: "0xabc",
+        privateKey: "0xkey"
+      },
+      { runtime }
+    );
+    await relayPrivacyProofSignerCall(
+      relayRequest,
+      {
+        rpcUrl: "https://rpc.configured.example",
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+        privateKey: "0xkey",
+        privacySignerClassHash: "0xabc"
+      },
+      { runtime, fetchImpl }
+    );
+    await submitProofBearingOutsideExecution(
+      request,
+      {
+        rpcUrl: "https://rpc.configured.example",
         chainId: "0x534e5f5345504f4c4941",
         accountAddress: "0xabc",
         privateKey: "0xkey"
       },
-      {
-        runtime: fakeRuntime,
-        fetchImpl: async (_url, init) => {
-          const body = JSON.parse(init?.body as string);
-          if (body.method === "starknet_estimateFee") {
-            seen.estimateBody = body;
-            return new Response(
-              JSON.stringify({
-                jsonrpc: "2.0",
-                id: 1,
-                result: [
-                  {
-                    l1_gas_consumed: "0x2",
-                    l1_gas_price: "0x4",
-                    l2_gas_consumed: "0x6",
-                    l2_gas_price: "0x8",
-                    l1_data_gas_consumed: "0xa",
-                    l1_data_gas_price: "0xc"
-                  }
-                ]
-              }),
-              { status: 200 }
-            );
-          }
-          seen.body = body;
-          return new Response(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              result: { transaction_hash: "0xplain" }
-            }),
-            { status: 200 }
-          );
-        }
-      }
+      { runtime, fetchImpl }
     );
 
-    const body = seen.body as {
-      params: {
-        invoke_transaction: {
-          proof?: string;
-          proof_facts?: string[];
-        };
-      };
-    };
-    const estimateBody = seen.estimateBody as {
-      params: {
-        request: Array<{
-          proof?: string;
-          proof_facts?: string[];
-        }>;
-      };
-    };
-    expect(result.transaction_hash).toBe("0xplain");
-    expect(estimateBody.params.request[0].proof).toBeUndefined();
-    expect(estimateBody.params.request[0].proof_facts).toBeUndefined();
-    expect(body.params.invoke_transaction.proof).toBeUndefined();
-    expect(body.params.invoke_transaction.proof_facts).toBeUndefined();
+    expect(providerUrls).not.toHaveLength(0);
+    expect(providerUrls.every((url) => url === "https://rpc.configured.example")).toBe(true);
   });
 
-  it("submits direct proof-bearing withdrawal calls without outside execution", async () => {
+  it("rejects relayed outside execution without proof fields", async () => {
+    const { proof: _proof, proof_facts: _proofFacts, ...plainRequest } = request;
+    await expect(
+      submitProofBearingOutsideExecution(plainRequest, {
+        rpcUrl: "https://rpc.example",
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+        privateKey: "0xkey"
+      })
+    ).rejects.toThrow("proof and proof_facts are required for paymaster execution");
+  });
+
+  it("submits direct proof-bearing apply_actions calls without outside execution", async () => {
     const { outside_transaction: _outsideTransaction, ...directRequest } = {
       ...request,
       call: {
         contract_address: "0x123",
-        entrypoint: "withdraw_settlement_output_with_proof_facts",
-        calldata: ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7", "0x64"]
+        entrypoint: "apply_actions",
+        calldata: ["0x1", "0x2", "0x3"]
       },
       relay_nonce: "0x456"
     };
@@ -186,7 +208,7 @@ describe("submitProofBearingOutsideExecution", () => {
       ...fakeRuntime,
       outsideExecution: {
         buildExecuteFromOutsideCall: () => {
-          throw new Error("outside execution should not be used for direct withdrawals");
+          throw new Error("outside execution should not be used for direct proof relays");
         }
       }
     } satisfies StarknetRuntime;
@@ -236,6 +258,583 @@ describe("submitProofBearingOutsideExecution", () => {
 
     expect(result.transaction_hash).toBe("0xdirect");
     expect((seen.body as { params: { invoke_transaction: { proof?: string } } }).params.invoke_transaction.proof).toBe("proof-bytes");
+  });
+
+  it("falls back to bounded resources when generic proof-bearing fee estimation fails", async () => {
+    const methods: string[] = [];
+    const seen: { body?: unknown } = {};
+    const result = await submitProofBearingOutsideExecution(
+      request,
+      {
+        rpcUrl: "https://rpc.example",
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+        privateKey: "0xkey"
+      },
+      {
+        runtime: fakeRuntime,
+        fetchImpl: async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          methods.push(body.method);
+          if (body.method === "starknet_estimateFee") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                error: {
+                  code: 41,
+                  message: "Transaction execution error"
+                }
+              }),
+              { status: 200 }
+            );
+          }
+          if (body.method === "starknet_getBlockWithTxHashes") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  l1_gas_price: { price_in_fri: "0x2" },
+                  l2_gas_price: { price_in_fri: "0x3" },
+                  l1_data_gas_price: { price_in_fri: "0x5" }
+                }
+              }),
+              { status: 200 }
+            );
+          }
+          seen.body = body;
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: { transaction_hash: "0xfallback" }
+            }),
+            { status: 200 }
+          );
+        }
+      }
+    );
+
+    const body = seen.body as {
+      params: {
+        invoke_transaction: {
+          resource_bounds: {
+            l1_gas: { max_amount: string; max_price_per_unit: string };
+            l2_gas: { max_amount: string; max_price_per_unit: string };
+            l1_data_gas: { max_amount: string; max_price_per_unit: string };
+          };
+        };
+      };
+    };
+    expect(result.transaction_hash).toBe("0xfallback");
+    expect(methods).toEqual([
+      "starknet_estimateFee",
+      "starknet_getBlockWithTxHashes",
+      "starknet_addInvokeTransaction"
+    ]);
+    expect(body.params.invoke_transaction.resource_bounds).toEqual({
+      l1_gas: { max_amount: "0x0", max_price_per_unit: "0x4" },
+      l2_gas: { max_amount: "0xaba9500", max_price_per_unit: "0x6" },
+      l1_data_gas: { max_amount: "0x1f40", max_price_per_unit: "0xa" }
+    });
+  });
+
+  it("falls back on structured allowance simulation errors only after live transfer preflight passes", async () => {
+    const methods: string[] = [];
+    let starknetCallCount = 0;
+    const seen: { body?: unknown } = {};
+    const requestWithTransfer = {
+      ...request,
+      outside_transaction: undefined,
+      call: {
+        contract_address: "0x123",
+        entrypoint: "apply_actions",
+        calldata: ["0x1", "0x2", "0x777", "0x456", "0x5"]
+      }
+    };
+
+    const result = await submitProofBearingOutsideExecution(
+      requestWithTransfer,
+      {
+        rpcUrl: "https://rpc.example",
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+        privateKey: "0xkey"
+      },
+      {
+        runtime: fakeRuntime,
+        fetchImpl: async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          methods.push(body.method);
+          if (body.method === "starknet_estimateFee") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                error: {
+                  code: 41,
+                  message: "Transaction execution error",
+                  data: {
+                    execution_error: "\"Insufficient ERC20 allowance\""
+                  }
+                }
+              }),
+              { status: 200 }
+            );
+          }
+          if (body.method === "starknet_call") {
+            starknetCallCount += 1;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: starknetCallCount === 3 ? ["0x0"] : ["0x5", "0x0"]
+              }),
+              { status: 200 }
+            );
+          }
+          if (body.method === "starknet_getBlockWithTxHashes") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  l1_gas_price: { price_in_fri: "0x2" },
+                  l2_gas_price: { price_in_fri: "0x3" },
+                  l1_data_gas_price: { price_in_fri: "0x5" }
+                }
+              }),
+              { status: 200 }
+            );
+          }
+          seen.body = body;
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: { transaction_hash: "0xpreflight-fallback" }
+            }),
+            { status: 200 }
+          );
+        }
+      }
+    );
+
+    expect(result.transaction_hash).toBe("0xpreflight-fallback");
+    expect(methods).toEqual([
+      "starknet_estimateFee",
+      "starknet_call",
+      "starknet_call",
+      "starknet_call",
+      "starknet_getBlockWithTxHashes",
+      "starknet_addInvokeTransaction"
+    ]);
+    expect(seen.body).toBeTruthy();
+  });
+
+  it("falls back on current privacy-pool server-action calldata with screening suffix after live transfer preflight passes", async () => {
+    const methods: string[] = [];
+    let starknetCallCount = 0;
+    const seen: { body?: unknown } = {};
+    const requestWithCurrentPoolActions = {
+      ...request,
+      outside_transaction: undefined,
+      call: {
+        contract_address: "0x123",
+        entrypoint: "apply_actions",
+        calldata: [
+          "0x6",
+          "0x2",
+          "0x777",
+          "0x456",
+          "0x5",
+          "0x7",
+          "0xa1",
+          "0xa2",
+          "0xa3",
+          "0x456",
+          "0xabc1",
+          "0x8",
+          "0xabc1",
+          "0x999",
+          "0x9",
+          "0xdead",
+          "0xa",
+          "0xbeef",
+          "0x2",
+          "0x1",
+          "0x2",
+          "0xb",
+          "0xbeef",
+          "0x0",
+          "0x1"
+        ]
+      }
+    };
+
+    const result = await submitProofBearingOutsideExecution(
+      requestWithCurrentPoolActions,
+      {
+        rpcUrl: "https://rpc.example",
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+        privateKey: "0xkey"
+      },
+      {
+        runtime: fakeRuntime,
+        fetchImpl: async (_url, init) => {
+          const body = JSON.parse(init?.body as string);
+          methods.push(body.method);
+          if (body.method === "starknet_estimateFee") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                error: {
+                  code: 41,
+                  message: "Transaction execution error",
+                  data: {
+                    execution_error: "\"Insufficient ERC20 allowance\""
+                  }
+                }
+              }),
+              { status: 200 }
+            );
+          }
+          if (body.method === "starknet_call") {
+            starknetCallCount += 1;
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: starknetCallCount === 3 ? ["0x0"] : ["0x5", "0x0"]
+              }),
+              { status: 200 }
+            );
+          }
+          if (body.method === "starknet_getBlockWithTxHashes") {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  l1_gas_price: { price_in_fri: "0x2" },
+                  l2_gas_price: { price_in_fri: "0x3" },
+                  l1_data_gas_price: { price_in_fri: "0x5" }
+                }
+              }),
+              { status: 200 }
+            );
+          }
+          seen.body = body;
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: { transaction_hash: "0xcurrent-pool-fallback" }
+            }),
+            { status: 200 }
+          );
+        }
+      }
+    );
+
+    expect(result.transaction_hash).toBe("0xcurrent-pool-fallback");
+    expect(methods).toEqual([
+      "starknet_estimateFee",
+      "starknet_call",
+      "starknet_call",
+      "starknet_call",
+      "starknet_getBlockWithTxHashes",
+      "starknet_addInvokeTransaction"
+    ]);
+    expect(seen.body).toBeTruthy();
+  });
+
+  it("does not fallback when the paymaster lacks privacy-pool fee allowance", async () => {
+    const methods: string[] = [];
+    let starknetCallCount = 0;
+    const requestWithTransfer = {
+      ...request,
+      outside_transaction: undefined,
+      call: {
+        contract_address: "0x123",
+        entrypoint: "apply_actions",
+        calldata: ["0x1", "0x2", "0x777", "0x456", "0x5"]
+      }
+    };
+
+    await expect(
+      submitProofBearingOutsideExecution(
+        requestWithTransfer,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(init?.body as string);
+            methods.push(body.method);
+            if (body.method === "starknet_estimateFee") {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  error: {
+                    code: 41,
+                    message: "Transaction execution error",
+                    data: {
+                      execution_error: "\"Insufficient ERC20 allowance\""
+                    }
+                  }
+                }),
+                { status: 200 }
+              );
+            }
+            if (body.method === "starknet_call") {
+              starknetCallCount += 1;
+              const result =
+                starknetCallCount === 3
+                  ? ["0x5"]
+                  : starknetCallCount === 5
+                    ? ["0x0", "0x0"]
+                    : ["0x5", "0x0"];
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result
+                }),
+                { status: 200 }
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: { transaction_hash: "0xunreachable" }
+              }),
+              { status: 200 }
+            );
+          }
+        }
+      )
+    ).rejects.toThrow(
+      "Starknet RPC rejected proof-bearing fee estimate: code=41 message=Transaction execution error data={\"execution_error\":\"\\\"Insufficient ERC20 allowance\\\"\"}"
+    );
+    expect(methods).toEqual([
+      "starknet_estimateFee",
+      "starknet_call",
+      "starknet_call",
+      "starknet_call",
+      "starknet_call",
+      "starknet_call"
+    ]);
+  });
+
+  it("does not fallback on malformed structured transfer calldata", async () => {
+    const methods: string[] = [];
+    const malformedTransferRequest = {
+      ...request,
+      outside_transaction: undefined,
+      call: {
+        contract_address: "0x123",
+        entrypoint: "apply_actions",
+        calldata: ["0x1", "0x2", "0x777", "0x456", "0x5", "0xdead"]
+      }
+    };
+
+    await expect(
+      submitProofBearingOutsideExecution(
+        malformedTransferRequest,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(init?.body as string);
+            methods.push(body.method);
+            if (body.method === "starknet_estimateFee") {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  error: {
+                    code: 41,
+                    message: "Transaction execution error",
+                    data: {
+                      execution_error: "\"Insufficient ERC20 allowance\""
+                    }
+                  }
+                }),
+                { status: 200 }
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: { transaction_hash: "0xunreachable" }
+              }),
+              { status: 200 }
+            );
+          }
+        }
+      )
+    ).rejects.toThrow(
+      "Starknet RPC rejected proof-bearing fee estimate: code=41 message=Transaction execution error data={\"execution_error\":\"\\\"Insufficient ERC20 allowance\\\"\"}"
+    );
+    expect(methods).toEqual(["starknet_estimateFee"]);
+  });
+
+  it("does not relay proof-bearing calls when fee estimation includes structured revert data", async () => {
+    const methods: string[] = [];
+    const privateFelt =
+      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    await expect(
+      submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(init?.body as string);
+            methods.push(body.method);
+            if (body.method === "starknet_estimateFee") {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  error: {
+                    code: 41,
+                    message: "Transaction execution error",
+                    data: {
+                      execution_error: "\"Insufficient ERC20 allowance\"",
+                      calldata: privateFelt
+                    }
+                  }
+                }),
+                { status: 200 }
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: { transaction_hash: "0xunreachable" }
+              }),
+              { status: 200 }
+            );
+          }
+        }
+      )
+    ).rejects.toThrow(
+      "Starknet RPC rejected proof-bearing fee estimate: code=41 message=Transaction execution error data={\"execution_error\":\"\\\"Insufficient ERC20 allowance\\\"\",\"calldata\":\"<felt>\"}"
+    );
+    expect(methods).toEqual(["starknet_estimateFee"]);
+  });
+
+  it("aborts stalled Starknet RPC calls", async () => {
+    vi.useFakeTimers();
+    try {
+      const attempt = submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async (_url, init) =>
+            new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener("abort", () => {
+                reject(new DOMException("aborted", "AbortError"));
+              });
+            })
+        }
+      );
+
+      const assertion = expect(attempt).rejects.toThrow("Starknet RPC request timed out");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a Starknet RPC response body that never completes", async () => {
+    vi.useFakeTimers();
+    try {
+      const attempt = submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async () =>
+            new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0"'));
+                }
+              }),
+              { status: 200 }
+            )
+        }
+      );
+
+      const assertion = expect(attempt).rejects.toThrow("Starknet RPC request timed out");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects oversized Starknet RPC response bodies", async () => {
+    await expect(
+      submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                padding: "x".repeat(1_000_000)
+              }),
+              { status: 200 }
+            )
+        }
+      )
+    ).rejects.toThrow("Starknet RPC response body is too large");
   });
 
   it("rebuilds and retries when the paymaster account nonce is stale", async () => {
@@ -321,6 +920,110 @@ describe("submitProofBearingOutsideExecution", () => {
 
     expect(result.transaction_hash).toBe("0xretry");
     expect(addInvokeNonces).toEqual(["0x7", "0x8"]);
+  });
+
+  it("redacts large RPC error fields before surfacing proof-bearing failures", async () => {
+    const privateFelt =
+      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const hugeNumber = "12345678901234567890123456789012345678901234567890";
+
+    await expect(
+      submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(init?.body as string);
+            if (body.method === "starknet_estimateFee") {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  error: {
+                    code: 52,
+                    message: "Transaction execution failed",
+                    data: `calldata=${privateFelt} amount=${hugeNumber}`
+                  }
+                }),
+                { status: 200 }
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: { transaction_hash: "0xunreachable" }
+              }),
+              { status: 200 }
+            );
+          }
+        }
+      )
+    ).rejects.toThrow(
+      "Starknet RPC rejected proof-bearing fee estimate: code=52 message=Transaction execution failed data=calldata=<felt> amount=<number>"
+    );
+  });
+
+  it("does not echo malformed fee estimate resource payloads", async () => {
+    const privateFelt =
+      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+    let thrown: unknown;
+    try {
+      await submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey"
+        },
+        {
+          runtime: fakeRuntime,
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(init?.body as string);
+            if (body.method === "starknet_estimateFee") {
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: [
+                    {
+                      resource_bounds: {
+                        l1_gas: { max_amount: "0x1", max_price_per_unit: "0x1" },
+                        debug_trace: privateFelt
+                      }
+                    }
+                  ]
+                }),
+                { status: 200 }
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: { transaction_hash: "0xunreachable" }
+              }),
+              { status: 200 }
+            );
+          }
+        }
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    expect(message).toContain("failed to parse proof-bearing fee estimate resource bounds");
+    expect(message).not.toContain(privateFelt);
   });
 
   it("retries embedded signer deployment when the paymaster nonce is already pending", async () => {

@@ -4,7 +4,6 @@ const args = new Set(process.argv.slice(2));
 const activeRelayTick = args.has("--active-relay-tick");
 const timeoutMs = Number(process.env.ZYLITH_MONITORING_DRILL_TIMEOUT_MS || 8_000);
 const failures = [];
-const warnings = [];
 const observations = [];
 
 const services = {
@@ -78,7 +77,7 @@ await checkText("prover metrics", `${services.prover}/api/internal/metrics`, (bo
     "zylith_prover_proof_lifecycle_withdrawal_submit_latency_ms",
   ]) {
     if (!hasMetricPrefix(metrics, requiredPrefix)) {
-      warnings.push(`prover metric ${requiredPrefix} has not been observed yet`);
+      failures.push(`prover metric ${requiredPrefix} has not been observed yet`);
     }
   }
 }, bearerOptions(controlToken));
@@ -102,7 +101,10 @@ await checkJson("renewal relayer ops summary", `${services.relayer}/ops/summary`
   expectTrue(body.worker_enabled, "renewal relayer worker");
   expectTrue(body.store_ok, "renewal relayer durable store");
   expectTrue(body.ready, "renewal relayer readiness");
-  const maxPackageSlots = Number(process.env.ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS || 0);
+  const maxPackageSlots = requiredNumberEnv(
+    "ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS",
+    "renewal relayer max package slots"
+  );
   expectAtLeast(maxPackageSlots, 86_400, "renewal relayer max package slots");
   observations.push(`renewal relayer packages=${body.package_count}`);
 }, bearerOptions(relayerToken));
@@ -126,8 +128,8 @@ await checkText("renewal relayer metrics", `${services.relayer}/metrics`, (body)
   }
   const missed = metrics.get("zylith_renewal_relay_recent_missed_slots") ?? 0;
   const failed = metrics.get("zylith_renewal_relay_recent_failed_slots") ?? 0;
-  if (missed > 0) warnings.push(`renewal relayer has ${missed} recently missed slots`);
-  if (failed > 0) warnings.push(`renewal relayer has ${failed} recently failed slots`);
+  if (missed > 0) failures.push(`renewal relayer has ${missed} recently missed slots`);
+  if (failed > 0) failures.push(`renewal relayer has ${failed} recently failed slots`);
 }, bearerOptions(relayerToken));
 
 if (activeRelayTick) {
@@ -152,11 +154,6 @@ if (activeRelayTick) {
 
 for (const observation of observations) console.log(observation);
 
-if (warnings.length > 0) {
-  console.error("monitoring drill warnings");
-  for (const warning of warnings) console.error(`- ${warning}`);
-}
-
 if (failures.length > 0) {
   console.error("monitoring drill failed");
   for (const failure of failures) console.error(`- ${failure}`);
@@ -179,24 +176,57 @@ async function checkText(label, url, validate, options = {}) {
 }
 
 async function check(label, url, validate, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, {
-      method: options.method || "GET",
-      headers: { accept: "application/json", ...(options.headers || {}) },
-      signal: controller.signal,
-    });
+    const response = await fetchWithTimeout(
+      url,
+      {
+        method: options.method || "GET",
+        headers: { accept: "application/json", ...(options.headers || {}) },
+      },
+      timeoutMs
+    );
     if (!response.ok) {
       failures.push(`${label} returned HTTP ${response.status}`);
       return;
     }
     await validate(response);
   } catch (error) {
-    failures.push(`${label} request failed: ${error.message}`);
+    failures.push(`${label} request failed: ${normalizedErrorMessage(error)}`);
+  }
+}
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController();
+  let timer;
+  const timeoutGuard = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(new DOMException("monitoring request timed out", "TimeoutError"));
+      reject(new Error(`timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      fetch(url, { ...init, signal: controller.signal }),
+      timeoutGuard,
+    ]);
   } finally {
     clearTimeout(timer);
   }
+}
+
+function normalizedErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const name = error instanceof Error ? error.name : "";
+  if (
+    /AbortError|TimeoutError/i.test(name) ||
+    /signal is aborted|aborted without reason|operation was aborted/i.test(message)
+  ) {
+    return `timed out after ${timeoutMs}ms`;
+  }
+  if (/failed to fetch|networkerror|load failed|fetch failed/i.test(message)) {
+    return "network request failed";
+  }
+  return message || "unknown error";
 }
 
 function parsePrometheusMetrics(body) {
@@ -239,6 +269,16 @@ function expectPositive(value, label) {
 
 function expectAtLeast(value, minimum, label) {
   if (!Number.isFinite(Number(value)) || Number(value) < minimum) failures.push(`${label} must be at least ${minimum}`);
+}
+
+function requiredNumberEnv(key, label) {
+  const raw = process.env[key];
+  const value = Number(raw);
+  if (!raw || !Number.isFinite(value)) {
+    failures.push(`${label} env ${key} is required`);
+    return Number.NaN;
+  }
+  return value;
 }
 
 function trimUrl(value) {

@@ -1,16 +1,21 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use starknet_crypto::get_public_key;
-use starknet_crypto::poseidon_hash;
+use starknet_crypto::{Felt, poseidon_hash};
+use zeroize::Zeroize;
 
 use crate::{
     ProtocolError,
     hash::{
-        domain_felt, encode_starknet_felt, felt_from_hex_str, field_from_bool, field_from_u64,
-        field_from_u128, poseidon_chain_hex, tagged_commitment_sha256,
+        domain_felt, encode_starknet_felt, felt_from_hex_str, felt_hex, field_from_bool,
+        field_from_u64, field_from_u128, normalize_felt_hex, poseidon_chain_hex,
+        tagged_commitment_sha256,
     },
     keys::UserKeys,
 };
@@ -22,16 +27,23 @@ pub const OUTPUT_NOTE_CIPHERTEXT_LEN: usize = OUTPUT_NOTE_PLAINTEXT_PADDED_LEN +
 pub const OUTPUT_RECOVERY_FIELD_COUNT: usize = 21;
 pub const OUTPUT_RECOVERY_PROOF_SLOTS: usize = 4;
 pub const MAX_ORDER_FUNDING_INPUTS: usize = 4;
-pub const MIN_MAKER_CURVE_POINTS: usize = 3;
-pub const MAX_MAKER_CURVE_POINTS: usize = 8;
-pub const MAKER_CURVE_MIN_SPREAD_BPS_STABLE_CONVERSION: u128 = 5;
-pub const MAKER_CURVE_MIN_SPREAD_BPS_CONVERSION: u128 = 10;
-pub const MAKER_CURVE_MIN_SPREAD_BPS_SPECULATIVE: u128 = 20;
+pub const MIN_LIQUIDITY_CURVE_POINTS: usize = 3;
+pub const MAX_LIQUIDITY_CURVE_POINTS: usize = 8;
+pub const LIQUIDITY_POSITION_VERSION: u32 = 1;
+pub const LIQUIDITY_POSITION_FIELD_COUNT: usize = 27;
+pub const MAX_LIQUIDITY_POSITION_ROTATION_BPS: u128 = 1_000;
+pub const LIQUIDITY_CURVE_MIN_SPREAD_BPS_STABLE_CONVERSION: u128 = 5;
+pub const LIQUIDITY_CURVE_MIN_SPREAD_BPS_CONVERSION: u128 = 10;
+pub const LIQUIDITY_CURVE_MIN_SPREAD_BPS_SPECULATIVE: u128 = 20;
 const BPS_DENOMINATOR: u128 = 10_000;
 const OUTPUT_RECOVERY_BUNDLE_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f62756e646c655f7631";
 const OUTPUT_RECOVERY_RECORD_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f7265635f7631";
 const FUNDING_INPUT_SET_DOMAIN_HEX: &str = "0x7a796c6974685f66756e64696e675f7365745f7631";
 const FUNDING_NULLIFIER_SET_DOMAIN_HEX: &str = "0x7a796c6974685f66756e64696e675f6e756c6c5f7631";
+pub const SPEND_AUTHORITY_DOMAIN_HEX: &str =
+    "0x21b92fb580b0e2cb7898509d56df3d7b51d6f68f17b50aa02e93e0227b15f3b";
+pub const SPEND_AUTHORIZATION_TAG_DOMAIN_HEX: &str =
+    "0x025a229e7207657107d37566206d51ed8d588a4c5406063f47350cb7ddc938f4";
 const RENEWAL_CHILD_NULLIFIER_DOMAIN_HEX: &str =
     "0x362b534b676bb36e394d08e276c8e64e65e3733e5d517a7eb6f438eafe54b61";
 const RENEWAL_PARENT_SECRET_DOMAIN_HEX: &str =
@@ -41,7 +53,7 @@ const RENEWAL_PARENT_DOMAIN_HEX: &str =
 pub const RENEWAL_PARENT_CANCEL_DOMAIN_HEX: &str =
     "0x26f84b60309c08d4030876815edb467f89f78e5a5f62823af4521f1be502ca3";
 
-mod serde_u128_decimal {
+pub(crate) mod serde_u128_decimal {
     use std::fmt;
 
     use serde::de::{self, Visitor};
@@ -152,7 +164,7 @@ mod serde_u128_decimal {
     }
 }
 
-mod serde_u64_decimal {
+pub(crate) mod serde_u64_decimal {
     use std::fmt;
 
     use serde::de::{self, Visitor};
@@ -226,6 +238,9 @@ pub struct Nullifier(pub String);
 pub struct OrderCommitment(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityPositionCommitment(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
     Buy,
     Sell,
@@ -235,7 +250,7 @@ pub enum OrderSide {
 pub enum OrderType {
     #[default]
     LimitBatch,
-    MakerCurve,
+    LiquidityCurve,
     HeartbeatCover,
 }
 
@@ -254,7 +269,8 @@ pub enum TimeInForce {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MakerCurvePoint {
+#[serde(deny_unknown_fields)]
+pub struct LiquidityCurvePoint {
     #[serde(with = "serde_u128_decimal")]
     pub price: u128,
     #[serde(with = "serde_u128_decimal")]
@@ -262,7 +278,7 @@ pub struct MakerCurvePoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MakerBandFillAttribution {
+pub struct LiquidityBandFillAttribution {
     pub band_index: u64,
     #[serde(with = "serde_u128_decimal")]
     pub band_price: u128,
@@ -273,7 +289,7 @@ pub struct MakerBandFillAttribution {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MakerBandAttribution {
+pub struct LiquidityBandAttribution {
     pub version: u32,
     pub pair_id: PairId,
     pub order_commitment: OrderCommitment,
@@ -283,23 +299,23 @@ pub struct MakerBandAttribution {
     pub clearing_price: u128,
     #[serde(with = "serde_u128_decimal")]
     pub filled_base_amount: u128,
-    pub bands: Vec<MakerBandFillAttribution>,
+    pub bands: Vec<LiquidityBandFillAttribution>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MakerAttributionPlaintext {
+pub struct LiquidityAttributionPlaintext {
     pub version: u32,
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub epoch_id: u64,
-    pub maker_public_key: String,
+    pub liquidity_provider_public_key: String,
     pub curve_commitment: String,
     pub output_note_commitment: NoteCommitment,
-    pub attribution: MakerBandAttribution,
+    pub attribution: LiquidityBandAttribution,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MakerAttributionReceipt {
+pub struct LiquidityAttributionReceipt {
     pub version: u32,
     pub signer_public_key: String,
     pub issued_at_unix_ms: u64,
@@ -308,13 +324,13 @@ pub struct MakerAttributionReceipt {
     pub signature_s: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EncryptedMakerAttributionArtifact {
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedLiquidityAttributionArtifact {
     pub version: u32,
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub epoch_id: u64,
-    pub maker_public_key: String,
+    pub liquidity_provider_public_key: String,
     pub curve_commitment: String,
     pub output_note_commitment: NoteCommitment,
     pub order_commitment: OrderCommitment,
@@ -323,29 +339,55 @@ pub struct EncryptedMakerAttributionArtifact {
     pub ephemeral_public_key: String,
     pub nonce: String,
     pub ciphertext: String,
-    pub receipt: MakerAttributionReceipt,
+    pub receipt: LiquidityAttributionReceipt,
+}
+
+impl fmt::Debug for EncryptedLiquidityAttributionArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptedLiquidityAttributionArtifact")
+            .field("version", &self.version)
+            .field("batch_id", &self.batch_id)
+            .field("pair_id", &self.pair_id)
+            .field("epoch_id", &self.epoch_id)
+            .field(
+                "liquidity_provider_public_key",
+                &self.liquidity_provider_public_key,
+            )
+            .field("curve_commitment", &self.curve_commitment)
+            .field("output_note_commitment", &self.output_note_commitment)
+            .field("order_commitment", &self.order_commitment)
+            .field("algorithm", &self.algorithm)
+            .field("key_id", &self.key_id)
+            .field("ephemeral_public_key", &self.ephemeral_public_key)
+            .field("nonce", &"<redacted>")
+            .field("ciphertext", &"<redacted>")
+            .field("receipt", &self.receipt)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MakerAttributionBundle {
+pub struct LiquidityAttributionBundle {
     pub version: u32,
     pub batch_id: BatchId,
-    pub artifacts: Vec<EncryptedMakerAttributionArtifact>,
+    pub artifacts: Vec<EncryptedLiquidityAttributionArtifact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MakerAttributionArtifactList {
+pub struct LiquidityAttributionArtifactList {
     pub batch_id: BatchId,
-    pub maker_public_key: String,
-    pub artifacts: Vec<EncryptedMakerAttributionArtifact>,
+    pub liquidity_provider_public_key: String,
+    pub artifacts: Vec<EncryptedLiquidityAttributionArtifact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HiddenMakerCurve {
-    pub points: Vec<MakerCurvePoint>,
+#[serde(deny_unknown_fields)]
+pub struct LiquidityCurve {
+    pub points: Vec<LiquidityCurvePoint>,
 }
 
-impl HiddenMakerCurve {
+impl LiquidityCurve {
     pub fn commitment(&self) -> Result<String, ProtocolError> {
         let mut fields = Vec::with_capacity(1 + self.points.len() * 2);
         fields.push(field_from_u64(self.points.len() as u64));
@@ -354,7 +396,7 @@ impl HiddenMakerCurve {
             fields.push(field_from_u128(point.base_amount));
         }
         Ok(poseidon_chain_hex(
-            domain_felt("zylith/maker-curve"),
+            domain_felt("zylith/liquidity-curve"),
             &fields,
         ))
     }
@@ -362,22 +404,22 @@ impl HiddenMakerCurve {
     pub fn total_base_amount(&self) -> Result<u128, ProtocolError> {
         self.points.iter().try_fold(0u128, |total, point| {
             total.checked_add(point.base_amount).ok_or_else(|| {
-                ProtocolError::InvalidOrder("maker curve base amount overflows u128".into())
+                ProtocolError::InvalidOrder("liquidity curve base amount overflows u128".into())
             })
         })
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.points.len() < MIN_MAKER_CURVE_POINTS {
+        if self.points.len() < MIN_LIQUIDITY_CURVE_POINTS {
             return Err(ProtocolError::InvalidOrder(format!(
-                "maker curve must contain at least {MIN_MAKER_CURVE_POINTS} points"
+                "liquidity curve must contain at least {MIN_LIQUIDITY_CURVE_POINTS} points"
             )));
         }
-        if self.points.len() > MAX_MAKER_CURVE_POINTS {
+        if self.points.len() > MAX_LIQUIDITY_CURVE_POINTS {
             return Err(ProtocolError::InvalidOrder(format!(
-                "maker curve uses {} points, maximum is {}",
+                "liquidity curve uses {} points, maximum is {}",
                 self.points.len(),
-                MAX_MAKER_CURVE_POINTS
+                MAX_LIQUIDITY_CURVE_POINTS
             )));
         }
 
@@ -385,12 +427,12 @@ impl HiddenMakerCurve {
         for point in &self.points {
             if point.price == 0 || point.base_amount == 0 {
                 return Err(ProtocolError::InvalidOrder(
-                    "maker curve prices and base amounts must be positive".into(),
+                    "liquidity curve prices and base amounts must be positive".into(),
                 ));
             }
             if previous_price.is_some_and(|price| point.price <= price) {
                 return Err(ProtocolError::InvalidOrder(
-                    "maker curve points must be strictly increasing by price".into(),
+                    "liquidity curve points must be strictly increasing by price".into(),
                 ));
             }
             previous_price = Some(point.price);
@@ -401,6 +443,457 @@ impl HiddenMakerCurve {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiquidityPositionBacking {
+    PrivateReserve,
+    ProtocolReserve,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiquidityPositionStatus {
+    Opening,
+    Active,
+    Closing,
+    Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiquidityPositionTransitionKind {
+    Open,
+    Update,
+    Close,
+    Reconfigure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiquidityPositionCurveKind {
+    StaticRange,
+    OraclePegged,
+    InventorySkewed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionCurvePolicy {
+    pub kind: LiquidityPositionCurveKind,
+    #[serde(with = "serde_u64_decimal")]
+    pub band_count: u64,
+    #[serde(with = "serde_u128_decimal")]
+    pub spread_bps: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub target_base_ratio_bps: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub inventory_skew_bps: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub max_price_deviation_bps: u128,
+}
+
+impl LiquidityPositionCurvePolicy {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.band_count < MIN_LIQUIDITY_CURVE_POINTS as u64
+            || self.band_count > MAX_LIQUIDITY_CURVE_POINTS as u64
+        {
+            return Err(ProtocolError::InvalidOrder(format!(
+                "liquidity position band count must be between {MIN_LIQUIDITY_CURVE_POINTS} and {MAX_LIQUIDITY_CURVE_POINTS}"
+            )));
+        }
+        if self.spread_bps > BPS_DENOMINATOR
+            || self.target_base_ratio_bps > BPS_DENOMINATOR
+            || self.inventory_skew_bps > BPS_DENOMINATOR
+            || self.max_price_deviation_bps > BPS_DENOMINATOR
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position bps values must be at most 10000".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionOracleGuard {
+    pub oracle_id: String,
+    #[serde(with = "serde_u128_decimal")]
+    pub max_staleness_ms: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub max_divergence_bps: u128,
+}
+
+impl LiquidityPositionOracleGuard {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.oracle_id.trim().is_empty() {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position oracle id is required".into(),
+            ));
+        }
+        if self.max_staleness_ms == 0 {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position oracle max staleness must be positive".into(),
+            ));
+        }
+        if self.max_divergence_bps > BPS_DENOMINATOR {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position oracle divergence must be at most 10000 bps".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionRotationPolicy {
+    #[serde(with = "serde_u128_decimal")]
+    pub max_price_rotation_bps: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub max_depth_rotation_bps: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub skip_epoch_bps: u128,
+}
+
+impl LiquidityPositionRotationPolicy {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.max_price_rotation_bps > MAX_LIQUIDITY_POSITION_ROTATION_BPS
+            || self.max_depth_rotation_bps > MAX_LIQUIDITY_POSITION_ROTATION_BPS
+            || self.skip_epoch_bps > BPS_DENOMINATOR
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position rotation policy is out of bounds".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateLiquidityPosition {
+    pub version: u32,
+    pub position_id: String,
+    pub backing: LiquidityPositionBacking,
+    pub status: LiquidityPositionStatus,
+    pub pair_id: PairId,
+    pub base_asset_id: AssetId,
+    pub quote_asset_id: AssetId,
+    pub owner_authority: String,
+    #[serde(with = "serde_u128_decimal")]
+    pub base_reserve: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub quote_reserve: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub price_lower_bound: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub price_upper_bound: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub max_fill_base_per_batch: u128,
+    pub curve_policy: LiquidityPositionCurvePolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_guard: Option<LiquidityPositionOracleGuard>,
+    pub rotation_policy: LiquidityPositionRotationPolicy,
+    #[serde(with = "serde_u64_decimal")]
+    pub opened_epoch: u64,
+    #[serde(with = "serde_u64_decimal")]
+    pub expiry_epoch: u64,
+    pub blinding: String,
+    pub metadata_commitment: String,
+}
+
+impl fmt::Debug for PrivateLiquidityPosition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateLiquidityPosition")
+            .field("version", &self.version)
+            .field("position_id", &"<redacted>")
+            .field("backing", &self.backing)
+            .field("status", &self.status)
+            .field("pair_id", &self.pair_id)
+            .field("base_asset_id", &self.base_asset_id)
+            .field("quote_asset_id", &self.quote_asset_id)
+            .field("owner_authority", &"<redacted>")
+            .field("base_reserve", &"<redacted>")
+            .field("quote_reserve", &"<redacted>")
+            .field("price_lower_bound", &"<redacted>")
+            .field("price_upper_bound", &"<redacted>")
+            .field("max_fill_base_per_batch", &"<redacted>")
+            .field("curve_policy", &self.curve_policy)
+            .field("oracle_guard", &self.oracle_guard)
+            .field("rotation_policy", &self.rotation_policy)
+            .field("opened_epoch", &self.opened_epoch)
+            .field("expiry_epoch", &self.expiry_epoch)
+            .field("blinding", &"<redacted>")
+            .field("metadata_commitment", &self.metadata_commitment)
+            .finish()
+    }
+}
+
+impl PrivateLiquidityPosition {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.version != LIQUIDITY_POSITION_VERSION {
+            return Err(ProtocolError::InvalidOrder(
+                "unsupported liquidity position version".into(),
+            ));
+        }
+        if normalize_felt_hex(&self.position_id)? == "0x0" {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position id must be non-zero".into(),
+            ));
+        }
+        if self.backing != LiquidityPositionBacking::PrivateReserve {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity positions must use private reserves".into(),
+            ));
+        }
+        if self.pair_id.0.trim().is_empty()
+            || self.base_asset_id.0.trim().is_empty()
+            || self.quote_asset_id.0.trim().is_empty()
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position pair and assets are required".into(),
+            ));
+        }
+        if self.base_reserve == 0 && self.quote_reserve == 0 {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position requires non-zero reserves".into(),
+            ));
+        }
+        if self.price_lower_bound == 0 || self.price_lower_bound >= self.price_upper_bound {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position price bounds are invalid".into(),
+            ));
+        }
+        if self.max_fill_base_per_batch == 0 {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position max fill must be positive".into(),
+            ));
+        }
+        if self.opened_epoch == 0 || self.expiry_epoch <= self.opened_epoch {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position epoch bounds are invalid".into(),
+            ));
+        }
+        self.curve_policy.validate()?;
+        self.rotation_policy.validate()?;
+        if let Some(oracle_guard) = &self.oracle_guard {
+            oracle_guard.validate()?;
+        }
+        felt_from_hex_str(&self.owner_authority)?;
+        felt_from_hex_str(&self.blinding)?;
+        felt_from_hex_str(&self.metadata_commitment)?;
+        Ok(())
+    }
+
+    pub fn commitment_field_elements(
+        &self,
+    ) -> Result<[Felt; LIQUIDITY_POSITION_FIELD_COUNT], ProtocolError> {
+        self.validate()?;
+        let backing = match self.backing {
+            LiquidityPositionBacking::PrivateReserve => field_from_u64(0),
+            LiquidityPositionBacking::ProtocolReserve => field_from_u64(1),
+        };
+        let status = match self.status {
+            LiquidityPositionStatus::Opening => field_from_u64(0),
+            LiquidityPositionStatus::Active => field_from_u64(1),
+            LiquidityPositionStatus::Closing => field_from_u64(2),
+            LiquidityPositionStatus::Closed => field_from_u64(3),
+        };
+        let curve_kind = match self.curve_policy.kind {
+            LiquidityPositionCurveKind::StaticRange => field_from_u64(0),
+            LiquidityPositionCurveKind::OraclePegged => field_from_u64(1),
+            LiquidityPositionCurveKind::InventorySkewed => field_from_u64(2),
+        };
+        let oracle_guard_commitment = match &self.oracle_guard {
+            Some(guard) => poseidon_chain_hex(
+                domain_felt("zylith/lp-oracle-guard-v1"),
+                &[
+                    felt_from_hex_str(&encode_starknet_felt("oracle-id", &guard.oracle_id))?,
+                    field_from_u128(guard.max_staleness_ms),
+                    field_from_u128(guard.max_divergence_bps),
+                ],
+            ),
+            None => "0x0".into(),
+        };
+        Ok([
+            field_from_u64(u64::from(self.version)),
+            felt_from_hex_str(&self.position_id)?,
+            backing,
+            status,
+            felt_from_hex_str(&encode_starknet_felt("pair-id", &self.pair_id.0))?,
+            felt_from_hex_str(&encode_starknet_felt("asset-id", &self.base_asset_id.0))?,
+            felt_from_hex_str(&encode_starknet_felt("asset-id", &self.quote_asset_id.0))?,
+            felt_from_hex_str(&self.owner_authority)?,
+            field_from_u128(self.base_reserve),
+            field_from_u128(self.quote_reserve),
+            field_from_u128(self.price_lower_bound),
+            field_from_u128(self.price_upper_bound),
+            field_from_u128(self.max_fill_base_per_batch),
+            curve_kind,
+            field_from_u64(self.curve_policy.band_count),
+            field_from_u128(self.curve_policy.spread_bps),
+            field_from_u128(self.curve_policy.target_base_ratio_bps),
+            field_from_u128(self.curve_policy.inventory_skew_bps),
+            field_from_u128(self.curve_policy.max_price_deviation_bps),
+            felt_from_hex_str(&oracle_guard_commitment)?,
+            field_from_u128(self.rotation_policy.max_price_rotation_bps),
+            field_from_u128(self.rotation_policy.max_depth_rotation_bps),
+            field_from_u128(self.rotation_policy.skip_epoch_bps),
+            field_from_u64(self.opened_epoch),
+            field_from_u64(self.expiry_epoch),
+            felt_from_hex_str(&self.blinding)?,
+            felt_from_hex_str(&self.metadata_commitment)?,
+        ])
+    }
+
+    pub fn commitment_fields(&self) -> Result<Vec<String>, ProtocolError> {
+        Ok(self
+            .commitment_field_elements()?
+            .iter()
+            .map(felt_hex)
+            .collect())
+    }
+
+    pub fn commitment(&self) -> Result<LiquidityPositionCommitment, ProtocolError> {
+        let fields = self.commitment_field_elements()?;
+        Ok(LiquidityPositionCommitment(poseidon_chain_hex(
+            domain_felt("zylith/private-liquidity-position-v1"),
+            &fields,
+        )))
+    }
+
+    pub fn apply_fill(
+        &self,
+        delta: &LiquidityPositionFillDelta,
+        next_blinding: &str,
+    ) -> Result<Self, ProtocolError> {
+        if self.status != LiquidityPositionStatus::Active {
+            return Err(ProtocolError::InvalidOrder(
+                "only an active liquidity position can be filled".into(),
+            ));
+        }
+        if delta.filled_base_amount == 0 || delta.filled_base_amount > self.max_fill_base_per_batch
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position fill is outside position bounds".into(),
+            ));
+        }
+        let mut next = self.clone();
+        match delta.position_side {
+            OrderSide::Buy => {
+                if delta.quote_amount > next.quote_reserve {
+                    return Err(ProtocolError::InvalidOrder(
+                        "liquidity position buy fill exceeds quote reserve".into(),
+                    ));
+                }
+                next.quote_reserve -= delta.quote_amount;
+                next.base_reserve = next
+                    .base_reserve
+                    .checked_add(delta.filled_base_amount)
+                    .ok_or_else(|| {
+                        ProtocolError::InvalidOrder(
+                            "liquidity position base reserve overflow".into(),
+                        )
+                    })?;
+            }
+            OrderSide::Sell => {
+                if delta.filled_base_amount > next.base_reserve {
+                    return Err(ProtocolError::InvalidOrder(
+                        "liquidity position sell fill exceeds base reserve".into(),
+                    ));
+                }
+                next.base_reserve -= delta.filled_base_amount;
+                next.quote_reserve = next
+                    .quote_reserve
+                    .checked_add(delta.quote_amount)
+                    .ok_or_else(|| {
+                        ProtocolError::InvalidOrder(
+                            "liquidity position quote reserve overflow".into(),
+                        )
+                    })?;
+            }
+        }
+        let normalized_next_blinding = normalize_felt_hex(next_blinding)?;
+        if normalized_next_blinding == "0x0"
+            || normalized_next_blinding == normalize_felt_hex(&self.blinding)?
+        {
+            return Err(ProtocolError::InvalidOrder(
+                "liquidity position updates require a fresh non-zero blinding".into(),
+            ));
+        }
+        next.blinding = normalized_next_blinding;
+        next.commitment()?;
+        Ok(next)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionFillDelta {
+    pub position_side: OrderSide,
+    #[serde(with = "serde_u128_decimal")]
+    pub filled_base_amount: u128,
+    #[serde(with = "serde_u128_decimal")]
+    pub quote_amount: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionRootTransition {
+    pub kind: LiquidityPositionTransitionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_position_commitment: Option<LiquidityPositionCommitment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_nullifier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_position_commitment: Option<LiquidityPositionCommitment>,
+}
+
+impl LiquidityPositionRootTransition {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let consumed = self
+            .consumed_position_commitment
+            .as_ref()
+            .map(|commitment| felt_from_hex_str(&commitment.0))
+            .transpose()?;
+        let nullifier = self
+            .position_nullifier
+            .as_ref()
+            .map(|value| felt_from_hex_str(value))
+            .transpose()?;
+        let output = self
+            .output_position_commitment
+            .as_ref()
+            .map(|commitment| felt_from_hex_str(&commitment.0))
+            .transpose()?;
+
+        match self.kind {
+            LiquidityPositionTransitionKind::Open => {
+                if consumed.is_some() || nullifier.is_some() || output.is_none() {
+                    return Err(ProtocolError::InvalidOrder(
+                        "open liquidity position transition must only output a position".into(),
+                    ));
+                }
+            }
+            LiquidityPositionTransitionKind::Update
+            | LiquidityPositionTransitionKind::Reconfigure => {
+                if consumed.is_none() || nullifier.is_none() || output.is_none() {
+                    return Err(ProtocolError::InvalidOrder(
+                        "update liquidity position transition must consume, nullify, and output a position".into(),
+                    ));
+                }
+            }
+            LiquidityPositionTransitionKind::Close => {
+                if consumed.is_none() || nullifier.is_none() || output.is_some() {
+                    return Err(ProtocolError::InvalidOrder(
+                        "close liquidity position transition must consume and nullify without outputting a position".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Note {
     pub asset_id: AssetId,
     #[serde(with = "serde_u128_decimal")]
@@ -412,6 +905,22 @@ pub struct Note {
     #[serde(with = "serde_u64_decimal")]
     pub nonce: u64,
     pub metadata_commitment: String,
+}
+
+impl fmt::Debug for Note {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Note")
+            .field("asset_id", &"<redacted>")
+            .field("amount", &"<redacted>")
+            .field("owner_public_key", &"<redacted>")
+            .field("spend_authority", &"<redacted>")
+            .field("withdraw_authority", &"<redacted>")
+            .field("blinding", &"<redacted>")
+            .field("nonce", &"<redacted>")
+            .field("metadata_commitment", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Note {
@@ -466,7 +975,10 @@ pub fn spend_authority_from_spend_auth_key_felt(
     spend_auth_key_felt: &str,
 ) -> Result<String, ProtocolError> {
     let spend_auth_key = felt_from_hex_str(spend_auth_key_felt)?;
-    Ok(crate::hash::felt_hex(&get_public_key(&spend_auth_key)))
+    Ok(poseidon_chain_hex(
+        felt_from_hex_str(SPEND_AUTHORITY_DOMAIN_HEX)?,
+        &[spend_auth_key],
+    ))
 }
 
 pub fn spend_authority_from_raw_key_hex(spend_auth_key_hex: &str) -> Result<String, ProtocolError> {
@@ -668,6 +1180,7 @@ pub fn withdraw_authority_from_raw_key_hex(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepositIntent {
     pub asset_id: AssetId,
     #[serde(with = "serde_u128_decimal")]
@@ -679,38 +1192,32 @@ pub struct DepositIntent {
     pub recipient_withdraw_authority: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderIntent {
     pub pair_id: PairId,
     pub batch_id: BatchId,
     pub side: OrderSide,
-    #[serde(default)]
     pub order_type: OrderType,
-    #[serde(default)]
     pub relay_mode: RelayMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maker_curve: Option<HiddenMakerCurve>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidity_curve: Option<LiquidityCurve>,
     #[serde(with = "serde_u128_decimal")]
     pub limit_price: u128,
     #[serde(with = "serde_u128_decimal")]
     pub amount: u128,
     #[serde(with = "serde_u128_decimal")]
     pub min_fill: u128,
-    #[serde(default)]
     pub time_in_force: TimeInForce,
     #[serde(with = "serde_u64_decimal")]
     pub expiry_epoch: u64,
     #[serde(with = "serde_u64_decimal")]
     pub order_nonce: u64,
-    #[serde(default = "zero_felt_string")]
     pub parent_order_commitment: String,
-    #[serde(default, with = "serde_u64_decimal")]
+    #[serde(with = "serde_u64_decimal")]
     pub parent_child_index: u64,
-    #[serde(default = "zero_felt_string")]
     pub parent_secret_commitment: String,
-    #[serde(default = "zero_felt_string")]
     pub parent_cancel_authority: String,
-    #[serde(default = "zero_felt_string")]
     pub parent_authorization_secret: String,
     pub funding_note_ref: NoteCommitment,
     pub funding_nullifier: Nullifier,
@@ -719,6 +1226,38 @@ pub struct OrderIntent {
     pub recipient_withdraw_authority: String,
     pub recipient_residual_withdraw_authority: String,
     pub auditor_view_allowed: bool,
+}
+
+impl fmt::Debug for OrderIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrderIntent")
+            .field("pair_id", &self.pair_id)
+            .field("batch_id", &self.batch_id)
+            .field("side", &self.side)
+            .field("order_type", &self.order_type)
+            .field("relay_mode", &self.relay_mode)
+            .field("liquidity_curve", &self.liquidity_curve.is_some())
+            .field("limit_price", &"<redacted>")
+            .field("amount", &"<redacted>")
+            .field("min_fill", &"<redacted>")
+            .field("time_in_force", &self.time_in_force)
+            .field("expiry_epoch", &self.expiry_epoch)
+            .field("order_nonce", &"<redacted>")
+            .field("parent_order_commitment", &self.parent_order_commitment)
+            .field("parent_child_index", &self.parent_child_index)
+            .field("parent_secret_commitment", &self.parent_secret_commitment)
+            .field("parent_cancel_authority", &self.parent_cancel_authority)
+            .field("parent_authorization_secret", &"<redacted>")
+            .field("funding_note_ref", &"<redacted>")
+            .field("funding_nullifier", &"<redacted>")
+            .field("recipient_owner_public_key", &"<redacted>")
+            .field("recipient_spend_authority", &"<redacted>")
+            .field("recipient_withdraw_authority", &"<redacted>")
+            .field("recipient_residual_withdraw_authority", &"<redacted>")
+            .field("auditor_view_allowed", &self.auditor_view_allowed)
+            .finish()
+    }
 }
 
 impl OrderIntent {
@@ -732,20 +1271,20 @@ impl OrderIntent {
         };
         let order_type = match self.order_type {
             OrderType::LimitBatch => field_from_u64(0),
-            OrderType::MakerCurve => field_from_u64(1),
+            OrderType::LiquidityCurve => field_from_u64(1),
             OrderType::HeartbeatCover => field_from_u64(2),
         };
         let relay_mode = match self.relay_mode {
             RelayMode::SelfRelay => field_from_u64(0),
             RelayMode::ZylithRelay => field_from_u64(1),
         };
-        let maker_curve_commitment = match self.order_type {
-            OrderType::MakerCurve => {
+        let liquidity_curve_commitment = match self.order_type {
+            OrderType::LiquidityCurve => {
                 let commitment = self
-                    .maker_curve
+                    .liquidity_curve
                     .as_ref()
                     .ok_or_else(|| {
-                        ProtocolError::InvalidOrder("maker curve order missing curve".into())
+                        ProtocolError::InvalidOrder("liquidity curve order missing curve".into())
                     })?
                     .commitment()?;
                 felt_from_hex_str(&commitment)?
@@ -786,7 +1325,7 @@ impl OrderIntent {
                 side,
                 order_type,
                 relay_mode,
-                maker_curve_commitment,
+                liquidity_curve_commitment,
                 limit_price,
                 amount,
                 min_fill,
@@ -875,9 +1414,9 @@ impl OrderIntent {
         match self.relay_mode {
             RelayMode::SelfRelay => Ok(()),
             RelayMode::ZylithRelay => {
-                if !matches!(self.order_type, OrderType::MakerCurve) {
+                if !matches!(self.order_type, OrderType::LimitBatch) {
                     return Err(ProtocolError::InvalidOrder(
-                        "Zylith relay mode requires a maker curve order".into(),
+                        "Zylith relay mode requires a renewal-backed limit order".into(),
                     ));
                 }
                 if !self.is_renewal_backed_child()? {
@@ -891,201 +1430,103 @@ impl OrderIntent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivateOrderPayload {
     pub order: OrderIntent,
     pub funding_note: Note,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_notes: Vec<Note>,
     pub funding_authorization: SpendAuthorization,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_maker_authorization: Option<ManagedMakerAuthorization>,
+}
+
+impl fmt::Debug for PrivateOrderPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let funding_notes = format!("<{} redacted>", self.effective_funding_notes().len());
+        formatter
+            .debug_struct("PrivateOrderPayload")
+            .field("pair_id", &self.order.pair_id)
+            .field("batch_id", &self.order.batch_id)
+            .field("side", &self.order.side)
+            .field("order_type", &self.order.order_type)
+            .field("relay_mode", &self.order.relay_mode)
+            .field("funding_note", &"<redacted>")
+            .field("funding_notes", &funding_notes)
+            .field("funding_authorization", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PrivateOrderPayload {
     pub fn effective_funding_notes(&self) -> Vec<&Note> {
-        if self.funding_notes.is_empty() {
-            vec![&self.funding_note]
-        } else {
-            self.funding_notes.iter().collect()
-        }
+        self.funding_notes.iter().collect()
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpendAuthorization {
     pub signature_r: String,
     pub signature_s: String,
 }
 
-pub const MANAGED_MAKER_POLICY_VERSION: u32 = 1;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedMakerPolicy {
-    pub version: u32,
-    pub delegate_public_key: String,
-    pub pair_id: PairId,
-    pub allow_buy: bool,
-    pub allow_sell: bool,
-    #[serde(with = "serde_u128_decimal")]
-    pub max_epoch_base: u128,
-    #[serde(with = "serde_u128_decimal")]
-    pub min_price: u128,
-    #[serde(with = "serde_u128_decimal")]
-    pub max_price: u128,
-    #[serde(with = "serde_u64_decimal")]
-    pub valid_from_epoch: u64,
-    #[serde(with = "serde_u64_decimal")]
-    pub valid_until_epoch: u64,
-    pub relay_mode: RelayMode,
-    pub parent_order_commitment: String,
-    pub recipient_owner_public_key: String,
-    pub recipient_spend_authority: String,
-    pub recipient_withdraw_authority: String,
-    pub recipient_residual_withdraw_authority: String,
-    pub auditor_view_allowed: bool,
-    #[serde(with = "serde_u64_decimal")]
-    pub policy_nonce: u64,
-}
-
-impl ManagedMakerPolicy {
-    pub fn commitment(&self) -> Result<String, ProtocolError> {
-        let pair_id = felt_from_hex_str(&encode_starknet_felt("pair-id", &self.pair_id.0))?;
-        let relay_mode = match self.relay_mode {
-            RelayMode::SelfRelay => field_from_u64(0),
-            RelayMode::ZylithRelay => field_from_u64(1),
-        };
-        let fields = [
-            field_from_u64(u64::from(self.version)),
-            felt_from_hex_str(&self.delegate_public_key)?,
-            pair_id,
-            field_from_u64(u64::from(self.allow_buy)),
-            field_from_u64(u64::from(self.allow_sell)),
-            field_from_u128(self.max_epoch_base),
-            field_from_u128(self.min_price),
-            field_from_u128(self.max_price),
-            field_from_u64(self.valid_from_epoch),
-            field_from_u64(self.valid_until_epoch),
-            relay_mode,
-            felt_from_hex_str(&self.parent_order_commitment)?,
-            felt_from_hex_str(&encode_starknet_felt(
-                "owner-public-key",
-                &self.recipient_owner_public_key,
-            ))?,
-            felt_from_hex_str(&self.recipient_spend_authority)?,
-            felt_from_hex_str(&self.recipient_withdraw_authority)?,
-            felt_from_hex_str(&self.recipient_residual_withdraw_authority)?,
-            field_from_u64(u64::from(self.auditor_view_allowed)),
-            field_from_u64(self.policy_nonce),
-        ];
-        Ok(poseidon_chain_hex(
-            domain_felt("zylith/managed-maker-policy-v1"),
-            &fields,
-        ))
-    }
-
-    pub fn validate_order(&self, order: &OrderIntent) -> Result<(), ProtocolError> {
-        if self.version != MANAGED_MAKER_POLICY_VERSION {
-            return Err(ProtocolError::InvalidOrder(
-                "unsupported managed maker policy version".into(),
-            ));
-        }
-        if felt_from_hex_str(&self.delegate_public_key)? == field_from_u64(0)
-            || self.policy_nonce == 0
-            || self.max_epoch_base == 0
-            || self.min_price == 0
-            || self.max_price < self.min_price
-            || self.valid_from_epoch == 0
-            || self.valid_until_epoch < self.valid_from_epoch
-        {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker policy bounds are invalid".into(),
-            ));
-        }
-        if order.order_type != OrderType::MakerCurve {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker delegation only authorizes maker curves".into(),
-            ));
-        }
-        if order.time_in_force != TimeInForce::CurrentBatchOnly {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker delegation requires current-batch orders".into(),
-            ));
-        }
-        if order.pair_id != self.pair_id {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker pair is not authorized".into(),
-            ));
-        }
-        if (order.side == OrderSide::Buy && !self.allow_buy)
-            || (order.side == OrderSide::Sell && !self.allow_sell)
-        {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker side is not authorized".into(),
-            ));
-        }
-        if order.amount == 0 || order.amount > self.max_epoch_base {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker order exceeds the authorized epoch size".into(),
-            ));
-        }
-        if order.expiry_epoch < self.valid_from_epoch || order.expiry_epoch > self.valid_until_epoch
-        {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker order is outside the authorized epoch range".into(),
-            ));
-        }
-        if order.relay_mode != self.relay_mode {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker relay mode is not authorized".into(),
-            ));
-        }
-        if felt_from_hex_str(&order.parent_order_commitment)?
-            != felt_from_hex_str(&self.parent_order_commitment)?
-        {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker renewal parent is not authorized".into(),
-            ));
-        }
-        if order.recipient_owner_public_key != self.recipient_owner_public_key
-            || order.recipient_spend_authority != self.recipient_spend_authority
-            || order.recipient_withdraw_authority != self.recipient_withdraw_authority
-            || order.recipient_residual_withdraw_authority
-                != self.recipient_residual_withdraw_authority
-            || order.auditor_view_allowed != self.auditor_view_allowed
-        {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker output authority is not authorized".into(),
-            ));
-        }
-        if order.limit_price < self.min_price || order.limit_price > self.max_price {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker limit price is outside the authorized range".into(),
-            ));
-        }
-        let curve = order.maker_curve.as_ref().ok_or_else(|| {
-            ProtocolError::InvalidOrder("managed maker order is missing its curve".into())
-        })?;
-        if curve
-            .points
-            .iter()
-            .any(|point| point.price < self.min_price || point.price > self.max_price)
-        {
-            return Err(ProtocolError::InvalidOrder(
-                "managed maker curve price is outside the authorized range".into(),
-            ));
-        }
-        Ok(())
+impl fmt::Debug for SpendAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpendAuthorization")
+            .field("signature_r", &"<redacted>")
+            .field("signature_s", &"<redacted>")
+            .finish()
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManagedMakerAuthorization {
-    pub policy: ManagedMakerPolicy,
-    pub owner_authorization: SpendAuthorization,
+pub fn spend_authorization_tag(
+    authorization_secret: &str,
+    message: &str,
+) -> Result<String, ProtocolError> {
+    let authorization_secret = felt_from_hex_str(&normalize_felt_hex(authorization_secret)?)?;
+    let message = felt_from_hex_str(&normalize_felt_hex(message)?)?;
+    if authorization_secret == field_from_u64(0) {
+        return Err(ProtocolError::Crypto(
+            "spend authorization secret cannot be zero".into(),
+        ));
+    }
+    Ok(poseidon_chain_hex(
+        felt_from_hex_str(SPEND_AUTHORIZATION_TAG_DOMAIN_HEX)?,
+        &[message, authorization_secret],
+    ))
+}
+
+pub fn build_spend_authorization(
+    authorization_secret: &str,
+    message: &str,
+) -> Result<SpendAuthorization, ProtocolError> {
+    let authorization_secret = normalize_felt_hex(authorization_secret)?;
+    let tag = spend_authorization_tag(&authorization_secret, message)?;
+    Ok(SpendAuthorization {
+        signature_r: authorization_secret,
+        signature_s: tag,
+    })
+}
+
+pub fn verify_spend_authorization(
+    spend_authority: &str,
+    message: &str,
+    authorization: &SpendAuthorization,
+) -> Result<bool, ProtocolError> {
+    let authorization_secret = normalize_felt_hex(&authorization.signature_r)?;
+    let tag = normalize_felt_hex(&authorization.signature_s)?;
+    if authorization_secret == "0x0" || tag == "0x0" {
+        return Ok(false);
+    }
+    let expected_authority = spend_authority_from_spend_auth_key_felt(&authorization_secret)?;
+    if normalize_felt_hex(spend_authority)? != expected_authority {
+        return Ok(false);
+    }
+    Ok(spend_authorization_tag(&authorization_secret, message)? == tag)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputRecoveryRecord {
     pub key_tag: String,
     pub ciphertext_fields: Vec<String>,
@@ -1093,24 +1534,41 @@ pub struct OutputRecoveryRecord {
     pub commitment: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedBlob {
     pub algorithm: String,
     pub key_id: String,
     pub ephemeral_public_key: String,
     pub nonce: String,
     pub ciphertext: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<OutputRecoveryRecord>,
 }
 
+impl fmt::Debug for EncryptedBlob {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptedBlob")
+            .field("algorithm", &self.algorithm)
+            .field("key_id", &self.key_id)
+            .field("ephemeral_public_key", &self.ephemeral_public_key)
+            .field("nonce", &"<redacted>")
+            .field("ciphertext", &"<redacted>")
+            .field("recovery", &self.recovery.is_some())
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderShare {
     pub execution_key_id: String,
     pub encrypted_share: EncryptedBlob,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderIngressReceipt {
     pub version: u32,
     pub ingress_id: String,
@@ -1118,12 +1576,28 @@ pub struct OrderIngressReceipt {
     pub pair_id: PairId,
     pub batch_id: BatchId,
     pub epoch_id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_mode: Option<RelayMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub renewal_package_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub renewal_package_commitment: Option<String>,
+    pub payload_commitment: String,
+    pub issued_at_unix_ms: u64,
+    pub signer: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionIngressReceipt {
+    pub version: u32,
+    pub ingress_id: String,
+    pub lifecycle_id: String,
+    pub pair_id: PairId,
+    pub batch_id: BatchId,
+    pub epoch_id: u64,
+    pub transition_commitment: String,
     pub payload_commitment: String,
     pub issued_at_unix_ms: u64,
     pub signer: String,
@@ -1138,6 +1612,7 @@ pub struct OrderIngressReceiptAttestation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderShareBundle {
     pub order_commitment: OrderCommitment,
     pub cancellation_auth_tag: String,
@@ -1145,54 +1620,98 @@ pub struct OrderShareBundle {
     pub batch_id: BatchId,
     pub epoch_id: u64,
     pub transport_envelope: Option<EncryptedBlob>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ingress_receipt: Option<OrderIngressReceipt>,
-    #[serde(default)]
     pub shares: Vec<OrderShare>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderSubmission {
     pub order_bundle: OrderShareBundle,
 }
 
-fn zero_felt_string() -> String {
-    "0x0".into()
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionLifecycleSubmission {
+    pub lifecycle_id: String,
+    pub pair_id: PairId,
+    pub batch_id: BatchId,
+    pub epoch_id: u64,
+    pub transition_commitment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_receipt: Option<LiquidityPositionIngressReceipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedLiquidityPositionIngressRequest {
+    pub pair_id: PairId,
+    pub batch_id: BatchId,
+    pub epoch_id: u64,
+    pub transition_witness: crate::liquidity::LiquidityPositionTransitionWitness,
+    pub ingress_telemetry: OrderIngressClientTelemetry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedLiquidityPositionIngressResponse {
+    pub receipt: LiquidityPositionIngressReceipt,
+    pub coordinator_submission: LiquidityPositionLifecycleSubmission,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityPositionLifecycleAccepted {
+    pub batch_id: BatchId,
+    pub lifecycle_id: String,
+    pub transition_commitment: String,
+    pub accepted_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderIngressClientTelemetry {
     pub version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_build_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_submission_delay_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_elapsed_before_private_ingress_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub private_ingress_roundtrip_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub client_elapsed_before_coordinator_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_time_remaining_before_private_ingress_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_time_remaining_before_coordinator_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub submission_safety_buffer_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedOrderIngressRequest {
     pub order_submission: OrderSubmission,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub renewal_package_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub renewal_package_commitment: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub renewal_relay_mode: Option<RelayMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingress_telemetry: Option<OrderIngressClientTelemetry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_slot_order_commitment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_slot_pair: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_slot_batch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_slot_epoch_id: Option<u64>,
+    pub ingress_telemetry: OrderIngressClientTelemetry,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<String>,
 }
 
@@ -1200,7 +1719,7 @@ pub struct TrustedOrderIngressRequest {
 pub struct TrustedOrderIngressResponse {
     pub receipt: OrderIngressReceipt,
     pub coordinator_submission: OrderSubmission,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<String>,
 }
 
@@ -1211,11 +1730,23 @@ pub struct OrderSubmissionAccepted {
     pub accepted_at_unix_ms: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderCancellationRequest {
     pub batch_id: BatchId,
     pub order_commitment: OrderCommitment,
     pub cancellation_secret: String,
+}
+
+impl fmt::Debug for OrderCancellationRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OrderCancellationRequest")
+            .field("batch_id", &self.batch_id)
+            .field("order_commitment", &self.order_commitment)
+            .field("cancellation_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1231,11 +1762,28 @@ pub struct PrivateExecutionKeyPublicConfig {
     pub public_key: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateExecutionKeyPrivateConfig {
     pub key_id: String,
     pub private_key: String,
     pub public_key: String,
+}
+
+impl fmt::Debug for PrivateExecutionKeyPrivateConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivateExecutionKeyPrivateConfig")
+            .field("key_id", &self.key_id)
+            .field("private_key", &"<redacted>")
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
+impl Drop for PrivateExecutionKeyPrivateConfig {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1243,7 +1791,7 @@ pub struct PrivateExecutionKeyRegistry {
     pub keys: Vec<PrivateExecutionKeyPublicConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecryptedOrderShare {
     pub key_id: String,
     pub order_commitment: OrderCommitment,
@@ -1251,6 +1799,26 @@ pub struct DecryptedOrderShare {
     pub share_count: u64,
     pub plaintext_len: u64,
     pub share_hex: String,
+}
+
+impl fmt::Debug for DecryptedOrderShare {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecryptedOrderShare")
+            .field("key_id", &self.key_id)
+            .field("order_commitment", &self.order_commitment)
+            .field("share_index", &self.share_index)
+            .field("share_count", &self.share_count)
+            .field("plaintext_len", &self.plaintext_len)
+            .field("share_hex", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for DecryptedOrderShare {
+    fn drop(&mut self) {
+        self.share_hex.zeroize();
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1263,6 +1831,12 @@ pub struct BatchShareContributions {
 pub struct SubmittedOrderRecord {
     pub received_at_unix_ms: u64,
     pub order_bundle: OrderShareBundle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedLiquidityPositionLifecycleRecord {
+    pub received_at_unix_ms: u64,
+    pub submission: LiquidityPositionLifecycleSubmission,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1311,6 +1885,8 @@ pub struct PublicBatchSummary {
 pub struct BatchOrderSet {
     pub batch: BatchSummary,
     pub orders: Vec<SubmittedOrderRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub liquidity_position_lifecycle_submissions: Vec<SubmittedLiquidityPositionLifecycleRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1321,18 +1897,17 @@ pub struct MatchedOrder {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderExecutionReport {
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub order_commitment: OrderCommitment,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub order_report_auth_tag: Option<String>,
     pub funding_note_commitment: NoteCommitment,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_note_commitments: Vec<NoteCommitment>,
     pub status: String,
     pub side: OrderSide,
-    #[serde(default)]
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
     #[serde(with = "serde_u128_decimal")]
@@ -1362,27 +1937,23 @@ pub struct OrderExecutionReport {
     pub residual_amount: u128,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatchedOrderWitness {
     pub order_commitment: OrderCommitment,
     pub funding_note: Note,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_notes: Vec<Note>,
     pub funding_note_ref: NoteCommitment,
     pub funding_nullifier: Nullifier,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_nullifiers: Vec<Nullifier>,
     pub funding_authorization: SpendAuthorization,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_maker_authorization: Option<ManagedMakerAuthorization>,
     pub side: OrderSide,
     pub order_type: OrderType,
-    #[serde(default)]
     pub relay_mode: RelayMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maker_curve: Option<HiddenMakerCurve>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maker_band_attribution: Option<MakerBandAttribution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidity_curve: Option<LiquidityCurve>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidity_provider_band_attribution: Option<LiquidityBandAttribution>,
     #[serde(with = "serde_u128_decimal")]
     pub limit_price: u128,
     #[serde(with = "serde_u128_decimal")]
@@ -1392,15 +1963,10 @@ pub struct MatchedOrderWitness {
     pub time_in_force: TimeInForce,
     pub expiry_epoch: u64,
     pub order_nonce: u64,
-    #[serde(default = "zero_felt_string")]
     pub parent_order_commitment: String,
-    #[serde(default)]
     pub parent_child_index: u64,
-    #[serde(default = "zero_felt_string")]
     pub parent_secret_commitment: String,
-    #[serde(default = "zero_felt_string")]
     pub parent_cancel_authority: String,
-    #[serde(default = "zero_felt_string")]
     pub parent_authorization_secret: String,
     pub auditor_view_allowed: bool,
     pub recipient_owner_public_key: String,
@@ -1413,43 +1979,64 @@ pub struct MatchedOrderWitness {
     pub residual_note: Option<Note>,
 }
 
-impl MatchedOrderWitness {
-    pub fn effective_funding_notes(&self) -> Vec<&Note> {
-        if self.funding_notes.is_empty() {
-            vec![&self.funding_note]
-        } else {
-            self.funding_notes.iter().collect()
-        }
-    }
-
-    pub fn effective_funding_nullifiers(&self) -> Vec<&Nullifier> {
-        if self.funding_nullifiers.is_empty() {
-            vec![&self.funding_nullifier]
-        } else {
-            self.funding_nullifiers.iter().collect()
-        }
+impl fmt::Debug for MatchedOrderWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let funding_notes = format!("<{} redacted>", self.effective_funding_notes().len());
+        formatter
+            .debug_struct("MatchedOrderWitness")
+            .field("order_commitment", &self.order_commitment)
+            .field("side", &self.side)
+            .field("order_type", &self.order_type)
+            .field("relay_mode", &self.relay_mode)
+            .field("order_amount", &self.order_amount)
+            .field("filled_amount", &self.filled_amount)
+            .field("funding_notes", &funding_notes)
+            .field("funding_authorization", &"<redacted>")
+            .field("output_note", &"<redacted>")
+            .field("residual_note", &self.residual_note.is_some())
+            .finish()
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl MatchedOrderWitness {
+    pub fn effective_funding_notes(&self) -> Vec<&Note> {
+        self.funding_notes.iter().collect()
+    }
+
+    pub fn effective_funding_nullifiers(&self) -> Vec<&Nullifier> {
+        self.funding_nullifiers.iter().collect()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuctionOrderWitness {
     pub order_commitment: OrderCommitment,
     pub order: OrderIntent,
     pub funding_note: Note,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub funding_notes: Vec<Note>,
     pub funding_authorization: SpendAuthorization,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub managed_maker_authorization: Option<ManagedMakerAuthorization>,
+}
+
+impl fmt::Debug for AuctionOrderWitness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let funding_notes = format!("<{} redacted>", self.effective_funding_notes().len());
+        formatter
+            .debug_struct("AuctionOrderWitness")
+            .field("order_commitment", &self.order_commitment)
+            .field("pair_id", &self.order.pair_id)
+            .field("batch_id", &self.order.batch_id)
+            .field("side", &self.order.side)
+            .field("order_type", &self.order.order_type)
+            .field("funding_notes", &funding_notes)
+            .field("funding_authorization", &"<redacted>")
+            .finish()
+    }
 }
 
 impl AuctionOrderWitness {
     pub fn effective_funding_notes(&self) -> Vec<&Note> {
-        if self.funding_notes.is_empty() {
-            vec![&self.funding_note]
-        } else {
-            self.funding_notes.iter().collect()
-        }
+        self.funding_notes.iter().collect()
     }
 }
 
@@ -1482,7 +2069,7 @@ pub struct OutputNoteRecord {
     pub withdraw_authority: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnedOutputNotePayload {
     pub version: u32,
     pub batch_id: BatchId,
@@ -1492,16 +2079,29 @@ pub struct OwnedOutputNotePayload {
     pub output_proof: OutputNoteMerkleProof,
 }
 
+impl fmt::Debug for OwnedOutputNotePayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedOutputNotePayload")
+            .field("version", &self.version)
+            .field("batch_id", &self.batch_id)
+            .field("output_index", &self.output_index)
+            .field("note", &"<redacted>")
+            .field("output_note", &self.output_note)
+            .field("output_proof", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputCiphertextBundle {
     pub batch_id: BatchId,
     pub bundle_commitment: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ciphertext_envelope_commitment: Option<String>,
     pub data_availability_ref: String,
-    #[serde(default)]
     pub ciphertext_count_bucket: String,
-    #[serde(default)]
     pub padded_ciphertext_count: u64,
     pub ciphertexts: Vec<EncryptedBlob>,
 }
@@ -1671,49 +2271,40 @@ fn random_field_hex() -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettlementTranscript {
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub batch_epoch: u64,
     pub order_commitment_root: String,
     pub encrypted_order_set_commitment: String,
-    #[serde(default = "zero_felt_string")]
     pub prior_note_root: String,
-    #[serde(default = "zero_felt_string")]
     pub prior_nullifier_root: String,
-    #[serde(default = "zero_felt_string")]
     pub prior_renewal_root: String,
-    #[serde(default = "zero_felt_string")]
     pub prior_fee_root: String,
-    #[serde(default = "zero_felt_string")]
+    #[serde(default = "zero_root_hex")]
+    pub prior_liquidity_position_root: String,
     pub new_nullifier_root: String,
-    #[serde(default = "zero_felt_string")]
     pub new_renewal_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub new_liquidity_position_root: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
-    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    #[serde(with = "serde_u128_decimal")]
     pub price_base_scale: u128,
-    #[serde(default = "default_speculative_taker_fee_bps")]
     pub taker_fee_bps: u16,
-    #[serde(default)]
-    pub maker_fee_bps: u16,
-    #[serde(default)]
     pub relay_fee_bps: u16,
-    #[serde(default = "default_protocol_fee_recipient")]
     pub protocol_fee_recipient: String,
-    #[serde(default = "default_relay_fee_recipient")]
     pub relay_fee_recipient: String,
     pub matched_orders: Vec<MatchedOrder>,
     pub consumed_inputs: Vec<ConsumedInput>,
-    #[serde(default)]
     pub renewal_child_uses: Vec<RenewalChildUse>,
+    #[serde(default)]
+    pub liquidity_position_transitions: Vec<LiquidityPositionRootTransition>,
     pub fees: Vec<FeeEntry>,
     pub output_notes: Vec<OutputNoteRecord>,
-    #[serde(default)]
     pub output_note_preimages: Vec<Note>,
-    #[serde(default)]
     pub output_recovery_records: Vec<OutputRecoveryRecord>,
-    #[serde(default)]
     pub output_recovery_dummy_commitments: Vec<String>,
     pub output_ciphertext_bundle_ref: String,
 }
@@ -1724,15 +2315,21 @@ pub struct RootOnlySettlementCommitments {
     pub prior_nullifier_root: String,
     pub prior_renewal_root: String,
     pub prior_fee_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub prior_liquidity_position_root: String,
     pub consumed_note_root: String,
     pub consumed_nullifier_root: String,
     pub renewal_child_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub liquidity_position_transition_root: String,
     pub output_note_root: String,
     pub fee_root: String,
     pub new_note_root: String,
     pub new_nullifier_root: String,
     pub new_renewal_root: String,
     pub new_fee_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub new_liquidity_position_root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1743,37 +2340,32 @@ pub enum NoteMembershipKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoteMembershipWitness {
     pub kind: NoteMembershipKind,
     pub prefix_root: String,
     pub batch_root: String,
-    #[serde(default)]
     pub merkle_path: Vec<String>,
-    #[serde(default)]
     pub merkle_directions: Vec<String>,
-    #[serde(default)]
     pub suffix_batch_roots: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NullifierHistoryBatch {
-    #[serde(default = "one_u64")]
     pub repeat_count: u64,
     pub nullifiers: Vec<Nullifier>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenewalStateHistoryBatch {
-    #[serde(default = "one_u64")]
     pub repeat_count: u64,
     pub entries: Vec<String>,
 }
 
-fn one_u64() -> u64 {
-    1
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NullifierSparseUpdateWitness {
     pub key_low: String,
     pub key_high: String,
@@ -1937,41 +2529,52 @@ fn validate_output_ciphertext_bundle_shape(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishedBatchArtifacts {
     pub transcript: SettlementTranscript,
     pub output_bundle: OutputCiphertextBundle,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maker_attribution_bundle: Option<MakerAttributionBundle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liquidity_provider_attribution_bundle: Option<LiquidityAttributionBundle>,
     pub settlement_witness: SettlementWitness,
-    #[serde(default)]
     pub published_at_unix_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_at_unix_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub settlement_transaction_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub settlement_contract_address: Option<String>,
-    #[serde(default)]
     pub order_execution_reports: Vec<OrderExecutionReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_shape: Option<TranscriptShapeMetadata>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivateSettlementReportQuery {
-    #[serde(default)]
     pub output_recovery_key_tags: Vec<String>,
-    #[serde(default)]
-    pub order_commitments: Vec<OrderCommitment>,
-    #[serde(default)]
     pub order_report_auths: Vec<OrderReportAuthRequest>,
+    pub liquidity_position_transition_commitments: Vec<String>,
+    #[serde(default)]
+    pub liquidity_provider_public_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderReportAuthRequest {
     pub order_commitment: OrderCommitment,
     pub order_report_auth_tag: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiquidityPositionLifecycleReport {
+    pub transition_commitment: String,
+    pub kind: LiquidityPositionTransitionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_position_commitment: Option<LiquidityPositionCommitment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_position_commitment: Option<LiquidityPositionCommitment>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1991,55 +2594,59 @@ pub struct PrivateSettlementReport {
     pub clearing_price: u128,
     #[serde(with = "serde_u128_decimal")]
     pub price_base_scale: u128,
-    pub matched_order_count: u64,
+    pub matched_order_count_bucket: String,
     pub output_recovery_records: Vec<PrivateSettlementOutputRecoveryRecord>,
     pub order_execution_reports: Vec<OrderExecutionReport>,
+    pub liquidity_position_lifecycle_reports: Vec<LiquidityPositionLifecycleReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub liquidity_provider_attribution_artifacts: Vec<EncryptedLiquidityAttributionArtifact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicSettlementTranscript {
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub batch_epoch: u64,
-    #[serde(default)]
     pub published_at_unix_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_at_unix_ms: Option<u64>,
     pub order_commitment_root: String,
     pub encrypted_order_set_commitment: String,
     pub transcript_commitment: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
-    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    #[serde(with = "serde_u128_decimal")]
     pub price_base_scale: u128,
-    #[serde(default = "default_speculative_taker_fee_bps")]
     pub taker_fee_bps: u16,
-    #[serde(default)]
-    pub maker_fee_bps: u16,
-    #[serde(default)]
     pub relay_fee_bps: u16,
-    #[serde(default = "default_protocol_fee_recipient")]
     pub protocol_fee_recipient: String,
-    #[serde(default = "default_relay_fee_recipient")]
     pub relay_fee_recipient: String,
     pub output_bundle_ref: String,
     pub prior_note_root: String,
     pub prior_nullifier_root: String,
     pub prior_renewal_root: String,
     pub prior_fee_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub prior_liquidity_position_root: String,
     pub consumed_note_root: String,
     pub consumed_nullifier_root: String,
     pub renewal_child_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub liquidity_position_transition_root: String,
     pub output_note_root: String,
     pub fee_root: String,
     pub new_note_root: String,
     pub new_nullifier_root: String,
     pub new_renewal_root: String,
     pub new_fee_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub new_liquidity_position_root: String,
     pub transcript_shape: TranscriptShapeMetadata,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettlementRootHistoryBatch {
     pub batch_id: BatchId,
     pub pair_id: PairId,
@@ -2048,29 +2655,39 @@ pub struct SettlementRootHistoryBatch {
     pub prior_nullifier_root: String,
     pub prior_renewal_root: String,
     pub prior_fee_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub prior_liquidity_position_root: String,
     pub output_note_root: String,
     pub consumed_nullifier_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub liquidity_position_transition_root: String,
     pub new_note_root: String,
     pub new_nullifier_root: String,
     pub new_renewal_root: String,
-    #[serde(default)]
+    #[serde(default = "zero_root_hex")]
+    pub new_liquidity_position_root: String,
     pub consumed_inputs: Vec<ConsumedInput>,
-    #[serde(default)]
     pub renewal_entries: Vec<String>,
     #[serde(default)]
+    pub liquidity_position_transitions: Vec<LiquidityPositionRootTransition>,
     pub output_notes: Vec<OutputNoteRecord>,
 }
 
+fn zero_root_hex() -> String {
+    "0x0".into()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenewalCancelMarkerRecord {
     pub cancel_marker: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_hash: Option<String>,
-    #[serde(default)]
     pub recorded_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenewalCancelMarkerList {
     pub records: Vec<RenewalCancelMarkerRecord>,
 }
@@ -2081,13 +2698,13 @@ pub struct SettlementRootHistoryArchive {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishedBatchArtifactSummary {
     pub batch_id: BatchId,
     pub pair_id: PairId,
     pub batch_epoch: u64,
-    #[serde(default)]
     pub published_at_unix_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_at_unix_ms: Option<u64>,
     pub transcript_commitment: String,
     pub output_bundle_ref: String,
@@ -2105,21 +2722,21 @@ pub struct PublishedBatchArtifactSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublishedBatchArtifactList {
     pub batches: Vec<PublishedBatchArtifactSummary>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub complete_through_epoch: Option<u64>,
 }
 
 pub const ARTIFACT_AGGREGATION_POLICY_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactAggregationPolicy {
     pub policy_version: u32,
     pub public_artifact_delay_epochs: u64,
-    #[serde(default)]
     pub public_artifact_delay_min_epochs: u64,
-    #[serde(default)]
     pub public_artifact_delay_max_epochs: u64,
     pub epoch_bucket_size: u64,
     pub aggregation_scope: String,
@@ -2187,9 +2804,7 @@ pub fn artifact_bundle_padded_count(count: usize) -> usize {
 pub struct CoordinatorStatus {
     pub service: String,
     pub current_batch_id: Option<BatchId>,
-    pub tracked_batches_bucket: String,
     pub batch_window_ms: u64,
-    pub batch_close_jitter_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2214,6 +2829,7 @@ pub struct BatchLiquidityReport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedBatchStatus {
     pub batch_id: BatchId,
     pub pair_id: PairId,
@@ -2229,7 +2845,6 @@ pub struct PreparedBatchStatus {
     pub matched_volume: u128,
     pub transcript_available: bool,
     pub liquidity: BatchLiquidityReport,
-    #[serde(default)]
     pub order_execution_reports: Vec<OrderExecutionReport>,
 }
 
@@ -2272,18 +2887,42 @@ pub struct ProofArtifactRecord {
     pub native_proof_file_path: Option<String>,
     pub native_proof_facts_file_path: Option<String>,
     pub native_execution_request_path: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_nullifier_proof_file_path: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_nullifier_proof_facts_file_path: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_nullifier_execution_request_path: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_renewal_proof_file_path: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_renewal_proof_facts_file_path: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_renewal_execution_request_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_liquidity_position_proof_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_liquidity_position_proof_facts_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_liquidity_position_execution_request_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_order_proof_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_order_proof_facts_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_order_execution_request_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_input_membership_proof_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_input_membership_proof_facts_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_input_membership_execution_request_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_output_recovery_proof_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_output_recovery_proof_facts_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_settlement_output_recovery_execution_request_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2307,13 +2946,13 @@ pub struct OnchainSubmissionRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettlementTimestampUpdate {
     pub settled_at_unix_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transaction_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub settlement_contract_address: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_note_root: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_commitment: Option<String>,
 }
 
@@ -2324,17 +2963,34 @@ pub struct StarknetCall {
     pub calldata: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenewalParentCancelPlanRequest {
     pub chain_id: String,
     pub auction_verifier_address: String,
     pub parent_secret_commitment: String,
     pub parent_cancel_authority: String,
     pub renewal_cancel_auth_key: String,
-    #[serde(default)]
     pub prior_renewal_entries: Vec<String>,
-    #[serde(default)]
     pub renewal_cancel_sparse_witness: Option<NullifierSparseUpdateWitness>,
+}
+
+impl fmt::Debug for RenewalParentCancelPlanRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RenewalParentCancelPlanRequest")
+            .field("chain_id", &self.chain_id)
+            .field("auction_verifier_address", &self.auction_verifier_address)
+            .field("parent_secret_commitment", &self.parent_secret_commitment)
+            .field("parent_cancel_authority", &self.parent_cancel_authority)
+            .field("renewal_cancel_auth_key", &"<redacted>")
+            .field("prior_renewal_entries", &self.prior_renewal_entries.len())
+            .field(
+                "renewal_cancel_sparse_witness",
+                &self.renewal_cancel_sparse_witness.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2386,22 +3042,7 @@ pub struct DepositActivationRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WithdrawalCallArguments {
-    pub note_commitment: String,
-    pub withdraw_authorization_r: String,
-    pub withdraw_authorization_s: String,
-    pub recipient: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WithdrawalSubmissionPlan {
-    pub funding_rail: FundingRailKind,
-    pub note_commitment: NoteCommitment,
-    pub starknet_call: StarknetCall,
-    pub encoded_args: WithdrawalCallArguments,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputNoteMerkleProof {
     pub merkle_path: Vec<String>,
     pub merkle_directions: Vec<String>,
@@ -2422,9 +3063,7 @@ pub struct SettlementOutputWithdrawalCallArguments {
     pub merkle_directions: Vec<String>,
     pub withdraw_authorization_r: String,
     pub withdraw_authorization_s: String,
-    pub recipient: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strk20_exit_commitment: Option<String>,
+    pub strk20_exit_commitment: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2461,63 +3100,46 @@ pub struct NoteConsolidationSubmissionPlan {
     pub encoded_args: NoteConsolidationCallArguments,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettlementOutputWithdrawalWitness {
     pub batch_id: BatchId,
     pub auction_verifier_address: String,
     pub shielded_asset_adapter_address: String,
     pub chain_id: String,
-    pub recipient: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strk20_exit_commitment: Option<String>,
+    pub strk20_exit_commitment: String,
     pub prior_nullifier_root: String,
     pub output_note: OutputNoteRecord,
     pub output_note_preimage: Note,
     pub output_proof: OutputNoteMerkleProof,
     pub withdraw_authorization: SpendAuthorization,
-    #[serde(default)]
     pub nullifier_history: Vec<NullifierHistoryBatch>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nullifier_sparse_witness: Option<NullifierSparseUpdateWitness>,
     pub new_nullifier_root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WithdrawalRecord {
-    pub withdrawal_id: u64,
-    pub asset_id: AssetId,
-    #[serde(with = "serde_u128_decimal")]
-    pub amount: u128,
-    pub recipient: String,
-    pub note_commitment: NoteCommitment,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepositSyncStatus {
     pub service: String,
-    pub rpc_configured: bool,
-    pub shielded_asset_adapter_configured: bool,
     pub cached_deposits_bucket: String,
     pub synced_deposit_count_bucket: String,
-    pub cached_withdrawals_bucket: String,
-    pub synced_withdrawal_count_bucket: String,
-    #[serde(default)]
     pub last_successful_sync_unix_ms: u64,
-    #[serde(default)]
     pub sync_lag_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepositConfirmationRequest {
     pub funding_commitments: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DepositConfirmationList {
     pub confirmed: Vec<DepositActivationRecord>,
-    #[serde(default)]
     pub last_successful_sync_unix_ms: u64,
-    #[serde(default)]
     pub sync_lag_ms: u64,
 }
 
@@ -2527,14 +3149,6 @@ pub struct DepositActivationRecordList {
     pub end: u64,
     pub count_bucket: String,
     pub records: Vec<DepositActivationRecord>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WithdrawalRecordList {
-    pub start: u64,
-    pub end: u64,
-    pub count_bucket: String,
-    pub records: Vec<WithdrawalRecord>,
 }
 
 pub const CLAIM_WINDOW_POLICY_VERSION: u32 = 1;
@@ -2742,7 +3356,6 @@ pub struct SettlementCallArguments {
     pub clearing_price: String,
     pub price_base_scale: String,
     pub taker_fee_bps: String,
-    pub maker_fee_bps: String,
     pub relay_fee_bps: String,
     pub protocol_fee_recipient: String,
     pub relay_fee_recipient: String,
@@ -2751,15 +3364,21 @@ pub struct SettlementCallArguments {
     pub prior_nullifier_root: String,
     pub prior_renewal_root: String,
     pub prior_fee_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub prior_liquidity_position_root: String,
     pub consumed_note_root: String,
     pub consumed_nullifier_root: String,
     pub renewal_child_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub liquidity_position_transition_root: String,
     pub output_note_root: String,
     pub fee_root: String,
     pub new_note_root: String,
     pub new_nullifier_root: String,
     pub new_renewal_root: String,
     pub new_fee_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub new_liquidity_position_root: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2771,7 +3390,8 @@ pub struct SettlementSubmissionPlan {
     pub encoded_args: SettlementCallArguments,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettlementWitness {
     pub batch_id: BatchId,
     pub pair_id: PairId,
@@ -2784,54 +3404,46 @@ pub struct SettlementWitness {
     pub prior_nullifier_root: String,
     pub prior_renewal_root: String,
     pub prior_fee_root: String,
-    #[serde(default = "zero_felt_string")]
+    #[serde(default = "zero_root_hex")]
+    pub prior_liquidity_position_root: String,
     pub new_nullifier_root: String,
-    #[serde(default = "zero_felt_string")]
     pub new_renewal_root: String,
+    #[serde(default = "zero_root_hex")]
+    pub new_liquidity_position_root: String,
     #[serde(with = "serde_u128_decimal")]
     pub clearing_price: u128,
-    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    #[serde(with = "serde_u128_decimal")]
     pub price_base_scale: u128,
-    #[serde(default = "default_speculative_taker_fee_bps")]
     pub taker_fee_bps: u16,
-    #[serde(default)]
-    pub maker_fee_bps: u16,
-    #[serde(default)]
     pub relay_fee_bps: u16,
-    #[serde(default = "default_protocol_fee_recipient")]
     pub protocol_fee_recipient: String,
-    #[serde(default = "default_relay_fee_recipient")]
     pub relay_fee_recipient: String,
     pub base_asset_id: AssetId,
     pub quote_asset_id: AssetId,
     pub matched_orders: Vec<MatchedOrder>,
     pub matched_order_witnesses: Vec<MatchedOrderWitness>,
     pub consumed_inputs: Vec<ConsumedInput>,
-    #[serde(default)]
     pub note_membership_witnesses: Vec<NoteMembershipWitness>,
-    #[serde(default)]
     pub nullifier_history: Vec<NullifierHistoryBatch>,
-    #[serde(default)]
     pub nullifier_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
-    #[serde(default)]
     pub renewal_history: Vec<RenewalStateHistoryBatch>,
-    #[serde(default)]
     pub renewal_child_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
-    #[serde(default)]
     pub renewal_cancel_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
     pub renewal_child_uses: Vec<RenewalChildUse>,
+    #[serde(default)]
+    pub liquidity_position_transitions: Vec<LiquidityPositionRootTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub liquidity_position_witnesses: Vec<crate::liquidity::LiquidityPositionTransitionWitness>,
     pub fees: Vec<FeeEntry>,
     pub output_notes: Vec<OutputNoteRecord>,
-    #[serde(default)]
     pub output_note_preimages: Vec<Note>,
-    #[serde(default)]
     pub output_recovery_records: Vec<OutputRecoveryRecord>,
-    #[serde(default)]
     pub output_recovery_dummy_commitments: Vec<String>,
     pub output_ciphertext_bundle_ref: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoteConsolidationWitness {
     pub consolidation_id: BatchId,
     pub auction_verifier_address: String,
@@ -2839,28 +3451,38 @@ pub struct NoteConsolidationWitness {
     pub prior_nullifier_root: String,
     pub input_notes: Vec<Note>,
     pub spend_authorization: SpendAuthorization,
-    #[serde(default)]
     pub note_membership_witnesses: Vec<NoteMembershipWitness>,
-    #[serde(default)]
     pub nullifier_history: Vec<NullifierHistoryBatch>,
-    #[serde(default)]
     pub nullifier_sparse_witnesses: Vec<NullifierSparseUpdateWitness>,
     pub output_notes: Vec<OutputNoteRecord>,
     pub output_note_preimages: Vec<Note>,
     pub output_recovery_records: Vec<OutputRecoveryRecord>,
-    #[serde(default)]
     pub output_recovery_dummy_commitments: Vec<String>,
     pub output_ciphertext_bundle_ref: String,
     pub new_nullifier_root: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletSnapshot {
     pub snapshot_id: String,
     pub latest_batch_id: Option<BatchId>,
     pub notes: Vec<Note>,
     pub spent_nullifiers: Vec<Nullifier>,
     pub tracked_orders: Vec<OrderCommitment>,
+}
+
+impl fmt::Debug for WalletSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let notes = format!("<{} redacted>", self.notes.len());
+        formatter
+            .debug_struct("WalletSnapshot")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("latest_batch_id", &self.latest_batch_id)
+            .field("notes", &notes)
+            .field("spent_nullifiers", &self.spent_nullifiers.len())
+            .field("tracked_orders", &self.tracked_orders.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2886,14 +3508,27 @@ pub enum RecoveryArtifactKind {
     WalletEvent,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedRecoveryPayload {
     pub algorithm: String,
     pub nonce: String,
     pub ciphertext: String,
 }
 
+impl fmt::Debug for EncryptedRecoveryPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncryptedRecoveryPayload")
+            .field("algorithm", &self.algorithm)
+            .field("nonce", &"<redacted>")
+            .field("ciphertext", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryArtifact {
     pub artifact_id: String,
     pub account_id: String,
@@ -2904,57 +3539,46 @@ pub struct RecoveryArtifact {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryArtifactUpload {
     pub artifact: RecoveryArtifact,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryArtifactList {
     pub account_id: String,
-    #[serde(default)]
     pub sequence_start: u64,
-    #[serde(default)]
     pub sequence_end: u64,
-    #[serde(default)]
     pub artifact_count_bucket: String,
     pub artifacts: Vec<RecoveryArtifact>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FundingRailKind {
-    #[default]
     StarknetPrivacy,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FundingRailCapabilities {
-    pub private_deposits: bool,
-    pub private_withdrawals: bool,
-    pub private_transfers: bool,
-    pub discovery_sync: bool,
-    pub proof_bearing_transactions: bool,
-    pub paymaster_ready: bool,
-    pub user_controlled_disclosure: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StarknetPrivacyFundingRail {
     pub privacy_pool: String,
-    #[serde(default)]
-    pub bridge_adapter: Option<String>,
-    #[serde(default)]
-    pub shielded_asset_adapter: Option<String>,
+    pub bridge_adapter: String,
     pub discovery_url: String,
     pub proving_url: String,
-    pub paymaster_address: Option<String>,
-    pub paymaster_url: Option<String>,
+    #[serde(default)]
+    pub proving_ohttp_enabled: bool,
+    pub paymaster_address: String,
+    pub paymaster_url: String,
+    pub ingress_key_registry_fingerprint: String,
     pub sdk_package: String,
     pub sdk_version: String,
     pub min_proving_delay_blocks: u64,
+    pub proof_signer_class_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FundingRailAssetConfig {
     pub asset_id: AssetId,
     pub token_address: String,
@@ -2967,28 +3591,8 @@ pub struct FundingRailAssetConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FundingRailConfig {
     pub primary: FundingRailKind,
-    pub capabilities: FundingRailCapabilities,
-    pub starknet_privacy: Option<StarknetPrivacyFundingRail>,
+    pub starknet_privacy: StarknetPrivacyFundingRail,
     pub assets: BTreeMap<String, FundingRailAssetConfig>,
-}
-
-impl Default for FundingRailConfig {
-    fn default() -> Self {
-        Self {
-            primary: FundingRailKind::StarknetPrivacy,
-            capabilities: FundingRailCapabilities {
-                private_deposits: false,
-                private_withdrawals: false,
-                private_transfers: false,
-                discovery_sync: false,
-                proof_bearing_transactions: false,
-                paymaster_ready: false,
-                user_controlled_disclosure: false,
-            },
-            starknet_privacy: None,
-            assets: BTreeMap::new(),
-        }
-    }
 }
 
 impl FundingRailConfig {
@@ -3003,52 +3607,44 @@ impl FundingRailConfig {
     }
 
     pub fn starknet_privacy_configured(&self) -> bool {
-        self.starknet_privacy.as_ref().is_some_and(|config| {
-            !config.privacy_pool.trim().is_empty()
-                && config
-                    .bridge_adapter
-                    .as_ref()
-                    .is_some_and(|address| !address.trim().is_empty())
-                && !config.discovery_url.trim().is_empty()
-                && !config.proving_url.trim().is_empty()
-                && config
-                    .paymaster_address
-                    .as_ref()
-                    .is_some_and(|address| !address.trim().is_empty())
-                && config
-                    .paymaster_url
-                    .as_ref()
-                    .is_some_and(|url| !url.trim().is_empty())
-        })
+        let config = &self.starknet_privacy;
+        !config.privacy_pool.trim().is_empty()
+            && !config.bridge_adapter.trim().is_empty()
+            && !config.discovery_url.trim().is_empty()
+            && !config.proving_url.trim().is_empty()
+            && config.proving_ohttp_enabled
+            && !config.paymaster_address.trim().is_empty()
+            && !config.paymaster_url.trim().is_empty()
+            && !config.proof_signer_class_hash.trim().is_empty()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductAssetConfig {
     pub asset_id: AssetId,
     #[serde(with = "serde_u128_decimal")]
     pub min_trade_amount: u128,
-    #[serde(default = "default_asset_decimals")]
     pub decimals: u8,
     pub enabled: bool,
+    pub token_address: String,
+    pub erc20_behavior: String,
+    pub audit_status: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductPairConfig {
     pub pair_id: PairId,
     pub base_asset_id: AssetId,
     pub quote_asset_id: AssetId,
     #[serde(with = "serde_u128_decimal")]
     pub min_order_amount: u128,
-    #[serde(default = "default_price_base_scale", with = "serde_u128_decimal")]
+    #[serde(with = "serde_u128_decimal")]
     pub price_base_scale: u128,
-    #[serde(default = "default_heartbeat_cover_price", with = "serde_u128_decimal")]
+    #[serde(with = "serde_u128_decimal")]
     pub heartbeat_cover_price: u128,
-    #[serde(default = "default_speculative_taker_fee_bps")]
     pub taker_fee_bps: u16,
-    #[serde(default)]
-    pub maker_fee_bps: u16,
-    #[serde(default)]
     pub relay_fee_bps: u16,
     pub enabled: bool,
 }
@@ -3069,22 +3665,25 @@ impl ProductPairConfig {
     }
 
     pub fn fee_bps_for_order(&self, order: &OrderIntent) -> Result<u16, ProtocolError> {
-        Ok(match order.order_type {
-            OrderType::HeartbeatCover => 0,
-            OrderType::MakerCurve => {
-                order.validate_parent_link()?;
-                self.maker_fee_bps
-            }
-            OrderType::LimitBatch => self.taker_fee_bps,
-        })
+        match order.order_type {
+            OrderType::HeartbeatCover => Ok(0),
+            OrderType::LiquidityCurve => Err(ProtocolError::InvalidOrder(
+                "legacy liquidity curve orders are disabled; open a private liquidity position lifecycle"
+                    .into(),
+            )),
+            OrderType::LimitBatch => Ok(self.taker_fee_bps),
+        }
     }
 
     pub fn relay_fee_bps_for_order(&self, order: &OrderIntent) -> Result<u16, ProtocolError> {
+        if matches!(order.order_type, OrderType::LiquidityCurve) {
+            return Err(ProtocolError::InvalidOrder(
+                "legacy liquidity curve orders are disabled; open a private liquidity position lifecycle"
+                    .into(),
+            ));
+        }
         order.validate_relay_mode()?;
-        Ok(match order.relay_mode {
-            RelayMode::ZylithRelay => self.relay_fee_bps,
-            RelayMode::SelfRelay => 0,
-        })
+        Ok(0)
     }
 }
 
@@ -3092,23 +3691,11 @@ fn default_heartbeat_cover_price() -> u128 {
     1
 }
 
-fn default_speculative_taker_fee_bps() -> u16 {
-    4
-}
-
-fn default_protocol_fee_recipient() -> String {
-    "zylith-protocol-treasury".into()
-}
-
-fn default_relay_fee_recipient() -> String {
-    "zylith-renewal-relay".into()
-}
-
-pub fn default_pair_fee_bps(pair_id: &PairId) -> (u16, u16, u16) {
+pub fn default_pair_fee_bps(pair_id: &PairId) -> (u16, u16) {
     if is_conversion_pair(pair_id) {
-        (2, 0, 1)
+        (1, 0)
     } else {
-        (4, 0, 2)
+        (4, 0)
     }
 }
 
@@ -3116,15 +3703,15 @@ pub fn is_conversion_pair(pair_id: &PairId) -> bool {
     matches!(pair_id.0.as_str(), "WBTC/strkBTC" | "USDC/USDT")
 }
 
-pub fn maker_curve_min_spread_bps(pair_id: &PairId) -> u128 {
+pub fn liquidity_curve_min_spread_bps(pair_id: &PairId) -> u128 {
     match pair_id.0.as_str() {
-        "USDC/USDT" => MAKER_CURVE_MIN_SPREAD_BPS_STABLE_CONVERSION,
-        _ if is_conversion_pair(pair_id) => MAKER_CURVE_MIN_SPREAD_BPS_CONVERSION,
-        _ => MAKER_CURVE_MIN_SPREAD_BPS_SPECULATIVE,
+        "USDC/USDT" => LIQUIDITY_CURVE_MIN_SPREAD_BPS_STABLE_CONVERSION,
+        _ if is_conversion_pair(pair_id) => LIQUIDITY_CURVE_MIN_SPREAD_BPS_CONVERSION,
+        _ => LIQUIDITY_CURVE_MIN_SPREAD_BPS_SPECULATIVE,
     }
 }
 
-pub fn maker_curve_min_band_base_amount(pair_id: &PairId) -> u128 {
+pub fn liquidity_curve_min_band_base_amount(pair_id: &PairId) -> u128 {
     match pair_id.0.as_str() {
         "ETH/USDC" => 1_000_000_000_000_000,
         "strkBTC/USDC" | "WBTC/strkBTC" => 100_000,
@@ -3135,50 +3722,7 @@ pub fn maker_curve_min_band_base_amount(pair_id: &PairId) -> u128 {
 }
 
 pub fn default_min_order_amount(pair_id: &PairId) -> u128 {
-    maker_curve_min_band_base_amount(pair_id)
-}
-
-fn validate_maker_curve_pair_shape(
-    pair_id: &PairId,
-    curve: &HiddenMakerCurve,
-) -> Result<(), ProtocolError> {
-    let min_band_amount = maker_curve_min_band_base_amount(pair_id);
-    for point in &curve.points {
-        if point.base_amount < min_band_amount {
-            return Err(ProtocolError::InvalidOrder(format!(
-                "maker curve band depth {} is below pair minimum {}",
-                point.base_amount, min_band_amount
-            )));
-        }
-    }
-
-    let first_price = curve
-        .points
-        .first()
-        .map(|point| point.price)
-        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve missing first price".into()))?;
-    let last_price = curve
-        .points
-        .last()
-        .map(|point| point.price)
-        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve missing last price".into()))?;
-    let min_spread_bps = maker_curve_min_spread_bps(pair_id);
-    let actual = last_price
-        .checked_mul(BPS_DENOMINATOR)
-        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve spread overflows u128".into()))?;
-    let required = first_price
-        .checked_mul(BPS_DENOMINATOR + min_spread_bps)
-        .ok_or_else(|| ProtocolError::InvalidOrder("maker curve spread overflows u128".into()))?;
-    if actual < required {
-        return Err(ProtocolError::InvalidOrder(format!(
-            "maker curve outer bands must span at least {min_spread_bps} bps"
-        )));
-    }
-    Ok(())
-}
-
-fn default_price_base_scale() -> u128 {
-    1
+    liquidity_curve_min_band_base_amount(pair_id)
 }
 
 fn default_asset_decimals() -> u8 {
@@ -3229,15 +3773,10 @@ pub fn base_amount_affordable_for_quote(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProductConfig {
     pub assets: BTreeMap<String, ProductAssetConfig>,
     pub pairs: BTreeMap<String, ProductPairConfig>,
-}
-
-impl Default for ProductConfig {
-    fn default() -> Self {
-        Self::default_v1()
-    }
 }
 
 impl ProductConfig {
@@ -3251,6 +3790,9 @@ impl ProductConfig {
                     min_trade_amount: 1,
                     decimals: known_asset_decimals(&AssetId(asset_id.to_owned())),
                     enabled: true,
+                    token_address: String::new(),
+                    erc20_behavior: String::new(),
+                    audit_status: String::new(),
                 },
             );
         }
@@ -3266,8 +3808,7 @@ impl ProductConfig {
             ("USDC/USDT", "USDC", "USDT"),
         ] {
             let pair_id_value = PairId(pair_id.to_owned());
-            let (taker_fee_bps, maker_fee_bps, relay_fee_bps) =
-                default_pair_fee_bps(&pair_id_value);
+            let (taker_fee_bps, relay_fee_bps) = default_pair_fee_bps(&pair_id_value);
             pairs.insert(
                 pair_id.to_owned(),
                 ProductPairConfig {
@@ -3278,7 +3819,6 @@ impl ProductConfig {
                     price_base_scale: asset_amount_scale(&AssetId(base_asset_id.to_owned())),
                     heartbeat_cover_price: default_heartbeat_cover_price(),
                     taker_fee_bps,
-                    maker_fee_bps,
                     relay_fee_bps,
                     enabled: true,
                 },
@@ -3317,6 +3857,9 @@ impl ProductConfig {
                         min_trade_amount: 1,
                         decimals: known_asset_decimals(asset_id),
                         enabled: true,
+                        token_address: String::new(),
+                        erc20_behavior: String::new(),
+                        audit_status: String::new(),
                     });
             }
             pairs.insert(pair.pair_id.0.clone(), pair);
@@ -3408,44 +3951,22 @@ impl ProductConfig {
                 "min_fill must be positive and no larger than amount".into(),
             ));
         }
-        match (&order.order_type, order.maker_curve.as_ref()) {
+        match (&order.order_type, order.liquidity_curve.as_ref()) {
             (OrderType::HeartbeatCover, _) => {
                 return Err(ProtocolError::InvalidOrder(
                     "heartbeat cover orders are protocol-generated".into(),
                 ));
             }
-            (OrderType::MakerCurve, Some(curve)) => {
-                curve.validate()?;
-                validate_maker_curve_pair_shape(&order.pair_id, curve)?;
-                let curve_base_amount = curve.total_base_amount()?;
-                if order.amount != curve_base_amount {
-                    return Err(ProtocolError::InvalidOrder(
-                        "maker curve order amount must equal the sum of curve base amounts".into(),
-                    ));
-                }
-                let envelope_price = match order.side {
-                    OrderSide::Buy => curve.points.last().map(|point| point.price),
-                    OrderSide::Sell => curve.points.first().map(|point| point.price),
-                }
-                .ok_or_else(|| {
-                    ProtocolError::InvalidOrder(
-                        "maker curve must contain at least one point".into(),
-                    )
-                })?;
-                if order.limit_price != envelope_price {
-                    return Err(ProtocolError::InvalidOrder(
-                        "maker curve limit_price must equal the curve envelope price".into(),
-                    ));
-                }
-            }
-            (OrderType::MakerCurve, None) => {
+            (OrderType::LiquidityCurve, _) => {
                 return Err(ProtocolError::InvalidOrder(
-                    "maker curve order missing curve".into(),
+                    "legacy liquidity curve orders are disabled; open a private liquidity position lifecycle"
+                        .into(),
                 ));
             }
             (_, Some(_)) => {
                 return Err(ProtocolError::InvalidOrder(
-                    "maker curve can only be attached to maker curve orders".into(),
+                    "legacy liquidity curve payloads are disabled; open a private liquidity position lifecycle"
+                        .into(),
                 ));
             }
             _ => {}
@@ -3518,29 +4039,11 @@ impl ProductConfig {
         }
 
         let minimum_funding = match order.side {
-            OrderSide::Buy if matches!(order.order_type, OrderType::MakerCurve) => {
-                let Some(curve) = order.maker_curve.as_ref() else {
-                    return Err(ProtocolError::InvalidOrder(
-                        "maker curve order missing curve".into(),
-                    ));
-                };
-                curve.points.iter().try_fold(0u128, |total, point| {
-                    let quote_amount = quote_amount_for_base_amount(
-                        point.base_amount,
-                        point.price,
-                        pair.price_base_scale,
-                    )?;
-                    total.checked_add(quote_amount).ok_or_else(|| {
-                        ProtocolError::InvalidOrder("maker curve buy funding overflows u128".into())
-                    })
-                })?
-            }
             OrderSide::Buy => quote_amount_for_base_amount(
                 order.min_fill,
                 order.limit_price,
                 pair.price_base_scale,
             )?,
-            OrderSide::Sell if matches!(order.order_type, OrderType::MakerCurve) => order.amount,
             OrderSide::Sell => order.min_fill,
         };
         if total_funding < minimum_funding {
@@ -3580,7 +4083,7 @@ impl ProductConfig {
         let base_asset_id = AssetId(base.to_owned());
         let quote_asset_id = AssetId(quote.to_owned());
         let price_base_scale = asset_amount_scale(&base_asset_id);
-        let (taker_fee_bps, maker_fee_bps, relay_fee_bps) = default_pair_fee_bps(&pair_id);
+        let (taker_fee_bps, relay_fee_bps) = default_pair_fee_bps(&pair_id);
 
         Ok(ProductPairConfig {
             min_order_amount: default_min_order_amount(&pair_id),
@@ -3590,7 +4093,6 @@ impl ProductConfig {
             price_base_scale,
             heartbeat_cover_price: default_heartbeat_cover_price(),
             taker_fee_bps,
-            maker_fee_bps,
             relay_fee_bps,
             enabled,
         })
@@ -3598,42 +4100,93 @@ impl ProductConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentContracts {
     pub commitment_registry: String,
     pub batch_registry: String,
     pub shielded_asset_adapter: String,
-    #[serde(default)]
     pub privacy_deposit_bridge: String,
-    #[serde(default)]
     pub auction_verifier: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeploymentProofConfig {
-    #[serde(default)]
+    pub scheme: String,
+    pub proof_version: String,
+    pub settlement_statement_type: u64,
+    pub settlement_statement_schema: u64,
+    pub auction_statement_type: u64,
+    pub auction_statement_schema: u64,
     pub settlement_entrypoint: String,
-    #[serde(default)]
     pub proof_entrypoint: String,
-    #[serde(default)]
     pub proof_program_address: String,
-    #[serde(default)]
     pub proof_program_hash: String,
-    #[serde(default)]
+    pub statement_proof_program_hashes: Option<BTreeMap<String, String>>,
+    pub admission_proof_program_hash: Option<String>,
+    pub auction_result_proof_program_hash: Option<String>,
+    pub nullifier_proof_program_hash: Option<String>,
+    pub renewal_proof_program_hash: Option<String>,
+    pub liquidity_position_proof_program_hash: Option<String>,
+    pub settlement_proof_program_hash: Option<String>,
+    pub settlement_order_proof_program_hash: Option<String>,
+    pub settlement_input_membership_proof_program_hash: Option<String>,
+    pub settlement_output_recovery_proof_program_hash: Option<String>,
+    pub note_consolidation_proof_program_hash: Option<String>,
+    pub aggregate_settlement_proof_program_hash: Option<String>,
+    pub withdrawal_proof_program_hash: Option<String>,
+    pub multi_pair_proof_program_hash: Option<String>,
+    pub starknet_os_config_hash: String,
     pub proof_account_address: String,
-    #[serde(default)]
     pub settlement_statement_program_address: String,
-    #[serde(default)]
+    pub settlement_note_fee_statement_program_address: Option<String>,
+    pub settlement_order_statement_program_address: Option<String>,
+    pub settlement_input_membership_statement_program_address: Option<String>,
+    pub settlement_output_recovery_statement_program_address: Option<String>,
+    pub liquidity_position_statement_program_address: Option<String>,
+    pub admission_statement_program_address: Option<String>,
+    pub auction_result_statement_program_address: Option<String>,
+    pub multi_pair_statement_program_address: Option<String>,
     pub nullifier_statement_program_address: String,
-    #[serde(default)]
     pub renewal_statement_program_address: String,
-    #[serde(default)]
     pub note_consolidation_statement_program_address: String,
-    #[serde(default)]
     pub withdrawal_statement_program_address: String,
-    #[serde(default)]
     pub settlement_account_address: String,
-    #[serde(default)]
+    pub deposit_root_registrar_address: String,
     pub proof_validity_blocks: u64,
+    pub output_claim_delay_seconds: u64,
+    pub proof_program_locked_after_deploy: bool,
+    pub operational_config_locked_after_deploy: bool,
+    pub native_tx_prover_url: String,
+    pub native_tx_prover_ohttp_enabled: bool,
+    pub initial_note_root: String,
+    pub initial_nullifier_root: String,
+    pub initial_renewal_root: String,
+    pub initial_fee_root: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentMetadata {
+    pub finalized: bool,
+    pub release_commit: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentRoles {
+    pub protocol_fee_recipient: String,
+    pub relay_fee_recipient: String,
+    pub pause_guardian_address: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentRuntime {
+    pub batch_window_ms: u64,
+    pub public_artifact_delay_min_epochs: u64,
+    pub public_artifact_delay_max_epochs: u64,
+    pub artifact_epoch_bucket_size: u64,
+    pub output_claim_delay_seconds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3643,24 +4196,38 @@ pub struct DeploymentManifest {
     pub chain_id: String,
     pub contracts: DeploymentContracts,
     pub token_addresses: BTreeMap<String, String>,
-    #[serde(default)]
     pub funding: FundingRailConfig,
-    #[serde(default)]
     pub product: ProductConfig,
-    #[serde(default)]
     pub proof: DeploymentProofConfig,
+    pub deployment: DeploymentMetadata,
+    pub roles: DeploymentRoles,
+    pub runtime: DeploymentRuntime,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AssetId, BatchId, BatchLiquidityReport, BatchStatus, BatchSummary, ClaimWindowPolicy,
-        DeploymentManifest, DepositIntent, FeeEntry, FundingRailConfig, FundingRailKind,
-        HiddenMakerCurve, MAX_MAKER_CURVE_POINTS, MakerCurvePoint, NOTE_RECOGNITION_ALGORITHM,
-        Note, NoteCommitment, Nullifier, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderIngressClientTelemetry,
-        OrderIntent, OrderShareBundle, OrderSide, OrderSubmission, OutputCiphertextBundle,
-        OutputNoteRecord, PairId, ProductConfig, RelayMode, SettlementTranscript,
-        StarknetPrivacyFundingRail, TRANSCRIPT_SHAPE_POLICY_VERSION, TrustedOrderIngressRequest,
+        ARTIFACT_AGGREGATION_POLICY_VERSION, ArtifactAggregationPolicy, AssetId, BatchId,
+        BatchLiquidityReport, BatchStatus, BatchSummary, ClaimWindowPolicy, ConsumedInput,
+        DecryptedOrderShare, DeploymentManifest, DepositConfirmationList, DepositIntent,
+        DepositSyncStatus, EncryptedLiquidityAttributionArtifact, EncryptedRecoveryPayload,
+        FeeEntry, FundingRailConfig, FundingRailKind, LIQUIDITY_POSITION_VERSION,
+        LiquidityAttributionReceipt, LiquidityCurve, LiquidityCurvePoint, LiquidityPositionBacking,
+        LiquidityPositionCurveKind, LiquidityPositionCurvePolicy, LiquidityPositionFillDelta,
+        LiquidityPositionOracleGuard, LiquidityPositionRotationPolicy, LiquidityPositionStatus,
+        MAX_LIQUIDITY_CURVE_POINTS, MatchedOrderWitness, NOTE_RECOGNITION_ALGORITHM, Note,
+        NoteCommitment, NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness,
+        Nullifier, NullifierHistoryBatch, OUTPUT_NOTE_CIPHERTEXT_LEN, OrderCancellationRequest,
+        OrderCommitment, OrderExecutionReport, OrderIntent, OrderShareBundle, OrderSide,
+        OrderSubmission, OrderType, OutputCiphertextBundle, OutputNoteMerkleProof,
+        OutputNoteRecord, OutputRecoveryRecord, PairId, PreparedBatchStatus,
+        PrivateExecutionKeyPrivateConfig, PrivateLiquidityPosition, PrivateOrderPayload,
+        PrivateSettlementReportQuery, ProductConfig, PublicSettlementTranscript,
+        PublishedBatchArtifactList, PublishedBatchArtifactSummary, RecoveryArtifactList, RelayMode,
+        RenewalCancelMarkerRecord, RenewalParentCancelPlanRequest, RenewalStateHistoryBatch,
+        SettlementOutputWithdrawalWitness, SettlementRootHistoryBatch, SettlementSubmissionPlan,
+        SettlementTranscript, SettlementWitness, SpendAuthorization, StarknetPrivacyFundingRail,
+        TRANSCRIPT_SHAPE_POLICY_VERSION, TimeInForce, TrustedOrderIngressRequest, WalletSnapshot,
         funding_input_set_commitment, funding_nullifier_set_commitment, renewal_parent_commitment,
         renewal_parent_secret_commitment,
     };
@@ -3670,6 +4237,7 @@ mod tests {
         RecoverySeed, derive_user_keys, nullifier_from_note_secret,
         spend_authority_from_raw_key_hex,
     };
+    use std::collections::BTreeMap;
 
     fn test_note_nullifier(note: &Note) -> Nullifier {
         let commitment = note.commitment().expect("test note commitment");
@@ -3702,7 +4270,7 @@ mod tests {
             side,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: 145,
             amount,
             min_fill,
@@ -3722,6 +4290,1126 @@ mod tests {
             recipient_residual_withdraw_authority: "0x445".into(),
             auditor_view_allowed: false,
         }
+    }
+
+    #[test]
+    fn debug_redacts_cancellation_secret() {
+        let request = OrderCancellationRequest {
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            order_commitment: OrderCommitment("0x123".into()),
+            cancellation_secret: "do-not-log-cancellation-secret".into(),
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("cancellation_secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("do-not-log-cancellation-secret"));
+    }
+
+    #[test]
+    fn debug_redacts_order_parent_authorization_secret() {
+        let funding_note = test_funding_note("STRK", 100);
+        let mut order = test_limit_order("STRK/USDC", OrderSide::Sell, 100, 1, &funding_note);
+        order.parent_authorization_secret = "do-not-log-renewal-parent-secret".into();
+        order.amount = 987_654_321;
+        order.limit_price = 123_456_789;
+        order.min_fill = 42;
+        order.order_nonce = 77;
+        order.funding_note_ref = NoteCommitment("do-not-log-funding-note-ref".into());
+        order.funding_nullifier = Nullifier("do-not-log-funding-nullifier".into());
+        order.recipient_owner_public_key = "do-not-log-recipient-owner".into();
+        order.recipient_spend_authority = "do-not-log-recipient-spend".into();
+        order.recipient_withdraw_authority = "do-not-log-recipient-withdraw".into();
+        order.recipient_residual_withdraw_authority =
+            "do-not-log-recipient-residual-withdraw".into();
+
+        let debug = format!("{order:?}");
+
+        assert!(debug.contains("parent_authorization_secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("do-not-log-renewal-parent-secret"));
+        assert!(!debug.contains("987654321"));
+        assert!(!debug.contains("123456789"));
+        assert!(!debug.contains("do-not-log-funding-note-ref"));
+        assert!(!debug.contains("do-not-log-funding-nullifier"));
+        assert!(!debug.contains("do-not-log-recipient-owner"));
+        assert!(!debug.contains("do-not-log-recipient-spend"));
+        assert!(!debug.contains("do-not-log-recipient-withdraw"));
+        assert!(!debug.contains("do-not-log-recipient-residual-withdraw"));
+    }
+
+    #[test]
+    fn debug_redacts_note_preimage_fields() {
+        let note = Note {
+            asset_id: AssetId("do-not-log-asset".into()),
+            amount: 123_456_789,
+            owner_public_key: "do-not-log-owner".into(),
+            spend_authority: "do-not-log-spend-authority".into(),
+            withdraw_authority: "do-not-log-withdraw-authority".into(),
+            blinding: "do-not-log-blinding".into(),
+            nonce: 987_654,
+            metadata_commitment: "do-not-log-metadata".into(),
+        };
+
+        let debug = format!("{note:?}");
+
+        assert!(debug.contains("Note"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("do-not-log-asset"));
+        assert!(!debug.contains("123456789"));
+        assert!(!debug.contains("do-not-log-owner"));
+        assert!(!debug.contains("do-not-log-spend-authority"));
+        assert!(!debug.contains("do-not-log-withdraw-authority"));
+        assert!(!debug.contains("do-not-log-blinding"));
+        assert!(!debug.contains("987654"));
+        assert!(!debug.contains("do-not-log-metadata"));
+    }
+
+    #[test]
+    fn witness_inputs_reject_unknown_unsupported_fields() {
+        let withdrawal = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "auction_verifier_address": "0x1",
+            "shielded_asset_adapter_address": "0x2",
+            "chain_id": "0x534e5f5345504f4c4941",
+            "strk20_exit_commitment": "0x3",
+            "prior_nullifier_root": "0x0",
+            "output_note": {
+                "note_commitment": "0x4",
+                "asset_id": "STRK",
+                "amount": "1",
+                "metadata_commitment": "0x5"
+            },
+            "output_note_preimage": test_funding_note("STRK", 1),
+            "output_proof": {
+                "merkle_path": [],
+                "merkle_directions": [],
+                "unsupported_path_hint": "unexpected"
+            },
+            "withdraw_authorization": {
+                "signature_r": "0x6",
+                "signature_s": "0x7"
+            },
+            "nullifier_history": [],
+            "new_nullifier_root": "0x8"
+        });
+
+        assert!(serde_json::from_value::<SettlementOutputWithdrawalWitness>(withdrawal).is_err());
+
+        let consolidation = serde_json::json!({
+            "consolidation_id": "consolidation-1",
+            "auction_verifier_address": "0x1",
+            "prior_note_root": "0x0",
+            "prior_nullifier_root": "0x0",
+            "input_notes": [],
+            "spend_authorization": {
+                "signature_r": "0x6",
+                "signature_s": "0x7"
+            },
+            "note_membership_witnesses": [],
+            "nullifier_history": [{
+                "repeat_count": 1,
+                "nullifiers": [],
+                "unsupported_nullifier_root": "0x0"
+            }],
+            "nullifier_sparse_witnesses": [],
+            "output_notes": [],
+            "output_note_preimages": [],
+            "output_recovery_records": [],
+            "output_recovery_dummy_commitments": [],
+            "output_ciphertext_bundle_ref": "0x9",
+            "new_nullifier_root": "0xa"
+        });
+
+        assert!(serde_json::from_value::<NoteConsolidationWitness>(consolidation).is_err());
+    }
+
+    #[test]
+    fn witness_inputs_require_current_proof_history_fields() {
+        let note = test_funding_note("STRK", 1);
+        let withdrawal = serde_json::to_value(SettlementOutputWithdrawalWitness {
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            auction_verifier_address: "0x1".into(),
+            shielded_asset_adapter_address: "0x2".into(),
+            chain_id: "0x534e5f5345504f4c4941".into(),
+            strk20_exit_commitment: "0x3".into(),
+            prior_nullifier_root: "0x0".into(),
+            output_note: OutputNoteRecord {
+                note_commitment: note.commitment().expect("note commitment"),
+                asset_id: note.asset_id.clone(),
+                amount: note.amount,
+                withdraw_authority: note.withdraw_authority.clone(),
+            },
+            output_note_preimage: note,
+            output_proof: OutputNoteMerkleProof {
+                merkle_path: vec![],
+                merkle_directions: vec![],
+            },
+            withdraw_authorization: SpendAuthorization {
+                signature_r: "0x6".into(),
+                signature_s: "0x7".into(),
+            },
+            nullifier_history: vec![],
+            nullifier_sparse_witness: None,
+            new_nullifier_root: "0x8".into(),
+        })
+        .expect("withdrawal witness json");
+        let mut missing = withdrawal;
+        missing.as_object_mut().unwrap().remove("nullifier_history");
+        assert!(
+            serde_json::from_value::<SettlementOutputWithdrawalWitness>(missing).is_err(),
+            "withdrawal witness must require explicit nullifier history"
+        );
+
+        let consolidation = serde_json::to_value(NoteConsolidationWitness {
+            consolidation_id: BatchId("consolidation-1".into()),
+            auction_verifier_address: "0x1".into(),
+            prior_note_root: "0x0".into(),
+            prior_nullifier_root: "0x0".into(),
+            input_notes: vec![],
+            spend_authorization: SpendAuthorization {
+                signature_r: "0x6".into(),
+                signature_s: "0x7".into(),
+            },
+            note_membership_witnesses: vec![],
+            nullifier_history: vec![],
+            nullifier_sparse_witnesses: vec![],
+            output_notes: vec![],
+            output_note_preimages: vec![],
+            output_recovery_records: vec![],
+            output_recovery_dummy_commitments: vec![],
+            output_ciphertext_bundle_ref: "0x9".into(),
+            new_nullifier_root: "0xa".into(),
+        })
+        .expect("consolidation witness json");
+        for field in [
+            "note_membership_witnesses",
+            "nullifier_history",
+            "nullifier_sparse_witnesses",
+            "output_recovery_dummy_commitments",
+        ] {
+            let mut missing = consolidation.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<NoteConsolidationWitness>(missing).is_err(),
+                "consolidation witness must require explicit field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_transcript_requires_every_bound_wire_field() {
+        let transcript = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "pair_id": "STRK/USDC",
+            "batch_epoch": 42,
+            "order_commitment_root": "0x1",
+            "encrypted_order_set_commitment": "0x2",
+            "prior_note_root": "0x3",
+            "prior_nullifier_root": "0x4",
+            "prior_renewal_root": "0x5",
+            "prior_fee_root": "0x6",
+            "prior_liquidity_position_root": "0x0",
+            "new_nullifier_root": "0x7",
+            "new_renewal_root": "0x8",
+            "new_liquidity_position_root": "0x0",
+            "clearing_price": "100",
+            "price_base_scale": "1000000000000000000",
+            "taker_fee_bps": 4,
+            "relay_fee_bps": 2,
+            "protocol_fee_recipient": "0x9",
+            "relay_fee_recipient": "0xa",
+            "matched_orders": [],
+            "consumed_inputs": [],
+            "renewal_child_uses": [],
+            "liquidity_position_transitions": [],
+            "fees": [],
+            "output_notes": [],
+            "output_note_preimages": [],
+            "output_recovery_records": [],
+            "output_recovery_dummy_commitments": [],
+            "output_ciphertext_bundle_ref": "0xb"
+        });
+        assert!(serde_json::from_value::<SettlementTranscript>(transcript.clone()).is_ok());
+
+        let mut missing = transcript.clone();
+        missing
+            .as_object_mut()
+            .expect("transcript object")
+            .remove("prior_fee_root");
+        assert!(serde_json::from_value::<SettlementTranscript>(missing).is_err());
+
+        let mut unknown = transcript;
+        unknown["unsupported_fee_hint"] = serde_json::json!("0x0");
+        assert!(serde_json::from_value::<SettlementTranscript>(unknown).is_err());
+    }
+
+    #[test]
+    fn debug_redacts_private_execution_key() {
+        let key = PrivateExecutionKeyPrivateConfig {
+            key_id: "execution-key-1".into(),
+            private_key: "do-not-log-private-execution-key".into(),
+            public_key: "public-key-material".into(),
+        };
+
+        let debug = format!("{key:?}");
+
+        assert!(debug.contains("execution-key-1"));
+        assert!(debug.contains("public-key-material"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("do-not-log-private-execution-key"));
+    }
+
+    #[test]
+    fn debug_redacts_private_order_payload_and_decrypted_share() {
+        let funding_note = test_funding_note("STRK", 1_000);
+        let payload = PrivateOrderPayload {
+            order: test_limit_order("STRK/USDC", OrderSide::Sell, 100, 0, &funding_note),
+            funding_note: funding_note.clone(),
+            funding_notes: vec![funding_note],
+            funding_authorization: SpendAuthorization {
+                signature_r: "do-not-log-signature-r".into(),
+                signature_s: "do-not-log-signature-s".into(),
+            },
+        };
+        let share = DecryptedOrderShare {
+            key_id: "key-1".into(),
+            order_commitment: OrderCommitment("0xabc".into()),
+            share_index: 0,
+            share_count: 1,
+            plaintext_len: 32,
+            share_hex: "do-not-log-share-hex".into(),
+        };
+
+        let payload_debug = format!("{payload:?}");
+        let share_debug = format!("{share:?}");
+
+        assert!(payload_debug.contains("funding_note"));
+        assert!(payload_debug.contains("<redacted>"));
+        assert!(!payload_debug.contains("do-not-log-signature-r"));
+        assert!(!payload_debug.contains("do-not-log-signature-s"));
+        assert!(!share_debug.contains("do-not-log-share-hex"));
+        assert!(share_debug.contains("share_hex"));
+        assert!(share_debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn private_order_payload_requires_current_funding_note_vector() {
+        let funding_note = test_funding_note("STRK", 1_000);
+        let payload = PrivateOrderPayload {
+            order: test_limit_order("STRK/USDC", OrderSide::Sell, 100, 0, &funding_note),
+            funding_note: funding_note.clone(),
+            funding_notes: vec![funding_note],
+            funding_authorization: SpendAuthorization {
+                signature_r: "0x1".into(),
+                signature_s: "0x2".into(),
+            },
+        };
+        let mut value = serde_json::to_value(payload).expect("payload json");
+        value.as_object_mut().unwrap().remove("funding_notes");
+
+        assert!(
+            serde_json::from_value::<PrivateOrderPayload>(value).is_err(),
+            "private ingress must reject stale single-note payload records"
+        );
+    }
+
+    #[test]
+    fn matched_order_witness_requires_current_execution_fields() {
+        let funding_note = test_funding_note("STRK", 1_000);
+        let funding_note_ref = funding_note.commitment().expect("funding note commitment");
+        let funding_nullifier = test_note_nullifier(&funding_note);
+        let witness = MatchedOrderWitness {
+            order_commitment: OrderCommitment("0x111".into()),
+            funding_note: funding_note.clone(),
+            funding_notes: vec![funding_note],
+            funding_note_ref,
+            funding_nullifier: funding_nullifier.clone(),
+            funding_nullifiers: vec![funding_nullifier],
+            funding_authorization: SpendAuthorization {
+                signature_r: "0x1".into(),
+                signature_s: "0x2".into(),
+            },
+            side: OrderSide::Sell,
+            order_type: OrderType::LimitBatch,
+            relay_mode: RelayMode::SelfRelay,
+            liquidity_curve: None,
+            liquidity_provider_band_attribution: None,
+            limit_price: 145,
+            order_amount: 100,
+            min_fill: 0,
+            time_in_force: TimeInForce::CurrentBatchOnly,
+            expiry_epoch: 42,
+            order_nonce: 9,
+            parent_order_commitment: "0x0".into(),
+            parent_child_index: 0,
+            parent_secret_commitment: "0x0".into(),
+            parent_cancel_authority: "0x0".into(),
+            parent_authorization_secret: "0x0".into(),
+            auditor_view_allowed: false,
+            recipient_owner_public_key: "ab".repeat(32),
+            recipient_spend_authority: "0x333".into(),
+            recipient_withdraw_authority: "0x444".into(),
+            recipient_residual_withdraw_authority: "0x445".into(),
+            filled_amount: 50,
+            output_note: test_funding_note("USDC", 50),
+            residual_note: None,
+        };
+        let value = serde_json::to_value(witness).expect("witness json");
+
+        for field in [
+            "funding_notes",
+            "funding_nullifiers",
+            "relay_mode",
+            "parent_order_commitment",
+            "parent_child_index",
+            "parent_secret_commitment",
+            "parent_cancel_authority",
+            "parent_authorization_secret",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<MatchedOrderWitness>(missing).is_err(),
+                "matched witness must require current execution field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_execution_report_requires_current_private_report_fields() {
+        let report = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "pair_id": "STRK/USDC",
+            "order_commitment": "0x111",
+            "order_report_auth_tag": "0x222",
+            "funding_note_commitment": "0x333",
+            "funding_note_commitments": ["0x333"],
+            "status": "filled",
+            "side": "Sell",
+            "order_type": "LimitBatch",
+            "time_in_force": "CurrentBatchOnly",
+            "submitted_amount": "100",
+            "filled_amount": "50",
+            "unfilled_amount": "50",
+            "limit_price": "145",
+            "execution_price": "145",
+            "fee_asset_id": "USDC",
+            "fee_amount": "1",
+            "output_note_commitment": "0x444",
+            "output_asset_id": "USDC",
+            "output_amount": "49",
+            "residual_note_commitment": "0x555",
+            "residual_asset_id": "STRK",
+            "residual_amount": "50"
+        });
+        assert!(serde_json::from_value::<OrderExecutionReport>(report.clone()).is_ok());
+
+        for field in ["funding_note_commitments", "order_type"] {
+            let mut missing = report.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<OrderExecutionReport>(missing).is_err(),
+                "private execution report must require current field {field}"
+            );
+        }
+
+        let mut unknown = report;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unsupported_report_hint".into(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<OrderExecutionReport>(unknown).is_err(),
+            "private execution report must reject unsupported fields"
+        );
+    }
+
+    #[test]
+    fn private_settlement_report_query_requires_explicit_auth_sets() {
+        let query = serde_json::json!({
+            "output_recovery_key_tags": [],
+            "order_report_auths": [],
+            "liquidity_position_transition_commitments": []
+        });
+        assert!(serde_json::from_value::<PrivateSettlementReportQuery>(query.clone()).is_ok());
+
+        for field in [
+            "output_recovery_key_tags",
+            "order_report_auths",
+            "liquidity_position_transition_commitments",
+        ] {
+            let mut missing = query.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<PrivateSettlementReportQuery>(missing).is_err(),
+                "private report query must require explicit field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn renewal_parent_cancel_plan_requires_explicit_history() {
+        let request = serde_json::json!({
+            "chain_id": "0x534e5f5345504f4c4941",
+            "auction_verifier_address": "0x1",
+            "parent_secret_commitment": "0x2",
+            "parent_cancel_authority": "0x3",
+            "renewal_cancel_auth_key": "0x4",
+            "prior_renewal_entries": []
+        });
+        assert!(serde_json::from_value::<RenewalParentCancelPlanRequest>(request.clone()).is_ok());
+
+        let mut missing = request;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("prior_renewal_entries");
+        assert!(
+            serde_json::from_value::<RenewalParentCancelPlanRequest>(missing).is_err(),
+            "renewal parent cancel planning must require explicit prior renewal entries"
+        );
+    }
+
+    #[test]
+    fn renewal_cancel_marker_record_requires_current_timestamp() {
+        let marker = serde_json::json!({
+            "cancel_marker": "0x123",
+            "transaction_hash": "0x456",
+            "recorded_at_unix_ms": 12345
+        });
+        assert!(serde_json::from_value::<RenewalCancelMarkerRecord>(marker.clone()).is_ok());
+
+        let mut missing = marker.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("recorded_at_unix_ms");
+        assert!(
+            serde_json::from_value::<RenewalCancelMarkerRecord>(missing).is_err(),
+            "renewal cancel marker must require recorded_at_unix_ms"
+        );
+
+        let mut unknown = marker;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unsupported_seen".into(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<RenewalCancelMarkerRecord>(unknown).is_err(),
+            "renewal cancel marker must reject unsupported fields"
+        );
+    }
+
+    #[test]
+    fn order_share_bundle_requires_explicit_shares_array() {
+        let bundle = serde_json::json!({
+            "order_commitment": "0x111",
+            "cancellation_auth_tag": "0x222",
+            "pair_id": "STRK/USDC",
+            "batch_id": "batch-strk-usdc-42",
+            "epoch_id": 42,
+            "transport_envelope": null,
+            "shares": []
+        });
+        assert!(serde_json::from_value::<OrderShareBundle>(bundle.clone()).is_ok());
+
+        let mut missing = bundle;
+        missing.as_object_mut().unwrap().remove("shares");
+        assert!(
+            serde_json::from_value::<OrderShareBundle>(missing).is_err(),
+            "order share bundles must explicitly carry the current shares array"
+        );
+    }
+
+    #[test]
+    fn output_ciphertext_bundle_requires_public_shape_metadata() {
+        let bundle = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "bundle_commitment": "0x111",
+            "data_availability_ref": "da://bundle",
+            "ciphertext_count_bucket": "1-8",
+            "padded_ciphertext_count": 8,
+            "ciphertexts": []
+        });
+        assert!(serde_json::from_value::<OutputCiphertextBundle>(bundle.clone()).is_ok());
+
+        for field in ["ciphertext_count_bucket", "padded_ciphertext_count"] {
+            let mut missing = bundle.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<OutputCiphertextBundle>(missing).is_err(),
+                "output bundle must require public shape metadata field {field}"
+            );
+        }
+
+        let mut unknown = bundle;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unsupported_ciphertext_count".into(), serde_json::json!(0));
+        assert!(
+            serde_json::from_value::<OutputCiphertextBundle>(unknown).is_err(),
+            "output bundle must reject unsupported fields"
+        );
+    }
+
+    #[test]
+    fn artifact_aggregation_policy_requires_delay_range() {
+        let policy = serde_json::to_value(ArtifactAggregationPolicy {
+            policy_version: ARTIFACT_AGGREGATION_POLICY_VERSION,
+            public_artifact_delay_epochs: 2,
+            public_artifact_delay_min_epochs: 1,
+            public_artifact_delay_max_epochs: 3,
+            epoch_bucket_size: 4,
+            aggregation_scope: "pair".into(),
+            proof_aggregation_mode: "root-only".into(),
+        })
+        .expect("policy json");
+        for field in [
+            "public_artifact_delay_min_epochs",
+            "public_artifact_delay_max_epochs",
+        ] {
+            let mut missing = policy.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ArtifactAggregationPolicy>(missing).is_err(),
+                "artifact policy must require explicit field {field}"
+            );
+        }
+
+        let mut unknown = policy;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unsupported_delay_epochs".into(), serde_json::json!(2));
+        assert!(
+            serde_json::from_value::<ArtifactAggregationPolicy>(unknown).is_err(),
+            "artifact policy must reject unsupported fields"
+        );
+    }
+
+    #[test]
+    fn published_artifact_summaries_require_current_public_fields() {
+        let summary = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "pair_id": "STRK/USDC",
+            "batch_epoch": 42,
+            "published_at_unix_ms": 12345,
+            "transcript_commitment": "0x1",
+            "output_bundle_ref": "0x2",
+            "output_note_root": "0x3",
+            "bundle_commitment": "0x4",
+            "data_availability_ref": "da://bundle",
+            "ciphertext_count_bucket": "1-8",
+            "padded_ciphertext_count": 8,
+            "matched_order_count_bucket": "0-7",
+            "consumed_input_count_bucket": "0-7",
+            "renewal_child_count_bucket": "0-7",
+            "fee_count_bucket": "0-7",
+            "output_note_count_bucket": "0-4",
+            "transcript_shape_policy_version": 1
+        });
+        assert!(serde_json::from_value::<PublishedBatchArtifactSummary>(summary.clone()).is_ok());
+
+        let mut missing = summary.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("published_at_unix_ms");
+        assert!(
+            serde_json::from_value::<PublishedBatchArtifactSummary>(missing).is_err(),
+            "artifact summaries must require published_at_unix_ms"
+        );
+
+        let mut unknown = summary;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unsupported_public_delay".into(), serde_json::json!(1));
+        assert!(
+            serde_json::from_value::<PublishedBatchArtifactSummary>(unknown).is_err(),
+            "artifact summaries must reject unsupported fields"
+        );
+
+        let list = serde_json::json!({
+            "batches": [],
+            "complete_through_epoch": null
+        });
+        assert!(serde_json::from_value::<PublishedBatchArtifactList>(list.clone()).is_ok());
+        let mut unknown = list;
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unsupported_batches".into(), serde_json::json!([]));
+        assert!(
+            serde_json::from_value::<PublishedBatchArtifactList>(unknown).is_err(),
+            "artifact lists must reject unsupported fields"
+        );
+    }
+
+    #[test]
+    fn public_status_lists_require_current_metadata_fields() {
+        let batch_status = serde_json::to_value(PreparedBatchStatus {
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            pair_id: PairId("STRK/USDC".into()),
+            order_count: 0,
+            state: "open".into(),
+            candidate_clearing_price: None,
+            matched_volume: 0,
+            transcript_available: false,
+            liquidity: BatchLiquidityReport {
+                status: "pending".into(),
+                reason: None,
+                diagnostic_price: None,
+                buy_base_demand: 0,
+                sell_base_supply: 0,
+                matched_base_volume: 0,
+                crossing_order_count: 0,
+                min_base_liquidity: 0,
+            },
+            order_execution_reports: vec![],
+        })
+        .expect("batch status json");
+        let mut missing = batch_status;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("order_execution_reports");
+        assert!(
+            serde_json::from_value::<PreparedBatchStatus>(missing).is_err(),
+            "prepared batch status must require explicit order_execution_reports"
+        );
+
+        let deposit_sync = serde_json::to_value(DepositSyncStatus {
+            service: "indexer".into(),
+            cached_deposits_bucket: "0".into(),
+            synced_deposit_count_bucket: "0".into(),
+            last_successful_sync_unix_ms: 1,
+            sync_lag_ms: 0,
+        })
+        .expect("deposit sync json");
+        for field in ["last_successful_sync_unix_ms", "sync_lag_ms"] {
+            let mut missing = deposit_sync.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<DepositSyncStatus>(missing).is_err(),
+                "deposit sync status must require explicit field {field}"
+            );
+        }
+
+        let confirmations = serde_json::to_value(DepositConfirmationList {
+            confirmed: vec![],
+            last_successful_sync_unix_ms: 1,
+            sync_lag_ms: 0,
+        })
+        .expect("deposit confirmations json");
+        for field in ["last_successful_sync_unix_ms", "sync_lag_ms"] {
+            let mut missing = confirmations.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<DepositConfirmationList>(missing).is_err(),
+                "deposit confirmation list must require explicit field {field}"
+            );
+        }
+
+        let artifacts = serde_json::to_value(RecoveryArtifactList {
+            account_id: "account-1".into(),
+            sequence_start: 1,
+            sequence_end: 1,
+            artifact_count_bucket: "0".into(),
+            artifacts: vec![],
+        })
+        .expect("recovery artifact list json");
+        for field in ["sequence_start", "sequence_end", "artifact_count_bucket"] {
+            let mut missing = artifacts.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<RecoveryArtifactList>(missing).is_err(),
+                "recovery artifact list must require explicit field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn proof_history_records_require_explicit_empty_vectors_and_repeat_counts() {
+        let membership = serde_json::to_value(NoteMembershipWitness {
+            kind: NoteMembershipKind::Deposit,
+            prefix_root: "0x1".into(),
+            batch_root: "0x2".into(),
+            merkle_path: vec![],
+            merkle_directions: vec![],
+            suffix_batch_roots: vec![],
+        })
+        .expect("membership json");
+        for field in ["merkle_path", "merkle_directions", "suffix_batch_roots"] {
+            let mut missing = membership.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<NoteMembershipWitness>(missing).is_err(),
+                "note membership witness must require explicit field {field}"
+            );
+        }
+
+        let nullifier_history = serde_json::to_value(NullifierHistoryBatch {
+            repeat_count: 1,
+            nullifiers: vec![],
+        })
+        .expect("nullifier history json");
+        let mut missing = nullifier_history;
+        missing.as_object_mut().unwrap().remove("repeat_count");
+        assert!(
+            serde_json::from_value::<NullifierHistoryBatch>(missing).is_err(),
+            "nullifier history must require explicit repeat_count"
+        );
+
+        let renewal_history = serde_json::to_value(RenewalStateHistoryBatch {
+            repeat_count: 1,
+            entries: vec![],
+        })
+        .expect("renewal history json");
+        let mut missing = renewal_history;
+        missing.as_object_mut().unwrap().remove("repeat_count");
+        assert!(
+            serde_json::from_value::<RenewalStateHistoryBatch>(missing).is_err(),
+            "renewal history must require explicit repeat_count"
+        );
+
+        let settlement_history = serde_json::to_value(SettlementRootHistoryBatch {
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            pair_id: PairId("STRK/USDC".into()),
+            batch_epoch: 42,
+            prior_note_root: "0x1".into(),
+            prior_nullifier_root: "0x2".into(),
+            prior_renewal_root: "0x3".into(),
+            prior_fee_root: "0x4".into(),
+            prior_liquidity_position_root: "0x0".into(),
+            output_note_root: "0x5".into(),
+            consumed_nullifier_root: "0x6".into(),
+            liquidity_position_transition_root: "0x0".into(),
+            new_note_root: "0x7".into(),
+            new_nullifier_root: "0x8".into(),
+            new_renewal_root: "0x9".into(),
+            new_liquidity_position_root: "0x0".into(),
+            consumed_inputs: Vec::<ConsumedInput>::new(),
+            renewal_entries: vec![],
+            liquidity_position_transitions: vec![],
+            output_notes: vec![],
+        })
+        .expect("settlement history json");
+        for field in ["consumed_inputs", "renewal_entries", "output_notes"] {
+            let mut missing = settlement_history.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SettlementRootHistoryBatch>(missing).is_err(),
+                "settlement root history must require explicit field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn settlement_root_history_decodes_pre_liquidity_position_records() {
+        let legacy = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "pair_id": "STRK/USDC",
+            "batch_epoch": 42,
+            "prior_note_root": "0x1",
+            "prior_nullifier_root": "0x2",
+            "prior_renewal_root": "0x3",
+            "prior_fee_root": "0x4",
+            "output_note_root": "0x5",
+            "consumed_nullifier_root": "0x6",
+            "new_note_root": "0x7",
+            "new_nullifier_root": "0x8",
+            "new_renewal_root": "0x9",
+            "consumed_inputs": [],
+            "renewal_entries": [],
+            "output_notes": []
+        });
+
+        let decoded =
+            serde_json::from_value::<SettlementRootHistoryBatch>(legacy).expect("legacy history");
+        assert_eq!(decoded.prior_liquidity_position_root, "0x0");
+        assert_eq!(decoded.liquidity_position_transition_root, "0x0");
+        assert_eq!(decoded.new_liquidity_position_root, "0x0");
+        assert!(decoded.liquidity_position_transitions.is_empty());
+    }
+
+    #[test]
+    fn settlement_submission_plan_decodes_pre_liquidity_position_arguments() {
+        let legacy = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "transcript_commitment": "0x333",
+            "proof_artifact_commitment": "0x444",
+            "settlement_call": {
+                "contract_address": "0xabc",
+                "entrypoint": "settle_batch_with_proof",
+                "calldata": []
+            },
+            "encoded_args": {
+                "batch_id": "0x42",
+                "order_commitment_root": "0x1",
+                "encrypted_order_set_commitment": "0x2",
+                "transcript_commitment": "0x3",
+                "proof_artifact_commitment": "0x4",
+                "clearing_price": "0x5",
+                "price_base_scale": "0x6",
+                "taker_fee_bps": "0x7",
+                "relay_fee_bps": "0x9",
+                "protocol_fee_recipient": "0xa",
+                "relay_fee_recipient": "0xb",
+                "output_bundle_ref": "0xc",
+                "prior_note_root": "0xd",
+                "prior_nullifier_root": "0xe",
+                "prior_renewal_root": "0xf",
+                "prior_fee_root": "0x10",
+                "consumed_note_root": "0x11",
+                "consumed_nullifier_root": "0x12",
+                "renewal_child_root": "0x13",
+                "output_note_root": "0x14",
+                "fee_root": "0x15",
+                "new_note_root": "0x16",
+                "new_nullifier_root": "0x17",
+                "new_renewal_root": "0x18",
+                "new_fee_root": "0x19"
+            }
+        });
+
+        let decoded =
+            serde_json::from_value::<SettlementSubmissionPlan>(legacy).expect("legacy plan");
+        assert_eq!(decoded.encoded_args.prior_liquidity_position_root, "0x0");
+        assert_eq!(
+            decoded.encoded_args.liquidity_position_transition_root,
+            "0x0"
+        );
+        assert_eq!(decoded.encoded_args.new_liquidity_position_root, "0x0");
+    }
+
+    #[test]
+    fn settlement_witness_decodes_pre_liquidity_position_roots() {
+        let legacy = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "pair_id": "STRK/USDC",
+            "batch_epoch": 42,
+            "order_commitment_root": "0x111",
+            "encrypted_order_set_commitment": "0x222",
+            "transcript_commitment": "0x333",
+            "auction_verifier_address": "0x444",
+            "prior_note_root": "0x0",
+            "prior_nullifier_root": "0x0",
+            "prior_renewal_root": "0x0",
+            "prior_fee_root": "0x0",
+            "new_nullifier_root": "0x0",
+            "new_renewal_root": "0x0",
+            "clearing_price": "1",
+            "price_base_scale": "1",
+            "taker_fee_bps": 4,
+            "relay_fee_bps": 0,
+            "protocol_fee_recipient": "0x555",
+            "relay_fee_recipient": "0x666",
+            "base_asset_id": "STRK",
+            "quote_asset_id": "USDC",
+            "matched_orders": [],
+            "matched_order_witnesses": [],
+            "consumed_inputs": [],
+            "note_membership_witnesses": [],
+            "nullifier_history": [],
+            "nullifier_sparse_witnesses": [],
+            "renewal_history": [],
+            "renewal_child_sparse_witnesses": [],
+            "renewal_cancel_sparse_witnesses": [],
+            "renewal_child_uses": [],
+            "fees": [],
+            "output_notes": [],
+            "output_note_preimages": [],
+            "output_recovery_records": [],
+            "output_recovery_dummy_commitments": [],
+            "output_ciphertext_bundle_ref": "bundle"
+        });
+
+        let decoded = serde_json::from_value::<SettlementWitness>(legacy).expect("legacy witness");
+        assert_eq!(decoded.prior_liquidity_position_root, "0x0");
+        assert_eq!(decoded.new_liquidity_position_root, "0x0");
+        assert!(decoded.liquidity_position_witnesses.is_empty());
+    }
+
+    #[test]
+    fn settlement_transcript_decodes_pre_liquidity_position_roots() {
+        let legacy = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "pair_id": "STRK/USDC",
+            "batch_epoch": 42,
+            "order_commitment_root": "0x111",
+            "encrypted_order_set_commitment": "0x222",
+            "prior_note_root": "0x0",
+            "prior_nullifier_root": "0x0",
+            "prior_renewal_root": "0x0",
+            "prior_fee_root": "0x0",
+            "new_nullifier_root": "0x0",
+            "new_renewal_root": "0x0",
+            "clearing_price": "1",
+            "price_base_scale": "1",
+            "taker_fee_bps": 4,
+            "relay_fee_bps": 0,
+            "protocol_fee_recipient": "0x555",
+            "relay_fee_recipient": "0x666",
+            "matched_orders": [],
+            "consumed_inputs": [],
+            "renewal_child_uses": [],
+            "fees": [],
+            "output_notes": [],
+            "output_note_preimages": [],
+            "output_recovery_records": [],
+            "output_recovery_dummy_commitments": [],
+            "output_ciphertext_bundle_ref": "bundle"
+        });
+
+        let decoded =
+            serde_json::from_value::<SettlementTranscript>(legacy).expect("legacy transcript");
+        assert_eq!(decoded.prior_liquidity_position_root, "0x0");
+        assert_eq!(decoded.new_liquidity_position_root, "0x0");
+        assert!(decoded.liquidity_position_transitions.is_empty());
+    }
+
+    #[test]
+    fn public_transcript_decodes_pre_liquidity_position_roots() {
+        let legacy = serde_json::json!({
+            "batch_id": "batch-strk-usdc-42",
+            "pair_id": "STRK/USDC",
+            "batch_epoch": 42,
+            "published_at_unix_ms": 1,
+            "order_commitment_root": "0x111",
+            "encrypted_order_set_commitment": "0x222",
+            "transcript_commitment": "0x333",
+            "clearing_price": "1",
+            "price_base_scale": "1",
+            "taker_fee_bps": 4,
+            "relay_fee_bps": 0,
+            "protocol_fee_recipient": "0x555",
+            "relay_fee_recipient": "0x666",
+            "output_bundle_ref": "bundle",
+            "prior_note_root": "0x0",
+            "prior_nullifier_root": "0x0",
+            "prior_renewal_root": "0x0",
+            "prior_fee_root": "0x0",
+            "consumed_note_root": "0x0",
+            "consumed_nullifier_root": "0x0",
+            "renewal_child_root": "0x0",
+            "output_note_root": "0x0",
+            "fee_root": "0x0",
+            "new_note_root": "0x0",
+            "new_nullifier_root": "0x0",
+            "new_renewal_root": "0x0",
+            "new_fee_root": "0x0",
+            "transcript_shape": {
+                "policy_version": 1,
+                "matched_order_count_bucket": "0",
+                "consumed_input_count_bucket": "0",
+                "renewal_child_count_bucket": "0",
+                "fee_count_bucket": "0",
+                "output_note_count_bucket": "0",
+                "output_ciphertext_count_bucket": "0",
+                "padded_output_ciphertext_count": 0
+            }
+        });
+
+        let decoded = serde_json::from_value::<PublicSettlementTranscript>(legacy)
+            .expect("legacy transcript");
+        assert_eq!(decoded.prior_liquidity_position_root, "0x0");
+        assert_eq!(decoded.liquidity_position_transition_root, "0x0");
+        assert_eq!(decoded.new_liquidity_position_root, "0x0");
+    }
+
+    #[test]
+    fn debug_redacts_encrypted_artifact_payloads() {
+        let blob = EncryptedBlob {
+            algorithm: "test-algorithm".into(),
+            key_id: "key-1".into(),
+            ephemeral_public_key: "ephemeral-public".into(),
+            nonce: "do-not-log-blob-nonce".into(),
+            ciphertext: "do-not-log-blob-ciphertext".into(),
+            recovery: Some(OutputRecoveryRecord {
+                key_tag: "tag".into(),
+                ciphertext_fields: vec!["field".into()],
+                auth_tag: "auth".into(),
+                commitment: "commitment".into(),
+            }),
+        };
+        let attribution = EncryptedLiquidityAttributionArtifact {
+            version: 1,
+            batch_id: BatchId("batch-strk-usdc-42".into()),
+            pair_id: PairId("STRK/USDC".into()),
+            epoch_id: 42,
+            liquidity_provider_public_key: "liquidity-public".into(),
+            curve_commitment: "curve-commitment".into(),
+            output_note_commitment: NoteCommitment("0xabc".into()),
+            order_commitment: OrderCommitment("0xdef".into()),
+            algorithm: "test-attribution-algorithm".into(),
+            key_id: "liquidity-key".into(),
+            ephemeral_public_key: "liquidity-ephemeral-public".into(),
+            nonce: "do-not-log-attribution-nonce".into(),
+            ciphertext: "do-not-log-attribution-ciphertext".into(),
+            receipt: LiquidityAttributionReceipt {
+                version: 1,
+                signer_public_key: "signer".into(),
+                issued_at_unix_ms: 123,
+                payload_commitment: "payload".into(),
+                signature_r: "0x1".into(),
+                signature_s: "0x2".into(),
+            },
+        };
+
+        let blob_debug = format!("{blob:?}");
+        let attribution_debug = format!("{attribution:?}");
+
+        assert!(blob_debug.contains("test-algorithm"));
+        assert!(blob_debug.contains("<redacted>"));
+        assert!(!blob_debug.contains("do-not-log-blob-nonce"));
+        assert!(!blob_debug.contains("do-not-log-blob-ciphertext"));
+        assert!(attribution_debug.contains("test-attribution-algorithm"));
+        assert!(attribution_debug.contains("<redacted>"));
+        assert!(!attribution_debug.contains("do-not-log-attribution-nonce"));
+        assert!(!attribution_debug.contains("do-not-log-attribution-ciphertext"));
+    }
+
+    #[test]
+    fn debug_redacts_wallet_recovery_and_cancel_material() {
+        let note = test_funding_note("STRK", 1_000);
+        let snapshot = WalletSnapshot {
+            snapshot_id: "snapshot-1".into(),
+            latest_batch_id: Some(BatchId("batch-strk-usdc-42".into())),
+            notes: vec![note],
+            spent_nullifiers: vec![Nullifier("0x123".into())],
+            tracked_orders: vec![OrderCommitment("0x456".into())],
+        };
+        let payload = EncryptedRecoveryPayload {
+            algorithm: "xchacha20poly1305".into(),
+            nonce: "do-not-log-recovery-nonce".into(),
+            ciphertext: "do-not-log-recovery-ciphertext".into(),
+        };
+        let cancel = RenewalParentCancelPlanRequest {
+            chain_id: "SN_SEPOLIA".into(),
+            auction_verifier_address: "0xabc".into(),
+            parent_secret_commitment: "0x111".into(),
+            parent_cancel_authority: "0x222".into(),
+            renewal_cancel_auth_key: "do-not-log-renewal-cancel-auth-key".into(),
+            prior_renewal_entries: Vec::new(),
+            renewal_cancel_sparse_witness: None,
+        };
+
+        let snapshot_debug = format!("{snapshot:?}");
+        let payload_debug = format!("{payload:?}");
+        let cancel_debug = format!("{cancel:?}");
+
+        assert!(snapshot_debug.contains("<1 redacted>"));
+        assert!(!snapshot_debug.contains("metadata_commitment"));
+        assert!(payload_debug.contains("xchacha20poly1305"));
+        assert!(!payload_debug.contains("do-not-log-recovery-nonce"));
+        assert!(!payload_debug.contains("do-not-log-recovery-ciphertext"));
+        assert!(cancel_debug.contains("renewal_cancel_auth_key"));
+        assert!(cancel_debug.contains("<redacted>"));
+        assert!(!cancel_debug.contains("do-not-log-renewal-cancel-auth-key"));
     }
 
     #[test]
@@ -3768,10 +5456,10 @@ mod tests {
     }
 
     #[test]
-    fn maker_curve_rejects_too_many_points() {
-        let curve = HiddenMakerCurve {
-            points: (0..=MAX_MAKER_CURVE_POINTS)
-                .map(|index| MakerCurvePoint {
+    fn liquidity_curve_rejects_too_many_points() {
+        let curve = LiquidityCurve {
+            points: (0..=MAX_LIQUIDITY_CURVE_POINTS)
+                .map(|index| LiquidityCurvePoint {
                     price: 100 + index as u128,
                     base_amount: 10,
                 })
@@ -3779,6 +5467,88 @@ mod tests {
         };
 
         assert!(curve.validate().is_err());
+    }
+
+    fn private_liquidity_position() -> PrivateLiquidityPosition {
+        PrivateLiquidityPosition {
+            version: LIQUIDITY_POSITION_VERSION,
+            position_id: "0x101".into(),
+            backing: LiquidityPositionBacking::PrivateReserve,
+            status: LiquidityPositionStatus::Active,
+            pair_id: PairId("ETH/USDC".into()),
+            base_asset_id: AssetId("ETH".into()),
+            quote_asset_id: AssetId("USDC".into()),
+            owner_authority: "0x111".into(),
+            base_reserve: 2_000_000_000_000_000_000,
+            quote_reserve: 5_000_000_000,
+            price_lower_bound: 2_250_000_000,
+            price_upper_bound: 2_750_000_000,
+            max_fill_base_per_batch: 500_000_000_000_000_000,
+            curve_policy: LiquidityPositionCurvePolicy {
+                kind: LiquidityPositionCurveKind::StaticRange,
+                band_count: 5,
+                spread_bps: 30,
+                target_base_ratio_bps: 5_000,
+                inventory_skew_bps: 100,
+                max_price_deviation_bps: 500,
+            },
+            oracle_guard: Some(LiquidityPositionOracleGuard {
+                oracle_id: "pragma-eth-usdc".into(),
+                max_staleness_ms: 60_000,
+                max_divergence_bps: 75,
+            }),
+            rotation_policy: LiquidityPositionRotationPolicy {
+                max_price_rotation_bps: 50,
+                max_depth_rotation_bps: 50,
+                skip_epoch_bps: 100,
+            },
+            opened_epoch: 10,
+            expiry_epoch: 100,
+            blinding: "0x222".into(),
+            metadata_commitment: "0x333".into(),
+        }
+    }
+
+    #[test]
+    fn private_liquidity_position_commitments_are_deterministic() {
+        let position = private_liquidity_position();
+
+        let a = position.commitment().expect("position commitment");
+        let b = position.commitment().expect("position commitment");
+        let debug = format!("{position:?}");
+
+        assert_eq!(a, b);
+        assert!(!debug.contains("2000000000000000000"));
+        assert!(!debug.contains("5000000000"));
+    }
+
+    #[test]
+    fn private_liquidity_position_rejects_invalid_bounds() {
+        let mut position = private_liquidity_position();
+        position.price_upper_bound = position.price_lower_bound;
+
+        assert!(position.validate().is_err());
+    }
+
+    #[test]
+    fn private_liquidity_position_apply_fill_updates_reserves() {
+        let position = private_liquidity_position();
+        let next = position
+            .apply_fill(
+                &LiquidityPositionFillDelta {
+                    position_side: OrderSide::Sell,
+                    filled_base_amount: 100_000_000_000_000_000,
+                    quote_amount: 250_000_000,
+                },
+                "0x444",
+            )
+            .expect("position fill");
+
+        assert_eq!(
+            next.base_reserve,
+            position.base_reserve - 100_000_000_000_000_000
+        );
+        assert_eq!(next.quote_reserve, position.quote_reserve + 250_000_000);
     }
 
     #[test]
@@ -3799,7 +5569,7 @@ mod tests {
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: 145,
             amount: 1_000,
             min_fill: 100,
@@ -3843,7 +5613,7 @@ mod tests {
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: 145,
             amount: 1_000,
             min_fill: 100,
@@ -3933,7 +5703,7 @@ mod tests {
             "pair_id": "STRK/ETH",
             "batch_id": "STRK-ETH-7",
             "side": "Buy",
-            "order_type": "MakerCurve",
+            "order_type": "LiquidityCurve",
             "relay_mode": "ZylithRelay",
             "limit_price": "120000000000000",
             "amount": "3000000000000000000",
@@ -3955,7 +5725,7 @@ mod tests {
             "auditor_view_allowed": false
         });
         let parsed_order: OrderIntent =
-            serde_json::from_value(order).expect("decimal string u64 order fields");
+            serde_json::from_value(order.clone()).expect("decimal string u64 order fields");
         assert_eq!(parsed_order.expiry_epoch, 42);
         assert_eq!(parsed_order.order_nonce, u64::MAX);
         assert_eq!(parsed_order.parent_child_index, 7);
@@ -3963,6 +5733,39 @@ mod tests {
         assert_eq!(order_json["expiry_epoch"], "42");
         assert_eq!(order_json["order_nonce"], "18446744073709551615");
         assert_eq!(order_json["parent_child_index"], "7");
+
+        for field in [
+            "pair_id",
+            "batch_id",
+            "side",
+            "order_type",
+            "relay_mode",
+            "limit_price",
+            "amount",
+            "min_fill",
+            "time_in_force",
+            "expiry_epoch",
+            "order_nonce",
+            "parent_order_commitment",
+            "parent_child_index",
+            "parent_secret_commitment",
+            "parent_cancel_authority",
+            "parent_authorization_secret",
+            "funding_note_ref",
+            "funding_nullifier",
+            "recipient_owner_public_key",
+            "recipient_spend_authority",
+            "recipient_withdraw_authority",
+            "recipient_residual_withdraw_authority",
+            "auditor_view_allowed",
+        ] {
+            let mut missing = order.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<OrderIntent>(missing).is_err(),
+                "order intent must require current wire field {field}"
+            );
+        }
 
         let numeric_amount = serde_json::json!({
             "asset_id": "USDC",
@@ -4004,7 +5807,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_manifest_defaults_to_starknet_privacy_funding() {
+    fn deployment_manifest_requires_explicit_funding_config() {
         let manifest = serde_json::json!({
             "network": "local",
             "rpc_url": "http://127.0.0.1:5050",
@@ -4021,55 +5824,133 @@ mod tests {
             }
         });
 
-        let manifest: DeploymentManifest =
-            serde_json::from_value(manifest).expect("deserialize manifest");
-        assert_eq!(manifest.funding.primary, FundingRailKind::StarknetPrivacy);
-        assert!(manifest.funding.active_rail().is_err());
-        assert!(!manifest.funding.capabilities.private_deposits);
-        assert!(!manifest.funding.capabilities.discovery_sync);
-        assert!(manifest.proof.settlement_entrypoint.is_empty());
-        assert_eq!(manifest.proof.proof_validity_blocks, 0);
+        assert!(serde_json::from_value::<DeploymentManifest>(manifest).is_err());
+    }
+
+    #[test]
+    fn deployment_manifest_tolerates_client_envelope_fields_but_rejects_product_drift() {
+        fn manifest() -> serde_json::Value {
+            serde_json::from_str(include_str!("../fixtures/deployment.example.json"))
+                .expect("checked-in deployment manifest is JSON")
+        }
+
+        let mut unsupported_top_level = manifest();
+        unsupported_top_level["unexpected_top_level"] = serde_json::json!(true);
+        serde_json::from_value::<DeploymentManifest>(unsupported_top_level)
+            .expect("client envelope fields are ignored by backend manifest parser");
+
+        let mut unsupported_funding = manifest();
+        unsupported_funding["funding"]["unexpected_funding"] = serde_json::json!(true);
+        serde_json::from_value::<DeploymentManifest>(unsupported_funding)
+            .expect("client funding envelope fields are ignored by backend manifest parser");
+
+        let mut unsupported_privacy = manifest();
+        unsupported_privacy["funding"]["starknet_privacy"]["unexpected_privacy"] =
+            serde_json::json!(true);
+        serde_json::from_value::<DeploymentManifest>(unsupported_privacy)
+            .expect("client privacy-rail envelope fields are ignored by backend manifest parser");
+
+        let mut unsupported_pair = manifest();
+        unsupported_pair["product"]["pairs"]["STRK/USDC"]["unexpected_pair_field"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<DeploymentManifest>(unsupported_pair).is_err());
+
+        let mut missing_heartbeat_price = manifest();
+        missing_heartbeat_price["product"]["pairs"]["STRK/USDC"]
+            .as_object_mut()
+            .expect("pair object")
+            .remove("heartbeat_cover_price");
+        assert!(serde_json::from_value::<DeploymentManifest>(missing_heartbeat_price).is_err());
+
+        let mut unsupported_proof = manifest();
+        unsupported_proof["proof"]["unexpected_proof_field"] = serde_json::json!(true);
+        serde_json::from_value::<DeploymentManifest>(unsupported_proof)
+            .expect("client proof envelope fields are ignored by backend manifest parser");
+
+        let mut missing_native_ohttp_flag = manifest();
+        missing_native_ohttp_flag["proof"]
+            .as_object_mut()
+            .expect("proof object")
+            .remove("native_tx_prover_ohttp_enabled");
+        assert!(serde_json::from_value::<DeploymentManifest>(missing_native_ohttp_flag).is_err());
+
+        serde_json::from_value::<DeploymentManifest>(manifest()).expect("current manifest schema");
+    }
+
+    #[test]
+    fn deployment_manifest_requires_every_proof_and_runtime_section() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/deployment.example.json"))
+                .expect("checked-in deployment manifest is JSON");
+
+        for path in [
+            ["proof", "proof_program_hash"],
+            ["proof", "starknet_os_config_hash"],
+            ["proof", "native_tx_prover_url"],
+            ["proof", "initial_note_root"],
+            ["deployment", "release_commit"],
+            ["roles", "protocol_fee_recipient"],
+            ["runtime", "batch_window_ms"],
+        ] {
+            let mut incomplete = manifest.clone();
+            incomplete[path[0]]
+                .as_object_mut()
+                .expect("deployment section")
+                .remove(path[1]);
+            assert!(
+                serde_json::from_value::<DeploymentManifest>(incomplete).is_err(),
+                "missing {}.{} must fail",
+                path[0],
+                path[1]
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_manifest_accepts_checked_in_schema_template() {
+        let public_manifest = include_str!("../fixtures/deployment.example.json");
+
+        serde_json::from_str::<DeploymentManifest>(public_manifest)
+            .expect("deployment template matches Rust schema");
     }
 
     #[test]
     fn starknet_privacy_funding_only_activates_when_configured() {
         let mut funding = FundingRailConfig {
             primary: FundingRailKind::StarknetPrivacy,
-            starknet_privacy: Some(StarknetPrivacyFundingRail {
+            starknet_privacy: StarknetPrivacyFundingRail {
                 privacy_pool: String::new(),
-                bridge_adapter: None,
-                shielded_asset_adapter: None,
+                bridge_adapter: String::new(),
                 discovery_url: "https://discovery.example".into(),
                 proving_url: "https://prover.example".into(),
-                paymaster_address: None,
-                paymaster_url: None,
+                proving_ohttp_enabled: false,
+                paymaster_address: String::new(),
+                paymaster_url: String::new(),
+                ingress_key_registry_fingerprint: String::new(),
                 sdk_package: "@starkware-libs/starknet-privacy-sdk".into(),
                 sdk_version: "0.14.2".into(),
                 min_proving_delay_blocks: 20,
-            }),
-            ..FundingRailConfig::default()
+                proof_signer_class_hash: String::new(),
+            },
+            assets: BTreeMap::new(),
         };
 
         assert!(funding.active_rail().is_err());
 
-        funding
-            .starknet_privacy
-            .as_mut()
-            .expect("privacy config")
-            .privacy_pool = "0x123".into();
+        funding.starknet_privacy.privacy_pool = "0x123".into();
         assert!(funding.active_rail().is_err());
 
-        funding
-            .starknet_privacy
-            .as_mut()
-            .expect("privacy config")
-            .bridge_adapter = Some("0xb00".into());
+        funding.starknet_privacy.bridge_adapter = "0xb00".into();
         assert!(funding.active_rail().is_err());
 
-        let privacy_config = funding.starknet_privacy.as_mut().expect("privacy config");
-        privacy_config.shielded_asset_adapter = Some("0xa00".into());
-        privacy_config.paymaster_address = Some("0xabc".into());
-        privacy_config.paymaster_url = Some("https://paymaster.example/execute-outside".into());
+        funding.starknet_privacy.paymaster_address = "0xabc".into();
+        funding.starknet_privacy.paymaster_url = "https://paymaster.example/execute-outside".into();
+        assert!(funding.active_rail().is_err());
+
+        funding.starknet_privacy.proving_ohttp_enabled = true;
+        assert!(funding.active_rail().is_err());
+
+        funding.starknet_privacy.proof_signer_class_hash = "0xproof".into();
         assert_eq!(
             funding.active_rail().expect("privacy rail"),
             FundingRailKind::StarknetPrivacy
@@ -4148,7 +6029,42 @@ mod tests {
         let error = product
             .validate_order_funding(&order, &funding_note)
             .expect_err("direct zylith relay mode must fail");
-        assert!(error.to_string().contains("maker curve order"));
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn product_config_accepts_zero_fee_hosted_renewal_limit_children() {
+        let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
+        let pair = product.pairs.get("STRK/USDC").unwrap();
+        let funding_note = test_funding_note("USDC", 2_000_000_000_000_000_000);
+        let parent_authorization_secret = "0xabc123";
+        let parent_secret_commitment =
+            renewal_parent_secret_commitment(parent_authorization_secret)
+                .expect("parent secret commitment");
+        let parent_cancel_authority =
+            super::renewal_cancel_authority_from_raw_key_hex(&"44".repeat(32))
+                .expect("parent cancel authority");
+        let parent_order_commitment =
+            renewal_parent_commitment(&parent_secret_commitment, &parent_cancel_authority)
+                .expect("parent commitment");
+        let mut order = test_limit_order(
+            "STRK/USDC",
+            OrderSide::Buy,
+            1_000_000_000_000_000_000,
+            1_000_000_000_000_000_000,
+            &funding_note,
+        );
+        order.relay_mode = RelayMode::ZylithRelay;
+        order.parent_order_commitment = parent_order_commitment;
+        order.parent_child_index = 1;
+        order.parent_secret_commitment = parent_secret_commitment;
+        order.parent_cancel_authority = parent_cancel_authority;
+        order.parent_authorization_secret = parent_authorization_secret.into();
+
+        product
+            .validate_order_funding(&order, &funding_note)
+            .expect("renewal-backed hosted limit child validates");
+        assert_eq!(pair.relay_fee_bps_for_order(&order).unwrap(), 0);
     }
 
     #[test]
@@ -4170,7 +6086,7 @@ mod tests {
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: 145,
             amount: 1_000_000_000_000_000_000,
             min_fill: 1_000_000_000_000_000_000,
@@ -4226,7 +6142,7 @@ mod tests {
             side: OrderSide::Sell,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: 145,
             amount: 1_000_000_000_000_000_000,
             min_fill: 1_000_000_000_000_000_000,
@@ -4273,7 +6189,7 @@ mod tests {
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: 145,
             amount: 2_000_000_000_000_000_000,
             min_fill: 1_000_000_000_000_000_000,
@@ -4310,182 +6226,7 @@ mod tests {
     }
 
     #[test]
-    fn product_config_enforces_maker_curve_envelope_price() {
-        let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
-        let funding_note = Note {
-            asset_id: AssetId("STRK".into()),
-            amount: 3_000_000_000_000_000_000,
-            owner_public_key: "ab".repeat(32),
-            spend_authority: "0x333".into(),
-            withdraw_authority: "0x333".into(),
-            blinding: "0x111".into(),
-            nonce: 7,
-            metadata_commitment: "0x222".into(),
-        };
-        let mut order = OrderIntent {
-            pair_id: PairId("STRK/USDC".into()),
-            batch_id: BatchId("batch-strk-usdc-42".into()),
-            side: OrderSide::Sell,
-            order_type: crate::OrderType::MakerCurve,
-            relay_mode: RelayMode::SelfRelay,
-            maker_curve: Some(HiddenMakerCurve {
-                points: vec![
-                    MakerCurvePoint {
-                        price: 1_000_000_000_000_000_000,
-                        base_amount: 1_000_000_000_000_000_000,
-                    },
-                    MakerCurvePoint {
-                        price: 1_001_000_000_000_000_000,
-                        base_amount: 1_000_000_000_000_000_000,
-                    },
-                    MakerCurvePoint {
-                        price: 1_002_000_000_000_000_000,
-                        base_amount: 1_000_000_000_000_000_000,
-                    },
-                ],
-            }),
-            limit_price: 1_001_000_000_000_000_000,
-            amount: 3_000_000_000_000_000_000,
-            min_fill: 1_000_000_000_000_000_000,
-            time_in_force: crate::TimeInForce::CurrentBatchOnly,
-            expiry_epoch: 42,
-            order_nonce: 9,
-            parent_order_commitment: "0x0".into(),
-            parent_child_index: 0,
-            parent_secret_commitment: "0x0".into(),
-            parent_cancel_authority: "0x0".into(),
-            parent_authorization_secret: "0x0".into(),
-            funding_note_ref: funding_note.commitment().expect("funding note commitment"),
-            funding_nullifier: test_note_nullifier(&funding_note),
-            recipient_owner_public_key: "ab".repeat(32),
-            recipient_spend_authority: "0x333".into(),
-            recipient_withdraw_authority: "0x444".into(),
-            recipient_residual_withdraw_authority: "0x445".into(),
-            auditor_view_allowed: false,
-        };
-
-        let error = product
-            .validate_order_funding(&order, &funding_note)
-            .expect_err("mismatched maker curve envelope must fail");
-        assert!(error.to_string().contains("curve envelope price"));
-
-        order.limit_price = 1_000_000_000_000_000_000;
-        assert!(
-            product
-                .validate_order_funding(&order, &funding_note)
-                .is_ok()
-        );
-
-        order.amount -= 1;
-        let error = product
-            .validate_order_funding(&order, &funding_note)
-            .expect_err("maker curve amount mismatch must fail");
-        assert!(error.to_string().contains("sum of curve base amounts"));
-    }
-
-    #[test]
-    fn product_config_enforces_maker_curve_band_count_depth_and_spread() {
-        let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
-        let funding_note = Note {
-            asset_id: AssetId("STRK".into()),
-            amount: 3_000_000_000_000_000_000,
-            owner_public_key: "ab".repeat(32),
-            spend_authority: "0x333".into(),
-            withdraw_authority: "0x333".into(),
-            blinding: "0x111".into(),
-            nonce: 7,
-            metadata_commitment: "0x222".into(),
-        };
-        let mut order = OrderIntent {
-            pair_id: PairId("STRK/USDC".into()),
-            batch_id: BatchId("batch-strk-usdc-42".into()),
-            side: OrderSide::Sell,
-            order_type: crate::OrderType::MakerCurve,
-            relay_mode: RelayMode::SelfRelay,
-            maker_curve: Some(HiddenMakerCurve {
-                points: vec![
-                    MakerCurvePoint {
-                        price: 1_000_000_000_000_000_000,
-                        base_amount: 1_000_000_000_000_000_000,
-                    },
-                    MakerCurvePoint {
-                        price: 1_001_000_000_000_000_000,
-                        base_amount: 1_000_000_000_000_000_000,
-                    },
-                ],
-            }),
-            limit_price: 1_000_000_000_000_000_000,
-            amount: 2_000_000_000_000_000_000,
-            min_fill: 1_000_000_000_000_000_000,
-            time_in_force: crate::TimeInForce::CurrentBatchOnly,
-            expiry_epoch: 42,
-            order_nonce: 9,
-            parent_order_commitment: "0x0".into(),
-            parent_child_index: 0,
-            parent_secret_commitment: "0x0".into(),
-            parent_cancel_authority: "0x0".into(),
-            parent_authorization_secret: "0x0".into(),
-            funding_note_ref: funding_note.commitment().expect("funding note commitment"),
-            funding_nullifier: test_note_nullifier(&funding_note),
-            recipient_owner_public_key: "ab".repeat(32),
-            recipient_spend_authority: "0x333".into(),
-            recipient_withdraw_authority: "0x444".into(),
-            recipient_residual_withdraw_authority: "0x445".into(),
-            auditor_view_allowed: false,
-        };
-
-        let error = product
-            .validate_order_funding(&order, &funding_note)
-            .expect_err("two-band maker curve must fail");
-        assert!(error.to_string().contains("at least 3"));
-
-        order.maker_curve = Some(HiddenMakerCurve {
-            points: vec![
-                MakerCurvePoint {
-                    price: 1_000_000_000_000_000_000,
-                    base_amount: 1_000_000_000_000_000_000,
-                },
-                MakerCurvePoint {
-                    price: 1_001_000_000_000_000_000,
-                    base_amount: 999_999_999_999_999_999,
-                },
-                MakerCurvePoint {
-                    price: 1_002_000_000_000_000_000,
-                    base_amount: 1_000_000_000_000_000_000,
-                },
-            ],
-        });
-        order.amount = 2_999_999_999_999_999_999;
-        let error = product
-            .validate_order_funding(&order, &funding_note)
-            .expect_err("sub-minimum maker band must fail");
-        assert!(error.to_string().contains("below pair minimum"));
-
-        order.maker_curve = Some(HiddenMakerCurve {
-            points: vec![
-                MakerCurvePoint {
-                    price: 1_000_000_000_000_000_000,
-                    base_amount: 1_000_000_000_000_000_000,
-                },
-                MakerCurvePoint {
-                    price: 1_001_000_000_000_000_000,
-                    base_amount: 1_000_000_000_000_000_000,
-                },
-                MakerCurvePoint {
-                    price: 1_001_999_999_999_999_999,
-                    base_amount: 1_000_000_000_000_000_000,
-                },
-            ],
-        });
-        order.amount = 3_000_000_000_000_000_000;
-        let error = product
-            .validate_order_funding(&order, &funding_note)
-            .expect_err("under-spread maker curve must fail");
-        assert!(error.to_string().contains("at least 20 bps"));
-    }
-
-    #[test]
-    fn maker_fee_applies_to_maker_curve_without_renewal_fee_gate() {
+    fn product_config_rejects_legacy_liquidity_curve_orders() {
         let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
         let pair = product
             .enabled_pair(&PairId("STRK/USDC".into()))
@@ -4500,23 +6241,23 @@ mod tests {
             nonce: 7,
             metadata_commitment: "0x222".into(),
         };
-        let mut order = OrderIntent {
+        let order = OrderIntent {
             pair_id: PairId("STRK/USDC".into()),
             batch_id: BatchId("batch-strk-usdc-42".into()),
             side: OrderSide::Sell,
-            order_type: crate::OrderType::MakerCurve,
+            order_type: crate::OrderType::LiquidityCurve,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: Some(HiddenMakerCurve {
+            liquidity_curve: Some(LiquidityCurve {
                 points: vec![
-                    MakerCurvePoint {
+                    LiquidityCurvePoint {
                         price: 1_000_000_000_000_000_000,
                         base_amount: 1_000_000_000_000_000_000,
                     },
-                    MakerCurvePoint {
+                    LiquidityCurvePoint {
                         price: 1_001_000_000_000_000_000,
                         base_amount: 1_000_000_000_000_000_000,
                     },
-                    MakerCurvePoint {
+                    LiquidityCurvePoint {
                         price: 1_002_000_000_000_000_000,
                         base_amount: 1_000_000_000_000_000_000,
                     },
@@ -4542,49 +6283,25 @@ mod tests {
             auditor_view_allowed: false,
         };
 
-        let self_relay_parent_commitment = order.commitment().expect("self relay commitment");
-        assert_eq!(pair.fee_bps_for_order(&order).expect("fee bps"), 0);
-        assert_eq!(
-            pair.relay_fee_bps_for_order(&order)
-                .expect("self relay fee bps"),
-            0
+        let error = product
+            .validate_order_funding(&order, &funding_note)
+            .expect_err("legacy liquidity curve order must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy liquidity curve orders are disabled")
         );
-        order.relay_mode = RelayMode::ZylithRelay;
+        assert!(
+            pair.fee_bps_for_order(&order)
+                .expect_err("legacy liquidity curve fee lookup must fail")
+                .to_string()
+                .contains("legacy liquidity curve orders are disabled")
+        );
         assert!(
             pair.relay_fee_bps_for_order(&order)
-                .expect_err("zylith relay requires renewal child")
+                .expect_err("legacy liquidity curve relay-fee lookup must fail")
                 .to_string()
-                .contains("renewal child parent fields")
-        );
-        order.relay_mode = RelayMode::SelfRelay;
-
-        order.parent_authorization_secret = "0x7777".into();
-        order.parent_secret_commitment =
-            renewal_parent_secret_commitment(&order.parent_authorization_secret)
-                .expect("parent secret commitment");
-        order.parent_cancel_authority = "0x8888".into();
-        order.parent_order_commitment = renewal_parent_commitment(
-            &order.parent_secret_commitment,
-            &order.parent_cancel_authority,
-        )
-        .expect("parent commitment");
-        order.parent_child_index = 1;
-
-        assert_eq!(pair.fee_bps_for_order(&order).expect("fee bps"), 0);
-        assert_eq!(
-            pair.relay_fee_bps_for_order(&order)
-                .expect("self relay child fee bps"),
-            0
-        );
-        order.relay_mode = RelayMode::ZylithRelay;
-        assert_ne!(
-            self_relay_parent_commitment,
-            order.commitment().expect("zylith relay commitment")
-        );
-        assert_eq!(
-            pair.relay_fee_bps_for_order(&order)
-                .expect("zylith relay fee bps"),
-            pair.relay_fee_bps
+                .contains("legacy liquidity curve orders are disabled")
         );
     }
 
@@ -4716,18 +6433,20 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            prior_liquidity_position_root: "0x0".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
+            new_liquidity_position_root: "0x0".into(),
             clearing_price: 100,
             price_base_scale: 1,
             taker_fee_bps: 4,
-            maker_fee_bps: 0,
             relay_fee_bps: 0,
             protocol_fee_recipient: "0x123".into(),
             relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
+            liquidity_position_transitions: vec![],
             fees: vec![FeeEntry {
                 asset_id: AssetId("USDC".into()),
                 amount: 1,
@@ -4781,18 +6500,20 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            prior_liquidity_position_root: "0x0".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
+            new_liquidity_position_root: "0x0".into(),
             clearing_price: 100,
             price_base_scale: 1,
             taker_fee_bps: 4,
-            maker_fee_bps: 0,
             relay_fee_bps: 0,
             protocol_fee_recipient: "0x123".into(),
             relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
+            liquidity_position_transitions: vec![],
             fees: vec![],
             output_notes: vec![OutputNoteRecord {
                 note_commitment: NoteCommitment("0x456".into()),
@@ -4838,18 +6559,20 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            prior_liquidity_position_root: "0x0".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
+            new_liquidity_position_root: "0x0".into(),
             clearing_price: 100,
             price_base_scale: 1,
             taker_fee_bps: 4,
-            maker_fee_bps: 0,
             relay_fee_bps: 0,
             protocol_fee_recipient: "0x123".into(),
             relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
+            liquidity_position_transitions: vec![],
             fees: vec![],
             output_notes: vec![OutputNoteRecord {
                 note_commitment: NoteCommitment("0x456".into()),
@@ -4916,18 +6639,20 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            prior_liquidity_position_root: "0x0".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
+            new_liquidity_position_root: "0x0".into(),
             clearing_price: 100,
             price_base_scale: 1,
             taker_fee_bps: 4,
-            maker_fee_bps: 0,
             relay_fee_bps: 0,
             protocol_fee_recipient: "0x123".into(),
             relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
+            liquidity_position_transitions: vec![],
             fees: vec![],
             output_notes: vec![OutputNoteRecord {
                 note_commitment: NoteCommitment("0x456".into()),
@@ -4979,18 +6704,20 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            prior_liquidity_position_root: "0x0".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
+            new_liquidity_position_root: "0x0".into(),
             clearing_price: 100,
             price_base_scale: 1,
             taker_fee_bps: 4,
-            maker_fee_bps: 0,
             relay_fee_bps: 0,
             protocol_fee_recipient: "zylith-protocol-treasury".into(),
             relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
+            liquidity_position_transitions: vec![],
             fees: vec![],
             output_notes: vec![output_note],
             output_note_preimages: vec![],
@@ -5047,8 +6774,8 @@ mod tests {
     }
 
     #[test]
-    fn trusted_order_ingress_telemetry_is_optional_and_out_of_band() {
-        let json = serde_json::json!({
+    fn trusted_order_ingress_requires_out_of_band_telemetry() {
+        let mut json = serde_json::json!({
             "order_submission": {
                 "order_bundle": {
                     "order_commitment": "0xabc",
@@ -5061,29 +6788,66 @@ mod tests {
                 }
             }
         });
-        let request: TrustedOrderIngressRequest =
-            serde_json::from_value(json).expect("legacy ingress request");
-        assert!(request.ingress_telemetry.is_none());
+        assert!(serde_json::from_value::<TrustedOrderIngressRequest>(json.clone()).is_err());
 
-        let request = TrustedOrderIngressRequest {
-            ingress_telemetry: Some(OrderIngressClientTelemetry {
-                version: 1,
-                client_build_ms: Some(25),
-                private_submission_delay_ms: Some(7_000),
-                client_elapsed_before_private_ingress_ms: Some(7_025),
-                private_ingress_roundtrip_ms: Some(120),
-                client_elapsed_before_coordinator_ms: Some(7_145),
-                batch_time_remaining_before_private_ingress_ms: Some(25_000),
-                batch_time_remaining_before_coordinator_ms: Some(24_850),
-                submission_safety_buffer_ms: Some(15_000),
-            }),
-            ..request
-        };
+        json["ingress_telemetry"] = serde_json::json!({
+                "version": 1,
+                "client_build_ms": 25,
+                "private_submission_delay_ms": 7_000,
+                "client_elapsed_before_private_ingress_ms": 7_025,
+                "private_ingress_roundtrip_ms": 120,
+                "client_elapsed_before_coordinator_ms": 7_145,
+                "batch_time_remaining_before_private_ingress_ms": 25_000,
+                "batch_time_remaining_before_coordinator_ms": 24_850,
+                "submission_safety_buffer_ms": 15_000,
+        });
+        let request: TrustedOrderIngressRequest =
+            serde_json::from_value(json).expect("telemetry request");
         let serialized = serde_json::to_value(&request).expect("telemetry request");
         assert_eq!(serialized["ingress_telemetry"]["version"], 1);
         assert_eq!(
             serialized["order_submission"]["order_bundle"]["order_commitment"],
             "0xabc"
         );
+    }
+
+    #[test]
+    fn trusted_order_ingress_accepts_renewal_slot_attestation_fields() {
+        let json = serde_json::json!({
+            "order_submission": {
+                "order_bundle": {
+                    "order_commitment": "0xabc",
+                    "cancellation_auth_tag": "cancel",
+                    "pair_id": "STRK/USDC",
+                    "batch_id": "batch-strk-usdc-1",
+                    "epoch_id": 1,
+                    "transport_envelope": null,
+                    "shares": []
+                }
+            },
+            "renewal_package_id": "pkg-1",
+            "renewal_package_commitment": "0xpackage",
+            "renewal_relay_mode": "ZylithRelay",
+            "renewal_slot_order_commitment": "0xabc",
+            "renewal_slot_pair": "STRK/USDC",
+            "renewal_slot_batch_id": "batch-strk-usdc-1",
+            "renewal_slot_epoch_id": 1,
+            "ingress_telemetry": {
+                "version": 1
+            }
+        });
+
+        let request: TrustedOrderIngressRequest =
+            serde_json::from_value(json).expect("renewal slot ingress request");
+        assert_eq!(
+            request.renewal_slot_order_commitment.as_deref(),
+            Some("0xabc")
+        );
+        assert_eq!(request.renewal_slot_pair.as_deref(), Some("STRK/USDC"));
+        assert_eq!(
+            request.renewal_slot_batch_id.as_deref(),
+            Some("batch-strk-usdc-1")
+        );
+        assert_eq!(request.renewal_slot_epoch_id, Some(1));
     }
 }

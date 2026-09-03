@@ -1,0 +1,324 @@
+{
+  "deployment": {
+    "finalized": false,
+    "release_commit": "0000000000000000000000000000000000000000"
+  },
+  "network": "sepolia",
+  "rpc_url": "https://rpc.example.invalid",
+  "chain_id": "0x534e5f5345504f4c4941",
+  "contracts": {
+    "commitment_registry": "0x0",
+    "batch_registry": "0x0",
+    "shielded_asset_adapter": "0x0",
+    "privacy_deposit_bridge": "0x0",
+    "auction_verifier": "0x0"
+  },
+  "token_addresses": {
+    "STRK": "0x0",
+    "ETH": "0x0",
+    "USDC": "0x0",
+    "strkBTC": "0x0",
+    "WBTC": "0x0",
+    "USDT": "0x0"
+  },
+  "funding": {
+    "primary": "starknet_privacy",
+    "starknet_privacy": {
+      "privacy_pool": "0x0",
+      "bridge_adapter": "0x0",
+      "discovery_url": "https://discovery.example.invalid",
+      "proving_url": "https://prover.example.invalid",
+      "proving_ohttp_enabled": true,
+      "paymaster_address": "0x0",
+      "paymaster_url": "https://paymaster.example.invalid/execute-outside",
+      "ingress_key_registry_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+      "sdk_package": "@starkware-libs/starknet-privacy-sdk",
+      "sdk_version": "0.14.3-rc.0",
+      "min_proving_delay_blocks": 10,
+      "proof_signer_class_hash": "0x0"
+    },
+    "assets": {
+      "STRK": {
+        "asset_id": "STRK",
+        "token_address": "0x0",
+        "rail_token_address": "0x0",
+        "min_trade_amount": "1000000000000000000",
+        "enabled_pairs": [
+          "STRK/USDC",
+          "STRK/ETH",
+          "STRK/strkBTC"
+        ]
+      },
+      "ETH": {
+        "asset_id": "ETH",
+        "token_address": "0x0",
+        "rail_token_address": "0x0",
+        "min_trade_amount": "1000000000000000",
+        "enabled_pairs": [
+          "ETH/USDC",
+          "STRK/ETH"
+        ]
+      },
+      "USDC": {
+        "asset_id": "USDC",
+        "token_address": "0x0",
+        "rail_token_address": "0x0",
+        "min_trade_amount": "1000000",
+        "enabled_pairs": [
+          "STRK/USDC",
+          "ETH/USDC",
+          "strkBTC/USDC",
+          "USDC/USDT"
+        ]
+      },
+      "strkBTC": {
+        "asset_id": "strkBTC",
+        "token_address": "0x0",
+        "rail_token_address": "0x0",
+        "min_trade_amount": "100000",
+        "enabled_pairs": [
+          "strkBTC/USDC",
+          "STRK/strkBTC",
+          "WBTC/strkBTC"
+        ]
+      },
+      "WBTC": {
+        "asset_id": "WBTC",
+        "token_address": "0x0",
+        "rail_token_address": "0x0",
+        "min_trade_amount": "100000",
+        "enabled_pairs": [
+          "WBTC/strkBTC"
+        ]
+      },
+      "USDT": {
+        "asset_id": "USDT",
+        "token_address": "0x0",
+        "rail_token_address": "0x0",
+        "min_trade_amount": "1000000",
+        "enabled_pairs": [
+          "USDC/USDT"
+        ]
+      }
+    }
+  },
+  "product": {
+    "assets": {
+      "STRK": {
+        "asset_id": "STRK",
+        "min_trade_amount": "1000000000000000000",
+        "decimals": 18,
+        "enabled": true,
+        "token_address": "0x0",
+        "erc20_behavior": "vanilla-exact-delta",
+        "audit_status": "pending"
+      },
+      "ETH": {
+        "asset_id": "ETH",
+        "min_trade_amount": "1000000000000000",
+        "decimals": 18,
+        "enabled": true,
+        "token_address": "0x0",
+        "erc20_behavior": "vanilla-exact-delta",
+        "audit_status": "pending"
+      },
+      "USDC": {
+        "asset_id": "USDC",
+        "min_trade_amount": "1000000",
+        "decimals": 6,
+        "enabled": true,
+        "token_address": "0x0",
+        "erc20_behavior": "vanilla-exact-delta",
+        "audit_status": "pending"
+      },
+      "strkBTC": {
+        "asset_id": "strkBTC",
+        "min_trade_amount": "100000",
+        "decimals": 8,
+        "enabled": true,
+        "token_address": "0x0",
+        "erc20_behavior": "vanilla-exact-delta",
+        "audit_status": "pending"
+      },
+      "WBTC": {
+        "asset_id": "WBTC",
+        "min_trade_amount": "100000",
+        "decimals": 8,
+        "enabled": true,
+        "token_address": "0x0",
+        "erc20_behavior": "vanilla-exact-delta",
+        "audit_status": "pending"
+      },
+      "USDT": {
+        "asset_id": "USDT",
+        "min_trade_amount": "1000000",
+        "decimals": 6,
+        "enabled": true,
+        "token_address": "0x0",
+        "erc20_behavior": "vanilla-exact-delta",
+        "audit_status": "pending"
+      }
+    },
+    "pairs": {
+      "STRK/USDC": {
+        "pair_id": "STRK/USDC",
+        "base_asset_id": "STRK",
+        "quote_asset_id": "USDC",
+        "min_order_amount": "1000000000000000000",
+        "price_base_scale": "1000000000000000000",
+        "taker_fee_bps": 4,
+        "relay_fee_bps": 0,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      },
+      "ETH/USDC": {
+        "pair_id": "ETH/USDC",
+        "base_asset_id": "ETH",
+        "quote_asset_id": "USDC",
+        "min_order_amount": "1000000000000000",
+        "price_base_scale": "1000000000000000000",
+        "taker_fee_bps": 4,
+        "relay_fee_bps": 0,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      },
+      "strkBTC/USDC": {
+        "pair_id": "strkBTC/USDC",
+        "base_asset_id": "strkBTC",
+        "quote_asset_id": "USDC",
+        "min_order_amount": "100000",
+        "price_base_scale": "100000000",
+        "taker_fee_bps": 4,
+        "relay_fee_bps": 0,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      },
+      "STRK/ETH": {
+        "pair_id": "STRK/ETH",
+        "base_asset_id": "STRK",
+        "quote_asset_id": "ETH",
+        "min_order_amount": "1000000000000000000",
+        "price_base_scale": "1000000000000000000",
+        "taker_fee_bps": 4,
+        "relay_fee_bps": 0,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      },
+      "STRK/strkBTC": {
+        "pair_id": "STRK/strkBTC",
+        "base_asset_id": "STRK",
+        "quote_asset_id": "strkBTC",
+        "min_order_amount": "1000000000000000000",
+        "price_base_scale": "1000000000000000000",
+        "taker_fee_bps": 4,
+        "relay_fee_bps": 0,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      },
+      "WBTC/strkBTC": {
+        "pair_id": "WBTC/strkBTC",
+        "base_asset_id": "WBTC",
+        "quote_asset_id": "strkBTC",
+        "min_order_amount": "100000",
+        "price_base_scale": "100000000",
+        "taker_fee_bps": 1,
+        "relay_fee_bps": 0,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      },
+      "USDC/USDT": {
+        "pair_id": "USDC/USDT",
+        "base_asset_id": "USDC",
+        "quote_asset_id": "USDT",
+        "min_order_amount": "1000000",
+        "price_base_scale": "1000000",
+        "taker_fee_bps": 1,
+        "relay_fee_bps": 0,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      }
+    }
+  },
+  "proof": {
+    "scheme": "native-starknet-proof-bearing-invoke-v3",
+    "proof_version": "PROOF1",
+    "settlement_statement_type": 1,
+    "settlement_statement_schema": 1,
+    "auction_statement_type": 2,
+    "auction_statement_schema": 1,
+    "settlement_entrypoint": "submit_settlement_with_proof_facts",
+    "proof_entrypoint": "compile_settlement_proof",
+    "proof_program_address": "0x0",
+    "proof_program_hash": "0x0",
+    "statement_proof_program_hashes": {
+      "ADMISSION": "0x0",
+      "AUCTION_RESULT": "0x0",
+      "NULLIFIER": "0x0",
+      "RENEWAL": "0x0",
+      "LIQUIDITY_POSITION": "0x0",
+      "SETTLEMENT_ORDER": "0x0",
+      "SETTLEMENT_INPUT_MEMBERSHIP": "0x0",
+      "SETTLEMENT_OUTPUT_RECOVERY": "0x0",
+      "SETTLEMENT": "0x0",
+      "NOTE_CONSOLIDATION": "0x0",
+      "AGGREGATE_SETTLEMENT": "0x0",
+      "WITHDRAWAL": "0x0",
+      "MULTI_PAIR": "0x0"
+    },
+    "admission_proof_program_hash": "0x0",
+    "auction_result_proof_program_hash": "0x0",
+    "nullifier_proof_program_hash": "0x0",
+    "renewal_proof_program_hash": "0x0",
+    "liquidity_position_proof_program_hash": "0x0",
+    "settlement_order_proof_program_hash": "0x0",
+    "settlement_input_membership_proof_program_hash": "0x0",
+    "settlement_output_recovery_proof_program_hash": "0x0",
+    "settlement_proof_program_hash": "0x0",
+    "note_consolidation_proof_program_hash": "0x0",
+    "aggregate_settlement_proof_program_hash": "0x0",
+    "withdrawal_proof_program_hash": "0x0",
+    "multi_pair_proof_program_hash": "0x0",
+    "starknet_os_config_hash": "0x0",
+    "settlement_statement_program_address": "0x0",
+    "settlement_note_fee_statement_program_address": "0x0",
+    "settlement_order_statement_program_address": "0x0",
+    "settlement_input_membership_statement_program_address": "0x0",
+    "settlement_output_recovery_statement_program_address": "0x0",
+    "liquidity_position_statement_program_address": "0x0",
+    "admission_statement_program_address": "0x0",
+    "auction_result_statement_program_address": "0x0",
+    "multi_pair_statement_program_address": "0x0",
+    "proof_account_address": "0x0",
+    "settlement_account_address": "0x0",
+    "deposit_root_registrar_address": "0x0",
+    "proof_validity_blocks": 450,
+    "output_claim_delay_seconds": 1800,
+    "proof_program_locked_after_deploy": true,
+    "operational_config_locked_after_deploy": true,
+    "commitment_registry_config_locked_after_deploy": true,
+    "batch_registry_config_locked_after_deploy": true,
+    "privacy_deposit_bridge_config_locked_after_deploy": true,
+    "native_tx_prover_url": "https://prover.example.invalid",
+    "native_tx_prover_ohttp_enabled": true,
+    "nullifier_statement_program_address": "0x0",
+    "renewal_statement_program_address": "0x0",
+    "note_consolidation_statement_program_address": "0x0",
+    "withdrawal_statement_program_address": "0x0",
+    "initial_note_root": "0x0",
+    "initial_nullifier_root": "0x0",
+    "initial_renewal_root": "0x0",
+    "initial_fee_root": "0x0"
+  },
+  "roles": {
+    "protocol_fee_recipient": "0x0",
+    "relay_fee_recipient": "0x0",
+    "pause_guardian_address": "0x0"
+  },
+  "runtime": {
+    "batch_window_ms": 20000,
+    "public_artifact_delay_min_epochs": 14,
+    "public_artifact_delay_max_epochs": 36,
+    "artifact_epoch_bucket_size": 8,
+    "output_claim_delay_seconds": 1800
+  }
+}

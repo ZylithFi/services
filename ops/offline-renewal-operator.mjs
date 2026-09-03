@@ -6,6 +6,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_STATE_PATH = ".deploy/offline-renewal-operator.state.json";
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main();
@@ -27,24 +28,26 @@ function parseArgs(argv) {
   let statePath = DEFAULT_STATE_PATH;
   let coordinatorUrl = "";
   let proverUrl = "";
+  let requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--package") packagePath = argv[++index] ?? "";
     else if (arg === "--state") statePath = argv[++index] ?? "";
     else if (arg === "--coordinator-url") coordinatorUrl = argv[++index] ?? "";
     else if (arg === "--prover-url") proverUrl = argv[++index] ?? "";
+    else if (arg === "--request-timeout-ms") requestTimeoutMs = parsePositiveInt(argv[++index], "request timeout");
     else if (arg === "--help" || arg === "-h") {
-      console.log("Usage: node ops/offline-renewal-operator.mjs --package PATH [--state PATH] [--coordinator-url URL] [--prover-url URL]");
+      console.log("Usage: node ops/offline-renewal-operator.mjs --package PATH [--state PATH] [--coordinator-url URL] [--prover-url URL] [--request-timeout-ms MS]");
       process.exit(0);
     } else {
       throw new Error(`unexpected argument: ${arg}`);
     }
   }
   if (!packagePath) throw new Error("missing --package PATH");
-  return { packagePath, statePath, coordinatorUrl, proverUrl };
+  return { packagePath, statePath, coordinatorUrl, proverUrl, requestTimeoutMs };
 }
 
-async function relayPackageOnce(renewalPackage, state, args) {
+export async function relayPackageOnce(renewalPackage, state, args) {
   const coordinatorUrl = normalizeUrl(args.coordinatorUrl || renewalPackage.relay_policy.coordinator_url);
   const proverUrl = normalizeUrl(args.proverUrl || renewalPackage.relay_policy.prover_url);
   if (!coordinatorUrl || !proverUrl) throw new Error("coordinator and prover URLs are required");
@@ -57,6 +60,7 @@ async function relayPackageOnce(renewalPackage, state, args) {
     const cancelStatus = await fetchJson(
       coordinatorUrl,
       `/api/renewal/cancel-markers/${encodeURIComponent(renewalPackage.parent_cancel_marker ?? "")}`,
+      args,
     );
     if (!cancelStatus) {
       results.push(slotResult(slot, "awaiting_settlement", "Waiting for renewal cancellation status before submitting child orders."));
@@ -66,13 +70,13 @@ async function relayPackageOnce(renewalPackage, state, args) {
       results.push(slotResult(slot, "missed", "Renewal parent cancellation marker is recorded."));
       continue;
     }
-    const reuseGuard = await priorSlotReuseGuard(proverUrl, renewalPackage, slot, state);
+    const reuseGuard = await priorSlotReuseGuard(proverUrl, renewalPackage, slot, state, args);
     if (reuseGuard) {
       results.push(reuseGuard);
       continue;
     }
     try {
-      const batch = await fetchCurrentPairBatch(coordinatorUrl, slot.pair);
+      const batch = await fetchRelayPairBatch(coordinatorUrl, slot.pair, args);
       if (!batch || batch.batch_id !== slot.batch_id || batch.epoch_id !== slot.epoch_id) {
         results.push(slotResult(slot, "not_due"));
         continue;
@@ -90,9 +94,9 @@ async function relayPackageOnce(renewalPackage, state, args) {
         results.push(slotResult(slot, "safety_buffer"));
         continue;
       }
-      const ingress = await postJson(proverUrl, "/api/private/orders", attestedIngressRequest(renewalPackage, slot));
+      const ingress = await postJson(proverUrl, "/api/private/orders", attestedIngressRequest(renewalPackage, slot), args);
       validateIngressForSlot(renewalPackage, slot, ingress.receipt);
-      const accepted = await postJson(coordinatorUrl, "/api/orders", ingress.coordinator_submission);
+      const accepted = await postJson(coordinatorUrl, "/api/orders", ingress.coordinator_submission, args);
       validateAcceptedForSlot(slot, accepted);
       state.submitted_order_commitments.push(slot.order_commitment);
       state.submitted_slots.push({
@@ -110,24 +114,28 @@ async function relayPackageOnce(renewalPackage, state, args) {
   return results;
 }
 
-async function fetchCurrentPairBatch(coordinatorUrl, pair) {
+async function fetchSubmittablePairBatch(coordinatorUrl, pair, args) {
   const [base, quote] = pair.split("/");
-  const response = await fetch(`${coordinatorUrl}/api/pairs/${base}/${quote}/batches/current`, {
+  const response = await fetchWithTimeout(`${coordinatorUrl}/api/pairs/${encodeURIComponent(base)}/${encodeURIComponent(quote)}/batches/submittable`, {
     headers: { accept: "application/json" },
-  });
+  }, args);
   if (!response.ok) return null;
   return response.json();
 }
 
-async function postJson(baseUrl, path, body) {
-  const response = await fetch(`${baseUrl}${path}`, {
+async function fetchRelayPairBatch(coordinatorUrl, pair, args) {
+  return fetchSubmittablePairBatch(coordinatorUrl, pair, args);
+}
+
+async function postJson(baseUrl, path, body, args) {
+  const response = await fetchWithTimeout(`${baseUrl}${path}`, {
     method: "POST",
     headers: {
       accept: "application/json",
       "content-type": "application/json",
     },
     body: JSON.stringify(body),
-  });
+  }, args);
   if (!response.ok) {
     throw new Error((await response.text().catch(() => "")) || `request failed with HTTP ${response.status}`);
   }
@@ -176,6 +184,7 @@ export function renewalPackageCommitment(renewalPackage) {
   const value = JSON.parse(JSON.stringify(renewalPackage));
   delete value.package_commitment;
   delete value.relay_authorization;
+  delete value.access_token;
   return `0x${createHash("sha256").update(stableJsonString(value)).digest("hex")}`;
 }
 
@@ -202,23 +211,23 @@ function sampleRelayDelayMs(batch, renewalPackage) {
   return maxDelay > 0 ? Math.floor(Math.random() * maxDelay) : 0;
 }
 
-async function priorSlotReuseGuard(proverUrl, renewalPackage, slot, state) {
+async function priorSlotReuseGuard(proverUrl, renewalPackage, slot, state, args) {
   const priorSlots = state.submitted_slots.filter((candidate) =>
     candidate.parent_child_index < slot.parent_child_index &&
     slotsReuseFundingNotes(candidate, slot)
   );
   for (const prior of priorSlots) {
-    const status = await fetchJson(proverUrl, `/api/public/proof-jobs/${encodeURIComponent(prior.batch_id)}`);
+    const status = await fetchJson(proverUrl, `/api/public/proof-jobs/${encodeURIComponent(prior.batch_id)}`, args);
     if (!status) {
       return slotResult(slot, "awaiting_settlement", `Waiting for prior child batch ${prior.batch_id} proof status.`);
     }
     if (proofJobFailed(status)) {
-      return slotResult(slot, "awaiting_settlement", `Prior child batch ${prior.batch_id} proof failed; refresh this package before reusing maker capital.`);
+      return slotResult(slot, "awaiting_settlement", `Prior child batch ${prior.batch_id} proof failed; refresh this package before reusing liquidity capital.`);
     }
     if (proofJobConfirmed(status)) {
       if (status.reuse_state === "no_fill") continue;
       if (status.reuse_state === "matched") {
-        return slotResult(slot, "awaiting_wallet_refresh", `Prior child batch ${prior.batch_id} settled; refresh this package before reusing maker capital.`);
+        return slotResult(slot, "awaiting_wallet_refresh", `Prior child batch ${prior.batch_id} settled; refresh this package before reusing liquidity capital.`);
       }
       return slotResult(slot, "awaiting_settlement", `Prior child batch ${prior.batch_id} is confirmed without a no-fill reuse attestation.`);
     }
@@ -227,12 +236,49 @@ async function priorSlotReuseGuard(proverUrl, renewalPackage, slot, state) {
   return null;
 }
 
-async function fetchJson(baseUrl, path) {
-  const response = await fetch(`${baseUrl}${path}`, {
+async function fetchJson(baseUrl, path, args) {
+  const response = await fetchWithTimeout(`${baseUrl}${path}`, {
     headers: { accept: "application/json" },
-  });
+  }, args);
   if (!response.ok) return null;
   return response.json();
+}
+
+async function fetchWithTimeout(url, init = {}, args = {}) {
+  const timeoutMs = parsePositiveInt(args.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, "request timeout");
+  const controller = new AbortController();
+  let timer;
+  const timeoutGuard = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(new DOMException("offline renewal request timed out", "TimeoutError"));
+      reject(new Error(`request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      fetch(url, { ...init, signal: controller.signal }),
+      timeoutGuard,
+    ]);
+  } catch (error) {
+    throw new Error(normalizedNetworkErrorMessage(error, timeoutMs));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function normalizedNetworkErrorMessage(error, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS) {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const name = error instanceof Error ? error.name : "";
+  if (
+    /AbortError|TimeoutError/i.test(name) ||
+    /signal is aborted|aborted without reason|operation was aborted/i.test(message)
+  ) {
+    return `request timed out after ${timeoutMs}ms`;
+  }
+  if (/failed to fetch|networkerror|network request failed|load failed|fetch failed/i.test(message)) {
+    return "network request failed";
+  }
+  return message || "request failed";
 }
 
 function validateIngressForSlot(renewalPackage, slot, receipt) {
@@ -296,4 +342,10 @@ function slotResult(slot, status, detail) {
 
 function normalizeUrl(value) {
   return String(value || "").replace(/\/+$/, "");
+}
+
+function parsePositiveInt(value, label) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new Error(`${label} must be a positive integer`);
+  return parsed;
 }

@@ -10,14 +10,48 @@ import type {
 } from "./types.js";
 
 const MAX_OUTSIDE_EXECUTION_WINDOW_SECONDS = 3_900;
-const RENEWAL_SPARSE_TREE_DEPTH = 128;
-const U128_MAX = (1n << 128n) - 1n;
 const SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS = new Set([
   "apply_actions",
   "submit_settlement_with_proof_facts",
-  "withdraw_settlement_output_with_proof_facts",
-  "cancel_renewal_parent_marker",
 ]);
+const EXECUTE_OUTSIDE_REQUEST_KEYS = new Set([
+  "chain_id",
+  "signer_address",
+  "paymaster_address",
+  "call",
+  "outside_transaction",
+  "relay_nonce",
+  "proof",
+  "proof_facts",
+]);
+const ENSURE_PRIVACY_SIGNER_REQUEST_KEYS = new Set([
+  "signer_public_key",
+  "salt",
+  "class_hash",
+]);
+const RELAY_PRIVACY_SIGNER_REQUEST_KEYS = new Set([
+  "account_address",
+  "calls",
+  "nonce",
+  "signature_r",
+  "signature_s",
+]);
+const CALL_KEYS = new Set(["contract_address", "entrypoint", "calldata"]);
+const OUTSIDE_TRANSACTION_KEYS = new Set([
+  "outsideExecution",
+  "signerAddress",
+  "version",
+  "signature",
+]);
+const OUTSIDE_EXECUTION_KEYS = new Set([
+  "caller",
+  "nonce",
+  "execute_after",
+  "execute_before",
+  "calls",
+]);
+const OUTSIDE_CALL_KEYS = new Set(["to", "selector", "calldata"]);
+const SIGNATURE_OBJECT_KEYS = new Set(["r", "s"]);
 
 export function validateExecuteOutsideRequest(
   value: unknown,
@@ -28,12 +62,11 @@ export function validateExecuteOutsideRequest(
     | "allowedEntrypoints"
     | "chainId"
     | "proofRequiredEntrypoints"
-    | "withdrawalAmountBuckets"
-    | "allowDirectWithdrawalRelays"
   >,
   nowUnixSeconds = Math.floor(Date.now() / 1000)
 ): ExecuteOutsideRequest {
   const request = expectRecord(value, "request") as Partial<ExecuteOutsideRequest>;
+  assertAllowedKeys(request, EXECUTE_OUTSIDE_REQUEST_KEYS, "request");
   const call = validateCall(request.call);
 
   const chainId = normalizeFelt(expectString(request.chain_id, "chain_id"));
@@ -59,6 +92,12 @@ export function validateExecuteOutsideRequest(
   if (!SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS.has(call.entrypoint)) {
     throw new Error("call entrypoint is not supported by paymaster");
   }
+  if (
+    SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS.has(call.entrypoint) &&
+    !config.proofRequiredEntrypoints.has(call.entrypoint)
+  ) {
+    throw new Error("supported paymaster entrypoint must be proof-required");
+  }
   if (config.proofRequiredEntrypoints.has(call.entrypoint)) {
     if (!proof) {
       throw new Error("proof cannot be empty for proof-required entrypoint");
@@ -70,8 +109,6 @@ export function validateExecuteOutsideRequest(
   if (!proof && proofFacts && proofFacts.length > 0) {
     throw new Error("proof_facts require proof");
   }
-  assertWithdrawalAmountBucket(call, config.withdrawalAmountBuckets);
-
   const outsideTransaction = request.outside_transaction
     ? (expectRecord(request.outside_transaction, "outside_transaction") as unknown as ExecuteOutsideRequest["outside_transaction"])
     : undefined;
@@ -79,11 +116,7 @@ export function validateExecuteOutsideRequest(
   if (outsideTransaction) {
     validateOutsideTransaction(outsideTransaction, signerAddress, config.accountAddress, call, nowUnixSeconds);
   } else {
-    validateDirectRelayedCall(
-      call,
-      Boolean(proof && proofFacts && proofFacts.length > 0),
-      config.allowDirectWithdrawalRelays,
-    );
+    validateDirectRelayedCall(call, Boolean(proof && proofFacts && proofFacts.length > 0));
     if (request.relay_nonce !== undefined) {
       normalizeFeltValue(request.relay_nonce, "relay_nonce");
     }
@@ -115,6 +148,16 @@ function validateOutsideTransaction(
 ): void {
   const outsideExecution = expectRecord(
     outsideTransaction.outsideExecution,
+    "outside_transaction.outsideExecution"
+  );
+  assertAllowedKeys(
+    outsideTransaction as unknown as Record<string, unknown>,
+    OUTSIDE_TRANSACTION_KEYS,
+    "outside_transaction"
+  );
+  assertAllowedKeys(
+    outsideExecution,
+    OUTSIDE_EXECUTION_KEYS,
     "outside_transaction.outsideExecution"
   );
   const caller = normalizeFelt(expectString(outsideExecution.caller, "outsideExecution.caller"));
@@ -159,10 +202,8 @@ export function validateEnsurePrivacySignerRequest(
   value: unknown,
   config: Pick<PaymasterConfig, "privacySignerClassHash">
 ): EnsurePrivacySignerRequest {
-  if (!config.privacySignerClassHash) {
-    throw new Error("privacy proof signer deployment is not configured");
-  }
   const request = expectRecord(value, "request") as Partial<EnsurePrivacySignerRequest>;
+  assertAllowedKeys(request, ENSURE_PRIVACY_SIGNER_REQUEST_KEYS, "request");
   const signerPublicKey = normalizeFelt(expectString(request.signer_public_key, "signer_public_key"));
   const salt = normalizeFelt(expectString(request.salt, "salt"));
   const classHash = request.class_hash === undefined
@@ -183,9 +224,10 @@ export function validateEnsurePrivacySignerRequest(
 
 export function validateRelayPrivacySignerRequest(
   value: unknown,
-  config: Pick<PaymasterConfig, "allowedContracts">
+  config: Pick<PaymasterConfig, "allowedContracts" | "approvalSpenders">
 ): RelayPrivacySignerRequest {
   const request = expectRecord(value, "request") as Partial<RelayPrivacySignerRequest>;
+  assertAllowedKeys(request, RELAY_PRIVACY_SIGNER_REQUEST_KEYS, "request");
   const accountAddress = normalizeFelt(expectString(request.account_address, "account_address"));
   const callsValue = request.calls;
   if (!Array.isArray(callsValue) || callsValue.length !== 1) {
@@ -209,7 +251,7 @@ export function validateRelayPrivacySignerRequest(
   if (!config.allowedContracts.has(call.contract_address)) {
     throw new Error("token approve contract is not allowlisted");
   }
-  if (!config.allowedContracts.has(spender)) {
+  if (!config.approvalSpenders.has(spender)) {
     throw new Error("token approve spender is not allowlisted");
   }
   return {
@@ -224,85 +266,16 @@ export function validateRelayPrivacySignerRequest(
 function validateDirectRelayedCall(
   call: StarknetCallPayload,
   hasProof: boolean,
-  allowDirectWithdrawalRelays: boolean,
 ): void {
   if (call.entrypoint === "apply_actions" && hasProof) {
-    return;
-  }
-  if (call.entrypoint === "withdraw_settlement_output_with_proof_facts" && hasProof) {
-    if (!allowDirectWithdrawalRelays) {
-      throw new Error("direct withdrawal relay sponsorship is disabled");
-    }
-    return;
-  }
-  if (call.entrypoint === "cancel_renewal_parent_marker") {
-    assertRenewalCancelMarkerCalldata(call);
     return;
   }
   throw new Error("direct paymaster relay requires proof facts for supported direct calls");
 }
 
-function assertRenewalCancelMarkerCalldata(call: StarknetCallPayload): void {
-  const calldata = call.calldata;
-  if (calldata.length < 8) {
-    throw new Error("renewal cancellation calldata is invalid");
-  }
-
-  const cancelMarker = feltToBigInt(calldata[0], "cancel marker");
-  const cancelAuthority = feltToBigInt(calldata[1], "cancel authority");
-  const sparseKeyLow = feltToBigInt(calldata[2], "renewal sparse key low");
-  const sparseKeyHigh = feltToBigInt(calldata[3], "renewal sparse key high");
-  if (cancelMarker === 0n) {
-    throw new Error("renewal cancellation marker cannot be zero");
-  }
-  if (cancelAuthority === 0n) {
-    throw new Error("renewal cancellation authority cannot be zero");
-  }
-  if (sparseKeyLow > U128_MAX || sparseKeyHigh > U128_MAX) {
-    throw new Error("renewal cancellation sparse key is out of range");
-  }
-
-  const pathCount = Number(feltToBigInt(calldata[4], "renewal merkle path length"));
-  if (!Number.isSafeInteger(pathCount) || pathCount < 0) {
-    throw new Error("renewal cancellation merkle path length is invalid");
-  }
-  if (pathCount !== 0 && pathCount !== RENEWAL_SPARSE_TREE_DEPTH) {
-    throw new Error("renewal cancellation merkle path length is invalid");
-  }
-
-  const directionsLenIndex = 5 + pathCount;
-  if (directionsLenIndex >= calldata.length) {
-    throw new Error("renewal cancellation calldata is invalid");
-  }
-  const directionsCount = Number(
-    feltToBigInt(calldata[directionsLenIndex], "renewal merkle directions length")
-  );
-  if (directionsCount !== pathCount) {
-    throw new Error("renewal cancellation merkle path and direction lengths differ");
-  }
-
-  const expectedLength = 4 + 1 + pathCount + 1 + directionsCount + 2;
-  if (calldata.length !== expectedLength) {
-    throw new Error("renewal cancellation calldata is invalid");
-  }
-
-  const directionsStart = directionsLenIndex + 1;
-  for (let index = 0; index < directionsCount; index += 1) {
-    const bit = feltToBigInt(calldata[directionsStart + index], "renewal merkle direction");
-    if (bit !== 0n && bit !== 1n) {
-      throw new Error("renewal cancellation merkle direction is invalid");
-    }
-  }
-
-  const signatureR = feltToBigInt(calldata[calldata.length - 2], "renewal cancellation signature r");
-  const signatureS = feltToBigInt(calldata[calldata.length - 1], "renewal cancellation signature s");
-  if (signatureR === 0n || signatureS === 0n) {
-    throw new Error("renewal cancellation signature cannot be zero");
-  }
-}
-
 function validateCall(value: unknown): StarknetCallPayload {
   const call = expectRecord(value, "call") as Partial<StarknetCallPayload>;
+  assertAllowedKeys(call, CALL_KEYS, "call");
   const contractAddress = normalizeFelt(
     expectString(call.contract_address, "call.contract_address")
   );
@@ -330,6 +303,7 @@ function assertOutsideCallMatchesPayload(
   }
 
   const outsideCall = expectRecord(calls[0], "outsideExecution.calls[0]");
+  assertAllowedKeys(outsideCall, OUTSIDE_CALL_KEYS, "outsideExecution.calls[0]");
   const outsideTo = normalizeFelt(expectString(outsideCall.to, "outside call to"));
   const outsideSelector = normalizeFelt(expectString(outsideCall.selector, "outside call selector"));
   const expectedSelector = normalizeFelt(String(selector.getSelectorFromName(call.entrypoint)));
@@ -353,6 +327,18 @@ function expectRecord(value: unknown, label: string): Record<string, unknown> {
     throw new Error(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function assertAllowedKeys(
+  value: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  label: string
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      throw new Error(`${label}.${key} is not supported`);
+    }
+  }
 }
 
 function expectString(value: unknown, label: string): string {
@@ -396,33 +382,6 @@ function optionalStringArray(value: unknown, label: string): string[] | undefine
   return expectStringArray(value, label);
 }
 
-function assertWithdrawalAmountBucket(
-  call: StarknetCallPayload,
-  withdrawalAmountBuckets: Set<string>
-): void {
-  if (withdrawalAmountBuckets.size === 0) {
-    return;
-  }
-  const amount = withdrawalAmountForEntrypoint(call);
-  if (amount === null) {
-    return;
-  }
-  if (!withdrawalAmountBuckets.has(amount.toString())) {
-    throw new Error("withdrawal amount is not in an allowed privacy bucket");
-  }
-}
-
-function withdrawalAmountForEntrypoint(call: StarknetCallPayload): bigint | null {
-  if (call.entrypoint === "withdraw_settlement_output_with_proof_facts") {
-    const amount = call.calldata[7];
-    return amount === undefined ? null : BigInt(amount);
-  }
-  if (call.entrypoint === "withdraw_verified_note") {
-    const amount = call.calldata[1];
-    return amount === undefined ? null : BigInt(amount);
-  }
-  return null;
-}
 
 function expectSignature(value: unknown, label: string): void {
   if (Array.isArray(value)) {
@@ -431,7 +390,8 @@ function expectSignature(value: unknown, label: string): void {
   }
 
   if (value && typeof value === "object") {
-    const signature = value as { r?: unknown; s?: unknown };
+    const signature = value as Record<string, unknown> & { r?: unknown; s?: unknown };
+    assertAllowedKeys(signature, SIGNATURE_OBJECT_KEYS, label);
     normalizeFeltValue(signature.r, `${label}.r`);
     normalizeFeltValue(signature.s, `${label}.s`);
     return;
@@ -450,16 +410,6 @@ function normalizeFeltValue(value: unknown, label: string): string {
   throw new Error(`${label} must be a felt string or non-negative integer`);
 }
 
-function feltToBigInt(value: string | undefined, label: string): bigint {
-  if (value === undefined) {
-    throw new Error(`${label} must be a felt value`);
-  }
-  try {
-    return BigInt(value);
-  } catch {
-    throw new Error(`${label} must be a felt value`);
-  }
-}
 
 function sameArray(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);

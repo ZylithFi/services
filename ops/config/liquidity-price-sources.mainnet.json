@@ -1,7 +1,7 @@
 {
   "version": 1,
   "network": "mainnet",
-  "description": "Production managed-maker reference-price policy. Last-cleared Zylith prices are intentionally not an allowed fallback.",
+  "description": "Production liquidity-position reference-price policy. Last-cleared Zylith prices are intentionally not an allowed fallback.",
   "pragma": {
     "oracle_address": "0x2a85bd616f912537c50a49a4076db02c00b29b2cdc8a197ce92ed1837fa875b",
     "entrypoint": "0x24b869ce68dd257b370701ca16e4aaf9c6483ff6805d04ba7661f3a0b6ce59",

@@ -1,7 +1,7 @@
-# Managed Relay Product Boundary
+# Hosted Relay Product Boundary
 
-The open-source renewal relayer is the tool a maker can run. Zylith Relay is the
-managed operation around that tool.
+The open-source renewal relayer is the tool a liquidity operator can run. Zylith
+Relay is the hosted operation around that tool.
 
 ## Public Relayer Repo Scope
 
@@ -22,15 +22,15 @@ The public relayer package should stay useful and complete for self-hosters:
 - machine-readable ops alerts and optional alert webhooks;
 - self-hosting documentation.
 
-This is enough for a technical maker to operate a relay without paying Zylith a
-managed-relay fee.
+This is enough for a technical liquidity operator to run a relay without paying Zylith a
+hosted-relay fee.
 
 ## Self Relay
 
-Self Relay is for makers who want 0bps managed-relay fees and are comfortable
+Self Relay is for liquidity operators who want 0bps hosted-relay fees and are comfortable
 operating infrastructure.
 
-The maker owns:
+The liquidity operator owns:
 
 - deployment and upgrades;
 - persistent storage and backups;
@@ -46,7 +46,7 @@ Self Relay should expose basic operational analytics: health, readiness, queue
 depth, submitted children, failed submissions, missed epochs, retry counts,
 package status, package results, local CSV export, logs, Prometheus metrics, and
 machine-readable ops summaries/alerts. It should not be positioned as the full
-managed TCA or maker-intelligence product.
+hosted performance or liquidity-intelligence product.
 
 Self Relay is deliberately valid. The product line is not "you must use
 Zylith's relay." It is "you can operate this yourself, or you can pay Zylith to
@@ -54,7 +54,7 @@ operate it well."
 
 ## Zylith Relay
 
-Zylith Relay is managed maker liquidity operations.
+Zylith Relay is hosted liquidity-position operations.
 
 The paid service should include:
 
@@ -63,12 +63,12 @@ The paid service should include:
 - queue and due-slot monitoring;
 - missed-slot and failed-slot alerting;
 - package-expiry alerts and renewal reminders;
-- managed gas/paymaster operations;
-- managed submission timing defaults and bounded smoothing where package policy allows it;
+- hosted gas/paymaster operations;
+- hosted submission timing defaults and bounded smoothing where package policy allows it;
 - encrypted immediate settlement reports;
-- maker health dashboard;
+- liquidity health dashboard;
 - fill reports, epoch history, and CSV/API exports;
-- call-auction-native maker TCA;
+- call-auction-native liquidity TCA;
 - curve performance and band-utilization analytics;
 - missed opportunity and missed renewal reports;
 - inventory exposure and relay-fee impact reports;
@@ -77,13 +77,13 @@ The paid service should include:
 
 ## Metadata Boundary
 
-Managed relay operation necessarily sees operational metadata: package id,
+Hosted relay operation necessarily sees operational metadata: package id,
 accepted relay mode, pair, epoch schedule, due-slot timing, submission attempts,
-retry outcomes, package expiry, and health metrics. It does not receive maker
+retry outcomes, package expiry, and health metrics. It does not receive LP
 spend keys, withdrawal keys, or authority to alter a signed curve, but the
 schedule/package metadata itself is sensitive.
 
-The managed service must mitigate that boundary with:
+The hosted service must mitigate that boundary with:
 
 - package-scoped authorization and strict relay-mode enforcement;
 - minimizing stored plaintext fields to what submission requires;
@@ -91,25 +91,25 @@ The managed service must mitigate that boundary with:
 - protected metrics and dashboards;
 - rate limits and per-package access controls;
 - URL allowlists and strict mode for outbound coordinator/prover calls;
-- explicit disclosure in maker-facing UI and docs.
+- explicit disclosure in liquidity-facing UI and docs.
 
-## Internal Managed-Service Surface
+## Internal Hosted-Service Surface
 
-These pieces are not just the public binary hosted by Zylith. They are managed
+These pieces are not just the public binary hosted by Zylith. They are hosted
 operations around the binary:
 
 - multi-region orchestration;
 - production dashboards;
-- alert routing through managed on-call/webhook infrastructure;
+- alert routing through hosted on-call/webhook infrastructure;
 - incident runbooks;
-- managed maker analytics UI;
+- hosted liquidity analytics UI;
 - RPC provider routing;
 - gas/paymaster funding operations;
 - nonce and replacement-transaction handling;
 - release automation;
 - SLA/support process.
 
-The repo gives makers the tool. The service gives them the operation.
+The repo gives liquidity operators the tool. The service gives them the operation.
 
 ## Pricing Rationale
 
@@ -120,13 +120,13 @@ Self Relay remains available and economically valid:
 
 ```text
 Self Relay:   0bps, full control, full operational burden.
-Zylith Relay: 1-2bps, managed renewals, monitoring, retries, gas ops,
-              reporting, alerts, and managed timing defaults.
+Zylith Relay: 1-2bps, hosted renewals, monitoring, retries, gas ops,
+              reporting, alerts, and hosted timing defaults.
 ```
 
-This makes the fee optional instead of extractive. Sophisticated makers can run
-their own relay. Makers who prefer not to operate infrastructure can pay for the
-managed service.
+This makes the fee optional instead of extractive. Sophisticated liquidity
+operators can run their own relay. Operators who prefer not to operate
+infrastructure can pay for the hosted service.
 
 ## Product Framing
 
@@ -136,7 +136,7 @@ commodity.
 Use:
 
 ```text
-Zylith Relay is managed maker liquidity operations.
+Zylith Relay is hosted liquidity-position operations.
 ```
 
 The practical comparison:
@@ -146,6 +146,6 @@ Self Relay:
 0bps, full control, full operational burden.
 
 Zylith Relay:
-1-2bps, managed renewals, monitoring, retries, gas ops, reporting, alerts,
-managed timing defaults, support, and operational accountability.
+1-2bps, hosted renewals, monitoring, retries, gas ops, reporting, alerts,
+hosted timing defaults, support, and operational accountability.
 ```

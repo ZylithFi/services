@@ -7,7 +7,6 @@ authors.workspace = true
 
 [dependencies]
 aes-gcm = "0.10"
-bip39 = "2.2.2"
 hex = "0.4"
 hkdf = "0.12"
 hmac = "0.12"

@@ -2,34 +2,22 @@
 import { createHash, verify } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 
-const args = new Set(process.argv.slice(2));
-const strict = args.has("--strict");
 const env = process.env;
 const failures = [];
-const warnings = [];
+const STARKNET_FIELD_PRIME =
+  3618502788666131213697322783095070105623107215331596699973092056135872020481n;
 
 checkSecret("ZYLITH_TRUSTED_INGRESS_RECEIPT_SECRET", 32);
 checkOptionalSecretList("ZYLITH_TRUSTED_INGRESS_RECEIPT_PREVIOUS_SECRETS", 32);
 checkSecret("ZYLITH_HEARTBEAT_COVER_SECRET", 32);
 
-expectNot("ZYLITH_ALLOW_DIRECT_PRIVATE_ORDER_PAYLOADS", "true", "direct private order payloads must stay disabled");
-expectNot("ZYLITH_AUCTION_PROVER_ALLOW_KEYGEN", "1", "prover keygen must be disabled in production");
-expectNot("ZYLITH_AUCTION_PROVER_ALLOW_KEYGEN", "true", "prover keygen must be disabled in production");
 expectNot("ZYLITH_COORDINATOR_EMERGENCY_PAUSED", "true", "coordinator is currently paused");
 expectNot("ZYLITH_PROVER_EMERGENCY_PAUSED", "true", "prover is currently paused");
 
-checkBoolDefault("ZYLITH_REQUIRE_TRUSTED_ORDER_INGRESS", true);
 checkRequired("ZYLITH_PROVER_STRICT");
 expectValue("ZYLITH_PROVER_STRICT", "true", "prover strict mode must be enabled in production");
-expectValue("ZYLITH_REQUIRE_ARTIFACT_ONCHAIN_VERIFICATION", "true", "artifact publication must verify on-chain output root and transcript commitment");
-expectValue(
-  "ZYLITH_AUDITED_ERC20_ALLOWLIST_ACK",
-  "true",
-  "supported assets must be restricted to audited vanilla ERC20s with exact balance-delta behavior",
-);
-checkHostedWithdrawalDisclosure();
-checkHostedConsolidationDisclosure();
-
+checkRequired("ZYLITH_PROVER_WORKER_SUBMIT_ONCHAIN");
+expectValue("ZYLITH_PROVER_WORKER_SUBMIT_ONCHAIN", "true", "prover worker must submit proofs on-chain in production");
 checkCsv("ZYLITH_COORDINATOR_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_PROVER_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_INDEXER_ALLOWED_ORIGINS");
@@ -49,9 +37,10 @@ checkPositiveInt("ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS", 60_000, 86_400_000);
 checkPositiveInt("ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS", 86_400_000, 31_536_000_000);
 checkPositiveInt("ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS", 86_400, 100_000);
 checkPositiveInt("ZYLITH_COORDINATOR_MAX_ORDERS_PER_BATCH", 1, 10_000);
-checkExactInt("ZYLITH_BATCH_WINDOW_MS", 90_000);
-checkPositiveInt("ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS", 3, 100);
-checkPositiveInt("ZYLITH_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS", 3, 100);
+checkCsv("ZYLITH_PRODUCT_PAIRS");
+checkExactInt("ZYLITH_BATCH_WINDOW_MS", 20_000);
+checkExactInt("ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS", 14);
+checkExactInt("ZYLITH_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS", 36);
 checkPositiveInt("ZYLITH_ARTIFACT_EPOCH_BUCKET_SIZE", 1, 64);
 if (
   env.ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS &&
@@ -64,17 +53,21 @@ checkPositiveInt("ZYLITH_OUTPUT_CLAIM_DELAY_SECONDS", 60, 86_400);
 
 checkRequired("ZYLITH_AUCTION_PROVER_KEYS_PATH");
 checkRequired("VITE_ZYLITH_INGRESS_KEY_REGISTRY_PIN");
-checkRequired("ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS");
-checkRequired("ZYLITH_NATIVE_PROOF_PROGRAM_HASH");
-checkRequired("ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS");
+checkFelt("ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_PROOF_PROGRAM_HASH");
+checkFelt("ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS");
 checkNativeProofAccountSigner();
 checkRequired("ZYLITH_NATIVE_TX_PROVER_URL");
 checkNativeProverOhttpPolicy();
-checkRequired("ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS");
-checkRequired("ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS");
-checkRequired("ZYLITH_NATIVE_RENEWAL_STATEMENT_PROGRAM_ADDRESS");
-checkRequired("ZYLITH_NATIVE_NOTE_CONSOLIDATION_STATEMENT_PROGRAM_ADDRESS");
-checkRequired("ZYLITH_NATIVE_WITHDRAWAL_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_RENEWAL_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_LIQUIDITY_POSITION_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_NOTE_CONSOLIDATION_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_WITHDRAWAL_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_ADMISSION_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_AUCTION_RESULT_STATEMENT_PROGRAM_ADDRESS");
+checkFelt("ZYLITH_NATIVE_MULTI_PAIR_STATEMENT_PROGRAM_ADDRESS");
 checkFelt("ZYLITH_STARKNET_OS_CONFIG_HASH");
 checkFelt("ZYLITH_STARKNET_CHAIN_ID");
 checkFelt("ZYLITH_STARKNET_ACCOUNT_ADDRESS");
@@ -104,6 +97,7 @@ checkFelt("ZYLITH_PAYMASTER_ACCOUNT_ADDRESS");
 checkRequired("ZYLITH_PAYMASTER_PRIVATE_KEY");
 checkFelt("ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_CONTRACTS");
+checkCsv("ZYLITH_PAYMASTER_APPROVAL_SPENDERS");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS");
 checkCsv("ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS");
 if ((value("ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS") || "").toLowerCase() === "true") {
@@ -118,59 +112,36 @@ if ((value("ZYLITH_TRUST_PROXY_HEADERS") || "").toLowerCase() === "true") {
     "coordinator trusted proxy headers require trusted proxy CIDRs",
   );
 }
-if ((value("ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS") || "").toLowerCase() === "true") {
-  checkCsv("ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS");
-}
-
 checkRequired("ZYLITH_RENEWAL_RELAY_STRICT");
 expectValue("ZYLITH_RENEWAL_RELAY_STRICT", "true", "renewal relay strict mode must be enabled in production");
+checkRequired("ZYLITH_RENEWAL_RELAY_ACCEPT_RELAY_MODE");
 checkRequired("ZYLITH_RENEWAL_RELAY_STORE_PATH");
-checkRecommended("ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN", "renewal relay package read/delete access token is unset; status/results/delete endpoints will be inaccessible to clients");
-if (relayAcceptsManagedMode()) {
+checkRequired("ZYLITH_RENEWAL_RELAY_PACKAGE_TOKEN");
+if (relayAcceptsHostedMode()) {
   checkSecret("ZYLITH_RENEWAL_RELAY_COORDINATOR_CONTROL_TOKEN", 32);
 }
 checkSecret("ZYLITH_RENEWAL_RELAY_PROVER_CONTROL_TOKEN", 32);
 checkRequired("ZYLITH_RENEWAL_RELAY_COORDINATOR_URL");
 checkRequired("ZYLITH_RENEWAL_RELAY_PROVER_URL");
 
-checkRecommended("ZYLITH_ALERT_WEBHOOK_URL", "monitoring alerts have no destination");
-checkRecommended("ZYLITH_MONITORING_ENV", "monitoring environment label is unset");
-checkRecommended("ZYLITH_CRASH_DUMP_POLICY", "crash dump policy is unset");
-expectValue(
-  "ZYLITH_ACK_FIRST_SET_CONFIG_NO_TIMELOCK_RISK",
-  "true",
-  "first-set fee/config values are not timelocked on-chain and require explicit launch acknowledgement",
-);
+checkRequired("ZYLITH_ALERT_WEBHOOK_URL");
+checkRequired("ZYLITH_MONITORING_ENV");
+checkRequired("ZYLITH_CRASH_DUMP_POLICY");
 checkExternalAuditSignals();
 checkKeyCustodySignals();
 checkDeploymentManifest();
-checkManagedMakerPricePolicy();
+checkLiquidityPricePolicy();
 
 if (failures.length > 0) {
   console.error("production readiness failed");
   for (const failure of failures) console.error(`- ${failure}`);
-  if (warnings.length > 0) {
-    console.error("warnings");
-    for (const warning of warnings) console.error(`- ${warning}`);
-  }
   process.exit(1);
-}
-
-if (warnings.length > 0) {
-  const heading = strict ? "production readiness warnings treated as failures" : "production readiness warnings";
-  console.error(heading);
-  for (const warning of warnings) console.error(`- ${warning}`);
-  if (strict) process.exit(1);
 }
 
 console.log("production readiness checks passed");
 
 function checkRequired(name) {
   if (!value(name)) failures.push(`${name} is required`);
-}
-
-function checkRecommended(name, message) {
-  if (!value(name)) warnings.push(`${name}: ${message}`);
 }
 
 function checkSecret(name, minLength) {
@@ -218,67 +189,82 @@ function checkNativeProofAccountSigner() {
 }
 
 function checkNativeProverOhttpPolicy() {
-  const enabled = (value("ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED") || "true").toLowerCase();
-  if (["0", "false", "no"].includes(enabled)) {
-    if (isLoopbackUrl(value("ZYLITH_NATIVE_TX_PROVER_URL"))) return;
-    failures.push("ZYLITH_NATIVE_TX_PROVER_OHTTP_ENABLED must not be disabled in production");
+  const proverUrl = value("ZYLITH_NATIVE_TX_PROVER_URL");
+  if (isPrivateOrLocalUrl(proverUrl)) {
+    failures.push(
+      "ZYLITH_NATIVE_TX_PROVER_URL must use the configured external Starknet prover endpoint; production must not use local, private, or self-hosted native prover URLs",
+    );
+    return;
+  }
+  if (!isHttpsUrl(proverUrl) && !value("ZYLITH_NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX")) {
+    failures.push(
+      "ZYLITH_NATIVE_TX_PROVER_OHTTP_KEY_CONFIG_HEX is required when the external native prover URL is not HTTPS",
+    );
   }
 }
 
-function isLoopbackUrl(current) {
+function isPrivateOrLocalUrl(current) {
   try {
     const hostname = new URL(current).hostname.toLowerCase();
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+    const host = hostname.replace(/^\[|\]$/g, "");
+    if (host === "localhost" || host === "::1") return true;
+    if (host.includes(":")) {
+      return (
+        host === "::" ||
+        host.startsWith("fc") ||
+        host.startsWith("fd") ||
+        host.startsWith("fe80:") ||
+        host.startsWith("ff") ||
+        host.startsWith("2001:db8:")
+      );
+    }
+    const ipv4 = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (!ipv4) return false;
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return false;
+    const [a, b] = octets;
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      a === 169 && b === 254 ||
+      a === 172 && b >= 16 && b <= 31 ||
+      a === 192 && b === 168 ||
+      a >= 224 && a <= 239 ||
+      a >= 240 ||
+      a === 100 && b >= 64 && b <= 127 ||
+      a === 192 && b === 0 ||
+      a === 192 && b === 0 && octets[2] === 2 ||
+      a === 198 && (b === 18 || b === 19) ||
+      a === 203 && b === 0 && octets[2] === 113
+    );
   } catch {
     return false;
   }
 }
 
-function anyTrue(names) {
-  return names.some((name) => (value(name) || "").toLowerCase() === "true");
+function isHttpsUrl(current) {
+  try {
+    return new URL(current).protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
-function expectAnyTrue(names, message) {
-  if (anyTrue(names)) return;
-  failures.push(`${names.join(" or ")} must be true: ${message}`);
-}
-
-function checkHostedConsolidationDisclosure() {
-  const hosted =
-    (value("ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION") || "").toLowerCase() === "true" ||
-    (value("VITE_ZYLITH_ENABLE_HOSTED_NOTE_CONSOLIDATION") || "").toLowerCase() === "true";
-  if (!hosted) return;
-  expectAnyTrue(
-    [
-      "ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
-      "VITE_ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
-      "ZYLITH_ACK_HOSTED_NOTE_CONSOLIDATION_PRIVACY_SINK",
-    ],
-    "hosted consolidation receives note preimages and requires explicit operator acknowledgement",
-  );
-}
-
-function checkHostedWithdrawalDisclosure() {
-  const hosted =
-    (value("ZYLITH_ENABLE_HOSTED_WITHDRAWALS") || "").toLowerCase() === "true" ||
-    (value("VITE_ZYLITH_ENABLE_HOSTED_WITHDRAWALS") || "").toLowerCase() === "true";
-  if (!hosted) return;
-  expectAnyTrue(
-    [
-      "ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
-      "VITE_ZYLITH_ACK_HOSTED_NOTE_PROOF_PRIVACY",
-      "ZYLITH_ACK_HOSTED_WITHDRAWAL_PRIVACY_SINK",
-    ],
-    "hosted withdrawals receive output-note preimages and require explicit operator acknowledgement",
-  );
+function normalizeEndpointUrl(current) {
+  if (typeof current !== "string" || current.trim() === "") return null;
+  try {
+    const parsed = new URL(current.trim());
+    parsed.hash = "";
+    parsed.search = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 }
 
 function checkExternalAuditSignals() {
-  const required = (value("ZYLITH_EXTERNAL_AUDIT_REQUIRED") || "").toLowerCase() === "true";
-  if (!required) {
-    warnings.push("ZYLITH_EXTERNAL_AUDIT_REQUIRED is not true; external audit is not enforced by this environment");
-    return;
-  }
   expectValue("ZYLITH_EXTERNAL_AUDIT_COMPLETE", "true", "external audit must be complete when required");
   checkExactInt("ZYLITH_EXTERNAL_AUDIT_CRITICAL_OPEN", 0);
   checkExactInt("ZYLITH_EXTERNAL_AUDIT_HIGH_OPEN", 0);
@@ -299,7 +285,7 @@ function checkExternalAuditSignals() {
 function checkKeyCustodySignals() {
   const mode = (value("ZYLITH_KEY_CUSTODY_MODE") || "").toLowerCase();
   if (!mode) {
-    warnings.push("ZYLITH_KEY_CUSTODY_MODE is unset; key custody is not described in deploy env");
+    failures.push("ZYLITH_KEY_CUSTODY_MODE is required");
     return;
   }
   if (!["hsm", "multisig", "hardware-multisig", "hardware"].includes(mode)) {
@@ -307,15 +293,18 @@ function checkKeyCustodySignals() {
   }
 }
 
-function relayAcceptsManagedMode() {
-  const mode = (value("ZYLITH_RENEWAL_RELAY_ACCEPT_RELAY_MODE") || "ZylithRelay").toLowerCase();
-  return ["", "zylith", "zylithrelay", "managed", "any", "both"].includes(mode);
+function relayAcceptsHostedMode() {
+  const mode = (value("ZYLITH_RENEWAL_RELAY_ACCEPT_RELAY_MODE") || "").toLowerCase();
+  if (!["zylith", "zylithrelay", "self", "selfrelay", "self-hosted", "selfhosted"].includes(mode)) {
+    failures.push("ZYLITH_RENEWAL_RELAY_ACCEPT_RELAY_MODE must be ZylithRelay or SelfRelay");
+    return false;
+  }
+  return ["zylith", "zylithrelay"].includes(mode);
 }
 
 function checkOptionalSecretList(name, minLength) {
   const current = value(name);
   if (!current) {
-    warnings.push(`${name} is empty; rotation is configured only after the first key roll`);
     return;
   }
   for (const [index, item] of current.split(",").map((entry) => entry.trim()).filter(Boolean).entries()) {
@@ -350,8 +339,11 @@ function checkFelt(name) {
     failures.push(`${name} is required`);
     return;
   }
-  if (!/^0x[0-9a-fA-F]+$/.test(current) && !/^[0-9]+$/.test(current)) {
-    failures.push(`${name} must be a felt string`);
+  const normalized = normalizeFeltText(current);
+  if (!normalized) {
+    failures.push(`${name} must be a valid Starknet felt`);
+  } else if (normalized === "0x0") {
+    failures.push(`${name} must be non-zero`);
   }
 }
 
@@ -376,22 +368,6 @@ function checkExactInt(name, expected) {
   const parsed = Number(current);
   if (!Number.isSafeInteger(parsed) || parsed !== expected) {
     failures.push(`${name} must be ${expected}`);
-  }
-}
-
-function checkBoolDefault(name, expectedDefault) {
-  const current = value(name);
-  if (!current) {
-    warnings.push(`${name} is unset; service default must remain ${expectedDefault}`);
-    return;
-  }
-  const normalized = current.toLowerCase();
-  if (!["true", "false", "1", "0"].includes(normalized)) {
-    failures.push(`${name} must be boolean-like`);
-  }
-  const actual = normalized === "true" || normalized === "1";
-  if (actual !== expectedDefault) {
-    failures.push(`${name} must be ${expectedDefault}`);
   }
 }
 
@@ -422,14 +398,7 @@ function value(name) {
 }
 
 function normalizeFelt(input) {
-  if (!input) return "";
-  if (/^0x[0-9a-fA-F]+$/.test(input)) {
-    return `0x${BigInt(input).toString(16)}`;
-  }
-  if (/^[0-9]+$/.test(input)) {
-    return `0x${BigInt(input).toString(16)}`;
-  }
-  return input.toLowerCase();
+  return normalizeFeltText(input) || "";
 }
 
 function checkDeploymentManifest() {
@@ -478,6 +447,7 @@ function checkDeploymentManifest() {
     failures.push(`deployment manifest at ${manifestPath} is not valid JSON: ${error.message}`);
     return;
   }
+  checkDeploymentJsonEnv(manifest);
 
   const releaseCommit = value("ZYLITH_DEPLOYMENT_RELEASE_COMMIT");
   if (!releaseCommit || !/^[0-9a-fA-F]{40}$/.test(releaseCommit)) {
@@ -496,19 +466,20 @@ function checkDeploymentManifest() {
 
   const requiredAssets = ["STRK", "ETH", "USDC", "strkBTC", "WBTC", "USDT"];
   const requiredPairs = {
-    "STRK/USDC": [4, 0],
-    "ETH/USDC": [4, 0],
-    "strkBTC/USDC": [4, 0],
-    "STRK/ETH": [4, 0],
-    "STRK/strkBTC": [4, 0],
-    "WBTC/strkBTC": [2, 0],
-    "USDC/USDT": [2, 0],
+    "STRK/USDC": 4,
+    "ETH/USDC": 4,
+    "strkBTC/USDC": 4,
+    "STRK/ETH": 4,
+    "STRK/strkBTC": 4,
+    "WBTC/strkBTC": 1,
+    "USDC/USDT": 1,
   };
 
   for (const asset of requiredAssets) {
     checkManifestNonZero(manifest.token_addresses?.[asset], `token_addresses.${asset}`);
     const assetConfig = manifest.product?.assets?.[asset];
     if (!assetConfig?.enabled) failures.push(`product.assets.${asset} must be enabled`);
+    checkManifestAssetTokenAliases(manifest, asset);
     if (assetConfig?.erc20_behavior !== "vanilla-exact-delta") {
       failures.push(`product.assets.${asset}.erc20_behavior must be vanilla-exact-delta`);
     }
@@ -518,7 +489,7 @@ function checkDeploymentManifest() {
     checkAssetAuditEvidence(assetConfig, `product.assets.${asset}`);
   }
 
-  for (const [pair, [taker, maker]] of Object.entries(requiredPairs)) {
+  for (const [pair, taker] of Object.entries(requiredPairs)) {
     const pairConfig = manifest.product?.pairs?.[pair];
     if (!pairConfig?.enabled) {
       failures.push(`product.pairs.${pair} must be enabled`);
@@ -527,36 +498,26 @@ function checkDeploymentManifest() {
     if (pairConfig.taker_fee_bps !== taker) {
       failures.push(`product.pairs.${pair}.taker_fee_bps must be ${taker}`);
     }
-    if (pairConfig.maker_fee_bps !== maker) {
-      failures.push(`product.pairs.${pair}.maker_fee_bps must be ${maker}`);
-    }
   }
 
-  if (manifest.contracts?.privacy_funding_verifier || manifest.funding?.starknet_privacy?.funding_verifier) {
-    failures.push("privacy_funding_verifier/funding_verifier must be absent; PrivacyDepositBridge uses custody-checked privacy-pool activation");
-  }
   if (manifest.funding?.primary !== "starknet_privacy") {
     failures.push("funding.primary must be starknet_privacy");
   }
   const privacyFunding = manifest.funding?.starknet_privacy || {};
   checkManifestNonZero(privacyFunding.privacy_pool, "funding.starknet_privacy.privacy_pool");
   checkManifestNonZero(privacyFunding.bridge_adapter, "funding.starknet_privacy.bridge_adapter");
-  checkManifestNonZero(privacyFunding.shielded_asset_adapter, "funding.starknet_privacy.shielded_asset_adapter");
   checkManifestNonZero(privacyFunding.paymaster_address, "funding.starknet_privacy.paymaster_address");
   checkManifestNonZero(privacyFunding.proof_signer_class_hash, "funding.starknet_privacy.proof_signer_class_hash");
   checkManifestUrl(privacyFunding.discovery_url, "funding.starknet_privacy.discovery_url");
   checkManifestUrl(privacyFunding.proving_url, "funding.starknet_privacy.proving_url");
+  if (privacyFunding.proving_ohttp_enabled !== true) {
+    failures.push("funding.starknet_privacy.proving_ohttp_enabled must be true");
+  }
   checkManifestUrl(privacyFunding.paymaster_url, "funding.starknet_privacy.paymaster_url");
   checkManifestFeltEquals(
     privacyFunding.bridge_adapter,
     manifest.contracts?.privacy_deposit_bridge,
     "funding.starknet_privacy.bridge_adapter",
-    "contracts.privacy_deposit_bridge",
-  );
-  checkManifestFeltEquals(
-    privacyFunding.shielded_asset_adapter,
-    manifest.contracts?.privacy_deposit_bridge,
-    "funding.starknet_privacy.shielded_asset_adapter",
     "contracts.privacy_deposit_bridge",
   );
   checkManifestFeltEquals(
@@ -577,17 +538,90 @@ function checkDeploymentManifest() {
   for (const key of [
     "proof_program_address",
     "proof_program_hash",
+    "admission_proof_program_hash",
+    "auction_result_proof_program_hash",
+    "nullifier_proof_program_hash",
+    "renewal_proof_program_hash",
+    "liquidity_position_proof_program_hash",
+    "settlement_proof_program_hash",
+    "settlement_order_proof_program_hash",
+    "settlement_input_membership_proof_program_hash",
+    "settlement_output_recovery_proof_program_hash",
+    "note_consolidation_proof_program_hash",
+    "aggregate_settlement_proof_program_hash",
+    "withdrawal_proof_program_hash",
+    "multi_pair_proof_program_hash",
     "settlement_statement_program_address",
+    "settlement_note_fee_statement_program_address",
+    "settlement_order_statement_program_address",
+    "settlement_input_membership_statement_program_address",
+    "settlement_output_recovery_statement_program_address",
     "nullifier_statement_program_address",
     "renewal_statement_program_address",
+    "liquidity_position_statement_program_address",
     "note_consolidation_statement_program_address",
     "withdrawal_statement_program_address",
+    "admission_statement_program_address",
+    "auction_result_statement_program_address",
+    "multi_pair_statement_program_address",
     "proof_account_address",
     "settlement_account_address",
   ]) {
     checkManifestNonZero(manifest.proof?.[key], `proof.${key}`);
   }
-  for (const key of ["proof_program_locked_after_deploy", "operational_config_locked_after_deploy"]) {
+  const statementProofHashes = manifest.proof?.statement_proof_program_hashes || {};
+  for (const [statementKind, proofField] of [
+    ["ADMISSION", "admission_proof_program_hash"],
+    ["AUCTION_RESULT", "auction_result_proof_program_hash"],
+    ["NULLIFIER", "nullifier_proof_program_hash"],
+    ["RENEWAL", "renewal_proof_program_hash"],
+    ["LIQUIDITY_POSITION", "liquidity_position_proof_program_hash"],
+    ["SETTLEMENT", "settlement_proof_program_hash"],
+    ["SETTLEMENT_ORDER", "settlement_order_proof_program_hash"],
+    [
+      "SETTLEMENT_INPUT_MEMBERSHIP",
+      "settlement_input_membership_proof_program_hash",
+    ],
+    [
+      "SETTLEMENT_OUTPUT_RECOVERY",
+      "settlement_output_recovery_proof_program_hash",
+    ],
+    ["NOTE_CONSOLIDATION", "note_consolidation_proof_program_hash"],
+    ["AGGREGATE_SETTLEMENT", "aggregate_settlement_proof_program_hash"],
+    ["WITHDRAWAL", "withdrawal_proof_program_hash"],
+    ["MULTI_PAIR", "multi_pair_proof_program_hash"],
+  ]) {
+    const mapValue = statementProofHashes[statementKind];
+    checkManifestNonZero(mapValue, `proof.statement_proof_program_hashes.${statementKind}`);
+    checkManifestFeltEquals(
+      mapValue,
+      manifest.proof?.[proofField],
+      `proof.statement_proof_program_hashes.${statementKind}`,
+      `proof.${proofField}`,
+    );
+  }
+  if (manifest.proof?.proof_version !== "PROOF1") {
+    failures.push("proof.proof_version must be PROOF1");
+  }
+  const manifestNativeProverUrl = normalizeEndpointUrl(manifest.proof?.native_tx_prover_url);
+  const configuredNativeProverUrl = normalizeEndpointUrl(value("ZYLITH_NATIVE_TX_PROVER_URL"));
+  if (!manifestNativeProverUrl) {
+    failures.push("proof.native_tx_prover_url must be a valid external URL");
+  } else if (isPrivateOrLocalUrl(manifestNativeProverUrl)) {
+    failures.push("proof.native_tx_prover_url must not reference local, private, or self-hosted prover URLs");
+  } else if (configuredNativeProverUrl && manifestNativeProverUrl !== configuredNativeProverUrl) {
+    failures.push("proof.native_tx_prover_url must match ZYLITH_NATIVE_TX_PROVER_URL");
+  }
+  if (manifest.proof?.native_tx_prover_ohttp_enabled !== true) {
+    failures.push("proof.native_tx_prover_ohttp_enabled must be true");
+  }
+  for (const key of [
+    "proof_program_locked_after_deploy",
+    "operational_config_locked_after_deploy",
+    "commitment_registry_config_locked_after_deploy",
+    "batch_registry_config_locked_after_deploy",
+    "privacy_deposit_bridge_config_locked_after_deploy",
+  ]) {
     if (manifest.proof?.[key] !== true) {
       failures.push(`proof.${key} must be true for production readiness`);
     }
@@ -596,6 +630,33 @@ function checkDeploymentManifest() {
   if (JSON.stringify(manifest).includes("example.invalid")) {
     failures.push("deployment manifest must not contain example.invalid placeholders");
   }
+}
+
+function checkDeploymentJsonEnv(manifest) {
+  const deploymentJson = value("ZYLITH_DEPLOYMENT_JSON");
+  if (!deploymentJson) return;
+  let envManifest;
+  try {
+    const parsed = JSON.parse(deploymentJson);
+    envManifest = parsed.manifest || parsed;
+  } catch (error) {
+    failures.push(`ZYLITH_DEPLOYMENT_JSON is not valid JSON: ${error.message}`);
+    return;
+  }
+  if (stableJson(envManifest) !== stableJson(manifest)) {
+    failures.push("ZYLITH_DEPLOYMENT_JSON must match the signed deployment manifest");
+  }
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function checkAssetAuditEvidence(assetConfig, label) {
@@ -618,57 +679,78 @@ function checkAssetAuditEvidence(assetConfig, label) {
   }
 }
 
-function checkManagedMakerPricePolicy() {
-  const policyPath = value("ZYLITH_MANAGED_MAKER_PRICE_POLICY_PATH") || "ops/config/managed-maker-price-sources.mainnet.json";
+function checkManifestAssetTokenAliases(manifest, asset) {
+  const canonical = manifest.token_addresses?.[asset];
+  const productToken = manifest.product?.assets?.[asset]?.token_address;
+  const fundingToken = manifest.funding?.assets?.[asset]?.token_address;
+  const railToken = manifest.funding?.assets?.[asset]?.rail_token_address;
+
+  checkManifestNonZero(productToken, `product.assets.${asset}.token_address`);
+  checkManifestNonZero(fundingToken, `funding.assets.${asset}.token_address`);
+  checkManifestNonZero(railToken, `funding.assets.${asset}.rail_token_address`);
+  checkManifestFeltEquals(productToken, canonical, `product.assets.${asset}.token_address`, `token_addresses.${asset}`);
+  checkManifestFeltEquals(fundingToken, canonical, `funding.assets.${asset}.token_address`, `token_addresses.${asset}`);
+  checkManifestFeltEquals(railToken, canonical, `funding.assets.${asset}.rail_token_address`, `token_addresses.${asset}`);
+}
+
+function checkLiquidityPricePolicy() {
+  const policyPath = value("ZYLITH_LIQUIDITY_PRICE_POLICY_PATH") || "ops/config/liquidity-price-sources.mainnet.json";
   if (!existsSync(policyPath)) {
-    failures.push(`managed maker price policy is required at ${policyPath}`);
+    failures.push(`liquidity price policy is required at ${policyPath}`);
     return;
   }
   let policy;
   try {
     policy = JSON.parse(readFileSync(policyPath, "utf8"));
   } catch (error) {
-    failures.push(`managed maker price policy at ${policyPath} is not valid JSON: ${error.message}`);
+    failures.push(`liquidity price policy at ${policyPath} is not valid JSON: ${error.message}`);
     return;
   }
-  if (policy.version !== 1) failures.push("managed maker price policy version must be 1");
-  if (policy.network !== "mainnet") failures.push("managed maker price policy network must be mainnet");
+  if (policy.version !== 1) failures.push("liquidity price policy version must be 1");
+  if (policy.network !== "mainnet") failures.push("liquidity price policy network must be mainnet");
   if (policy.description && /last[- ]?cleared/i.test(policy.description) && !/intentionally not/i.test(policy.description)) {
-    failures.push("managed maker price policy must not use last-cleared prices as a fallback");
+    failures.push("liquidity price policy must not use last-cleared prices as a fallback");
   }
-  checkManifestNonZero(policy.pragma?.oracle_address, "managed maker price policy pragma.oracle_address");
-  checkManifestNonZero(policy.pragma?.entrypoint, "managed maker price policy pragma.entrypoint");
+  checkManifestNonZero(policy.pragma?.oracle_address, "liquidity price policy pragma.oracle_address");
+  checkManifestNonZero(policy.pragma?.entrypoint, "liquidity price policy pragma.entrypoint");
   if (Number(policy.pragma?.min_source_count ?? 0) < 2) {
-    failures.push("managed maker price policy pragma.min_source_count must be at least 2");
+    failures.push("liquidity price policy pragma.min_source_count must be at least 2");
   }
   const forbidden = (policy.global_policy?.forbidden_fallbacks || []).map((entry) => String(entry).toLowerCase());
   for (const required of ["last-cleared-price", "fixed-price", "single-exchange-only"]) {
     if (!forbidden.includes(required)) {
-      failures.push(`managed maker price policy must forbid ${required}`);
+      failures.push(`liquidity price policy must forbid ${required}`);
     }
+  }
+  if (policy.global_policy?.large_move_policy !== "require-confirmation-widen-size-reduce-or-halt") {
+    failures.push("liquidity price policy global_policy.large_move_policy must require confirmation, widening, size reduction, or halt");
   }
   const requiredPairs = ["STRK/USDC", "ETH/USDC", "strkBTC/USDC", "STRK/ETH", "STRK/strkBTC", "WBTC/strkBTC", "USDC/USDT"];
   const minSources = Number(policy.global_policy?.min_sources ?? 0);
-  if (minSources < 3) failures.push("managed maker price policy global_policy.min_sources must be at least 3");
+  if (minSources < 3) failures.push("liquidity price policy global_policy.min_sources must be at least 3");
   for (const pair of requiredPairs) {
     const pairPolicy = policy.pairs?.[pair];
     if (!pairPolicy) {
-      failures.push(`managed maker price policy must include ${pair}`);
+      failures.push(`liquidity price policy must include ${pair}`);
       continue;
     }
     if (!String(pairPolicy.primary ?? "").startsWith("pragma:")) {
-      failures.push(`managed maker price policy ${pair}.primary must use Pragma as primary source`);
+      failures.push(`liquidity price policy ${pair}.primary must use Pragma as primary source`);
     }
     const confirmations = Array.isArray(pairPolicy.confirmations) ? pairPolicy.confirmations : [];
     if (confirmations.length < 2) {
-      failures.push(`managed maker price policy ${pair}.confirmations must include at least two independent confirmations`);
+      failures.push(`liquidity price policy ${pair}.confirmations must include at least two independent confirmations`);
+    }
+    const uniqueConfirmations = new Set(confirmations.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean));
+    if (uniqueConfirmations.size !== confirmations.length) {
+      failures.push(`liquidity price policy ${pair}.confirmations must be unique independent sources`);
     }
     if (Number(pairPolicy.min_independent_sources ?? 0) < minSources) {
-      failures.push(`managed maker price policy ${pair}.min_independent_sources must be >= global_policy.min_sources`);
+      failures.push(`liquidity price policy ${pair}.min_independent_sources must be >= global_policy.min_sources`);
     }
     const serialized = JSON.stringify(pairPolicy).toLowerCase();
     if (serialized.includes("last-cleared") || serialized.includes("last cleared") || serialized.includes("\"fixed\"")) {
-      failures.push(`managed maker price policy ${pair} must not include last-cleared or fixed-price fallbacks`);
+      failures.push(`liquidity price policy ${pair} must not include last-cleared or fixed-price fallbacks`);
     }
   }
 }
@@ -677,8 +759,11 @@ function normalizeFeltText(current) {
   if (typeof current !== "string" || current.trim() === "") return null;
   const trimmed = current.trim();
   try {
-    if (/^0x[0-9a-fA-F]+$/.test(trimmed)) return `0x${BigInt(trimmed).toString(16)}`;
-    if (/^[0-9]+$/.test(trimmed)) return `0x${BigInt(trimmed).toString(16)}`;
+    let parsed = null;
+    if (/^0x[0-9a-fA-F]+$/.test(trimmed)) parsed = BigInt(trimmed);
+    if (/^[0-9]+$/.test(trimmed)) parsed = BigInt(trimmed);
+    if (parsed === null || parsed < 0n || parsed >= STARKNET_FIELD_PRIME) return null;
+    return `0x${parsed.toString(16)}`;
   } catch {
     return null;
   }
@@ -701,7 +786,12 @@ function checkManifestNonZero(current, label) {
     failures.push(`${label} must be configured`);
     return;
   }
-  if (isZeroFelt(current)) {
+  const normalized = normalizeFeltText(current);
+  if (!normalized) {
+    failures.push(`${label} must be a valid Starknet felt`);
+    return;
+  }
+  if (normalized === "0x0") {
     failures.push(`${label} must be non-zero`);
   }
 }
@@ -733,9 +823,5 @@ function checkManifestUrl(current, label) {
 }
 
 function isZeroFelt(current) {
-  if (typeof current !== "string" || current.trim() === "") return false;
-  const normalized = current.startsWith("0x") || current.startsWith("0X")
-    ? current.slice(2)
-    : current;
-  return /^0*$/i.test(normalized);
+  return normalizeFeltText(current) === "0x0";
 }

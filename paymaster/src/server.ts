@@ -1,5 +1,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 
 import type { PaymasterConfig } from "./config.js";
 import type { SubmitterDeps } from "./starknetSubmitter.js";
@@ -19,10 +21,13 @@ export type PaymasterServerDeps = SubmitterDeps & {
   submissionStore?: SubmissionStore;
 };
 
+const PAYMASTER_REQUEST_BODY_TIMEOUT_MS = 30_000;
+const PAYMASTER_MAX_PENDING_SUBMISSIONS = 128;
+
 export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterServerDeps = {}) {
   const signerRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute);
   const clientRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute * 3);
-  const submissionQueues = new SubmissionQueues();
+  const submissionQueues = new SubmissionQueues(PAYMASTER_MAX_PENDING_SUBMISSIONS);
   const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
   const metrics = new PaymasterMetrics();
 
@@ -50,7 +55,12 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
 
       if (request.method === "POST" && request.url === "/privacy-signer/ensure") {
         const result = await measuredPaymasterRoute(metrics, "privacy_signer_ensure", async () => {
-          const rawBody = await readBody(request, config.maxBodyBytes);
+          requireJsonContentType(request);
+          const rawBody = await readBody(
+            request,
+            config.maxBodyBytes,
+            PAYMASTER_REQUEST_BODY_TIMEOUT_MS
+          );
           const body = JSON.parse(rawBody) as unknown;
           const validated = validateEnsurePrivacySignerRequest(body, config);
           enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
@@ -64,7 +74,12 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
 
       if (request.method === "POST" && request.url === "/privacy-signer/relay") {
         const result = await measuredPaymasterRoute(metrics, "privacy_signer_relay", async () => {
-          const rawBody = await readBody(request, config.maxBodyBytes);
+          requireJsonContentType(request);
+          const rawBody = await readBody(
+            request,
+            config.maxBodyBytes,
+            PAYMASTER_REQUEST_BODY_TIMEOUT_MS
+          );
           const body = JSON.parse(rawBody) as unknown;
           const validated = validateRelayPrivacySignerRequest(body, config);
           enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.account_address);
@@ -82,7 +97,12 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
       }
 
       const result = await measuredPaymasterRoute(metrics, "execute_outside", async () => {
-        const rawBody = await readBody(request, config.maxBodyBytes);
+        requireJsonContentType(request);
+        const rawBody = await readBody(
+          request,
+          config.maxBodyBytes,
+          PAYMASTER_REQUEST_BODY_TIMEOUT_MS
+        );
         const body = JSON.parse(rawBody) as unknown;
         const validated = validateExecuteOutsideRequest(body, config);
         enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_address);
@@ -96,9 +116,30 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const status = statusForError(message);
-      sendJson(request, response, status, { error: message });
+      const safeMessage = safeLogErrorMessage(message);
+      console.error(JSON.stringify({
+        event: "paymaster_request_failed",
+        method: request.method,
+        url: request.url,
+        status,
+        error: safeMessage,
+      }));
+      sendJson(request, response, status, { error: safeMessage });
     }
   });
+}
+
+function safeLogErrorMessage(message: string): string {
+  return message
+    .replace(/"calldata"\s*:\s*\[[^\]]*\]/gi, '"calldata":[...]')
+    .replace(/"signature"\s*:\s*\[[^\]]*\]/gi, '"signature":[...]')
+    .replace(/"proof"\s*:\s*"[^"]*"/gi, '"proof":"<redacted>"')
+    .replace(/"proof_facts"\s*:\s*\[[^\]]*\]/gi, '"proof_facts":[...]')
+    .replace(/0x[0-9a-fA-F]{33,}/g, "<felt>")
+    .replace(/\b[0-9]{32,}\b/g, "<number>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 600);
 }
 
 function enforceRequestLimits(
@@ -134,28 +175,47 @@ function requireMetricsAuth(request: IncomingMessage, config: PaymasterConfig): 
     throw new Error("paymaster metrics token is not configured");
   }
   const expected = `Bearer ${config.internalApiToken}`;
-  if (request.headers.authorization !== expected) {
+  if (!constantTimeStringEqual(request.headers.authorization, expected)) {
     throw new Error("metrics authorization failed");
   }
+}
+
+function constantTimeStringEqual(actual: string | undefined, expected: string): boolean {
+  if (typeof actual !== "string") return false;
+  const actualBytes = Buffer.from(actual);
+  const expectedBytes = Buffer.from(expected);
+  const maxLength = Math.max(actualBytes.length, expectedBytes.length, 1);
+  const paddedActual = Buffer.alloc(maxLength);
+  const paddedExpected = Buffer.alloc(maxLength);
+  actualBytes.copy(paddedActual);
+  expectedBytes.copy(paddedExpected);
+  return (
+    timingSafeEqual(paddedActual, paddedExpected) &&
+    actualBytes.length === expectedBytes.length
+  );
 }
 
 function clientIp(request: IncomingMessage, config: PaymasterConfig): string {
   const socketIp = normalizeRemoteAddress(request.socket.remoteAddress ?? "unknown");
   if (config.trustProxyHeaders && isTrustedProxy(socketIp, config.trustedProxyCidrs)) {
     const forwarded = request.headers["x-forwarded-for"];
-    if (typeof forwarded === "string" && forwarded.trim()) {
-      return forwarded.split(",")[0]?.trim() || "unknown";
-    }
+    const forwardedIp = forwardedClientIp(forwarded);
+    if (forwardedIp) return forwardedIp;
     const realIp = request.headers["x-real-ip"];
-    if (typeof realIp === "string" && realIp.trim()) {
-      return realIp.trim();
-    }
+    const realClientIp = forwardedClientIp(realIp);
+    if (realClientIp) return realClientIp;
   }
   return socketIp;
 }
 
 function normalizeRemoteAddress(address: string): string {
   return address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
+}
+
+function forwardedClientIp(value: string | string[] | undefined): string | null {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const candidate = normalizeRemoteAddress((raw ?? "").split(",")[0]?.trim() ?? "");
+  return candidate && isIP(candidate) !== 0 ? candidate : null;
 }
 
 function isTrustedProxy(peerIp: string, cidrs: string[]): boolean {
@@ -192,24 +252,57 @@ function ipv4ToUint(value: string): number | null {
   return result;
 }
 
-function readBody(request: IncomingMessage, maxBytes: number): Promise<string> {
+function requireJsonContentType(request: IncomingMessage): void {
+  const contentType = request.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") {
+    throw new Error("content-type must be application/json");
+  }
+}
+
+function readBody(request: IncomingMessage, maxBytes: number, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks: Buffer[] = [];
+    let settled = false;
+    const timeout = setTimeout(() => {
+      fail(new Error("request body timed out"));
+    }, timeoutMs);
 
-    request.on("data", (chunk: Buffer) => {
+    const cleanup = () => {
+      clearTimeout(timeout);
+      request.off("data", onData);
+      request.off("end", onEnd);
+      request.off("error", onError);
+      request.off("aborted", onAborted);
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      request.resume();
+      reject(error);
+    };
+    const onData = (chunk: Buffer) => {
       size += chunk.byteLength;
       if (size > maxBytes) {
-        reject(new Error("request body too large"));
-        request.destroy();
+        fail(new Error("request body too large"));
         return;
       }
       chunks.push(chunk);
-    });
-    request.on("end", () => {
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-    request.on("error", reject);
+    };
+    const onError = (error: Error) => fail(error);
+    const onAborted = () => fail(new Error("request body was aborted"));
+
+    request.on("data", onData);
+    request.on("end", onEnd);
+    request.on("error", onError);
+    request.on("aborted", onAborted);
   });
 }
 
@@ -232,8 +325,7 @@ function validateCors(
 }
 
 function isOriginAllowed(config: PaymasterConfig, origin: string): boolean {
-  return config.allowedOrigins.has(origin) ||
-    config.allowedOriginPatterns.some((pattern) => pattern.test(origin));
+  return config.allowedOrigins.has(origin);
 }
 
 function sendJson(
@@ -284,6 +376,18 @@ function sendText(
 }
 
 function statusForError(message: string): number {
+  if (message.includes("request body too large")) {
+    return 413;
+  }
+  if (message.includes("content-type must be application/json")) {
+    return 415;
+  }
+  if (message.includes("request body timed out")) {
+    return 408;
+  }
+  if (message.includes("submission queue is full")) {
+    return 503;
+  }
   if (message.includes("authorization failed")) {
     return 401;
   }
@@ -391,13 +495,22 @@ class HistogramCounts {
   }
 }
 
-class FixedWindowRateLimiter {
+export class FixedWindowRateLimiter {
   private readonly buckets = new Map<string, { windowStartedAt: number; count: number }>();
+  private lastSweepAt = 0;
 
   constructor(private readonly limitPerMinute: number) {}
 
   check(key: string, now = Date.now()): void {
     const windowMs = 60_000;
+    if (now - this.lastSweepAt >= windowMs) {
+      for (const [bucketKey, bucket] of this.buckets) {
+        if (now - bucket.windowStartedAt >= windowMs * 2) {
+          this.buckets.delete(bucketKey);
+        }
+      }
+      this.lastSweepAt = now;
+    }
     const existing = this.buckets.get(key);
     if (!existing || now - existing.windowStartedAt >= windowMs) {
       this.buckets.set(key, { windowStartedAt: now, count: 1 });
@@ -409,18 +522,52 @@ class FixedWindowRateLimiter {
       throw new Error("signer rate limit exceeded");
     }
   }
+
+  get size(): number {
+    return this.buckets.size;
+  }
 }
 
-class SubmissionQueues {
+export class SubmissionQueues {
   private readonly tails = new Map<string, Promise<unknown>>();
+  private pendingCount = 0;
+
+  constructor(private readonly maxPending = PAYMASTER_MAX_PENDING_SUBMISSIONS) {
+    if (!Number.isSafeInteger(maxPending) || maxPending <= 0) {
+      throw new Error("maxPending must be a positive integer");
+    }
+  }
 
   enqueue<T>(queueKey: string, task: () => Promise<T>): Promise<T> {
+    if (this.pendingCount >= this.maxPending) {
+      throw new Error("paymaster submission queue is full");
+    }
+    this.pendingCount += 1;
     const tail = this.tails.get(queueKey) ?? Promise.resolve();
-    const run = tail.catch(() => undefined).then(task);
-    this.tails.set(queueKey, run.then(
+    const run = tail
+      .catch(() => undefined)
+      .then(task)
+      .finally(() => {
+        this.pendingCount -= 1;
+      });
+    const queuedTail = run.then(
       () => undefined,
       () => undefined
-    ));
+    );
+    this.tails.set(queueKey, queuedTail);
+    void queuedTail.then(() => {
+      if (this.tails.get(queueKey) === queuedTail) {
+        this.tails.delete(queueKey);
+      }
+    });
     return run;
+  }
+
+  get size(): number {
+    return this.tails.size;
+  }
+
+  get pending(): number {
+    return this.pendingCount;
   }
 }

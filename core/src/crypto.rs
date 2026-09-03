@@ -15,38 +15,45 @@ use serde_json::Value;
 use sha2::Sha256;
 use starknet_crypto::{Felt, get_public_key, poseidon_hash, rfc6979_generate_k, sign, verify};
 use std::collections::{BTreeMap, BTreeSet};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput, DecryptedOrderShare,
     DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
-    EncryptedMakerAttributionArtifact, EncryptedRecoveryPayload, FundingRailKind,
-    MakerAttributionPlaintext, MakerAttributionReceipt, MatchedOrderWitness, Note, NoteCommitment,
+    EncryptedLiquidityAttributionArtifact, EncryptedRecoveryPayload, FundingRailKind,
+    LiquidityAttributionPlaintext, LiquidityAttributionReceipt, LiquidityPositionIngressReceipt,
+    LiquidityPositionLifecycleSubmission, LiquidityPositionRootTransition,
+    LiquidityPositionTransitionKind, MatchedOrderWitness, MultiPairAssetDelta,
+    MultiPairAssetDeltaDirection, MultiPairAssetDeltaSource, MultiPairFill,
+    MultiPairObjectiveWeight, MultiPairOptimalityProblem, Note, NoteCommitment,
     NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan, NoteConsolidationWitness,
     NoteMembershipKind, NoteMembershipWitness, Nullifier, NullifierHistoryBatch,
     NullifierSparseUpdateWitness, OrderCommitment, OrderIngressReceipt,
     OrderIngressReceiptAttestation, OrderIntent, OrderShare, OrderShareBundle, OrderSide,
     OrderSubmission, OrderType, OutputNoteMerkleProof, OutputNoteRecord, OutputRecoveryRecord,
     OwnedOutputNotePayload, PairId, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyRegistry,
-    PrivateOrderPayload, ProtocolError, RecoveryArtifact, RecoveryArtifactKind, RecoverySeed,
-    RelayMode, RenewalChildUse, RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
+    PrivateLiquidityPosition, PrivateOrderPayload, ProtocolError, RecoveryArtifact,
+    RecoveryArtifactKind, RecoverySeed, RelayMode, RenewalChildUse,
+    RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
     RenewalParentCancelSubmissionPlan, RenewalStateHistoryBatch, RootOnlySettlementCommitments,
     SettlementCallArguments, SettlementOutputWithdrawalCallArguments,
     SettlementOutputWithdrawalSubmissionPlan, SettlementOutputWithdrawalWitness,
     SettlementSubmissionPlan, SettlementTranscript, SettlementWitness, StarknetCall, TimeInForce,
-    WithdrawalSubmissionPlan, derive_user_keys,
+    derive_user_keys,
     hash::{
         domain_felt, domain_felt_hex, encode_starknet_felt, felt_from_hex_str, felt_hex,
         normalize_felt_hex, poseidon_chain_hex, tagged_commitment_sha256, tagged_field_hex,
         tagged_sha256_bytes, tagged_sha256_hex,
     },
+    liquidity::{LiquidityPositionProofWitness, verify_liquidity_position_proof_witness},
     types::{
-        MAX_ORDER_FUNDING_INPUTS, MakerBandAttribution, NOTE_RECOGNITION_ALGORITHM,
+        LiquidityBandAttribution, MAX_ORDER_FUNDING_INPUTS, NOTE_RECOGNITION_ALGORITHM,
         OUTPUT_NOTE_PLAINTEXT_PADDED_LEN, OUTPUT_RECOVERY_FIELD_COUNT, OUTPUT_RECOVERY_PROOF_SLOTS,
         RENEWAL_PARENT_CANCEL_DOMAIN_HEX, funding_input_set_commitment,
         funding_nullifier_set_commitment, nullifier_from_note_secret, output_recovery_bundle_root,
         output_recovery_record_commitment, renewal_child_nullifier, renewal_parent_cancel_marker,
         spend_auth_key_felt_from_raw_key_hex, spend_authority_from_raw_key_hex,
-        withdraw_authority_from_raw_key_hex,
+        verify_spend_authorization, withdraw_authority_from_raw_key_hex,
     },
 };
 
@@ -82,6 +89,12 @@ pub const RENEWAL_SPARSE_TREE_DEPTH: usize = 128;
 const SETTLEMENT_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f736574746c655f7631";
 const NULLIFIER_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6e756c6c5f7631";
 const RENEWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f72656e65775f7631";
+const LIQUIDITY_POSITION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6c705f7631";
+const SETTLEMENT_ORDER_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6f72645f7631";
+const SETTLEMENT_INPUT_MEMBERSHIP_PROOF_MESSAGE_DOMAIN_HEX: &str =
+    "0x7a796c6974685f696e6d656d5f7631";
+const SETTLEMENT_OUTPUT_RECOVERY_PROOF_MESSAGE_DOMAIN_HEX: &str =
+    "0x7a796c6974685f6f75747265635f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
 const NOTE_CONSOLIDATION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f636f6e736f6c5f7631";
@@ -91,14 +104,15 @@ const ADMISSION_LEAF_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f6c6561665f7
 const PRIVATE_ORDER_SHARE_ALGORITHM_V1: &str = "ecdh-p256+hkdf-sha256+aes-256-gcm/private-order-v1";
 const PRIVATE_ORDER_SHARE_HKDF_SALT: &[u8] = b"zylith/private-order-share-key-separation-v1";
 const OUTPUT_NOTE_HKDF_SALT: &[u8] = b"zylith/output-note-key-separation-v2";
-const MAKER_ATTRIBUTION_ALGORITHM_V1: &str =
-    "ecdh-p256+hkdf-sha256+aes-256-gcm/maker-attribution-v1";
-const MAKER_ATTRIBUTION_HKDF_SALT: &[u8] = b"zylith/maker-attribution-key-separation-v1";
-const MAKER_ATTRIBUTION_PLAINTEXT_PADDED_LEN: usize = 4096;
-const MAKER_ATTRIBUTION_RECEIPT_VERSION: u32 = 1;
+const LIQUIDITY_ATTRIBUTION_ALGORITHM_V1: &str =
+    "ecdh-p256+hkdf-sha256+aes-256-gcm/liquidity-attribution-v1";
+const LIQUIDITY_ATTRIBUTION_HKDF_SALT: &[u8] = b"zylith/liquidity-attribution-key-separation-v1";
+const LIQUIDITY_ATTRIBUTION_PLAINTEXT_PADDED_LEN: usize = 4096;
+const LIQUIDITY_ATTRIBUTION_RECEIPT_VERSION: u32 = 1;
 const RECOVERY_ARTIFACT_ALGORITHM_V2: &str = "aes-256-gcm/recovery-v2";
 const WALLET_HKDF_SALT: &[u8] = b"zylith/wallet-key-separation-v2";
 const ORDER_INGRESS_RECEIPT_VERSION: u32 = 1;
+const LIQUIDITY_POSITION_INGRESS_RECEIPT_VERSION: u32 = 1;
 const STATEMENT_TYPE_NOTE_CONSOLIDATION_HEX: &str = "0x5";
 const STATEMENT_TYPE_WITHDRAWAL_HEX: &str = "0x6";
 
@@ -109,8 +123,11 @@ fn aes_nonce_from_slice(bytes: &[u8]) -> Result<Nonce<U12>, ProtocolError> {
     Ok(nonce.into())
 }
 const SETTLEMENT_STATEMENT_TYPE_TAG: u64 = 1;
+const STWO_SETTLEMENT_HEADER_FIELD_COUNT: usize = 38;
 const ADMISSION_STATEMENT_TYPE_TAG: u64 = 3;
 const AUCTION_RESULT_STATEMENT_TYPE_TAG: u64 = 4;
+const LIQUIDITY_POSITION_STATEMENT_TYPE_TAG: u64 = 7;
+const MULTI_PAIR_STATEMENT_TYPE_TAG: u64 = 8;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -125,8 +142,7 @@ pub struct SettlementOutputWithdrawalPlanRequest<'a> {
     pub new_nullifier_root: &'a str,
     pub proof_artifact_commitment: &'a str,
     pub withdraw_auth_key_felt: &'a str,
-    pub recipient: &'a str,
-    pub strk20_exit_commitment: Option<&'a str>,
+    pub strk20_exit_commitment: &'a str,
     pub auction_verifier_address: &'a str,
     pub shielded_asset_adapter_address: &'a str,
     pub chain_id: &'a str,
@@ -140,17 +156,16 @@ pub struct SettlementOutputWithdrawalMessage<'a> {
     pub note_commitment: &'a str,
     pub asset_id: &'a str,
     pub amount: &'a str,
-    pub recipient: &'a str,
-    pub strk20_exit_commitment: Option<&'a str>,
+    pub strk20_exit_commitment: &'a str,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HeartbeatCoverOrder {
     pub order_commitment: OrderCommitment,
     pub payload: PrivateOrderPayload,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SecretSharePayload {
     order_commitment: String,
     share_index: usize,
@@ -159,8 +174,14 @@ struct SecretSharePayload {
     share_hex: String,
 }
 
+impl Drop for SecretSharePayload {
+    fn drop(&mut self) {
+        self.share_hex.zeroize();
+    }
+}
+
 pub fn derive_account_id(seed: &RecoverySeed) -> String {
-    let recovery_key_hex = hex::encode(derive_user_keys(seed).recovery_key);
+    let recovery_key_hex = Zeroizing::new(hex::encode(derive_user_keys(seed).recovery_key));
     tagged_sha256_hex("zylith/account-id:", recovery_key_hex.as_bytes())
 }
 
@@ -180,8 +201,8 @@ pub fn build_order_submission(
         derive_order_cancellation_auth_tag(order_cancellation_key_hex, &order_commitment)?;
     validate_private_order_authorization(payload)?;
 
-    let plaintext = serde_json::to_vec(payload)?;
-    let split_shares = split_into_xor_shares(&plaintext, registry.keys.len());
+    let plaintext = Zeroizing::new(serde_json::to_vec(payload)?);
+    let split_shares = Zeroizing::new(split_into_xor_shares(&plaintext, registry.keys.len()));
 
     let shares = registry
         .keys
@@ -195,13 +216,14 @@ pub fn build_order_submission(
                 plaintext_len: plaintext.len(),
                 share_hex: hex::encode(&split_shares[index]),
             };
+            let share_plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
 
             Ok(OrderShare {
                 execution_key_id: member.key_id.clone(),
                 encrypted_share: encrypt_for_private_execution_key(
                     &member.key_id,
                     &member.public_key,
-                    &serde_json::to_vec(&payload)?,
+                    &share_plaintext,
                 )?,
             })
         })
@@ -462,6 +484,253 @@ fn order_ingress_receipt_payload(receipt: &OrderIngressReceipt) -> Result<Vec<u8
     })?)
 }
 
+pub fn liquidity_position_transition_commitment(
+    witness: &crate::liquidity::LiquidityPositionTransitionWitness,
+) -> Result<String, ProtocolError> {
+    crate::liquidity::liquidity_position_transition_summary_root(std::slice::from_ref(
+        &witness.transition,
+    ))
+}
+
+pub fn liquidity_position_lifecycle_id(
+    pair_id: &PairId,
+    batch_id: &BatchId,
+    epoch_id: u64,
+    transition_commitment: &str,
+) -> Result<String, ProtocolError> {
+    #[derive(Serialize)]
+    struct LifecycleIdView<'a> {
+        pair_id: &'a PairId,
+        batch_id: &'a BatchId,
+        epoch_id: u64,
+        transition_commitment: &'a str,
+    }
+
+    tagged_commitment_sha256(
+        "zylith/liquidity-position-lifecycle-id-v1",
+        &LifecycleIdView {
+            pair_id,
+            batch_id,
+            epoch_id,
+            transition_commitment,
+        },
+    )
+}
+
+pub fn liquidity_position_transition_witness_payload_commitment(
+    witness: &crate::liquidity::LiquidityPositionTransitionWitness,
+) -> Result<String, ProtocolError> {
+    tagged_commitment_sha256(
+        "zylith/private-liquidity-position-transition-payload-v1",
+        witness,
+    )
+}
+
+pub fn create_liquidity_position_ingress_receipt(
+    submission: &LiquidityPositionLifecycleSubmission,
+    payload_commitment: &str,
+    ingress_id: &str,
+    signer: &str,
+    receipt_secret: &str,
+    issued_at_unix_ms: u64,
+) -> Result<LiquidityPositionIngressReceipt, ProtocolError> {
+    validate_liquidity_position_lifecycle_manifest_fields(submission)?;
+    if submission.ingress_receipt.is_some() {
+        return Err(ProtocolError::Crypto(
+            "liquidity position lifecycle manifest already has an ingress receipt".into(),
+        ));
+    }
+    if payload_commitment.trim().is_empty() {
+        return Err(ProtocolError::Crypto(
+            "liquidity position lifecycle payload commitment is empty".into(),
+        ));
+    }
+    let mut receipt = LiquidityPositionIngressReceipt {
+        version: LIQUIDITY_POSITION_INGRESS_RECEIPT_VERSION,
+        ingress_id: ingress_id.into(),
+        lifecycle_id: submission.lifecycle_id.clone(),
+        pair_id: submission.pair_id.clone(),
+        batch_id: submission.batch_id.clone(),
+        epoch_id: submission.epoch_id,
+        transition_commitment: submission.transition_commitment.clone(),
+        payload_commitment: payload_commitment.into(),
+        issued_at_unix_ms,
+        signer: signer.into(),
+        signature: String::new(),
+    };
+    receipt.signature = sign_liquidity_position_ingress_receipt(&receipt, receipt_secret)?;
+    Ok(receipt)
+}
+
+pub fn verify_liquidity_position_ingress_receipt(
+    receipt: &LiquidityPositionIngressReceipt,
+    receipt_secret: &str,
+) -> Result<(), ProtocolError> {
+    if receipt.version != LIQUIDITY_POSITION_INGRESS_RECEIPT_VERSION {
+        return Err(ProtocolError::Crypto(format!(
+            "unsupported liquidity position ingress receipt version {}",
+            receipt.version
+        )));
+    }
+    let signature = hex::decode(&receipt.signature)?;
+    let payload = liquidity_position_ingress_receipt_payload(receipt)?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(receipt_secret.as_bytes()).map_err(|_| {
+        ProtocolError::Crypto(
+            "liquidity position ingress receipt secret could not initialize HMAC".into(),
+        )
+    })?;
+    mac.update(&payload);
+    mac.verify_slice(&signature).map_err(|_| {
+        ProtocolError::Crypto("liquidity position ingress receipt signature mismatch".into())
+    })
+}
+
+pub fn verify_liquidity_position_ingress_receipt_with_secrets(
+    receipt: &LiquidityPositionIngressReceipt,
+    receipt_secrets: &[String],
+) -> Result<(), ProtocolError> {
+    let mut configured_secret_count = 0_u64;
+    for receipt_secret in receipt_secrets {
+        if receipt_secret.trim().is_empty() {
+            continue;
+        }
+        configured_secret_count += 1;
+        if verify_liquidity_position_ingress_receipt(receipt, receipt_secret).is_ok() {
+            return Ok(());
+        }
+    }
+    if configured_secret_count == 0 {
+        return Err(ProtocolError::Crypto(
+            "liquidity position ingress receipt secret keyring is empty".into(),
+        ));
+    }
+    Err(ProtocolError::Crypto(
+        "liquidity position ingress receipt signature mismatch for configured keyring".into(),
+    ))
+}
+
+pub fn validate_liquidity_position_ingress_receipt_for_manifest(
+    submission: &LiquidityPositionLifecycleSubmission,
+    receipt_secret: &str,
+) -> Result<(), ProtocolError> {
+    let receipt = submission.ingress_receipt.as_ref().ok_or_else(|| {
+        ProtocolError::Crypto(
+            "liquidity position lifecycle submission is missing prover ingress receipt".into(),
+        )
+    })?;
+    validate_liquidity_position_ingress_receipt_fields(submission, receipt)?;
+    verify_liquidity_position_ingress_receipt(receipt, receipt_secret)
+}
+
+pub fn validate_liquidity_position_ingress_receipt_for_manifest_with_secrets(
+    submission: &LiquidityPositionLifecycleSubmission,
+    receipt_secrets: &[String],
+) -> Result<(), ProtocolError> {
+    let receipt = submission.ingress_receipt.as_ref().ok_or_else(|| {
+        ProtocolError::Crypto(
+            "liquidity position lifecycle submission is missing prover ingress receipt".into(),
+        )
+    })?;
+    validate_liquidity_position_ingress_receipt_fields(submission, receipt)?;
+    verify_liquidity_position_ingress_receipt_with_secrets(receipt, receipt_secrets)
+}
+
+fn validate_liquidity_position_lifecycle_manifest_fields(
+    submission: &LiquidityPositionLifecycleSubmission,
+) -> Result<(), ProtocolError> {
+    if submission.lifecycle_id.trim().is_empty()
+        || submission.transition_commitment.trim().is_empty()
+        || submission.epoch_id == 0
+        || submission.pair_id.0.trim().is_empty()
+        || submission.batch_id.0.trim().is_empty()
+    {
+        return Err(ProtocolError::Crypto(
+            "liquidity position lifecycle manifest is missing required metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_liquidity_position_ingress_receipt_fields(
+    submission: &LiquidityPositionLifecycleSubmission,
+    receipt: &LiquidityPositionIngressReceipt,
+) -> Result<(), ProtocolError> {
+    validate_liquidity_position_lifecycle_manifest_fields(submission)?;
+    if receipt.lifecycle_id != submission.lifecycle_id
+        || receipt.pair_id != submission.pair_id
+        || receipt.batch_id != submission.batch_id
+        || receipt.epoch_id != submission.epoch_id
+        || receipt.transition_commitment != submission.transition_commitment
+    {
+        return Err(ProtocolError::Crypto(
+            "liquidity position ingress receipt does not match lifecycle metadata".into(),
+        ));
+    }
+    if receipt.ingress_id.trim().is_empty() || receipt.signer.trim().is_empty() {
+        return Err(ProtocolError::Crypto(
+            "liquidity position ingress receipt is missing ingress identity".into(),
+        ));
+    }
+    if receipt.payload_commitment.trim().is_empty() || receipt.signature.trim().is_empty() {
+        return Err(ProtocolError::Crypto(
+            "liquidity position ingress receipt is missing payload commitment or signature".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sign_liquidity_position_ingress_receipt(
+    receipt: &LiquidityPositionIngressReceipt,
+    receipt_secret: &str,
+) -> Result<String, ProtocolError> {
+    if receipt_secret.trim().is_empty() {
+        return Err(ProtocolError::Crypto(
+            "liquidity position ingress receipt secret is not configured".into(),
+        ));
+    }
+    let payload = liquidity_position_ingress_receipt_payload(receipt)?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(receipt_secret.as_bytes()).map_err(|_| {
+        ProtocolError::Crypto(
+            "liquidity position ingress receipt secret could not initialize HMAC".into(),
+        )
+    })?;
+    mac.update(&payload);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn liquidity_position_ingress_receipt_payload(
+    receipt: &LiquidityPositionIngressReceipt,
+) -> Result<Vec<u8>, ProtocolError> {
+    #[derive(Serialize)]
+    struct LiquidityPositionIngressReceiptSigningPayload<'a> {
+        version: u32,
+        ingress_id: &'a str,
+        lifecycle_id: &'a str,
+        pair_id: &'a PairId,
+        batch_id: &'a BatchId,
+        epoch_id: u64,
+        transition_commitment: &'a str,
+        payload_commitment: &'a str,
+        issued_at_unix_ms: u64,
+        signer: &'a str,
+    }
+
+    Ok(serde_json::to_vec(
+        &LiquidityPositionIngressReceiptSigningPayload {
+            version: receipt.version,
+            ingress_id: &receipt.ingress_id,
+            lifecycle_id: &receipt.lifecycle_id,
+            pair_id: &receipt.pair_id,
+            batch_id: &receipt.batch_id,
+            epoch_id: receipt.epoch_id,
+            transition_commitment: &receipt.transition_commitment,
+            payload_commitment: &receipt.payload_commitment,
+            issued_at_unix_ms: receipt.issued_at_unix_ms,
+            signer: &receipt.signer,
+        },
+    )?)
+}
+
 pub fn decrypt_order_bundle(
     bundle: &OrderShareBundle,
     private_execution_keys: &[PrivateExecutionKeyPrivateConfig],
@@ -488,8 +757,11 @@ pub fn decrypt_order_share(
                 member_key.key_id
             ))
         })?;
-    let plaintext = decrypt_encrypted_blob(&member_key.private_key, &share.encrypted_share)?;
-    let payload = serde_json::from_slice::<SecretSharePayload>(&plaintext)?;
+    let plaintext = Zeroizing::new(decrypt_encrypted_blob(
+        &member_key.private_key,
+        &share.encrypted_share,
+    )?);
+    let mut payload = serde_json::from_slice::<SecretSharePayload>(&plaintext)?;
 
     if payload.order_commitment != bundle.order_commitment.0 {
         return Err(ProtocolError::Crypto(
@@ -503,7 +775,7 @@ pub fn decrypt_order_share(
         share_index: payload.share_index as u64,
         share_count: payload.share_count as u64,
         plaintext_len: payload.plaintext_len as u64,
-        share_hex: payload.share_hex,
+        share_hex: std::mem::take(&mut payload.share_hex),
     })
 }
 
@@ -517,7 +789,7 @@ pub fn reconstruct_order_from_shares(
         ));
     }
 
-    let mut ordered_payloads = share_payloads.to_vec();
+    let mut ordered_payloads = share_payloads.iter().collect::<Vec<_>>();
     ordered_payloads.sort_by_key(|payload| payload.share_index);
 
     for payload in &ordered_payloads {
@@ -548,9 +820,9 @@ pub fn reconstruct_order_from_shares(
         }
     }
 
-    let mut plaintext = vec![0_u8; plaintext_len];
+    let mut plaintext = Zeroizing::new(vec![0_u8; plaintext_len]);
     for payload in &ordered_payloads {
-        let share_bytes = hex::decode(&payload.share_hex)?;
+        let share_bytes = Zeroizing::new(hex::decode(&payload.share_hex)?);
         if share_bytes.len() != plaintext_len {
             return Err(ProtocolError::Crypto(
                 "share payload length mismatch".into(),
@@ -621,45 +893,13 @@ pub fn validate_private_order_authorization(
         ));
     }
 
-    let signature_r = felt_from_hex_str(&payload.funding_authorization.signature_r)?;
-    let signature_s = felt_from_hex_str(&payload.funding_authorization.signature_s)?;
-    let message = felt_from_hex_str(&expected_order_commitment.0)?;
-    let owner_public_key = felt_from_hex_str(&first_spend_authority)?;
-    if let Some(managed) = payload.managed_maker_authorization.as_ref() {
-        managed.policy.validate_order(&payload.order)?;
-        let policy_commitment = felt_from_hex_str(&managed.policy.commitment()?)?;
-        let owner_signature_r = felt_from_hex_str(&managed.owner_authorization.signature_r)?;
-        let owner_signature_s = felt_from_hex_str(&managed.owner_authorization.signature_s)?;
-        if !verify(
-            &owner_public_key,
-            &policy_commitment,
-            &owner_signature_r,
-            &owner_signature_s,
-        )
-        .map_err(|err| {
-            ProtocolError::Crypto(format!(
-                "managed maker owner authorization verify failed: {err}"
-            ))
-        })? {
-            return Err(ProtocolError::Crypto(
-                "managed maker policy is not authorized by the funding note owner".into(),
-            ));
-        }
-        let delegate_public_key = felt_from_hex_str(&managed.policy.delegate_public_key)?;
-        if !verify(&delegate_public_key, &message, &signature_r, &signature_s).map_err(|err| {
-            ProtocolError::Crypto(format!(
-                "managed maker delegate authorization verify failed: {err}"
-            ))
-        })? {
-            return Err(ProtocolError::Crypto(
-                "managed maker order is not signed by the authorized delegate".into(),
-            ));
-        }
-    } else if !verify(&owner_public_key, &message, &signature_r, &signature_s).map_err(|err| {
-        ProtocolError::Crypto(format!("funding authorization verify failed: {err}"))
-    })? {
+    if !verify_spend_authorization(
+        &first_spend_authority,
+        &expected_order_commitment.0,
+        &payload.funding_authorization,
+    )? {
         return Err(ProtocolError::Crypto(
-            "funding authorization signature does not match note spend authority".into(),
+            "funding authorization does not match note spend authority".into(),
         ));
     }
 
@@ -759,7 +999,7 @@ pub fn build_heartbeat_cover_orders(
             side: OrderSide::Buy,
             order_type: OrderType::HeartbeatCover,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: cover_price,
             amount: 1,
             min_fill: 1,
@@ -792,10 +1032,9 @@ pub fn build_heartbeat_cover_orders(
             order_commitment,
             payload: PrivateOrderPayload {
                 order,
-                funding_note,
-                funding_notes: Vec::new(),
+                funding_note: funding_note.clone(),
+                funding_notes: vec![funding_note],
                 funding_authorization,
-                managed_maker_authorization: None,
             },
         });
     }
@@ -838,7 +1077,9 @@ fn heartbeat_cover_nonce(secret: &str, batch: &BatchSummary, public_index: usize
         "zylith/heartbeat-cover/nonce-v1",
         heartbeat_cover_material(secret, batch, public_index, "nonce").as_bytes(),
     );
-    u64::from_be_bytes(seed[..8].try_into().expect("seed prefix"))
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&seed[..8]);
+    u64::from_be_bytes(prefix)
 }
 
 fn heartbeat_cover_material(
@@ -869,31 +1110,13 @@ pub fn sign_order_authorization(
     )
 }
 
-pub fn sign_managed_maker_policy_authorization(
-    spend_auth_key_felt: &str,
-    policy: &crate::ManagedMakerPolicy,
-) -> Result<crate::SpendAuthorization, ProtocolError> {
-    sign_felt_authorization(
-        spend_auth_key_felt,
-        &policy.commitment()?,
-        "managed maker policy authorization",
-    )
-}
-
 fn sign_felt_authorization(
-    private_key_felt: &str,
+    authorization_secret_felt: &str,
     message_felt: &str,
     label: &str,
 ) -> Result<crate::SpendAuthorization, ProtocolError> {
-    let private_key = felt_from_hex_str(private_key_felt)?;
-    let message = felt_from_hex_str(message_felt)?;
-    let k = rfc6979_generate_k(&message, &private_key, None);
-    let signature = sign(&private_key, &message, &k)
-        .map_err(|err| ProtocolError::Crypto(format!("{label} signing failed: {err}")))?;
-    Ok(crate::SpendAuthorization {
-        signature_r: felt_hex(&signature.r),
-        signature_s: felt_hex(&signature.s),
-    })
+    crate::build_spend_authorization(authorization_secret_felt, message_felt)
+        .map_err(|err| ProtocolError::Crypto(format!("{label} authorization failed: {err}")))
 }
 
 pub fn renewal_relay_package_registration_message_hash(
@@ -1054,10 +1277,10 @@ pub fn output_note_metadata_commitment(
     )
 }
 
-pub fn validate_maker_band_attribution_payload(
-    attribution: &MakerBandAttribution,
+pub fn validate_liquidity_band_attribution_payload(
+    attribution: &LiquidityBandAttribution,
 ) -> Result<(), ProtocolError> {
-    maker_band_attribution_commitment(attribution)?;
+    liquidity_band_attribution_commitment(attribution)?;
     let mut previous_index = None;
     let mut total_filled = 0u128;
     for band in &attribution.bands {
@@ -1065,43 +1288,43 @@ pub fn validate_maker_band_attribution_payload(
             && band.band_index <= previous
         {
             return Err(ProtocolError::Crypto(
-                "maker band attribution indexes must be strictly increasing".into(),
+                "liquidity band attribution indexes must be strictly increasing".into(),
             ));
         }
         if band.band_base_amount == 0 || band.filled_base_amount == 0 {
             return Err(ProtocolError::Crypto(
-                "maker band attribution amounts must be non-zero".into(),
+                "liquidity band attribution amounts must be non-zero".into(),
             ));
         }
         if band.filled_base_amount > band.band_base_amount {
             return Err(ProtocolError::Crypto(
-                "maker band attribution fill exceeds band depth".into(),
+                "liquidity band attribution fill exceeds band depth".into(),
             ));
         }
         total_filled = total_filled
             .checked_add(band.filled_base_amount)
-            .ok_or_else(|| ProtocolError::Crypto("maker band attribution overflow".into()))?;
+            .ok_or_else(|| ProtocolError::Crypto("liquidity band attribution overflow".into()))?;
         previous_index = Some(band.band_index);
     }
     if total_filled != attribution.filled_base_amount {
         return Err(ProtocolError::Crypto(
-            "maker band attribution total does not match filled amount".into(),
+            "liquidity band attribution total does not match filled amount".into(),
         ));
     }
     Ok(())
 }
 
-pub fn maker_band_attribution_commitment(
-    attribution: &MakerBandAttribution,
+pub fn liquidity_band_attribution_commitment(
+    attribution: &LiquidityBandAttribution,
 ) -> Result<String, ProtocolError> {
     if attribution.version != 1 {
         return Err(ProtocolError::Crypto(
-            "unsupported maker band attribution version".into(),
+            "unsupported liquidity band attribution version".into(),
         ));
     }
     if attribution.bands.is_empty() {
         return Err(ProtocolError::Crypto(
-            "maker band attribution must include at least one band".into(),
+            "liquidity band attribution must include at least one band".into(),
         ));
     }
     let mut fields = Vec::with_capacity(7 + attribution.bands.len() * 4);
@@ -1122,24 +1345,30 @@ pub fn maker_band_attribution_commitment(
         fields.push(encode_u128(band.filled_base_amount));
     }
     let refs = fields.iter().map(String::as_str).collect::<Vec<_>>();
-    poseidon_chain_hex_from_hexes(&domain_felt_hex("zylith/maker-band-attribution-v1"), &refs)
+    poseidon_chain_hex_from_hexes(
+        &domain_felt_hex("zylith/liquidity-band-attribution-v1"),
+        &refs,
+    )
 }
 
-pub fn create_maker_attribution_artifact(
-    plaintext: &MakerAttributionPlaintext,
+pub fn create_liquidity_attribution_artifact(
+    plaintext: &LiquidityAttributionPlaintext,
     recipient_owner_public_key: &str,
     signer_private_key: &str,
     issued_at_unix_ms: u64,
-) -> Result<EncryptedMakerAttributionArtifact, ProtocolError> {
-    validate_maker_attribution_plaintext(plaintext)?;
-    if plaintext.maker_public_key != recipient_owner_public_key {
+) -> Result<EncryptedLiquidityAttributionArtifact, ProtocolError> {
+    validate_liquidity_attribution_plaintext(plaintext)?;
+    if plaintext.liquidity_provider_public_key != recipient_owner_public_key {
         return Err(ProtocolError::Crypto(
-            "maker attribution recipient does not match plaintext owner".into(),
+            "liquidity attribution recipient does not match plaintext owner".into(),
         ));
     }
-    let payload_commitment = maker_attribution_payload_commitment(plaintext)?;
-    let receipt =
-        sign_maker_attribution_receipt(&payload_commitment, signer_private_key, issued_at_unix_ms)?;
+    let payload_commitment = liquidity_attribution_payload_commitment(plaintext)?;
+    let receipt = sign_liquidity_attribution_receipt(
+        &payload_commitment,
+        signer_private_key,
+        issued_at_unix_ms,
+    )?;
 
     let recipient_public_key = parse_note_recognition_public_key(recipient_owner_public_key)?;
     let ephemeral_secret = SecretKey::random(&mut OsRng);
@@ -1156,25 +1385,25 @@ pub fn create_maker_attribution_artifact(
     let mut key_id = [0_u8; 32];
     OsRng.fill_bytes(&mut key_id);
     let key_id_hex = hex::encode(key_id);
-    let key_bytes = derive_maker_attribution_key(
+    let key_bytes = Zeroizing::new(derive_liquidity_attribution_key(
         shared_secret.raw_secret_bytes(),
         &key_id_hex,
         &ephemeral_public_key,
-    )?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let mut nonce_bytes = [0_u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = aes_nonce_from_slice(&nonce_bytes)?;
     let nonce_hex = hex::encode(nonce_bytes);
-    let plaintext_bytes = padded_maker_attribution_plaintext(plaintext)?;
+    let plaintext_bytes = padded_liquidity_attribution_plaintext(plaintext)?;
     let ciphertext = cipher
         .encrypt(
             &nonce,
             Payload {
                 msg: plaintext_bytes.as_ref(),
-                aad: maker_attribution_blob_aad(
-                    MAKER_ATTRIBUTION_ALGORITHM_V1,
+                aad: liquidity_attribution_blob_aad(
+                    LIQUIDITY_ATTRIBUTION_ALGORITHM_V1,
                     &key_id_hex,
                     &ephemeral_public_key,
                     &nonce_hex,
@@ -1182,18 +1411,20 @@ pub fn create_maker_attribution_artifact(
                 .as_ref(),
             },
         )
-        .map_err(|err| ProtocolError::Crypto(format!("maker attribution encrypt failed: {err}")))?;
+        .map_err(|err| {
+            ProtocolError::Crypto(format!("liquidity attribution encrypt failed: {err}"))
+        })?;
 
-    Ok(EncryptedMakerAttributionArtifact {
+    Ok(EncryptedLiquidityAttributionArtifact {
         version: 1,
         batch_id: plaintext.batch_id.clone(),
         pair_id: plaintext.pair_id.clone(),
         epoch_id: plaintext.epoch_id,
-        maker_public_key: plaintext.maker_public_key.clone(),
+        liquidity_provider_public_key: plaintext.liquidity_provider_public_key.clone(),
         curve_commitment: plaintext.curve_commitment.clone(),
         output_note_commitment: plaintext.output_note_commitment.clone(),
         order_commitment: plaintext.attribution.order_commitment.clone(),
-        algorithm: MAKER_ATTRIBUTION_ALGORITHM_V1.into(),
+        algorithm: LIQUIDITY_ATTRIBUTION_ALGORITHM_V1.into(),
         key_id: key_id_hex,
         ephemeral_public_key,
         nonce: nonce_hex,
@@ -1202,17 +1433,17 @@ pub fn create_maker_attribution_artifact(
     })
 }
 
-pub fn decrypt_maker_attribution_artifact(
+pub fn decrypt_liquidity_attribution_artifact(
     note_recognition_key_hex: &str,
-    artifact: &EncryptedMakerAttributionArtifact,
-) -> Result<Option<MakerAttributionPlaintext>, ProtocolError> {
-    if artifact.algorithm != MAKER_ATTRIBUTION_ALGORITHM_V1 {
+    artifact: &EncryptedLiquidityAttributionArtifact,
+) -> Result<Option<LiquidityAttributionPlaintext>, ProtocolError> {
+    if artifact.algorithm != LIQUIDITY_ATTRIBUTION_ALGORITHM_V1 {
         return Ok(None);
     }
     let recipient_secret = note_recognition_secret_from_raw_key_hex(note_recognition_key_hex)?;
     let recipient_public_key =
         note_recognition_public_key_from_raw_key_hex(note_recognition_key_hex)?;
-    if artifact.maker_public_key != recipient_public_key {
+    if artifact.liquidity_provider_public_key != recipient_public_key {
         return Ok(None);
     }
     let ephemeral_public_key = parse_public_key(&artifact.ephemeral_public_key)?;
@@ -1220,12 +1451,12 @@ pub fn decrypt_maker_attribution_artifact(
         recipient_secret.to_nonzero_scalar(),
         ephemeral_public_key.as_affine(),
     );
-    let key_bytes = derive_maker_attribution_key(
+    let key_bytes = Zeroizing::new(derive_liquidity_attribution_key(
         shared_secret.raw_secret_bytes(),
         &artifact.key_id,
         &artifact.ephemeral_public_key,
-    )?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let nonce_bytes = hex::decode(&artifact.nonce)?;
     let nonce = aes_nonce_from_slice(&nonce_bytes)?;
@@ -1234,7 +1465,7 @@ pub fn decrypt_maker_attribution_artifact(
         &nonce,
         Payload {
             msg: ciphertext.as_ref(),
-            aad: maker_attribution_blob_aad(
+            aad: liquidity_attribution_blob_aad(
                 &artifact.algorithm,
                 &artifact.key_id,
                 &artifact.ephemeral_public_key,
@@ -1243,39 +1474,39 @@ pub fn decrypt_maker_attribution_artifact(
             .as_ref(),
         },
     ) {
-        Ok(plaintext) => plaintext,
+        Ok(plaintext) => Zeroizing::new(plaintext),
         Err(_) => return Ok(None),
     };
-    let payload = parse_padded_maker_attribution_plaintext(&plaintext)?;
-    validate_maker_attribution_plaintext(&payload)?;
-    let payload_commitment = maker_attribution_payload_commitment(&payload)?;
+    let payload = parse_padded_liquidity_attribution_plaintext(&plaintext)?;
+    validate_liquidity_attribution_plaintext(&payload)?;
+    let payload_commitment = liquidity_attribution_payload_commitment(&payload)?;
     if payload_commitment != artifact.receipt.payload_commitment {
         return Err(ProtocolError::Crypto(
-            "maker attribution receipt does not match plaintext".into(),
+            "liquidity attribution receipt does not match plaintext".into(),
         ));
     }
-    validate_maker_attribution_receipt(&artifact.receipt)?;
+    validate_liquidity_attribution_receipt(&artifact.receipt)?;
     if payload.batch_id != artifact.batch_id
         || payload.pair_id != artifact.pair_id
         || payload.epoch_id != artifact.epoch_id
-        || payload.maker_public_key != artifact.maker_public_key
+        || payload.liquidity_provider_public_key != artifact.liquidity_provider_public_key
         || payload.curve_commitment != artifact.curve_commitment
         || payload.output_note_commitment != artifact.output_note_commitment
         || payload.attribution.order_commitment != artifact.order_commitment
     {
         return Err(ProtocolError::Crypto(
-            "maker attribution envelope does not match plaintext".into(),
+            "liquidity attribution envelope does not match plaintext".into(),
         ));
     }
     Ok(Some(payload))
 }
 
-pub fn validate_maker_attribution_receipt(
-    receipt: &MakerAttributionReceipt,
+pub fn validate_liquidity_attribution_receipt(
+    receipt: &LiquidityAttributionReceipt,
 ) -> Result<(), ProtocolError> {
-    if receipt.version != MAKER_ATTRIBUTION_RECEIPT_VERSION {
+    if receipt.version != LIQUIDITY_ATTRIBUTION_RECEIPT_VERSION {
         return Err(ProtocolError::Crypto(format!(
-            "unsupported maker attribution receipt version {}",
+            "unsupported liquidity attribution receipt version {}",
             receipt.version
         )));
     }
@@ -1284,55 +1515,63 @@ pub fn validate_maker_attribution_receipt(
     let r = felt_from_hex_str(&normalize_felt_hex(&receipt.signature_r)?)?;
     let s = felt_from_hex_str(&normalize_felt_hex(&receipt.signature_s)?)?;
     verify(&signer, &message, &r, &s)
-        .map_err(|err| ProtocolError::Crypto(format!("maker attribution verify failed: {err}")))?
+        .map_err(|err| {
+            ProtocolError::Crypto(format!("liquidity attribution verify failed: {err}"))
+        })?
         .then_some(())
-        .ok_or_else(|| ProtocolError::Crypto("maker attribution receipt signature mismatch".into()))
+        .ok_or_else(|| {
+            ProtocolError::Crypto("liquidity attribution receipt signature mismatch".into())
+        })
 }
 
-fn validate_maker_attribution_plaintext(
-    plaintext: &MakerAttributionPlaintext,
+fn validate_liquidity_attribution_plaintext(
+    plaintext: &LiquidityAttributionPlaintext,
 ) -> Result<(), ProtocolError> {
     if plaintext.version != 1 {
         return Err(ProtocolError::Crypto(
-            "unsupported maker attribution plaintext version".into(),
+            "unsupported liquidity attribution plaintext version".into(),
         ));
     }
     if plaintext.batch_id.0.trim().is_empty()
         || plaintext.pair_id.0.trim().is_empty()
-        || plaintext.maker_public_key.trim().is_empty()
+        || plaintext.liquidity_provider_public_key.trim().is_empty()
         || plaintext.curve_commitment.trim().is_empty()
         || plaintext.output_note_commitment.0.trim().is_empty()
     {
         return Err(ProtocolError::Crypto(
-            "maker attribution plaintext is missing required metadata".into(),
+            "liquidity attribution plaintext is missing required metadata".into(),
         ));
     }
     if plaintext.attribution.pair_id != plaintext.pair_id {
         return Err(ProtocolError::Crypto(
-            "maker attribution pair does not match plaintext".into(),
+            "liquidity attribution pair does not match plaintext".into(),
         ));
     }
-    validate_maker_band_attribution_payload(&plaintext.attribution)
+    validate_liquidity_band_attribution_payload(&plaintext.attribution)
 }
 
-fn maker_attribution_payload_commitment(
-    plaintext: &MakerAttributionPlaintext,
+fn liquidity_attribution_payload_commitment(
+    plaintext: &LiquidityAttributionPlaintext,
 ) -> Result<String, ProtocolError> {
-    tagged_field_hex("zylith/maker-attribution-artifact-payload-v1", plaintext)
+    tagged_field_hex(
+        "zylith/liquidity-attribution-artifact-payload-v1",
+        plaintext,
+    )
 }
 
-fn sign_maker_attribution_receipt(
+fn sign_liquidity_attribution_receipt(
     payload_commitment: &str,
     signer_private_key: &str,
     issued_at_unix_ms: u64,
-) -> Result<MakerAttributionReceipt, ProtocolError> {
+) -> Result<LiquidityAttributionReceipt, ProtocolError> {
     let private_key = felt_from_hex_str(&normalize_felt_hex(signer_private_key)?)?;
     let message = felt_from_hex_str(&normalize_felt_hex(payload_commitment)?)?;
     let k = rfc6979_generate_k(&message, &private_key, None);
-    let signature = sign(&private_key, &message, &k)
-        .map_err(|err| ProtocolError::Crypto(format!("maker attribution signing failed: {err}")))?;
-    Ok(MakerAttributionReceipt {
-        version: MAKER_ATTRIBUTION_RECEIPT_VERSION,
+    let signature = sign(&private_key, &message, &k).map_err(|err| {
+        ProtocolError::Crypto(format!("liquidity attribution signing failed: {err}"))
+    })?;
+    Ok(LiquidityAttributionReceipt {
+        version: LIQUIDITY_ATTRIBUTION_RECEIPT_VERSION,
         signer_public_key: felt_hex(&get_public_key(&private_key)),
         issued_at_unix_ms,
         payload_commitment: payload_commitment.into(),
@@ -1346,14 +1585,16 @@ pub fn derive_order_cancellation_secret(
     order_commitment: &OrderCommitment,
 ) -> Result<String, ProtocolError> {
     let normalized = order_cancellation_key_hex.trim_start_matches("0x");
-    let key_bytes = hex::decode(normalized)?;
+    let key_bytes = Zeroizing::new(hex::decode(normalized)?);
     if key_bytes.len() != 32 {
         return Err(ProtocolError::Crypto(format!(
             "order cancellation key must be 32 bytes, got {}",
             key_bytes.len()
         )));
     }
-    let mut material = Vec::with_capacity(key_bytes.len() + order_commitment.0.len());
+    let mut material = Zeroizing::new(Vec::with_capacity(
+        key_bytes.len() + order_commitment.0.len(),
+    ));
     material.extend_from_slice(&key_bytes);
     material.extend_from_slice(order_commitment.0.as_bytes());
     Ok(tagged_sha256_hex("zylith/order-cancel-secret", &material))
@@ -1383,7 +1624,10 @@ pub fn derive_order_cancellation_auth_tag(
     order_cancellation_key_hex: &str,
     order_commitment: &OrderCommitment,
 ) -> Result<String, ProtocolError> {
-    let secret = derive_order_cancellation_secret(order_cancellation_key_hex, order_commitment)?;
+    let secret = Zeroizing::new(derive_order_cancellation_secret(
+        order_cancellation_key_hex,
+        order_commitment,
+    )?);
     Ok(derive_order_cancellation_tag(&secret))
 }
 
@@ -1454,26 +1698,6 @@ pub fn build_deposit_submission_plan(
     })
 }
 
-pub fn build_withdrawal_submission_plan(
-    note_commitment: &str,
-    withdraw_auth_key_felt: &str,
-    recipient: &str,
-    shielded_asset_adapter_address: &str,
-    chain_id: &str,
-) -> Result<WithdrawalSubmissionPlan, ProtocolError> {
-    let _ = (
-        note_commitment,
-        withdraw_auth_key_felt,
-        recipient,
-        shielded_asset_adapter_address,
-        chain_id,
-    );
-    Err(ProtocolError::InvalidWithdrawal(
-        "raw adapter withdrawals are disabled; withdrawals must consume the verifier nullifier root"
-            .into(),
-    ))
-}
-
 fn encode_output_root_id(batch_id: &BatchId) -> String {
     let domain = if batch_id.0.starts_with("consolidation-") {
         "note-consolidation-id"
@@ -1496,12 +1720,8 @@ pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
     }
     let roots = settlement_output_withdrawal_root_fields(witness)?;
     let withdrawal_commitment = settlement_output_withdrawal_commitment(witness)?;
-    let strk20_exit_commitment = witness
-        .strk20_exit_commitment
-        .as_ref()
-        .map(|value| normalize_felt_hex(value))
-        .transpose()?;
-    if matches!(strk20_exit_commitment.as_deref(), Some("0x0")) {
+    let strk20_exit_commitment = normalize_felt_hex(&witness.strk20_exit_commitment)?;
+    if strk20_exit_commitment == "0x0" {
         return Err(ProtocolError::Crypto(
             "settlement output STRK20 exit commitment must be non-zero".into(),
         ));
@@ -1531,19 +1751,9 @@ pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
             .collect::<Result<Vec<_>, ProtocolError>>()?,
         withdraw_authorization_r: normalize_felt_hex(&witness.withdraw_authorization.signature_r)?,
         withdraw_authorization_s: normalize_felt_hex(&witness.withdraw_authorization.signature_s)?,
-        recipient: if strk20_exit_commitment.is_some() {
-            "0x0".into()
-        } else {
-            normalize_felt_hex(&witness.recipient)?
-        },
         strk20_exit_commitment,
     };
     let calldata = flatten_settlement_output_withdrawal_call_arguments(&encoded_args);
-    let entrypoint = if encoded_args.strk20_exit_commitment.is_some() {
-        "withdraw_settlement_output_to_strk20_with_proof_facts"
-    } else {
-        "withdraw_settlement_output_with_proof_facts"
-    };
     Ok(SettlementOutputWithdrawalSubmissionPlan {
         funding_rail: FundingRailKind::StarknetPrivacy,
         batch_id: witness.batch_id.clone(),
@@ -1552,7 +1762,7 @@ pub fn build_settlement_output_withdrawal_submission_plan_from_witness(
         proof_artifact_commitment: normalized_proof_artifact_commitment,
         starknet_call: StarknetCall {
             contract_address: normalized_verifier_address,
-            entrypoint: entrypoint.into(),
+            entrypoint: "withdraw_settlement_output_to_strk20_with_proof_facts".into(),
             calldata,
         },
         encoded_args,
@@ -1566,11 +1776,12 @@ pub fn build_settlement_output_withdrawal_submission_plan(
     let shielded_asset_adapter_address =
         normalize_felt_hex(request.shielded_asset_adapter_address)?;
     let chain_id = normalize_felt_hex(request.chain_id)?;
-    let recipient = normalize_felt_hex(request.recipient)?;
-    let strk20_exit_commitment = request
-        .strk20_exit_commitment
-        .map(normalize_felt_hex)
-        .transpose()?;
+    let strk20_exit_commitment = normalize_felt_hex(request.strk20_exit_commitment)?;
+    if strk20_exit_commitment == "0x0" {
+        return Err(ProtocolError::Crypto(
+            "settlement output STRK20 exit commitment must be non-zero".into(),
+        ));
+    }
     let encoded_batch_id = encode_output_root_id(request.batch_id);
     let encoded_asset_id = encode_asset_id(&request.output_note.asset_id.0);
     let encoded_amount = encode_u128(request.output_note.amount);
@@ -1584,8 +1795,7 @@ pub fn build_settlement_output_withdrawal_submission_plan(
             note_commitment: &request.output_note.note_commitment.0,
             asset_id: &encoded_asset_id,
             amount: &encoded_amount,
-            recipient: &recipient,
-            strk20_exit_commitment: strk20_exit_commitment.as_deref(),
+            strk20_exit_commitment: &strk20_exit_commitment,
         },
     )?;
     let witness = SettlementOutputWithdrawalWitness {
@@ -1593,7 +1803,6 @@ pub fn build_settlement_output_withdrawal_submission_plan(
         auction_verifier_address: auction_verifier_address.clone(),
         shielded_asset_adapter_address: shielded_asset_adapter_address.clone(),
         chain_id: chain_id.clone(),
-        recipient: recipient.clone(),
         strk20_exit_commitment,
         prior_nullifier_root: normalize_felt_hex(request.prior_nullifier_root)?,
         output_note: request.output_note.clone(),
@@ -1730,26 +1939,10 @@ pub fn settlement_output_withdrawal_message_hash(
         note_commitment,
         asset_id,
         amount,
-        recipient,
         strk20_exit_commitment,
     } = message;
-    if let Some(exit_commitment) = strk20_exit_commitment {
-        return Ok(poseidon_chain_hex(
-            felt_from_hex_str(OUTPUT_WITHDRAWAL_STRK20_EXIT_DOMAIN_HEX)?,
-            &[
-                felt_from_hex_str(chain_id)?,
-                felt_from_hex_str(auction_verifier_address)?,
-                felt_from_hex_str(shielded_asset_adapter_address)?,
-                felt_from_hex_str(batch_id)?,
-                felt_from_hex_str(note_commitment)?,
-                felt_from_hex_str(asset_id)?,
-                felt_from_hex_str(amount)?,
-                felt_from_hex_str(exit_commitment)?,
-            ],
-        ));
-    }
     Ok(poseidon_chain_hex(
-        felt_from_hex_str("0x031ff5b95d48149e26b5a946562ff5ea925eb8b3ea09d3b389b209b672a37b6e")?,
+        felt_from_hex_str(OUTPUT_WITHDRAWAL_STRK20_EXIT_DOMAIN_HEX)?,
         &[
             felt_from_hex_str(chain_id)?,
             felt_from_hex_str(auction_verifier_address)?,
@@ -1758,7 +1951,7 @@ pub fn settlement_output_withdrawal_message_hash(
             felt_from_hex_str(note_commitment)?,
             felt_from_hex_str(asset_id)?,
             felt_from_hex_str(amount)?,
-            felt_from_hex_str(recipient)?,
+            felt_from_hex_str(strk20_exit_commitment)?,
         ],
     ))
 }
@@ -1856,12 +2049,12 @@ pub fn encrypt_output_note_for_owner(
     let mut key_id = [0_u8; 32];
     OsRng.fill_bytes(&mut key_id);
     let key_id_hex = hex::encode(key_id);
-    let key_bytes = derive_output_note_key(
+    let key_bytes = Zeroizing::new(derive_output_note_key(
         shared_secret.raw_secret_bytes(),
         &key_id_hex,
         &ephemeral_public_key,
-    )?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let note_commitment = note.commitment()?;
     if output_note.note_commitment != note_commitment {
@@ -1936,12 +2129,12 @@ pub fn decrypt_output_note_for_owner(
         recipient_secret.to_nonzero_scalar(),
         ephemeral_public_key.as_affine(),
     );
-    let key_bytes = derive_output_note_key(
+    let key_bytes = Zeroizing::new(derive_output_note_key(
         shared_secret.raw_secret_bytes(),
         &blob.key_id,
         &blob.ephemeral_public_key,
-    )?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let nonce_bytes = hex::decode(&blob.nonce)?;
     let nonce = aes_nonce_from_slice(&nonce_bytes)?;
@@ -1959,7 +2152,7 @@ pub fn decrypt_output_note_for_owner(
             aad: aad.as_ref(),
         },
     ) {
-        Ok(plaintext) => plaintext,
+        Ok(plaintext) => Zeroizing::new(plaintext),
         Err(_) => return Ok(None),
     };
 
@@ -1984,8 +2177,13 @@ pub fn encrypt_output_recovery_record(
 ) -> Result<OutputRecoveryRecord, ProtocolError> {
     let recovery_key = normalize_felt_hex(&note.spend_authority)?;
     let batch_id_felt = encode_starknet_felt("batch-id", batch_id);
-    let plaintext_fields =
-        output_recovery_plaintext_fields(batch_id, output_index, note, output_note, output_proof)?;
+    let plaintext_fields = Zeroizing::new(output_recovery_plaintext_fields(
+        batch_id,
+        output_index,
+        note,
+        output_note,
+        output_proof,
+    )?);
     let key_tag = output_recovery_key_tag(&recovery_key, &batch_id_felt, output_index)?;
     let auth_tag = output_recovery_auth_tag(&recovery_key, &plaintext_fields)?;
     let mut stream_state =
@@ -2032,16 +2230,18 @@ pub fn decrypt_output_recovery_record(
     }
     let mut stream_state =
         output_recovery_stream_seed(&recovery_key, &batch_id_felt, output_index)?;
-    let plaintext_fields = record
-        .ciphertext_fields
-        .iter()
-        .enumerate()
-        .map(|(field_index, ciphertext)| {
-            let stream = output_recovery_next_stream_field(&mut stream_state, field_index)?;
-            let plaintext = felt_from_hex_str(ciphertext)? - stream;
-            Ok(felt_hex(&plaintext))
-        })
-        .collect::<Result<Vec<_>, ProtocolError>>()?;
+    let plaintext_fields = Zeroizing::new(
+        record
+            .ciphertext_fields
+            .iter()
+            .enumerate()
+            .map(|(field_index, ciphertext)| {
+                let stream = output_recovery_next_stream_field(&mut stream_state, field_index)?;
+                let plaintext = felt_from_hex_str(ciphertext)? - stream;
+                Ok(felt_hex(&plaintext))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
     if felt_from_hex_str(&record.auth_tag)?
         != felt_from_hex_str(&output_recovery_auth_tag(&recovery_key, &plaintext_fields)?)?
     {
@@ -2294,11 +2494,14 @@ pub fn create_recovery_artifact(
     payload: &Value,
 ) -> Result<RecoveryArtifact, ProtocolError> {
     let account_id = derive_account_id(seed);
-    let key_bytes = derive_wallet_aes_key(seed, b"zylith/recovery-artifact-aes-key")?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    let key_bytes = Zeroizing::new(derive_wallet_aes_key(
+        seed,
+        b"zylith/recovery-artifact-aes-key",
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let nonce = random_nonce();
-    let plaintext = serde_json::to_vec(payload)?;
+    let plaintext = Zeroizing::new(serde_json::to_vec(payload)?);
     let aad = recovery_artifact_aad(
         RECOVERY_ARTIFACT_ALGORITHM_V2,
         &account_id,
@@ -2350,8 +2553,11 @@ pub fn decrypt_recovery_artifact_payload(
         )));
     }
 
-    let key_bytes = derive_wallet_aes_key(seed, b"zylith/recovery-artifact-aes-key")?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    let key_bytes = Zeroizing::new(derive_wallet_aes_key(
+        seed,
+        b"zylith/recovery-artifact-aes-key",
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let nonce = hex::decode(&artifact.payload.nonce)?;
     let ciphertext = hex::decode(&artifact.payload.ciphertext)?;
@@ -2362,15 +2568,17 @@ pub fn decrypt_recovery_artifact_payload(
         artifact.sequence,
         artifact.created_at_unix_ms,
     );
-    let plaintext = cipher
-        .decrypt(
-            &aes_nonce_from_slice(&nonce)?,
-            Payload {
-                msg: ciphertext.as_ref(),
-                aad: aad.as_ref(),
-            },
-        )
-        .map_err(|err| ProtocolError::Crypto(format!("recovery decrypt failed: {err}")))?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                &aes_nonce_from_slice(&nonce)?,
+                Payload {
+                    msg: ciphertext.as_ref(),
+                    aad: aad.as_ref(),
+                },
+            )
+            .map_err(|err| ProtocolError::Crypto(format!("recovery decrypt failed: {err}")))?,
+    );
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
@@ -2403,7 +2611,6 @@ pub fn settlement_transcript_commitment(
     state = poseidon_hash(state, Felt::from(transcript.clearing_price));
     state = poseidon_hash(state, Felt::from(transcript.price_base_scale));
     state = poseidon_hash(state, Felt::from(transcript.taker_fee_bps));
-    state = poseidon_hash(state, Felt::from(transcript.maker_fee_bps));
     state = poseidon_hash(state, Felt::from(transcript.relay_fee_bps));
     state = poseidon_hash(
         state,
@@ -2424,6 +2631,7 @@ pub fn settlement_transcript_commitment(
         roots.prior_nullifier_root,
         roots.prior_renewal_root,
         roots.prior_fee_root,
+        roots.prior_liquidity_position_root,
         roots.consumed_note_root,
         roots.consumed_nullifier_root,
         roots.renewal_child_root,
@@ -2433,6 +2641,7 @@ pub fn settlement_transcript_commitment(
         roots.new_nullifier_root,
         roots.new_renewal_root,
         roots.new_fee_root,
+        roots.new_liquidity_position_root,
     ] {
         state = poseidon_hash(state, felt_from_hex_str(&normalize_felt_hex(&root)?)?);
     }
@@ -2456,6 +2665,8 @@ pub fn root_only_settlement_commitments(
     let prior_nullifier_root = normalize_felt_hex(&transcript.prior_nullifier_root)?;
     let prior_renewal_root = normalize_felt_hex(&transcript.prior_renewal_root)?;
     let prior_fee_root = normalize_felt_hex(&transcript.prior_fee_root)?;
+    let prior_liquidity_position_root =
+        normalize_felt_hex(&transcript.prior_liquidity_position_root)?;
     let consumed_note_root = settlement_root(
         "zylith/root/consumed-notes-v1",
         transcript
@@ -2471,6 +2682,8 @@ pub fn root_only_settlement_commitments(
             .iter()
             .map(|renewal| Ok(vec![normalize_felt_hex(&renewal.child_nullifier)?])),
     )?;
+    let liquidity_position_transition_root =
+        settlement_liquidity_position_transition_root(&transcript.liquidity_position_transitions)?;
     let output_note_root = output_note_merkle_root(
         &transcript.output_notes,
         &transcript.output_ciphertext_bundle_ref,
@@ -2506,22 +2719,397 @@ pub fn root_only_settlement_commitments(
         ));
     }
     let new_fee_root = settlement_state_transition_root(&prior_fee_root, &fee_root)?;
+    let mut new_liquidity_position_root =
+        normalize_felt_hex(&transcript.new_liquidity_position_root)?;
+    if transcript.liquidity_position_transitions.is_empty() && new_liquidity_position_root == "0x0"
+    {
+        new_liquidity_position_root = prior_liquidity_position_root.clone();
+    }
+    if transcript.liquidity_position_transitions.is_empty()
+        && new_liquidity_position_root != prior_liquidity_position_root
+    {
+        return Err(ProtocolError::Crypto(
+            "empty liquidity position transition must preserve liquidity position root".into(),
+        ));
+    }
+    if !transcript.liquidity_position_transitions.is_empty() && new_liquidity_position_root == "0x0"
+    {
+        return Err(ProtocolError::Crypto(
+            "non-empty liquidity position transition requires a new active position root".into(),
+        ));
+    }
 
     Ok(RootOnlySettlementCommitments {
         prior_note_root,
         prior_nullifier_root,
         prior_renewal_root,
         prior_fee_root,
+        prior_liquidity_position_root,
         consumed_note_root,
         consumed_nullifier_root,
         renewal_child_root,
+        liquidity_position_transition_root,
         output_note_root,
         fee_root,
         new_note_root,
         new_nullifier_root,
         new_renewal_root,
         new_fee_root,
+        new_liquidity_position_root,
     })
+}
+
+pub fn settlement_liquidity_position_transition_root(
+    transitions: &[LiquidityPositionRootTransition],
+) -> Result<String, ProtocolError> {
+    settlement_root(
+        "zylith/root/liquidity-position-transitions-v1",
+        transitions.iter().map(|transition| {
+            transition.validate()?;
+            Ok(vec![
+                encode_liquidity_position_transition_kind(&transition.kind),
+                transition
+                    .consumed_position_commitment
+                    .as_ref()
+                    .map(|commitment| normalize_felt_hex(&commitment.0))
+                    .transpose()?
+                    .unwrap_or_else(|| "0x0".into()),
+                transition
+                    .position_nullifier
+                    .as_ref()
+                    .map(|nullifier| normalize_felt_hex(nullifier))
+                    .transpose()?
+                    .unwrap_or_else(|| "0x0".into()),
+                transition
+                    .output_position_commitment
+                    .as_ref()
+                    .map(|commitment| normalize_felt_hex(&commitment.0))
+                    .transpose()?
+                    .unwrap_or_else(|| "0x0".into()),
+            ])
+        }),
+    )
+}
+
+fn encode_liquidity_position_transition_kind(kind: &LiquidityPositionTransitionKind) -> String {
+    match kind {
+        LiquidityPositionTransitionKind::Open => encode_u64(0),
+        LiquidityPositionTransitionKind::Update => encode_u64(1),
+        LiquidityPositionTransitionKind::Close => encode_u64(2),
+        LiquidityPositionTransitionKind::Reconfigure => encode_u64(4),
+    }
+}
+
+fn validate_liquidity_position_transition_roots(
+    prior_liquidity_position_root: &str,
+    transitions: &[LiquidityPositionRootTransition],
+    new_liquidity_position_root: &str,
+) -> Result<(), ProtocolError> {
+    let prior_root = normalize_felt_hex(prior_liquidity_position_root)?;
+    let mut new_root = normalize_felt_hex(new_liquidity_position_root)?;
+    if transitions.is_empty() {
+        if new_root == "0x0" {
+            new_root = prior_root.clone();
+        }
+        if new_root != prior_root {
+            return Err(ProtocolError::Crypto(
+                "empty liquidity position transition must preserve liquidity position root".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let _transition_root = settlement_liquidity_position_transition_root(transitions)?;
+    if new_root == "0x0" {
+        return Err(ProtocolError::Crypto(
+            "non-empty liquidity position transition requires a new active position root".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_liquidity_position_witnesses_for_serialization(
+    witness: &SettlementWitness,
+    liquidity_position_transition_root: &str,
+) -> Result<(), ProtocolError> {
+    if witness.liquidity_position_transitions.is_empty() {
+        if !witness.liquidity_position_witnesses.is_empty() {
+            return Err(ProtocolError::Crypto(
+                "liquidity position witnesses require public transition summaries".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if witness.liquidity_position_witnesses.len() != witness.liquidity_position_transitions.len() {
+        return Err(ProtocolError::Crypto(
+            "liquidity position witness count does not match transition count".into(),
+        ));
+    }
+    let witness_summaries = witness
+        .liquidity_position_witnesses
+        .iter()
+        .map(|entry| entry.transition.clone())
+        .collect::<Vec<_>>();
+    if witness_summaries != witness.liquidity_position_transitions {
+        return Err(ProtocolError::Crypto(
+            "liquidity position witness summaries do not match public transitions".into(),
+        ));
+    }
+    let verified = verify_liquidity_position_proof_witness(&LiquidityPositionProofWitness {
+        prior_root: witness.prior_liquidity_position_root.clone(),
+        transitions: witness.liquidity_position_witnesses.clone(),
+    })?;
+    if verified.transition_root != normalize_felt_hex(liquidity_position_transition_root)? {
+        return Err(ProtocolError::Crypto(
+            "liquidity position witness transition root mismatch".into(),
+        ));
+    }
+    let claimed_new_root = normalize_felt_hex(&witness.new_liquidity_position_root)?;
+    if verified.new_root != claimed_new_root {
+        return Err(ProtocolError::Crypto(
+            "liquidity position witnesses do not reconstruct new_liquidity_position_root".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct LiquidityPositionSerializedWitnessVectors {
+    prior_position_fields: Vec<String>,
+    output_position_fields: Vec<String>,
+    position_sides: Vec<String>,
+    filled_base_amounts: Vec<String>,
+    clearing_prices: Vec<String>,
+    price_base_scales: Vec<String>,
+    market_reference_prices: Vec<String>,
+    market_confirmation_prices: Vec<String>,
+    market_observed_at_unix_ms: Vec<String>,
+    market_current_time_unix_ms: Vec<String>,
+    oracle_guard_ids: Vec<String>,
+    oracle_guard_max_staleness_ms: Vec<String>,
+    oracle_guard_max_divergence_bps: Vec<String>,
+    state_position_ids: Vec<String>,
+    state_key_lows: Vec<String>,
+    state_key_highs: Vec<String>,
+    state_prior_commitments: Vec<String>,
+    state_output_commitments: Vec<String>,
+    state_path_counts: Vec<String>,
+    state_path_values: Vec<String>,
+    state_path_directions: Vec<String>,
+    lifecycle_signature_rs: Vec<String>,
+    lifecycle_signature_ss: Vec<String>,
+    lifecycle_base_amounts: Vec<String>,
+    lifecycle_quote_amounts: Vec<String>,
+    open_input_counts: Vec<String>,
+    open_input_note_commitments: Vec<String>,
+    open_input_asset_ids: Vec<String>,
+    open_input_amounts: Vec<String>,
+    open_input_owner_keys: Vec<String>,
+    open_input_spend_authorities: Vec<String>,
+    open_input_withdraw_authorities: Vec<String>,
+    open_input_blindings: Vec<String>,
+    open_input_nonces: Vec<String>,
+    open_input_metadata_commitments: Vec<String>,
+    lifecycle_output_counts: Vec<String>,
+}
+
+fn liquidity_position_serialized_witness_vectors(
+    witnesses: &[crate::liquidity::LiquidityPositionTransitionWitness],
+) -> Result<LiquidityPositionSerializedWitnessVectors, ProtocolError> {
+    let mut vectors = LiquidityPositionSerializedWitnessVectors::default();
+    for witness in witnesses {
+        match witness.prior_position.as_ref() {
+            Some(prior) => vectors
+                .prior_position_fields
+                .extend(encode_liquidity_position_fields(prior)?),
+            None => vectors.prior_position_fields.extend(std::iter::repeat_n(
+                "0x0".to_string(),
+                crate::LIQUIDITY_POSITION_FIELD_COUNT,
+            )),
+        }
+        match witness.output_position.as_ref() {
+            Some(output) => vectors
+                .output_position_fields
+                .extend(encode_liquidity_position_fields(output)?),
+            None => vectors.output_position_fields.extend(std::iter::repeat_n(
+                "0x0".to_string(),
+                crate::LIQUIDITY_POSITION_FIELD_COUNT,
+            )),
+        }
+        if let Some(fill) = witness.fill.as_ref() {
+            vectors
+                .position_sides
+                .push(encode_order_side(&fill.position_side));
+            vectors
+                .filled_base_amounts
+                .push(encode_u128(fill.filled_base_amount));
+            vectors
+                .clearing_prices
+                .push(encode_u128(fill.clearing_price));
+            vectors
+                .price_base_scales
+                .push(encode_u128(fill.price_base_scale));
+            vectors
+                .market_reference_prices
+                .push(encode_u128(fill.market_context.reference_price));
+            vectors.market_confirmation_prices.push(
+                fill.market_context
+                    .confirmation_price
+                    .map(encode_u128)
+                    .unwrap_or_else(|| "0x0".into()),
+            );
+            vectors
+                .market_observed_at_unix_ms
+                .push(encode_u64(fill.market_context.observed_at_unix_ms));
+            vectors
+                .market_current_time_unix_ms
+                .push(encode_u64(fill.market_context.current_time_unix_ms));
+        } else {
+            vectors.position_sides.push("0x0".into());
+            vectors.filled_base_amounts.push("0x0".into());
+            vectors.clearing_prices.push("0x0".into());
+            vectors.price_base_scales.push("0x0".into());
+            vectors.market_reference_prices.push("0x0".into());
+            vectors.market_confirmation_prices.push("0x0".into());
+            vectors.market_observed_at_unix_ms.push("0x0".into());
+            vectors.market_current_time_unix_ms.push("0x0".into());
+        }
+        let oracle_guard = witness
+            .prior_position
+            .as_ref()
+            .or(witness.output_position.as_ref())
+            .and_then(|position| position.oracle_guard.as_ref());
+        if let Some(guard) = oracle_guard {
+            vectors
+                .oracle_guard_ids
+                .push(encode_starknet_felt("oracle-id", &guard.oracle_id));
+            vectors
+                .oracle_guard_max_staleness_ms
+                .push(encode_u128(guard.max_staleness_ms));
+            vectors
+                .oracle_guard_max_divergence_bps
+                .push(encode_u128(guard.max_divergence_bps));
+        } else {
+            vectors.oracle_guard_ids.push("0x0".into());
+            vectors.oracle_guard_max_staleness_ms.push("0x0".into());
+            vectors.oracle_guard_max_divergence_bps.push("0x0".into());
+        }
+        vectors
+            .state_position_ids
+            .push(normalize_felt_hex(&witness.state_update.position_id)?);
+        vectors.state_key_lows.push(normalize_felt_hex(
+            &witness.state_update.sparse_witness.key_low,
+        )?);
+        vectors.state_key_highs.push(normalize_felt_hex(
+            &witness.state_update.sparse_witness.key_high,
+        )?);
+        vectors.state_prior_commitments.push(
+            witness
+                .state_update
+                .prior_commitment
+                .as_ref()
+                .map(|commitment| normalize_felt_hex(&commitment.0))
+                .transpose()?
+                .unwrap_or_else(|| "0x0".into()),
+        );
+        vectors.state_output_commitments.push(
+            witness
+                .state_update
+                .output_commitment
+                .as_ref()
+                .map(|commitment| normalize_felt_hex(&commitment.0))
+                .transpose()?
+                .unwrap_or_else(|| "0x0".into()),
+        );
+        vectors.state_path_counts.push(encode_usize(
+            witness.state_update.sparse_witness.merkle_path.len(),
+        ));
+        vectors.state_path_values.extend(
+            witness
+                .state_update
+                .sparse_witness
+                .merkle_path
+                .iter()
+                .map(|value| normalize_felt_hex(value))
+                .collect::<Result<Vec<_>, ProtocolError>>()?,
+        );
+        vectors.state_path_directions.extend(
+            witness
+                .state_update
+                .sparse_witness
+                .merkle_directions
+                .iter()
+                .map(|value| normalize_felt_hex(value))
+                .collect::<Result<Vec<_>, ProtocolError>>()?,
+        );
+        let lifecycle_authorization = witness
+            .open_funding
+            .as_ref()
+            .map(|funding| &funding.authorization)
+            .or(witness.lifecycle_authorization.as_ref());
+        vectors.lifecycle_signature_rs.push(
+            lifecycle_authorization
+                .map(|authorization| normalize_felt_hex(&authorization.signature_r))
+                .transpose()?
+                .unwrap_or_else(|| "0x0".into()),
+        );
+        vectors.lifecycle_signature_ss.push(
+            lifecycle_authorization
+                .map(|authorization| normalize_felt_hex(&authorization.signature_s))
+                .transpose()?
+                .unwrap_or_else(|| "0x0".into()),
+        );
+        vectors
+            .lifecycle_base_amounts
+            .push(encode_u128(witness.base_amount));
+        vectors
+            .lifecycle_quote_amounts
+            .push(encode_u128(witness.quote_amount));
+        if let Some(funding) = witness.open_funding.as_ref() {
+            vectors
+                .open_input_counts
+                .push(encode_usize(funding.input_notes.len()));
+            for note in &funding.input_notes {
+                vectors
+                    .open_input_note_commitments
+                    .push(note.commitment()?.0);
+                vectors
+                    .open_input_asset_ids
+                    .push(encode_asset_id(&note.asset_id.0));
+                vectors.open_input_amounts.push(encode_u128(note.amount));
+                vectors
+                    .open_input_owner_keys
+                    .push(encode_owner_public_key(&note.owner_public_key));
+                vectors
+                    .open_input_spend_authorities
+                    .push(normalize_felt_hex(&note.spend_authority)?);
+                vectors
+                    .open_input_withdraw_authorities
+                    .push(normalize_felt_hex(&note.withdraw_authority)?);
+                vectors
+                    .open_input_blindings
+                    .push(normalize_felt_hex(&note.blinding)?);
+                vectors.open_input_nonces.push(encode_u64(note.nonce));
+                vectors
+                    .open_input_metadata_commitments
+                    .push(normalize_felt_hex(&note.metadata_commitment)?);
+            }
+            vectors
+                .lifecycle_output_counts
+                .push(encode_usize(funding.change_notes.len()));
+        } else {
+            vectors.open_input_counts.push("0x0".into());
+            vectors
+                .lifecycle_output_counts
+                .push(encode_usize(witness.output_notes.len()));
+        }
+    }
+    Ok(vectors)
+}
+
+fn encode_liquidity_position_fields(
+    position: &PrivateLiquidityPosition,
+) -> Result<Vec<String>, ProtocolError> {
+    position.commitment_fields()
 }
 
 #[derive(Clone, Debug)]
@@ -2723,10 +3311,11 @@ fn settlement_output_withdrawal_root_fields(
             std::slice::from_ref(&nullifier),
         )?
     } else {
-        let provided = witness
-            .nullifier_sparse_witness
-            .clone()
-            .expect("checked is_some");
+        let Some(provided) = witness.nullifier_sparse_witness.clone() else {
+            return Err(ProtocolError::Crypto(
+                "withdrawal nullifier sparse witness is required without local history".into(),
+            ));
+        };
         let computed_new_root = verify_nullifier_sparse_insert_witness(
             &witness.prior_nullifier_root,
             &nullifier,
@@ -2916,12 +3505,12 @@ pub fn sign_settlement_output_withdrawal_witness(
     let batch_id = encode_output_root_id(&witness.batch_id);
     let asset_id = encode_asset_id(&witness.output_note.asset_id.0);
     let amount = encode_u128(witness.output_note.amount);
-    let recipient = normalize_felt_hex(&witness.recipient)?;
-    let strk20_exit_commitment = witness
-        .strk20_exit_commitment
-        .as_ref()
-        .map(|value| normalize_felt_hex(value))
-        .transpose()?;
+    let strk20_exit_commitment = normalize_felt_hex(&witness.strk20_exit_commitment)?;
+    if strk20_exit_commitment == "0x0" {
+        return Err(ProtocolError::Crypto(
+            "settlement output STRK20 exit commitment must be non-zero".into(),
+        ));
+    }
 
     sign_settlement_output_withdrawal_authorization(
         withdraw_auth_key_felt,
@@ -2933,8 +3522,7 @@ pub fn sign_settlement_output_withdrawal_witness(
             note_commitment: &witness.output_note.note_commitment.0,
             asset_id: &asset_id,
             amount: &amount,
-            recipient: &recipient,
-            strk20_exit_commitment: strk20_exit_commitment.as_deref(),
+            strk20_exit_commitment: &strk20_exit_commitment,
         },
     )
 }
@@ -2943,18 +3531,11 @@ pub fn sign_note_consolidation_authorization(
     spend_auth_key_felt: &str,
     consolidation_commitment: &str,
 ) -> Result<crate::SpendAuthorization, ProtocolError> {
-    let private_key = felt_from_hex_str(spend_auth_key_felt)?;
-    let message = felt_from_hex_str(&normalize_felt_hex(consolidation_commitment)?)?;
-    let k = rfc6979_generate_k(&message, &private_key, None);
-    let signature = sign(&private_key, &message, &k).map_err(|err| {
-        ProtocolError::Crypto(format!(
-            "note consolidation authorization signing failed: {err}"
-        ))
-    })?;
-    Ok(crate::SpendAuthorization {
-        signature_r: felt_hex(&signature.r),
-        signature_s: felt_hex(&signature.s),
-    })
+    sign_felt_authorization(
+        spend_auth_key_felt,
+        &normalize_felt_hex(consolidation_commitment)?,
+        "note consolidation authorization",
+    )
 }
 
 pub fn build_note_consolidation_submission_plan(
@@ -3340,9 +3921,11 @@ fn sparse_nullifier_levels(
     let mut levels = Vec::with_capacity(NULLIFIER_SPARSE_TREE_DEPTH + 1);
     levels.push(entries.clone());
     for _ in 0..NULLIFIER_SPARSE_TREE_DEPTH {
-        let current = levels
-            .last()
-            .expect("sparse tree always has a current level");
+        let Some(current) = levels.last() else {
+            return Err(ProtocolError::Crypto(
+                "sparse nullifier tree missing current level".into(),
+            ));
+        };
         let mut parent_pairs = BTreeMap::<Vec<bool>, (Felt, Felt)>::new();
         for (key, value) in current {
             if key.is_empty() {
@@ -3503,9 +4086,11 @@ fn renewal_sparse_levels(
     let mut levels = Vec::with_capacity(RENEWAL_SPARSE_TREE_DEPTH + 1);
     levels.push(entries.clone());
     for _ in 0..RENEWAL_SPARSE_TREE_DEPTH {
-        let current = levels
-            .last()
-            .expect("sparse tree always has a current level");
+        let Some(current) = levels.last() else {
+            return Err(ProtocolError::Crypto(
+                "renewal sparse tree missing current level".into(),
+            ));
+        };
         let mut next = BTreeMap::new();
         for (key, value) in current {
             if key.is_empty() {
@@ -3987,12 +4572,13 @@ fn default_note_membership_witnesses(
     if witness.consumed_inputs.is_empty() {
         return Ok(Vec::new());
     }
-    let funding_notes = witness
+    let mut funding_notes = witness
         .matched_order_witnesses
         .iter()
         .flat_map(|entry| entry.effective_funding_notes())
         .cloned()
         .collect::<Vec<_>>();
+    funding_notes.extend(liquidity_position_open_funding_notes(witness));
     let deposit_roots = funding_notes
         .iter()
         .map(deposit_root_from_note)
@@ -4004,6 +4590,15 @@ fn default_note_membership_witnesses(
     Err(ProtocolError::Crypto(
         "settlement witness missing consumed-note membership witnesses for prior_note_root".into(),
     ))
+}
+
+fn liquidity_position_open_funding_notes(witness: &SettlementWitness) -> Vec<Note> {
+    witness
+        .liquidity_position_witnesses
+        .iter()
+        .filter_map(|entry| entry.open_funding.as_ref())
+        .flat_map(|funding| funding.input_notes.iter().cloned())
+        .collect()
 }
 
 fn note_membership_witnesses_for_serialization(
@@ -4100,7 +4695,6 @@ pub fn build_settlement_submission_plan(
         clearing_price: encode_u128(transcript.clearing_price),
         price_base_scale: encode_u128(transcript.price_base_scale),
         taker_fee_bps: encode_u64(u64::from(transcript.taker_fee_bps)),
-        maker_fee_bps: encode_u64(u64::from(transcript.maker_fee_bps)),
         relay_fee_bps: encode_u64(u64::from(transcript.relay_fee_bps)),
         protocol_fee_recipient: encode_fee_recipient(&transcript.protocol_fee_recipient),
         relay_fee_recipient: encode_fee_recipient(&transcript.relay_fee_recipient),
@@ -4109,15 +4703,18 @@ pub fn build_settlement_submission_plan(
         prior_nullifier_root: roots.prior_nullifier_root,
         prior_renewal_root: roots.prior_renewal_root,
         prior_fee_root: roots.prior_fee_root,
+        prior_liquidity_position_root: roots.prior_liquidity_position_root,
         consumed_note_root: roots.consumed_note_root,
         consumed_nullifier_root: roots.consumed_nullifier_root,
         renewal_child_root: roots.renewal_child_root,
+        liquidity_position_transition_root: roots.liquidity_position_transition_root,
         output_note_root: roots.output_note_root,
         fee_root: roots.fee_root,
         new_note_root: roots.new_note_root,
         new_nullifier_root: roots.new_nullifier_root,
         new_renewal_root: roots.new_renewal_root,
         new_fee_root: roots.new_fee_root,
+        new_liquidity_position_root: roots.new_liquidity_position_root,
     };
 
     let calldata = flatten_settlement_call_arguments(&encoded_args);
@@ -4292,6 +4889,211 @@ pub fn renewal_proof_message_hash_from_statement(
         felt_from_hex_str(statement_message_hash)?,
     ];
     Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
+pub fn native_liquidity_position_message_hash(
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+    prior_liquidity_position_root: &str,
+    liquidity_position_transition_root: &str,
+    new_liquidity_position_root: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(LIQUIDITY_POSITION_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(&normalize_felt_hex(auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(transcript_commitment)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(prior_liquidity_position_root)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(liquidity_position_transition_root)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(new_liquidity_position_root)?)?,
+    );
+    Ok(felt_hex(&state))
+}
+
+pub fn liquidity_position_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+    prior_liquidity_position_root: &str,
+    liquidity_position_transition_root: &str,
+    new_liquidity_position_root: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash = native_liquidity_position_message_hash(
+        auction_verifier_address,
+        transcript_commitment,
+        prior_liquidity_position_root,
+        liquidity_position_transition_root,
+        new_liquidity_position_root,
+    )?;
+    liquidity_position_proof_message_hash_from_statement(
+        proof_program_address,
+        &statement_message_hash,
+    )
+}
+
+pub fn liquidity_position_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    let fields = [
+        felt_from_hex_str(proof_program_address)?,
+        Felt::ZERO,
+        Felt::from(2_u64),
+        felt_from_hex_str(LIQUIDITY_POSITION_PROOF_MESSAGE_DOMAIN_HEX)?,
+        felt_from_hex_str(statement_message_hash)?,
+    ];
+    Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
+fn native_settlement_component_message_hash(
+    domain_hex: &str,
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        felt_from_hex_str(domain_hex)?,
+        felt_from_hex_str(&normalize_felt_hex(auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(transcript_commitment)?)?,
+    );
+    Ok(felt_hex(&state))
+}
+
+fn settlement_component_proof_message_hash_from_statement(
+    domain_hex: &str,
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    let fields = [
+        felt_from_hex_str(proof_program_address)?,
+        Felt::ZERO,
+        Felt::from(2_u64),
+        felt_from_hex_str(domain_hex)?,
+        felt_from_hex_str(statement_message_hash)?,
+    ];
+    Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
+pub fn native_settlement_order_message_hash(
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+) -> Result<String, ProtocolError> {
+    native_settlement_component_message_hash(
+        SETTLEMENT_ORDER_PROOF_MESSAGE_DOMAIN_HEX,
+        auction_verifier_address,
+        transcript_commitment,
+    )
+}
+
+pub fn settlement_order_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash =
+        native_settlement_order_message_hash(auction_verifier_address, transcript_commitment)?;
+    settlement_order_proof_message_hash_from_statement(
+        proof_program_address,
+        &statement_message_hash,
+    )
+}
+
+pub fn settlement_order_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    settlement_component_proof_message_hash_from_statement(
+        SETTLEMENT_ORDER_PROOF_MESSAGE_DOMAIN_HEX,
+        proof_program_address,
+        statement_message_hash,
+    )
+}
+
+pub fn native_settlement_input_membership_message_hash(
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+) -> Result<String, ProtocolError> {
+    native_settlement_component_message_hash(
+        SETTLEMENT_INPUT_MEMBERSHIP_PROOF_MESSAGE_DOMAIN_HEX,
+        auction_verifier_address,
+        transcript_commitment,
+    )
+}
+
+pub fn settlement_input_membership_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash = native_settlement_input_membership_message_hash(
+        auction_verifier_address,
+        transcript_commitment,
+    )?;
+    settlement_input_membership_proof_message_hash_from_statement(
+        proof_program_address,
+        &statement_message_hash,
+    )
+}
+
+pub fn settlement_input_membership_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    settlement_component_proof_message_hash_from_statement(
+        SETTLEMENT_INPUT_MEMBERSHIP_PROOF_MESSAGE_DOMAIN_HEX,
+        proof_program_address,
+        statement_message_hash,
+    )
+}
+
+pub fn native_settlement_output_recovery_message_hash(
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+) -> Result<String, ProtocolError> {
+    native_settlement_component_message_hash(
+        SETTLEMENT_OUTPUT_RECOVERY_PROOF_MESSAGE_DOMAIN_HEX,
+        auction_verifier_address,
+        transcript_commitment,
+    )
+}
+
+pub fn settlement_output_recovery_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    transcript_commitment: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash = native_settlement_output_recovery_message_hash(
+        auction_verifier_address,
+        transcript_commitment,
+    )?;
+    settlement_output_recovery_proof_message_hash_from_statement(
+        proof_program_address,
+        &statement_message_hash,
+    )
+}
+
+pub fn settlement_output_recovery_proof_message_hash_from_statement(
+    proof_program_address: &str,
+    statement_message_hash: &str,
+) -> Result<String, ProtocolError> {
+    settlement_component_proof_message_hash_from_statement(
+        SETTLEMENT_OUTPUT_RECOVERY_PROOF_MESSAGE_DOMAIN_HEX,
+        proof_program_address,
+        statement_message_hash,
+    )
 }
 
 pub fn native_note_consolidation_message_hash(
@@ -4528,12 +5330,15 @@ pub fn build_settlement_witness(
         prior_nullifier_root: normalize_felt_hex(&transcript.prior_nullifier_root)?,
         prior_renewal_root: normalize_felt_hex(&transcript.prior_renewal_root)?,
         prior_fee_root: normalize_felt_hex(&transcript.prior_fee_root)?,
+        prior_liquidity_position_root: normalize_felt_hex(
+            &transcript.prior_liquidity_position_root,
+        )?,
         new_nullifier_root: normalize_felt_hex(&transcript.new_nullifier_root)?,
         new_renewal_root: normalize_felt_hex(&transcript.new_renewal_root)?,
+        new_liquidity_position_root: normalize_felt_hex(&transcript.new_liquidity_position_root)?,
         clearing_price: transcript.clearing_price,
         price_base_scale: transcript.price_base_scale,
         taker_fee_bps: transcript.taker_fee_bps,
-        maker_fee_bps: transcript.maker_fee_bps,
         relay_fee_bps: transcript.relay_fee_bps,
         protocol_fee_recipient: transcript.protocol_fee_recipient.clone(),
         relay_fee_recipient: transcript.relay_fee_recipient.clone(),
@@ -4549,6 +5354,8 @@ pub fn build_settlement_witness(
         renewal_child_sparse_witnesses: Vec::new(),
         renewal_cancel_sparse_witnesses: Vec::new(),
         renewal_child_uses,
+        liquidity_position_transitions: transcript.liquidity_position_transitions.clone(),
+        liquidity_position_witnesses: Vec::new(),
         fees: transcript.fees.clone(),
         output_notes: transcript.output_notes.clone(),
         output_note_preimages: transcript.output_note_preimages.clone(),
@@ -4570,6 +5377,13 @@ pub fn build_stwo_serialized_input(
         if entry.expiry_epoch != witness.batch_epoch {
             return Err(ProtocolError::Crypto(
                 "matched order expiry_epoch does not match settlement batch_epoch".into(),
+            ));
+        }
+    }
+    for transition in &witness.liquidity_position_witnesses {
+        if transition.epoch != witness.batch_epoch {
+            return Err(ProtocolError::Crypto(
+                "liquidity position transition epoch does not match settlement batch_epoch".into(),
             ));
         }
     }
@@ -4620,6 +5434,8 @@ pub fn build_stwo_serialized_input(
     }
     let note_membership_witnesses = note_membership_witnesses_for_serialization(witness)?;
     let consumed_nullifier_root = settlement_consumed_nullifier_root(&witness.consumed_inputs)?;
+    let liquidity_position_transition_root =
+        settlement_liquidity_position_transition_root(&witness.liquidity_position_transitions)?;
     let current_nullifiers = witness
         .consumed_inputs
         .iter()
@@ -4748,48 +5564,63 @@ pub fn build_stwo_serialized_input(
             "renewal cancel sparse witness count does not match renewal children".into(),
         ));
     }
+    validate_liquidity_position_transition_roots(
+        &witness.prior_liquidity_position_root,
+        &witness.liquidity_position_transitions,
+        &witness.new_liquidity_position_root,
+    )?;
+    validate_liquidity_position_witnesses_for_serialization(
+        witness,
+        &liquidity_position_transition_root,
+    )?;
+    let liquidity_position_witness_vectors =
+        liquidity_position_serialized_witness_vectors(&witness.liquidity_position_witnesses)?;
     validate_output_recovery_witness(witness)?;
     let _ = consumed_nullifier_root;
 
-    let maker_curve_commitments = witness
+    let liquidity_curve_commitments = witness
         .matched_order_witnesses
         .iter()
-        .map(encode_maker_curve_commitment)
+        .map(encode_liquidity_curve_commitment)
         .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let maker_curve_point_counts = witness
+    let liquidity_curve_point_counts = witness
         .matched_order_witnesses
         .iter()
         .map(|entry| {
             encode_u64(
                 entry
-                    .maker_curve
+                    .liquidity_curve
                     .as_ref()
                     .map(|curve| curve.points.len())
                     .unwrap_or(0) as u64,
             )
         })
         .collect::<Vec<_>>();
-    let maker_curve_prices = witness
+    let liquidity_curve_prices = witness
         .matched_order_witnesses
         .iter()
         .flat_map(|entry| {
             entry
-                .maker_curve
+                .liquidity_curve
                 .as_ref()
                 .into_iter()
                 .flat_map(|curve| curve.points.iter().map(|point| encode_u128(point.price)))
         })
         .collect::<Vec<_>>();
-    let maker_curve_base_amounts = witness
+    let liquidity_curve_base_amounts = witness
         .matched_order_witnesses
         .iter()
         .flat_map(|entry| {
-            entry.maker_curve.as_ref().into_iter().flat_map(|curve| {
-                curve
-                    .points
-                    .iter()
-                    .map(|point| encode_u128(point.base_amount))
-            })
+            entry
+                .liquidity_curve
+                .as_ref()
+                .into_iter()
+                .flat_map(|curve| {
+                    curve
+                        .points
+                        .iter()
+                        .map(|point| encode_u128(point.base_amount))
+                })
         })
         .collect::<Vec<_>>();
     let mut matched_funding_input_counts =
@@ -4841,7 +5672,7 @@ pub fn build_stwo_serialized_input(
         domain_felt_hex("zylith/spend-authority"),
         domain_felt_hex("zylith/nullifier"),
         domain_felt_hex("zylith/order"),
-        domain_felt_hex("zylith/maker-curve"),
+        domain_felt_hex("zylith/liquidity-curve"),
         PUBLIC_SETTLEMENT_DOMAIN_HEX.into(),
         encode_starknet_felt("batch-id", &witness.batch_id.0),
         encode_starknet_felt("pair-id", &witness.pair_id.0),
@@ -4854,7 +5685,6 @@ pub fn build_stwo_serialized_input(
         encode_u128(witness.clearing_price),
         encode_u128(witness.price_base_scale),
         encode_u64(u64::from(witness.taker_fee_bps)),
-        encode_u64(u64::from(witness.maker_fee_bps)),
         encode_u64(u64::from(witness.relay_fee_bps)),
         encode_fee_recipient(&witness.protocol_fee_recipient),
         encode_fee_recipient(&witness.relay_fee_recipient),
@@ -4864,15 +5694,19 @@ pub fn build_stwo_serialized_input(
         normalize_felt_hex(&witness.prior_nullifier_root)?,
         normalize_felt_hex(&witness.prior_renewal_root)?,
         normalize_felt_hex(&witness.prior_fee_root)?,
+        normalize_felt_hex(&witness.prior_liquidity_position_root)?,
+        liquidity_position_transition_root,
         domain_felt_hex("zylith/root/consumed-notes-v1"),
         domain_felt_hex("zylith/root/consumed-nullifiers-v1"),
         domain_felt_hex("zylith/root/renewal-children-v1"),
+        domain_felt_hex("zylith/root/liquidity-position-transitions-v1"),
         domain_felt_hex("zylith/root/output-notes-v1"),
         domain_felt_hex("zylith/root/fees-v1"),
         ROOT_ONLY_STATE_TRANSITION_DOMAIN_HEX.into(),
         NULLIFIER_SPARSE_LEAF_DOMAIN_HEX.into(),
         NULLIFIER_SPARSE_NODE_DOMAIN_HEX.into(),
     ];
+    debug_assert_eq!(payload.len(), STWO_SETTLEMENT_HEADER_FIELD_COUNT);
 
     push_span(
         &mut payload,
@@ -4914,10 +5748,10 @@ pub fn build_stwo_serialized_input(
             .map(|entry| encode_relay_mode(&entry.relay_mode))
             .collect::<Vec<_>>(),
     );
-    push_span(&mut payload, &maker_curve_commitments);
-    push_span(&mut payload, &maker_curve_point_counts);
-    push_span(&mut payload, &maker_curve_prices);
-    push_span(&mut payload, &maker_curve_base_amounts);
+    push_span(&mut payload, &liquidity_curve_commitments);
+    push_span(&mut payload, &liquidity_curve_point_counts);
+    push_span(&mut payload, &liquidity_curve_prices);
+    push_span(&mut payload, &liquidity_curve_base_amounts);
     push_span(
         &mut payload,
         &witness
@@ -5516,6 +6350,206 @@ pub fn build_stwo_serialized_input(
     push_span(
         &mut payload,
         &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition.validate()?;
+                Ok(encode_liquidity_position_transition_kind(&transition.kind))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition
+                    .consumed_position_commitment
+                    .as_ref()
+                    .map(|commitment| normalize_felt_hex(&commitment.0))
+                    .transpose()
+                    .map(|value| value.unwrap_or_else(|| "0x0".into()))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition
+                    .position_nullifier
+                    .as_ref()
+                    .map(|nullifier| normalize_felt_hex(nullifier))
+                    .transpose()
+                    .map(|value| value.unwrap_or_else(|| "0x0".into()))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition
+                    .output_position_commitment
+                    .as_ref()
+                    .map(|commitment| normalize_felt_hex(&commitment.0))
+                    .transpose()
+                    .map(|value| value.unwrap_or_else(|| "0x0".into()))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.prior_position_fields,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.output_position_fields,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.position_sides,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.filled_base_amounts,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.clearing_prices,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.price_base_scales,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.market_reference_prices,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.market_confirmation_prices,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.market_observed_at_unix_ms,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.market_current_time_unix_ms,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.oracle_guard_ids,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.oracle_guard_max_staleness_ms,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.oracle_guard_max_divergence_bps,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_position_ids,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_key_lows,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_key_highs,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_prior_commitments,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_output_commitments,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_path_counts,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_path_values,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_path_directions,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.lifecycle_signature_rs,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.lifecycle_signature_ss,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.lifecycle_base_amounts,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.lifecycle_quote_amounts,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_counts,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_note_commitments,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_asset_ids,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_amounts,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_owner_keys,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_spend_authorities,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_withdraw_authorities,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_blindings,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_nonces,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.open_input_metadata_commitments,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.lifecycle_output_counts,
+    );
+    push_span(
+        &mut payload,
+        &witness
             .output_notes
             .iter()
             .map(|output| output.note_commitment.0.clone())
@@ -5636,9 +6670,411 @@ pub fn build_stwo_serialized_input(
         }
     };
     payload.push(claimed_new_renewal_root);
+    let claimed_new_liquidity_position_root = {
+        let normalized_new_root = normalize_felt_hex(&witness.new_liquidity_position_root)?;
+        if witness.liquidity_position_transitions.is_empty() && normalized_new_root == "0x0" {
+            normalize_felt_hex(&witness.prior_liquidity_position_root)?
+        } else {
+            normalized_new_root
+        }
+    };
+    payload.push(claimed_new_liquidity_position_root);
     let mut serialized = vec![encode_usize(payload.len())];
     serialized.extend(payload);
     Ok(serialized)
+}
+
+pub fn build_liquidity_position_serialized_input(
+    witness: &SettlementWitness,
+) -> Result<Vec<String>, ProtocolError> {
+    if witness.batch_epoch == 0 {
+        return Err(ProtocolError::Crypto(
+            "settlement witness batch_epoch must be non-zero".into(),
+        ));
+    }
+    for transition in &witness.liquidity_position_witnesses {
+        if transition.epoch != witness.batch_epoch {
+            return Err(ProtocolError::Crypto(
+                "liquidity position transition epoch does not match settlement batch_epoch".into(),
+            ));
+        }
+    }
+    let liquidity_position_transition_root =
+        settlement_liquidity_position_transition_root(&witness.liquidity_position_transitions)?;
+    validate_liquidity_position_transition_roots(
+        &witness.prior_liquidity_position_root,
+        &witness.liquidity_position_transitions,
+        &witness.new_liquidity_position_root,
+    )?;
+    validate_liquidity_position_witnesses_for_serialization(
+        witness,
+        &liquidity_position_transition_root,
+    )?;
+    let liquidity_position_witness_vectors =
+        liquidity_position_serialized_witness_vectors(&witness.liquidity_position_witnesses)?;
+    let claimed_new_liquidity_position_root = {
+        let normalized_new_root = normalize_felt_hex(&witness.new_liquidity_position_root)?;
+        if witness.liquidity_position_transitions.is_empty() && normalized_new_root == "0x0" {
+            normalize_felt_hex(&witness.prior_liquidity_position_root)?
+        } else {
+            normalized_new_root
+        }
+    };
+
+    let mut payload = vec![
+        encode_u64(LIQUIDITY_POSITION_STATEMENT_TYPE_TAG),
+        normalize_felt_hex(&witness.transcript_commitment)?,
+        normalize_felt_hex(&witness.prior_liquidity_position_root)?,
+        liquidity_position_transition_root,
+        claimed_new_liquidity_position_root,
+        domain_felt_hex("zylith/root/liquidity-position-transitions-v1"),
+        normalize_felt_hex(ROOT_ONLY_STATE_TRANSITION_DOMAIN_HEX)?,
+    ];
+
+    push_span(
+        &mut payload,
+        &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition.validate()?;
+                Ok(encode_liquidity_position_transition_kind(&transition.kind))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition
+                    .consumed_position_commitment
+                    .as_ref()
+                    .map(|commitment| normalize_felt_hex(&commitment.0))
+                    .transpose()
+                    .map(|value| value.unwrap_or_else(|| "0x0".into()))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition
+                    .position_nullifier
+                    .as_ref()
+                    .map(|nullifier| normalize_felt_hex(nullifier))
+                    .transpose()
+                    .map(|value| value.unwrap_or_else(|| "0x0".into()))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .liquidity_position_transitions
+            .iter()
+            .map(|transition| {
+                transition
+                    .output_position_commitment
+                    .as_ref()
+                    .map(|commitment| normalize_felt_hex(&commitment.0))
+                    .transpose()
+                    .map(|value| value.unwrap_or_else(|| "0x0".into()))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_position_ids,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_key_lows,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_key_highs,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_prior_commitments,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_output_commitments,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_path_counts,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_path_values,
+    );
+    push_span(
+        &mut payload,
+        &liquidity_position_witness_vectors.state_path_directions,
+    );
+    let mut serialized = vec![encode_usize(payload.len())];
+    serialized.extend(payload);
+    Ok(serialized)
+}
+
+pub fn build_multi_pair_serialized_input(
+    problem: &MultiPairOptimalityProblem,
+) -> Result<Vec<String>, ProtocolError> {
+    crate::multipair::verify_multi_pair_optimality(problem)?;
+
+    let mut payload = vec![
+        encode_u64(MULTI_PAIR_STATEMENT_TYPE_TAG),
+        encode_starknet_felt("batch-id", &problem.chosen.batch_id.0),
+    ];
+
+    push_multi_pair_fills(&mut payload, &problem.chosen.fills)?;
+    push_multi_pair_asset_deltas(&mut payload, &problem.chosen.asset_deltas)?;
+    push_span(
+        &mut payload,
+        &problem
+            .eligible_order_commitments
+            .iter()
+            .map(|commitment| normalize_felt_hex(&commitment.0))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_multi_pair_objective_weights(&mut payload, &problem.objective_weights);
+    push_span(
+        &mut payload,
+        &problem
+            .candidate_solutions
+            .iter()
+            .map(|candidate| encode_starknet_felt("multi-pair-solution-id", &candidate.solution_id))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &problem
+            .candidate_solutions
+            .iter()
+            .map(|candidate| encode_usize(candidate.fills.len()))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &problem
+            .candidate_solutions
+            .iter()
+            .map(|candidate| encode_usize(candidate.asset_deltas.len()))
+            .collect::<Vec<_>>(),
+    );
+    push_multi_pair_fills(
+        &mut payload,
+        &problem
+            .candidate_solutions
+            .iter()
+            .flat_map(|candidate| candidate.fills.iter().cloned())
+            .collect::<Vec<_>>(),
+    )?;
+    push_multi_pair_asset_deltas(
+        &mut payload,
+        &problem
+            .candidate_solutions
+            .iter()
+            .flat_map(|candidate| candidate.asset_deltas.iter().cloned())
+            .collect::<Vec<_>>(),
+    )?;
+
+    let mut serialized = vec![encode_usize(payload.len())];
+    serialized.extend(payload);
+    Ok(serialized)
+}
+
+fn push_multi_pair_fills(
+    payload: &mut Vec<String>,
+    fills: &[MultiPairFill],
+) -> Result<(), ProtocolError> {
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| normalize_felt_hex(&fill.order_commitment.0))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_starknet_felt("pair-id", &fill.pair_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_asset_id(&fill.base_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_asset_id(&fill.quote_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_order_side(&fill.side))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_u128(fill.submitted_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_u128(fill.min_fill_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_u128(fill.limit_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_u128(fill.price_base_scale))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_u128(fill.filled_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_u128(fill.quote_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
+            .map(|fill| encode_u128(fill.fee_amount))
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+fn push_multi_pair_asset_deltas(
+    payload: &mut Vec<String>,
+    deltas: &[MultiPairAssetDelta],
+) -> Result<(), ProtocolError> {
+    push_span(
+        payload,
+        &deltas
+            .iter()
+            .map(|delta| encode_asset_id(&delta.asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &deltas
+            .iter()
+            .map(|delta| encode_u128(delta.amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &deltas
+            .iter()
+            .map(|delta| encode_multi_pair_delta_direction(&delta.direction))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &deltas
+            .iter()
+            .map(|delta| encode_multi_pair_delta_source(&delta.source))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &deltas
+            .iter()
+            .map(|delta| {
+                delta
+                    .source_commitment
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ProtocolError::InvalidSettlementProof(
+                            "multi-pair asset delta is missing its source commitment".into(),
+                        )
+                    })
+                    .and_then(normalize_felt_hex)
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    Ok(())
+}
+
+fn push_multi_pair_objective_weights(
+    payload: &mut Vec<String>,
+    weights: &[MultiPairObjectiveWeight],
+) {
+    push_span(
+        payload,
+        &weights
+            .iter()
+            .map(|weight| encode_asset_id(&weight.asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &weights
+            .iter()
+            .map(|weight| encode_u128(weight.numerator))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &weights
+            .iter()
+            .map(|weight| encode_u128(weight.denominator))
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn encode_multi_pair_delta_direction(direction: &MultiPairAssetDeltaDirection) -> String {
+    match direction {
+        MultiPairAssetDeltaDirection::In => "0x0".into(),
+        MultiPairAssetDeltaDirection::Out => "0x1".into(),
+    }
+}
+
+fn encode_multi_pair_delta_source(source: &MultiPairAssetDeltaSource) -> String {
+    match source {
+        MultiPairAssetDeltaSource::User => "0x0".into(),
+        MultiPairAssetDeltaSource::LiquidityPosition => "0x1".into(),
+        MultiPairAssetDeltaSource::ProtocolBackstop => "0x2".into(),
+        MultiPairAssetDeltaSource::Fee => "0x3".into(),
+    }
 }
 
 fn note_consolidation_membership_witnesses_for_serialization(
@@ -6302,7 +7738,6 @@ fn auction_proof_vectors(
             funding_note: entry.funding_note.clone(),
             funding_notes: entry.funding_notes.clone(),
             funding_authorization: entry.funding_authorization.clone(),
-            managed_maker_authorization: entry.managed_maker_authorization.clone(),
         })?;
     }
     for matched in &witness.matched_orders {
@@ -6316,40 +7751,40 @@ fn auction_proof_vectors(
         }
     }
 
-    let maker_curve_commitments = all_orders
+    let liquidity_curve_commitments = all_orders
         .iter()
-        .map(|entry| encode_order_maker_curve_commitment(&entry.order))
+        .map(|entry| encode_order_liquidity_curve_commitment(&entry.order))
         .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let maker_curve_point_counts = all_orders
+    let liquidity_curve_point_counts = all_orders
         .iter()
         .map(|entry| {
             encode_u64(
                 entry
                     .order
-                    .maker_curve
+                    .liquidity_curve
                     .as_ref()
                     .map(|curve| curve.points.len())
                     .unwrap_or(0) as u64,
             )
         })
         .collect::<Vec<_>>();
-    let maker_curve_prices = all_orders
+    let liquidity_curve_prices = all_orders
         .iter()
         .flat_map(|entry| {
             entry
                 .order
-                .maker_curve
+                .liquidity_curve
                 .as_ref()
                 .into_iter()
                 .flat_map(|curve| curve.points.iter().map(|point| encode_u128(point.price)))
         })
         .collect::<Vec<_>>();
-    let maker_curve_base_amounts = all_orders
+    let liquidity_curve_base_amounts = all_orders
         .iter()
         .flat_map(|entry| {
             entry
                 .order
-                .maker_curve
+                .liquidity_curve
                 .as_ref()
                 .into_iter()
                 .flat_map(|curve| {
@@ -6417,11 +7852,6 @@ fn auction_proof_vectors(
         funding_note_amounts.push(encode_u128(total_amount));
         funding_note_owner_keys.push(encode_owner_public_key(&funding_notes[0].owner_public_key));
     }
-    let managed_maker_fields = all_orders
-        .iter()
-        .map(managed_maker_proof_fields)
-        .collect::<Result<Vec<_>, ProtocolError>>()?;
-
     Ok(AuctionProofVectors {
         settlement_payload: settlement_payload.to_vec(),
         order_commitments: all_orders
@@ -6440,10 +7870,10 @@ fn auction_proof_vectors(
             .iter()
             .map(|entry| encode_relay_mode(&entry.order.relay_mode))
             .collect(),
-        maker_curve_commitments,
-        maker_curve_point_counts,
-        maker_curve_prices,
-        maker_curve_base_amounts,
+        liquidity_curve_commitments,
+        liquidity_curve_point_counts,
+        liquidity_curve_prices,
+        liquidity_curve_base_amounts,
         limit_prices: all_orders
             .iter()
             .map(|entry| encode_u128(entry.order.limit_price))
@@ -6522,54 +7952,6 @@ fn auction_proof_vectors(
             .iter()
             .map(|entry| normalize_felt_hex(&entry.funding_authorization.signature_s))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
-        managed_authorization_modes: managed_maker_fields
-            .iter()
-            .map(|fields| fields.mode.clone())
-            .collect(),
-        managed_delegate_public_keys: managed_maker_fields
-            .iter()
-            .map(|fields| fields.delegate_public_key.clone())
-            .collect(),
-        managed_allow_buy: managed_maker_fields
-            .iter()
-            .map(|fields| fields.allow_buy.clone())
-            .collect(),
-        managed_allow_sell: managed_maker_fields
-            .iter()
-            .map(|fields| fields.allow_sell.clone())
-            .collect(),
-        managed_max_epoch_base: managed_maker_fields
-            .iter()
-            .map(|fields| fields.max_epoch_base.clone())
-            .collect(),
-        managed_min_prices: managed_maker_fields
-            .iter()
-            .map(|fields| fields.min_price.clone())
-            .collect(),
-        managed_max_prices: managed_maker_fields
-            .iter()
-            .map(|fields| fields.max_price.clone())
-            .collect(),
-        managed_valid_from_epochs: managed_maker_fields
-            .iter()
-            .map(|fields| fields.valid_from_epoch.clone())
-            .collect(),
-        managed_valid_until_epochs: managed_maker_fields
-            .iter()
-            .map(|fields| fields.valid_until_epoch.clone())
-            .collect(),
-        managed_policy_nonces: managed_maker_fields
-            .iter()
-            .map(|fields| fields.policy_nonce.clone())
-            .collect(),
-        managed_owner_authorization_rs: managed_maker_fields
-            .iter()
-            .map(|fields| fields.owner_authorization_r.clone())
-            .collect(),
-        managed_owner_authorization_ss: managed_maker_fields
-            .iter()
-            .map(|fields| fields.owner_authorization_s.clone())
-            .collect(),
         funding_nullifiers: all_orders
             .iter()
             .map(|entry| entry.order.funding_nullifier.0.clone())
@@ -6594,17 +7976,17 @@ fn auction_proof_vectors(
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct AuctionProofVectors {
     settlement_payload: Vec<String>,
     order_commitments: Vec<String>,
     sides: Vec<String>,
     order_types: Vec<String>,
     relay_modes: Vec<String>,
-    maker_curve_commitments: Vec<String>,
-    maker_curve_point_counts: Vec<String>,
-    maker_curve_prices: Vec<String>,
-    maker_curve_base_amounts: Vec<String>,
+    liquidity_curve_commitments: Vec<String>,
+    liquidity_curve_point_counts: Vec<String>,
+    liquidity_curve_prices: Vec<String>,
+    liquidity_curve_base_amounts: Vec<String>,
     limit_prices: Vec<String>,
     order_amounts: Vec<String>,
     min_fills: Vec<String>,
@@ -6632,86 +8014,12 @@ struct AuctionProofVectors {
     funding_note_owner_keys: Vec<String>,
     funding_authorization_rs: Vec<String>,
     funding_authorization_ss: Vec<String>,
-    managed_authorization_modes: Vec<String>,
-    managed_delegate_public_keys: Vec<String>,
-    managed_allow_buy: Vec<String>,
-    managed_allow_sell: Vec<String>,
-    managed_max_epoch_base: Vec<String>,
-    managed_min_prices: Vec<String>,
-    managed_max_prices: Vec<String>,
-    managed_valid_from_epochs: Vec<String>,
-    managed_valid_until_epochs: Vec<String>,
-    managed_policy_nonces: Vec<String>,
-    managed_owner_authorization_rs: Vec<String>,
-    managed_owner_authorization_ss: Vec<String>,
     funding_nullifiers: Vec<String>,
     recipient_owner_keys: Vec<String>,
     recipient_spend_authorities: Vec<String>,
     recipient_withdraw_authorities: Vec<String>,
     recipient_residual_withdraw_authorities: Vec<String>,
     allocation_fill_amounts: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
-struct ManagedMakerProofFields {
-    mode: String,
-    delegate_public_key: String,
-    allow_buy: String,
-    allow_sell: String,
-    max_epoch_base: String,
-    min_price: String,
-    max_price: String,
-    valid_from_epoch: String,
-    valid_until_epoch: String,
-    policy_nonce: String,
-    owner_authorization_r: String,
-    owner_authorization_s: String,
-}
-
-fn managed_maker_proof_fields(
-    entry: &AuctionOrderWitness,
-) -> Result<ManagedMakerProofFields, ProtocolError> {
-    let Some(managed) = entry.managed_maker_authorization.as_ref() else {
-        return Ok(ManagedMakerProofFields {
-            mode: "0x0".into(),
-            delegate_public_key: "0x0".into(),
-            allow_buy: "0x0".into(),
-            allow_sell: "0x0".into(),
-            max_epoch_base: "0x0".into(),
-            min_price: "0x0".into(),
-            max_price: "0x0".into(),
-            valid_from_epoch: "0x0".into(),
-            valid_until_epoch: "0x0".into(),
-            policy_nonce: "0x0".into(),
-            owner_authorization_r: "0x0".into(),
-            owner_authorization_s: "0x0".into(),
-        });
-    };
-    managed.policy.validate_order(&entry.order)?;
-    Ok(ManagedMakerProofFields {
-        mode: "0x1".into(),
-        delegate_public_key: normalize_felt_hex(&managed.policy.delegate_public_key)?,
-        allow_buy: if managed.policy.allow_buy {
-            "0x1"
-        } else {
-            "0x0"
-        }
-        .into(),
-        allow_sell: if managed.policy.allow_sell {
-            "0x1"
-        } else {
-            "0x0"
-        }
-        .into(),
-        max_epoch_base: encode_u128(managed.policy.max_epoch_base),
-        min_price: encode_u128(managed.policy.min_price),
-        max_price: encode_u128(managed.policy.max_price),
-        valid_from_epoch: encode_u64(managed.policy.valid_from_epoch),
-        valid_until_epoch: encode_u64(managed.policy.valid_until_epoch),
-        policy_nonce: encode_u64(managed.policy.policy_nonce),
-        owner_authorization_r: normalize_felt_hex(&managed.owner_authorization.signature_r)?,
-        owner_authorization_s: normalize_felt_hex(&managed.owner_authorization.signature_s)?,
-    })
 }
 
 pub fn auction_admission_root(
@@ -6748,10 +8056,10 @@ pub fn build_auction_result_serialized_input(
     push_span(&mut payload, &vectors.sides);
     push_span(&mut payload, &vectors.order_types);
     push_span(&mut payload, &vectors.relay_modes);
-    push_span(&mut payload, &vectors.maker_curve_commitments);
-    push_span(&mut payload, &vectors.maker_curve_point_counts);
-    push_span(&mut payload, &vectors.maker_curve_prices);
-    push_span(&mut payload, &vectors.maker_curve_base_amounts);
+    push_span(&mut payload, &vectors.liquidity_curve_commitments);
+    push_span(&mut payload, &vectors.liquidity_curve_point_counts);
+    push_span(&mut payload, &vectors.liquidity_curve_prices);
+    push_span(&mut payload, &vectors.liquidity_curve_base_amounts);
     push_span(&mut payload, &vectors.limit_prices);
     push_span(&mut payload, &vectors.order_amounts);
     push_span(&mut payload, &vectors.min_fills);
@@ -6769,10 +8077,10 @@ fn push_admission_order_vectors(payload: &mut Vec<String>, vectors: &AuctionProo
     push_span(payload, &vectors.sides);
     push_span(payload, &vectors.order_types);
     push_span(payload, &vectors.relay_modes);
-    push_span(payload, &vectors.maker_curve_commitments);
-    push_span(payload, &vectors.maker_curve_point_counts);
-    push_span(payload, &vectors.maker_curve_prices);
-    push_span(payload, &vectors.maker_curve_base_amounts);
+    push_span(payload, &vectors.liquidity_curve_commitments);
+    push_span(payload, &vectors.liquidity_curve_point_counts);
+    push_span(payload, &vectors.liquidity_curve_prices);
+    push_span(payload, &vectors.liquidity_curve_base_amounts);
     push_span(payload, &vectors.limit_prices);
     push_span(payload, &vectors.order_amounts);
     push_span(payload, &vectors.min_fills);
@@ -6800,18 +8108,6 @@ fn push_admission_order_vectors(payload: &mut Vec<String>, vectors: &AuctionProo
     push_span(payload, &vectors.funding_note_owner_keys);
     push_span(payload, &vectors.funding_authorization_rs);
     push_span(payload, &vectors.funding_authorization_ss);
-    push_span(payload, &vectors.managed_authorization_modes);
-    push_span(payload, &vectors.managed_delegate_public_keys);
-    push_span(payload, &vectors.managed_allow_buy);
-    push_span(payload, &vectors.managed_allow_sell);
-    push_span(payload, &vectors.managed_max_epoch_base);
-    push_span(payload, &vectors.managed_min_prices);
-    push_span(payload, &vectors.managed_max_prices);
-    push_span(payload, &vectors.managed_valid_from_epochs);
-    push_span(payload, &vectors.managed_valid_until_epochs);
-    push_span(payload, &vectors.managed_policy_nonces);
-    push_span(payload, &vectors.managed_owner_authorization_rs);
-    push_span(payload, &vectors.managed_owner_authorization_ss);
     push_span(payload, &vectors.funding_nullifiers);
     push_span(payload, &vectors.recipient_owner_keys);
     push_span(payload, &vectors.recipient_spend_authorities);
@@ -6825,7 +8121,7 @@ fn admission_root_from_vectors(vectors: &AuctionProofVectors) -> Result<String, 
         vectors.sides.len(),
         vectors.order_types.len(),
         vectors.relay_modes.len(),
-        vectors.maker_curve_commitments.len(),
+        vectors.liquidity_curve_commitments.len(),
         vectors.limit_prices.len(),
         vectors.order_amounts.len(),
         vectors.min_fills.len(),
@@ -6846,7 +8142,7 @@ fn admission_root_from_vectors(vectors: &AuctionProofVectors) -> Result<String, 
             vectors.sides[index].as_str(),
             vectors.order_types[index].as_str(),
             vectors.relay_modes[index].as_str(),
-            vectors.maker_curve_commitments[index].as_str(),
+            vectors.liquidity_curve_commitments[index].as_str(),
             vectors.limit_prices[index].as_str(),
             vectors.order_amounts[index].as_str(),
             vectors.min_fills[index].as_str(),
@@ -6876,7 +8172,7 @@ fn encode_order_side(side: &OrderSide) -> String {
 fn encode_order_type(order_type: &OrderType) -> String {
     match order_type {
         OrderType::LimitBatch => "0x0".into(),
-        OrderType::MakerCurve => "0x1".into(),
+        OrderType::LiquidityCurve => "0x1".into(),
         OrderType::HeartbeatCover => "0x2".into(),
     }
 }
@@ -6888,27 +8184,29 @@ fn encode_relay_mode(relay_mode: &RelayMode) -> String {
     }
 }
 
-fn encode_order_maker_curve_commitment(order: &OrderIntent) -> Result<String, ProtocolError> {
-    match (&order.order_type, order.maker_curve.as_ref()) {
-        (OrderType::MakerCurve, Some(curve)) => curve.commitment(),
-        (OrderType::MakerCurve, None) => Err(ProtocolError::Crypto(
-            "maker curve order missing curve points".into(),
+fn encode_order_liquidity_curve_commitment(order: &OrderIntent) -> Result<String, ProtocolError> {
+    match (&order.order_type, order.liquidity_curve.as_ref()) {
+        (OrderType::LiquidityCurve, Some(curve)) => curve.commitment(),
+        (OrderType::LiquidityCurve, None) => Err(ProtocolError::Crypto(
+            "liquidity curve order missing curve points".into(),
         )),
         (_, Some(_)) => Err(ProtocolError::Crypto(
-            "non-maker-curve order carries curve points".into(),
+            "non-liquidity-curve order carries curve points".into(),
         )),
         _ => Ok("0x0".into()),
     }
 }
 
-fn encode_maker_curve_commitment(witness: &MatchedOrderWitness) -> Result<String, ProtocolError> {
-    match (&witness.order_type, witness.maker_curve.as_ref()) {
-        (OrderType::MakerCurve, Some(curve)) => curve.commitment(),
-        (OrderType::MakerCurve, None) => Err(ProtocolError::Crypto(
-            "maker curve witness is missing curve points".into(),
+fn encode_liquidity_curve_commitment(
+    witness: &MatchedOrderWitness,
+) -> Result<String, ProtocolError> {
+    match (&witness.order_type, witness.liquidity_curve.as_ref()) {
+        (OrderType::LiquidityCurve, Some(curve)) => curve.commitment(),
+        (OrderType::LiquidityCurve, None) => Err(ProtocolError::Crypto(
+            "liquidity curve witness is missing curve points".into(),
         )),
         (_, Some(_)) => Err(ProtocolError::Crypto(
-            "non-maker-curve witness carries curve points".into(),
+            "non-liquidity-curve witness carries curve points".into(),
         )),
         _ => Ok("0x0".into()),
     }
@@ -7001,9 +8299,12 @@ fn encrypt_for_private_execution_key(
         recipient_public.as_affine(),
     );
     let ephemeral_public_key = hex::encode(ephemeral_public.to_encoded_point(false).as_bytes());
-    let aes_key_material =
-        derive_private_order_share_key(shared.raw_secret_bytes(), key_id, &ephemeral_public_key)?;
-    let cipher = Aes256Gcm::new_from_slice(&aes_key_material)
+    let aes_key_material = Zeroizing::new(derive_private_order_share_key(
+        shared.raw_secret_bytes(),
+        key_id,
+        &ephemeral_public_key,
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&aes_key_material[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let nonce = random_nonce();
     let nonce_hex = hex::encode(nonce);
@@ -7041,7 +8342,7 @@ fn decrypt_encrypted_blob(
         )));
     }
 
-    let private_key_bytes = hex::decode(private_key_hex)?;
+    let private_key_bytes = Zeroizing::new(hex::decode(private_key_hex)?);
     let private_key = SecretKey::from_slice(&private_key_bytes)
         .map_err(|err| ProtocolError::Crypto(format!("invalid private execution key: {err}")))?;
     let encoded_point = p256::EncodedPoint::from_bytes(hex::decode(&blob.ephemeral_public_key)?)
@@ -7053,12 +8354,12 @@ fn decrypt_encrypted_blob(
         private_key.to_nonzero_scalar(),
         ephemeral_public.as_affine(),
     );
-    let aes_key_material = derive_private_order_share_key(
+    let aes_key_material = Zeroizing::new(derive_private_order_share_key(
         shared.raw_secret_bytes(),
         &blob.key_id,
         &blob.ephemeral_public_key,
-    )?;
-    let cipher = Aes256Gcm::new_from_slice(&aes_key_material)
+    )?);
+    let cipher = Aes256Gcm::new_from_slice(&aes_key_material[..])
         .map_err(|err| ProtocolError::Crypto(format!("aes key init failed: {err}")))?;
     let nonce = hex::decode(&blob.nonce)?;
     let ciphertext = hex::decode(&blob.ciphertext)?;
@@ -7096,7 +8397,7 @@ fn parse_note_recognition_public_key(owner_key_hex: &str) -> Result<PublicKey, P
 }
 
 fn note_recognition_secret_from_raw_key_hex(raw_key_hex: &str) -> Result<SecretKey, ProtocolError> {
-    let raw_key = hex::decode(raw_key_hex.trim_start_matches("0x"))?;
+    let raw_key = Zeroizing::new(hex::decode(raw_key_hex.trim_start_matches("0x"))?);
     if raw_key.len() != 32 {
         return Err(ProtocolError::Crypto(format!(
             "note recognition key must be 32 bytes, got {}",
@@ -7105,11 +8406,14 @@ fn note_recognition_secret_from_raw_key_hex(raw_key_hex: &str) -> Result<SecretK
     }
 
     for counter in 0_u16..=255 {
-        let mut material = Vec::with_capacity(raw_key.len() + 2);
+        let mut material = Zeroizing::new(Vec::with_capacity(raw_key.len() + 2));
         material.extend_from_slice(&raw_key);
         material.extend_from_slice(&counter.to_be_bytes());
-        let candidate = tagged_sha256_bytes("zylith/note-recognition-p256-secret-v1", &material);
-        if let Ok(secret) = SecretKey::from_slice(&candidate) {
+        let candidate = Zeroizing::new(tagged_sha256_bytes(
+            "zylith/note-recognition-p256-secret-v1",
+            &material,
+        ));
+        if let Ok(secret) = SecretKey::from_slice(&candidate[..]) {
             return Ok(secret);
         }
     }
@@ -7155,15 +8459,16 @@ fn derive_output_note_key(
     )
 }
 
-fn derive_maker_attribution_key(
+fn derive_liquidity_attribution_key(
     shared_secret: &[u8],
     key_id: &str,
     ephemeral_public_key_hex: &str,
 ) -> Result<[u8; 32], ProtocolError> {
     hkdf_expand(
         shared_secret,
-        MAKER_ATTRIBUTION_HKDF_SALT,
-        format!("zylith/maker-attribution-aes-key:{key_id}:{ephemeral_public_key_hex}").as_bytes(),
+        LIQUIDITY_ATTRIBUTION_HKDF_SALT,
+        format!("zylith/liquidity-attribution-aes-key:{key_id}:{ephemeral_public_key_hex}")
+            .as_bytes(),
     )
 }
 
@@ -7193,20 +8498,20 @@ fn output_note_blob_aad(
         .into_bytes()
 }
 
-fn maker_attribution_blob_aad(
+fn liquidity_attribution_blob_aad(
     algorithm: &str,
     key_id: &str,
     ephemeral_public_key: &str,
     nonce: &str,
 ) -> Vec<u8> {
-    format!("zylith-maker-attribution-blob:{algorithm}:{key_id}:{ephemeral_public_key}:{nonce}")
+    format!("zylith-liquidity-attribution-blob:{algorithm}:{key_id}:{ephemeral_public_key}:{nonce}")
         .into_bytes()
 }
 
 fn padded_output_note_plaintext(
     payload: &OwnedOutputNotePayload,
-) -> Result<Vec<u8>, ProtocolError> {
-    let payload_json = serde_json::to_vec(payload)?;
+) -> Result<Zeroizing<Vec<u8>>, ProtocolError> {
+    let payload_json = Zeroizing::new(serde_json::to_vec(payload)?);
     let payload_len = u32::try_from(payload_json.len())
         .map_err(|_| ProtocolError::Crypto("output note plaintext exceeds u32 length".into()))?;
     if payload_json.len() + 4 > OUTPUT_NOTE_PLAINTEXT_PADDED_LEN {
@@ -7221,7 +8526,7 @@ fn padded_output_note_plaintext(
     plaintext[..4].copy_from_slice(&payload_len.to_be_bytes());
     plaintext[4..4 + payload_json.len()].copy_from_slice(&payload_json);
     OsRng.fill_bytes(&mut plaintext[4 + payload_json.len()..]);
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
 fn parse_padded_output_note_plaintext(
@@ -7252,45 +8557,45 @@ fn parse_padded_output_note_plaintext(
     Ok(payload)
 }
 
-fn padded_maker_attribution_plaintext(
-    payload: &MakerAttributionPlaintext,
-) -> Result<Vec<u8>, ProtocolError> {
-    let payload_json = serde_json::to_vec(payload)?;
+fn padded_liquidity_attribution_plaintext(
+    payload: &LiquidityAttributionPlaintext,
+) -> Result<Zeroizing<Vec<u8>>, ProtocolError> {
+    let payload_json = Zeroizing::new(serde_json::to_vec(payload)?);
     let payload_len = u32::try_from(payload_json.len()).map_err(|_| {
-        ProtocolError::Crypto("maker attribution plaintext exceeds u32 length".into())
+        ProtocolError::Crypto("liquidity attribution plaintext exceeds u32 length".into())
     })?;
-    if payload_json.len() + 4 > MAKER_ATTRIBUTION_PLAINTEXT_PADDED_LEN {
+    if payload_json.len() + 4 > LIQUIDITY_ATTRIBUTION_PLAINTEXT_PADDED_LEN {
         return Err(ProtocolError::Crypto(format!(
-            "maker attribution plaintext must fit {} bytes, got {}",
-            MAKER_ATTRIBUTION_PLAINTEXT_PADDED_LEN,
+            "liquidity attribution plaintext must fit {} bytes, got {}",
+            LIQUIDITY_ATTRIBUTION_PLAINTEXT_PADDED_LEN,
             payload_json.len() + 4
         )));
     }
 
-    let mut plaintext = vec![0_u8; MAKER_ATTRIBUTION_PLAINTEXT_PADDED_LEN];
+    let mut plaintext = vec![0_u8; LIQUIDITY_ATTRIBUTION_PLAINTEXT_PADDED_LEN];
     plaintext[..4].copy_from_slice(&payload_len.to_be_bytes());
     plaintext[4..4 + payload_json.len()].copy_from_slice(&payload_json);
     OsRng.fill_bytes(&mut plaintext[4 + payload_json.len()..]);
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
-fn parse_padded_maker_attribution_plaintext(
+fn parse_padded_liquidity_attribution_plaintext(
     plaintext: &[u8],
-) -> Result<MakerAttributionPlaintext, ProtocolError> {
-    if plaintext.len() != MAKER_ATTRIBUTION_PLAINTEXT_PADDED_LEN {
+) -> Result<LiquidityAttributionPlaintext, ProtocolError> {
+    if plaintext.len() != LIQUIDITY_ATTRIBUTION_PLAINTEXT_PADDED_LEN {
         return Err(ProtocolError::Crypto(format!(
-            "maker attribution plaintext must be {} bytes, got {}",
-            MAKER_ATTRIBUTION_PLAINTEXT_PADDED_LEN,
+            "liquidity attribution plaintext must be {} bytes, got {}",
+            LIQUIDITY_ATTRIBUTION_PLAINTEXT_PADDED_LEN,
             plaintext.len()
         )));
     }
     let len_bytes: [u8; 4] = plaintext[..4]
         .try_into()
-        .map_err(|_| ProtocolError::Crypto("missing maker attribution length prefix".into()))?;
+        .map_err(|_| ProtocolError::Crypto("missing liquidity attribution length prefix".into()))?;
     let payload_len = u32::from_be_bytes(len_bytes) as usize;
     if payload_len == 0 || payload_len + 4 > plaintext.len() {
         return Err(ProtocolError::Crypto(
-            "invalid maker attribution length prefix".into(),
+            "invalid liquidity attribution length prefix".into(),
         ));
     }
     Ok(serde_json::from_slice(&plaintext[4..4 + payload_len])?)
@@ -7320,7 +8625,6 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
     calldata.push(args.clearing_price.clone());
     calldata.push(args.price_base_scale.clone());
     calldata.push(args.taker_fee_bps.clone());
-    calldata.push(args.maker_fee_bps.clone());
     calldata.push(args.relay_fee_bps.clone());
     calldata.push(args.protocol_fee_recipient.clone());
     calldata.push(args.relay_fee_recipient.clone());
@@ -7329,15 +8633,18 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
     calldata.push(args.prior_nullifier_root.clone());
     calldata.push(args.prior_renewal_root.clone());
     calldata.push(args.prior_fee_root.clone());
+    calldata.push(args.prior_liquidity_position_root.clone());
     calldata.push(args.consumed_note_root.clone());
     calldata.push(args.consumed_nullifier_root.clone());
     calldata.push(args.renewal_child_root.clone());
+    calldata.push(args.liquidity_position_transition_root.clone());
     calldata.push(args.output_note_root.clone());
     calldata.push(args.fee_root.clone());
     calldata.push(args.new_note_root.clone());
     calldata.push(args.new_nullifier_root.clone());
     calldata.push(args.new_renewal_root.clone());
     calldata.push(args.new_fee_root.clone());
+    calldata.push(args.new_liquidity_position_root.clone());
     calldata
 }
 
@@ -7374,11 +8681,7 @@ fn flatten_settlement_output_withdrawal_call_arguments(
     push_span(&mut calldata, &args.merkle_directions);
     calldata.push(args.withdraw_authorization_r.clone());
     calldata.push(args.withdraw_authorization_s.clone());
-    calldata.push(
-        args.strk20_exit_commitment
-            .clone()
-            .unwrap_or_else(|| args.recipient.clone()),
-    );
+    calldata.push(args.strk20_exit_commitment.clone());
     calldata
 }
 
@@ -7426,22 +8729,23 @@ mod tests {
     use p256::SecretKey;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rand_core::OsRng;
-    use starknet_crypto::get_public_key;
 
     use super::{
-        FeeOutputNoteInput, SettlementOutputWithdrawalMessage,
+        FeeOutputNoteInput, STWO_SETTLEMENT_HEADER_FIELD_COUNT, SettlementOutputWithdrawalMessage,
         SettlementOutputWithdrawalPlanRequest, Strk20ExitClaimMessage, auction_admission_root,
         build_admission_serialized_input, build_auction_result_serialized_input,
         build_deposit_note, build_deposit_submission_plan, build_fee_output_note,
-        build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
-        build_order_submission, build_output_note, build_renewal_parent_cancel_submission_plan,
+        build_liquidity_position_serialized_input, build_note_consolidation_serialized_input,
+        build_note_consolidation_submission_plan, build_order_submission, build_output_note,
+        build_renewal_parent_cancel_submission_plan,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
-        build_settlement_witness, build_stwo_serialized_input, create_maker_attribution_artifact,
-        create_order_ingress_receipt, create_recovery_artifact, decrypt_maker_attribution_artifact,
-        decrypt_note_for_owner, decrypt_order_bundle, decrypt_order_share,
-        decrypt_output_recovery_record, decrypt_recovery_artifact_payload, deposit_root_from_note,
-        derive_account_id, derive_order_cancellation_secret, derive_order_cancellation_tag,
-        derive_user_keys, encode_asset_id, encode_output_root_id, encrypt_note_for_owner,
+        build_settlement_witness, build_stwo_serialized_input,
+        create_liquidity_attribution_artifact, create_order_ingress_receipt,
+        create_recovery_artifact, decrypt_liquidity_attribution_artifact, decrypt_note_for_owner,
+        decrypt_order_bundle, decrypt_order_share, decrypt_output_recovery_record,
+        decrypt_recovery_artifact_payload, deposit_root_from_note, derive_account_id,
+        derive_order_cancellation_secret, derive_order_cancellation_tag, derive_user_keys,
+        encode_asset_id, encode_output_root_id, encrypt_note_for_owner,
         encrypt_output_recovery_record, encrypted_note_activation_commitment,
         funding_commitment_for_deposit, native_note_consolidation_message_hash,
         note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
@@ -7452,23 +8756,23 @@ mod tests {
         root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
         settlement_note_root_after_deposit_roots, settlement_nullifier_root_after_history,
         settlement_output_withdrawal_message_hash, settlement_transcript_commitment,
-        sign_managed_maker_policy_authorization, sign_note_consolidation_authorization,
-        sign_order_authorization, sign_renewal_relay_package_authorization,
-        strk20_exit_claim_message_hash, validate_maker_attribution_receipt,
-        validate_order_ingress_receipt_for_manifest,
+        sign_note_consolidation_authorization, sign_order_authorization,
+        sign_renewal_relay_package_authorization, strk20_exit_claim_message_hash,
+        validate_liquidity_attribution_receipt, validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_private_execution_key_registry_pin, validate_private_order_authorization,
         verify_order_ingress_receipt, verify_order_ingress_receipt_with_secrets,
         verify_output_note_membership, verify_renewal_relay_package_authorization,
         withdrawal_message_hash,
     };
-    use crate::hash::{felt_from_hex_str, felt_hex};
     use crate::types::{
-        HiddenMakerCurve, MakerAttributionPlaintext, MakerBandAttribution,
-        MakerBandFillAttribution, MakerCurvePoint, output_bundle_bucket_size,
+        LiquidityAttributionPlaintext, LiquidityBandAttribution, LiquidityBandFillAttribution,
+        LiquidityCurve, LiquidityCurvePoint, output_bundle_bucket_size,
         output_recovery_bundle_root,
     };
-    use crate::{FundingRailKind, RelayMode, RenewalParentCancelPlanRequest};
+    use crate::{
+        FundingRailKind, OrderIngressReceiptAttestation, RelayMode, RenewalParentCancelPlanRequest,
+    };
 
     fn with_deposit_prior_note_root(
         mut transcript: SettlementTranscript,
@@ -7585,12 +8889,13 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 321,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "zylith-protocol-treasury".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -7605,6 +8910,7 @@ mod tests {
                         nullifier: funding_nullifier.clone(),
                     }],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![],
                     output_notes: vec![OutputNoteRecord {
                         note_commitment: output_note.commitment().expect("output note commitment"),
@@ -7629,18 +8935,17 @@ mod tests {
             AssetId("USDC".into()),
             vec![MatchedOrderWitness {
                 order_commitment,
-                funding_note,
-                funding_notes: vec![],
+                funding_note: funding_note.clone(),
+                funding_notes: vec![funding_note],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
-                funding_nullifier,
-                funding_nullifiers: vec![],
+                funding_nullifier: funding_nullifier.clone(),
+                funding_nullifiers: vec![funding_nullifier],
                 funding_authorization: sample_authorization_unchecked(),
-                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
-                maker_curve: None,
-                maker_band_attribution: None,
+                liquidity_curve: None,
+                liquidity_provider_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -7666,14 +8971,20 @@ mod tests {
     }
     use crate::{
         AssetId, AuctionOrderWitness, BatchId, ConsumedInput, DepositIntent, FeeEntry,
-        MatchedOrderWitness, Note, NoteCommitment, NoteConsolidationWitness, Nullifier,
-        NullifierHistoryBatch, OrderCommitment, OrderIntent, OrderSide, OutputNoteRecord, PairId,
+        LIQUIDITY_POSITION_VERSION, LiquidityPositionBacking, LiquidityPositionCommitment,
+        LiquidityPositionCurveKind, LiquidityPositionCurvePolicy, LiquidityPositionMarketContext,
+        LiquidityPositionRootTransition, LiquidityPositionRotationPolicy,
+        LiquidityPositionSettlementFill, LiquidityPositionState, LiquidityPositionStatus,
+        LiquidityPositionTransitionKind, LiquidityPositionTransitionWitness, MatchedOrderWitness,
+        Note, NoteCommitment, NoteConsolidationWitness, Nullifier, NullifierHistoryBatch,
+        OrderCommitment, OrderIntent, OrderSide, OutputNoteRecord, PairId,
         PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
-        PrivateExecutionKeyRegistry, PrivateOrderPayload, ProtocolError, RecoveryArtifactKind,
-        RecoverySeed, SettlementTranscript, SettlementWitness,
+        PrivateExecutionKeyRegistry, PrivateLiquidityPosition, PrivateOrderPayload, ProtocolError,
+        RecoveryArtifactKind, RecoverySeed, SettlementTranscript, SettlementWitness,
+        apply_liquidity_position_fill,
         hash::{encode_starknet_felt, ordered_felt_list_commitment},
-        nullifier_from_note_secret, spend_auth_key_felt_from_raw_key_hex,
-        spend_authority_from_raw_key_hex,
+        liquidity_position_root_transition, nullifier_from_note_secret,
+        spend_auth_key_felt_from_raw_key_hex, spend_authority_from_raw_key_hex,
     };
 
     #[test]
@@ -7718,6 +9029,17 @@ mod tests {
         assert!(
             matches!(error, ProtocolError::Crypto(message) if message.contains("funding nullifier"))
         );
+    }
+
+    #[test]
+    fn private_order_authorization_rejects_singular_only_funding_payload() {
+        let mut payload = sample_private_order();
+        payload.funding_notes.clear();
+
+        let error = validate_private_order_authorization(&payload)
+            .expect_err("singular funding note mirror must not authorize an order");
+        assert!(matches!(error, ProtocolError::Crypto(message) if
+                message.contains("invalid funding input count")));
     }
 
     #[test]
@@ -7810,6 +9132,53 @@ mod tests {
     }
 
     #[test]
+    fn order_ingress_receipt_signature_binds_relay_attestation_fields() {
+        let execution_keys = private_execution_keys();
+        let registry = PrivateExecutionKeyRegistry {
+            keys: execution_keys
+                .iter()
+                .map(|member| PrivateExecutionKeyPublicConfig {
+                    key_id: member.key_id.clone(),
+                    public_key: member.public_key.clone(),
+                })
+                .collect(),
+        };
+        let payload = sample_private_order();
+        let submission =
+            build_order_submission(&payload, &registry, &"11".repeat(32)).expect("submission");
+        let receipt_secret = "test-order-ingress-receipt-secret";
+        let receipt = create_order_ingress_receipt(
+            &submission.order_bundle,
+            "test-ingress",
+            "zylith-prover",
+            receipt_secret,
+            123,
+            OrderIngressReceiptAttestation {
+                relay_mode: Some(RelayMode::SelfRelay),
+                renewal_package_id: Some("pkg-1".into()),
+                renewal_package_commitment: Some("0xpackage".into()),
+            },
+        )
+        .expect("receipt");
+        verify_order_ingress_receipt(&receipt, receipt_secret).expect("receipt verifies");
+
+        let mut wrong_relay_mode = receipt.clone();
+        wrong_relay_mode.relay_mode = Some(RelayMode::ZylithRelay);
+        verify_order_ingress_receipt(&wrong_relay_mode, receipt_secret)
+            .expect_err("relay mode mutation must invalidate signature");
+
+        let mut wrong_package_id = receipt.clone();
+        wrong_package_id.renewal_package_id = Some("pkg-2".into());
+        verify_order_ingress_receipt(&wrong_package_id, receipt_secret)
+            .expect_err("package id mutation must invalidate signature");
+
+        let mut wrong_package_commitment = receipt;
+        wrong_package_commitment.renewal_package_commitment = Some("0xother".into());
+        verify_order_ingress_receipt(&wrong_package_commitment, receipt_secret)
+            .expect_err("package commitment mutation must invalidate signature");
+    }
+
+    #[test]
     fn private_execution_key_registry_pin_rejects_unpinned_keyset() {
         let execution_keys = private_execution_keys();
         let registry = PrivateExecutionKeyRegistry {
@@ -7829,7 +9198,7 @@ mod tests {
         let mut rotated = registry.clone();
         rotated.keys[0].key_id = "unexpected-key".into();
         validate_private_execution_key_registry_pin(&rotated, &fingerprint)
-            .expect_err("changed registry must not satisfy old pin");
+            .expect_err("changed registry must not satisfy previous pin");
     }
 
     #[test]
@@ -7969,7 +9338,7 @@ mod tests {
     }
 
     #[test]
-    fn maker_attribution_artifact_roundtrip_recovers_band_details() {
+    fn liquidity_attribution_artifact_roundtrip_recovers_band_details() {
         let seed = RecoverySeed([7_u8; 32]);
         let keys = derive_user_keys(&seed);
         let note_recognition_key = hex::encode(keys.note_recognition_key);
@@ -7977,18 +9346,18 @@ mod tests {
             .expect("owner public key");
         let payload = sample_private_order();
         let mut order = payload.order;
-        order.order_type = crate::OrderType::MakerCurve;
-        order.maker_curve = Some(HiddenMakerCurve {
+        order.order_type = crate::OrderType::LiquidityCurve;
+        order.liquidity_curve = Some(LiquidityCurve {
             points: vec![
-                MakerCurvePoint {
+                LiquidityCurvePoint {
                     price: 410,
                     base_amount: 750,
                 },
-                MakerCurvePoint {
+                LiquidityCurvePoint {
                     price: 420,
                     base_amount: 250,
                 },
-                MakerCurvePoint {
+                LiquidityCurvePoint {
                     price: 430,
                     base_amount: 250,
                 },
@@ -7996,7 +9365,7 @@ mod tests {
         });
         order.recipient_owner_public_key = owner_public_key.clone();
         let order_commitment = order.commitment().expect("commitment");
-        let attribution = MakerBandAttribution {
+        let attribution = LiquidityBandAttribution {
             version: 1,
             pair_id: order.pair_id.clone(),
             order_commitment: order_commitment.clone(),
@@ -8004,38 +9373,38 @@ mod tests {
             side: order.side.clone(),
             clearing_price: 400,
             filled_base_amount: 500,
-            bands: vec![MakerBandFillAttribution {
+            bands: vec![LiquidityBandFillAttribution {
                 band_index: 0,
                 band_price: 410,
                 band_base_amount: 750,
                 filled_base_amount: 500,
             }],
         };
-        let plaintext = MakerAttributionPlaintext {
+        let plaintext = LiquidityAttributionPlaintext {
             version: 1,
             batch_id: BatchId("batch-attribution".into()),
             pair_id: order.pair_id.clone(),
             epoch_id: 42,
-            maker_public_key: owner_public_key.clone(),
+            liquidity_provider_public_key: owner_public_key.clone(),
             curve_commitment: order
-                .maker_curve
+                .liquidity_curve
                 .as_ref()
-                .expect("maker curve")
+                .expect("liquidity curve")
                 .commitment()
                 .expect("curve commitment"),
             output_note_commitment: NoteCommitment("0x777".into()),
             attribution: attribution.clone(),
         };
         let signer_private_key = "0x12345";
-        let artifact = create_maker_attribution_artifact(
+        let artifact = create_liquidity_attribution_artifact(
             &plaintext,
             &order.recipient_owner_public_key,
             signer_private_key,
             1_778_661_520_000,
         )
         .expect("encrypted attribution artifact");
-        validate_maker_attribution_receipt(&artifact.receipt).expect("receipt verifies");
-        let decrypted = decrypt_maker_attribution_artifact(&note_recognition_key, &artifact)
+        validate_liquidity_attribution_receipt(&artifact.receipt).expect("receipt verifies");
+        let decrypted = decrypt_liquidity_attribution_artifact(&note_recognition_key, &artifact)
             .expect("decrypt")
             .expect("matching owner");
 
@@ -8044,16 +9413,16 @@ mod tests {
         let wrong_key =
             hex::encode(derive_user_keys(&RecoverySeed([8_u8; 32])).note_recognition_key);
         assert!(
-            decrypt_maker_attribution_artifact(&wrong_key, &artifact)
+            decrypt_liquidity_attribution_artifact(&wrong_key, &artifact)
                 .expect("wrong owner decrypt")
                 .is_none(),
-            "wrong owner must not decrypt maker attribution"
+            "wrong owner must not decrypt liquidity attribution"
         );
 
         let mut tampered = artifact.clone();
         tampered.receipt.payload_commitment = "0x123".into();
         assert!(
-            decrypt_maker_attribution_artifact(&note_recognition_key, &tampered).is_err(),
+            decrypt_liquidity_attribution_artifact(&note_recognition_key, &tampered).is_err(),
             "receipt must bind the encrypted attribution plaintext"
         );
     }
@@ -8275,64 +9644,25 @@ mod tests {
                 new_nullifier_root: &new_nullifier_root,
                 proof_artifact_commitment: "0x999",
                 withdraw_auth_key_felt: &withdraw_auth_key_felt,
-                recipient: "0x444",
-                strk20_exit_commitment: None,
+                strk20_exit_commitment: "0xabc123",
                 auction_verifier_address: "0x123",
                 shielded_asset_adapter_address: "0x456",
                 chain_id: "0x534e5f5345504f4c4941",
             },
         )
-        .expect("nullifier-consuming settlement output withdrawal plan");
+        .expect("nullifier-consuming STRK20 settlement output withdrawal plan");
 
         assert_eq!(
             plan.starknet_call.entrypoint,
-            "withdraw_settlement_output_with_proof_facts"
+            "withdraw_settlement_output_to_strk20_with_proof_facts"
         );
         assert_eq!(plan.encoded_args.prior_nullifier_root, prior_nullifier_root);
         assert_eq!(plan.encoded_args.new_nullifier_root, new_nullifier_root);
         assert_eq!(plan.encoded_args.proof_artifact_commitment, "0x999");
-
-        let strk20_plan = build_settlement_output_withdrawal_submission_plan(
-            SettlementOutputWithdrawalPlanRequest {
-                batch_id: &batch_id,
-                output_note: &outputs[1],
-                output_note_preimage: &output_note_preimage,
-                output_proof: &proof,
-                prior_nullifier_root: &prior_nullifier_root,
-                nullifier_history: &[],
-                nullifier_sparse_witness: Some(&sparse_witness),
-                new_nullifier_root: &new_nullifier_root,
-                proof_artifact_commitment: "0x999",
-                withdraw_auth_key_felt: &withdraw_auth_key_felt,
-                recipient: "0x444",
-                strk20_exit_commitment: Some("0xabc123"),
-                auction_verifier_address: "0x123",
-                shielded_asset_adapter_address: "0x456",
-                chain_id: "0x534e5f5345504f4c4941",
-            },
-        )
-        .expect("STRK20 open-note withdrawal plan");
-
+        assert_eq!(plan.encoded_args.strk20_exit_commitment, "0xabc123");
         assert_eq!(
-            strk20_plan.starknet_call.entrypoint,
-            "withdraw_settlement_output_to_strk20_with_proof_facts"
-        );
-        assert_eq!(strk20_plan.encoded_args.recipient, "0x0");
-        assert_eq!(
-            strk20_plan.encoded_args.strk20_exit_commitment.as_deref(),
+            plan.starknet_call.calldata.last().map(String::as_str),
             Some("0xabc123")
-        );
-        assert_eq!(
-            strk20_plan
-                .starknet_call
-                .calldata
-                .last()
-                .map(String::as_str),
-            Some("0xabc123")
-        );
-        assert_ne!(
-            plan.encoded_args.withdraw_authorization_r,
-            strk20_plan.encoded_args.withdraw_authorization_r
         );
     }
 
@@ -8391,8 +9721,7 @@ mod tests {
                 new_nullifier_root: &new_nullifier_root,
                 proof_artifact_commitment: "0x999",
                 withdraw_auth_key_felt: &withdraw_auth_key_felt,
-                recipient: "0x444",
-                strk20_exit_commitment: None,
+                strk20_exit_commitment: "0xabc123",
                 auction_verifier_address: "0x123",
                 shielded_asset_adapter_address: "0x456",
                 chain_id: "0x534e5f5345504f4c4941",
@@ -8434,8 +9763,7 @@ mod tests {
             note_commitment: "0x888",
             asset_id: "0x999",
             amount: "0x64",
-            recipient: "0xabc",
-            strk20_exit_commitment: None,
+            strk20_exit_commitment: "0xabc",
         })
         .expect("base hash");
         let other_verifier =
@@ -8447,8 +9775,7 @@ mod tests {
                 note_commitment: "0x888",
                 asset_id: "0x999",
                 amount: "0x64",
-                recipient: "0xabc",
-                strk20_exit_commitment: None,
+                strk20_exit_commitment: "0xabc",
             })
             .expect("verifier hash");
         let other_adapter =
@@ -8460,8 +9787,7 @@ mod tests {
                 note_commitment: "0x888",
                 asset_id: "0x999",
                 amount: "0x64",
-                recipient: "0xabc",
-                strk20_exit_commitment: None,
+                strk20_exit_commitment: "0xabc",
             })
             .expect("adapter hash");
         assert_ne!(base, other_verifier);
@@ -8470,18 +9796,6 @@ mod tests {
 
     #[test]
     fn settlement_output_strk20_exit_hash_is_domain_separated() {
-        let legacy = settlement_output_withdrawal_message_hash(SettlementOutputWithdrawalMessage {
-            auction_verifier_address: "0x123",
-            shielded_asset_adapter_address: "0x456",
-            chain_id: "0x534e5f5345504f4c4941",
-            batch_id: "0x777",
-            note_commitment: "0x888",
-            asset_id: "0x999",
-            amount: "0x64",
-            recipient: "0xabc",
-            strk20_exit_commitment: None,
-        })
-        .expect("legacy hash");
         let strk20 = settlement_output_withdrawal_message_hash(SettlementOutputWithdrawalMessage {
             auction_verifier_address: "0x123",
             shielded_asset_adapter_address: "0x456",
@@ -8490,8 +9804,7 @@ mod tests {
             note_commitment: "0x888",
             asset_id: "0x999",
             amount: "0x64",
-            recipient: "0xabc",
-            strk20_exit_commitment: Some("0xabc"),
+            strk20_exit_commitment: "0xabc",
         })
         .expect("strk20 hash");
         let other_exit =
@@ -8503,11 +9816,9 @@ mod tests {
                 note_commitment: "0x888",
                 asset_id: "0x999",
                 amount: "0x64",
-                recipient: "0xabc",
-                strk20_exit_commitment: Some("0xabd"),
+                strk20_exit_commitment: "0xabd",
             })
             .expect("other exit hash");
-        assert_ne!(legacy, strk20);
         assert_ne!(strk20, other_exit);
     }
 
@@ -8615,12 +9926,13 @@ mod tests {
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                prior_liquidity_position_root: "0x0".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
+                new_liquidity_position_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
                 taker_fee_bps: 4,
-                maker_fee_bps: 0,
                 relay_fee_bps: 0,
                 protocol_fee_recipient: "fee-recipient".into(),
                 relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -8633,6 +9945,7 @@ mod tests {
                     nullifier: funding_nullifier,
                 }],
                 renewal_child_uses: vec![],
+                liquidity_position_transitions: vec![],
                 fees: vec![FeeEntry {
                     asset_id: AssetId("USDC".into()),
                     amount: 10,
@@ -8669,7 +9982,7 @@ mod tests {
         assert_eq!(plan.proof_artifact_commitment, proof_commitment);
         assert_ne!(plan.encoded_args.consumed_note_root, "0x0");
         assert_ne!(plan.encoded_args.output_note_root, "0x0");
-        assert_eq!(plan.settlement_call.calldata.len(), 26);
+        assert_eq!(plan.settlement_call.calldata.len(), 28);
     }
 
     #[test]
@@ -8685,18 +9998,20 @@ mod tests {
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                prior_liquidity_position_root: "0x0".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
+                new_liquidity_position_root: "0x0".into(),
                 clearing_price: 145,
                 price_base_scale: 1,
                 taker_fee_bps: 4,
-                maker_fee_bps: 0,
                 relay_fee_bps: 0,
                 protocol_fee_recipient: "zylith-protocol-fee".into(),
                 relay_fee_recipient: "zylith-renewal-relay".into(),
                 matched_orders: vec![],
                 consumed_inputs: vec![],
                 renewal_child_uses: vec![],
+                liquidity_position_transitions: vec![],
                 fees: vec![],
                 output_notes: vec![],
                 output_note_preimages: vec![],
@@ -8743,12 +10058,13 @@ mod tests {
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                prior_liquidity_position_root: "0x0".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
+                new_liquidity_position_root: "0x0".into(),
                 clearing_price: 300,
                 price_base_scale: 1,
                 taker_fee_bps: 4,
-                maker_fee_bps: 0,
                 relay_fee_bps: 0,
                 protocol_fee_recipient: "zylith-protocol-fee".into(),
                 relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -8779,6 +10095,7 @@ mod tests {
                     },
                 ],
                 renewal_child_uses: vec![],
+                liquidity_position_transitions: vec![],
                 fees: vec![FeeEntry {
                     asset_id: AssetId("USDC".into()),
                     amount: 30,
@@ -8817,7 +10134,7 @@ mod tests {
             settlement_transcript_commitment(&transcript).expect("transcript commitment");
         let plan = build_settlement_submission_plan(&transcript, "0x123", "0x456").expect("plan");
         assert_eq!(commitment, plan.encoded_args.transcript_commitment);
-        assert_eq!(plan.settlement_call.calldata.len(), 26);
+        assert_eq!(plan.settlement_call.calldata.len(), 28);
     }
 
     fn settlement_binding_transcript() -> SettlementTranscript {
@@ -8831,12 +10148,13 @@ mod tests {
             prior_nullifier_root: "0x444".into(),
             prior_renewal_root: "0x555".into(),
             prior_fee_root: "0x666".into(),
+            prior_liquidity_position_root: "0x667".into(),
             new_nullifier_root: "0x777".into(),
             new_renewal_root: "0x888".into(),
+            new_liquidity_position_root: "0x667".into(),
             clearing_price: 123,
             price_base_scale: 10,
             taker_fee_bps: 4,
-            maker_fee_bps: 1,
             relay_fee_bps: 2,
             protocol_fee_recipient:
                 "0x02478731e01081aa57abe958afa8c29dfa83032c10d647a63b0394c23beb6192".into(),
@@ -8854,6 +10172,7 @@ mod tests {
                 parent_order_commitment: "0xccc".into(),
                 child_nullifier: "0xddd".into(),
             }],
+            liquidity_position_transitions: vec![],
             fees: vec![
                 FeeEntry {
                     asset_id: AssetId("USDC".into()),
@@ -8935,7 +10254,6 @@ mod tests {
             ("clearing_price", Box::new(|tx| tx.clearing_price += 1)),
             ("price_base_scale", Box::new(|tx| tx.price_base_scale += 1)),
             ("taker_fee_bps", Box::new(|tx| tx.taker_fee_bps += 1)),
-            ("maker_fee_bps", Box::new(|tx| tx.maker_fee_bps += 1)),
             ("relay_fee_bps", Box::new(|tx| tx.relay_fee_bps += 1)),
             (
                 "protocol_fee_recipient",
@@ -9037,12 +10355,13 @@ mod tests {
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                prior_liquidity_position_root: "0x0".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
+                new_liquidity_position_root: "0x0".into(),
                 clearing_price: 200,
                 price_base_scale: 1,
                 taker_fee_bps: 4,
-                maker_fee_bps: 0,
                 relay_fee_bps: 0,
                 protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -9055,6 +10374,7 @@ mod tests {
                     nullifier: funding_nullifier.clone(),
                 }],
                 renewal_child_uses: vec![],
+                liquidity_position_transitions: vec![],
                 fees: vec![],
                 output_notes: vec![OutputNoteRecord {
                     note_commitment: output_note.commitment().expect("output note commitment"),
@@ -9078,18 +10398,17 @@ mod tests {
             AssetId("ETH".into()),
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-2".into()),
-                funding_note,
-                funding_notes: vec![],
+                funding_note: funding_note.clone(),
+                funding_notes: vec![funding_note],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
-                funding_nullifier,
-                funding_nullifiers: vec![],
+                funding_nullifier: funding_nullifier.clone(),
+                funding_nullifiers: vec![funding_nullifier],
                 funding_authorization: sample_authorization_unchecked(),
-                managed_maker_authorization: None,
                 side: OrderSide::Sell,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
-                maker_curve: None,
-                maker_band_attribution: None,
+                liquidity_curve: None,
+                liquidity_provider_band_attribution: None,
                 limit_price: 180,
                 order_amount: 700,
                 min_fill: 100,
@@ -9141,12 +10460,13 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 321,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "recipient-3".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -9161,6 +10481,7 @@ mod tests {
                         nullifier: funding_nullifier.clone(),
                     }],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![FeeEntry {
                         asset_id: AssetId("USDC".into()),
                         amount: 7,
@@ -9190,18 +10511,17 @@ mod tests {
             AssetId("USDC".into()),
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-3".into()),
-                funding_note,
-                funding_notes: vec![],
+                funding_note: funding_note.clone(),
+                funding_notes: vec![funding_note],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
-                funding_nullifier,
-                funding_nullifiers: vec![],
+                funding_nullifier: funding_nullifier.clone(),
+                funding_nullifiers: vec![funding_nullifier],
                 funding_authorization: sample_authorization_unchecked(),
-                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
-                maker_curve: None,
-                maker_band_attribution: None,
+                liquidity_curve: None,
+                liquidity_provider_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -9270,12 +10590,13 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 145,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "recipient-asset-owner".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -9294,6 +10615,7 @@ mod tests {
                         },
                     ],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![],
                     output_notes: vec![
                         OutputNoteRecord {
@@ -9336,12 +10658,11 @@ mod tests {
                 funding_nullifier: funding_nullifier.clone(),
                 funding_nullifiers: vec![funding_nullifier_a, funding_nullifier_b],
                 funding_authorization: sample_authorization_unchecked(),
-                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
-                maker_curve: None,
-                maker_band_attribution: None,
+                liquidity_curve: None,
+                liquidity_provider_band_attribution: None,
                 limit_price: 145,
                 order_amount: 1000,
                 min_fill: 1000,
@@ -9366,16 +10687,16 @@ mod tests {
         .expect("multi-input witness");
 
         let serialized = build_stwo_serialized_input(&witness).expect("serialized input");
-        let mut index = 1 + 36;
+        let mut index = 1 + STWO_SETTLEMENT_HEADER_FIELD_COUNT;
         let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
         let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_sides = read_serialized_span(&serialized, &mut index);
         let _matched_order_types = read_serialized_span(&serialized, &mut index);
         let _matched_relay_modes = read_serialized_span(&serialized, &mut index);
-        let _matched_maker_curve_commitments = read_serialized_span(&serialized, &mut index);
-        let _matched_maker_curve_point_counts = read_serialized_span(&serialized, &mut index);
-        let _matched_maker_curve_prices = read_serialized_span(&serialized, &mut index);
-        let _matched_maker_curve_base_amounts = read_serialized_span(&serialized, &mut index);
+        let _matched_liquidity_curve_commitments = read_serialized_span(&serialized, &mut index);
+        let _matched_liquidity_curve_point_counts = read_serialized_span(&serialized, &mut index);
+        let _matched_liquidity_curve_prices = read_serialized_span(&serialized, &mut index);
+        let _matched_liquidity_curve_base_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_limit_prices = read_serialized_span(&serialized, &mut index);
         let _matched_order_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_min_fills = read_serialized_span(&serialized, &mut index);
@@ -9436,12 +10757,13 @@ mod tests {
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                prior_liquidity_position_root: "0x0".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
+                new_liquidity_position_root: "0x0".into(),
                 clearing_price: 321,
                 price_base_scale: 1,
                 taker_fee_bps: 4,
-                maker_fee_bps: 0,
                 relay_fee_bps: 0,
                 protocol_fee_recipient: "zylith-protocol-treasury".into(),
                 relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -9451,6 +10773,7 @@ mod tests {
                 }],
                 consumed_inputs: vec![],
                 renewal_child_uses: vec![],
+                liquidity_position_transitions: vec![],
                 fees: vec![],
                 output_notes: vec![OutputNoteRecord {
                     note_commitment: output_note.commitment().expect("output note commitment"),
@@ -9482,6 +10805,401 @@ mod tests {
     }
 
     #[test]
+    fn stwo_serialized_input_rejects_liquidity_position_summary_without_private_witness() {
+        let funding_note = sample_note("USDC", 80_000, 11);
+        let funding_commitment = funding_note.commitment().expect("funding commitment");
+        let funding_nullifier =
+            nullifier_from_note_secret(&funding_commitment, &funding_note.blinding)
+                .expect("funding nullifier");
+        let output_note = sample_note("STRK", 104, 12);
+        let mut witness = sample_single_match_witness(
+            "batch-lp-summary-without-witness",
+            funding_note,
+            funding_nullifier,
+            output_note,
+        );
+        witness.liquidity_position_transitions = vec![LiquidityPositionRootTransition {
+            kind: LiquidityPositionTransitionKind::Open,
+            consumed_position_commitment: None,
+            position_nullifier: None,
+            output_position_commitment: Some(LiquidityPositionCommitment("0x123".into())),
+        }];
+        witness.new_liquidity_position_root = "0x456".into();
+
+        let error = build_stwo_serialized_input(&witness)
+            .expect_err("LP transition summary without private witness rejected");
+        assert!(
+            matches!(error, ProtocolError::Crypto(message) if message.contains("witness count"))
+        );
+    }
+
+    #[test]
+    fn stwo_serialized_input_includes_private_liquidity_position_fill_witness() {
+        let funding_note = sample_note("USDC", 44_400, 81);
+        let funding_nullifier = sample_nullifier(&funding_note);
+        let output_note = sample_note("STRK", 111, 82);
+        let lp_owner = "0x222";
+        let position = PrivateLiquidityPosition {
+            version: LIQUIDITY_POSITION_VERSION,
+            position_id: "0x101".into(),
+            backing: LiquidityPositionBacking::PrivateReserve,
+            status: LiquidityPositionStatus::Active,
+            pair_id: PairId("STRK/USDC".into()),
+            base_asset_id: AssetId("STRK".into()),
+            quote_asset_id: AssetId("USDC".into()),
+            owner_authority: lp_owner.into(),
+            base_reserve: 1_000,
+            quote_reserve: 0,
+            price_lower_bound: 300,
+            price_upper_bound: 400,
+            max_fill_base_per_batch: 200,
+            curve_policy: LiquidityPositionCurvePolicy {
+                kind: LiquidityPositionCurveKind::StaticRange,
+                band_count: 3,
+                spread_bps: 0,
+                target_base_ratio_bps: 5_000,
+                inventory_skew_bps: 0,
+                max_price_deviation_bps: 0,
+            },
+            oracle_guard: None,
+            rotation_policy: LiquidityPositionRotationPolicy {
+                max_price_rotation_bps: 0,
+                max_depth_rotation_bps: 0,
+                skip_epoch_bps: 0,
+            },
+            opened_epoch: 1,
+            expiry_epoch: 20,
+            blinding: "0x333".into(),
+            metadata_commitment: "0x444".into(),
+        };
+        let market_context = LiquidityPositionMarketContext {
+            epoch: 12,
+            observed_at_unix_ms: 1,
+            current_time_unix_ms: 1,
+            reference_price: 0,
+            confirmation_price: None,
+            price_base_scale: 1,
+        };
+        let (next_position, _) = apply_liquidity_position_fill(
+            &position,
+            OrderSide::Sell,
+            111,
+            400,
+            market_context.price_base_scale,
+            "0x334",
+        )
+        .expect("position fill");
+        let mut position_state =
+            LiquidityPositionState::from_positions(std::slice::from_ref(&position))
+                .expect("prior position state");
+        let prior_position_root = position_state.root().expect("prior position root");
+        let (state_prior_root, new_position_root, position_update) = position_state
+            .replace(&position, &next_position)
+            .expect("position state update");
+        assert_eq!(state_prior_root, prior_position_root);
+        let lp_transition = liquidity_position_root_transition(
+            LiquidityPositionTransitionKind::Update,
+            Some(&position),
+            Some(&next_position),
+        )
+        .expect("position transition");
+        let lp_witness = LiquidityPositionTransitionWitness {
+            transition: lp_transition.clone(),
+            prior_position: Some(position),
+            output_position: Some(next_position),
+            state_update: position_update,
+            epoch: market_context.epoch,
+            fill: Some(LiquidityPositionSettlementFill {
+                market_context,
+                position_side: OrderSide::Sell,
+                filled_base_amount: 111,
+                clearing_price: 400,
+                price_base_scale: 1,
+            }),
+            open_funding: None,
+            output_notes: vec![],
+            base_amount: 0,
+            quote_amount: 0,
+            lifecycle_authorization: None,
+        };
+        let order_commitment = OrderCommitment("0xabc123".into());
+        let transcript = with_proof_bound_output_recovery(
+            with_deposit_prior_note_root(
+                SettlementTranscript {
+                    batch_id: BatchId("batch-private-lp-fill".into()),
+                    pair_id: PairId("STRK/USDC".into()),
+                    batch_epoch: 12,
+                    order_commitment_root: "0x111".into(),
+                    encrypted_order_set_commitment: "0x222".into(),
+                    prior_note_root: "0x0".into(),
+                    prior_nullifier_root: "0x0".into(),
+                    prior_renewal_root: "0x0".into(),
+                    prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: prior_position_root,
+                    new_nullifier_root: "0x0".into(),
+                    new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: new_position_root.clone(),
+                    clearing_price: 400,
+                    price_base_scale: 1,
+                    taker_fee_bps: 0,
+                    relay_fee_bps: 0,
+                    protocol_fee_recipient: "zylith-protocol-treasury".into(),
+                    relay_fee_recipient: "zylith-renewal-relay".into(),
+                    matched_orders: vec![crate::MatchedOrder {
+                        order_commitment: order_commitment.clone(),
+                        filled_amount: 111,
+                    }],
+                    consumed_inputs: vec![ConsumedInput {
+                        note_commitment: funding_note
+                            .commitment()
+                            .expect("funding note commitment"),
+                        nullifier: funding_nullifier.clone(),
+                    }],
+                    renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![lp_transition],
+                    fees: vec![],
+                    output_notes: vec![OutputNoteRecord {
+                        note_commitment: output_note.commitment().expect("output note commitment"),
+                        asset_id: AssetId("STRK".into()),
+                        amount: 111,
+                        withdraw_authority: output_note.withdraw_authority.clone(),
+                    }],
+                    output_note_preimages: vec![],
+                    output_recovery_records: vec![],
+                    output_recovery_dummy_commitments: vec![],
+                    output_ciphertext_bundle_ref: "bundle-private-lp-fill".into(),
+                },
+                std::slice::from_ref(&funding_note),
+            ),
+            vec![output_note.clone()],
+        );
+        let mut witness = build_settlement_witness(
+            &transcript,
+            PairId("STRK/USDC".into()),
+            "0x999",
+            AssetId("STRK".into()),
+            AssetId("USDC".into()),
+            vec![MatchedOrderWitness {
+                order_commitment,
+                funding_note: funding_note.clone(),
+                funding_notes: vec![funding_note],
+                funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
+                funding_nullifier: funding_nullifier.clone(),
+                funding_nullifiers: vec![funding_nullifier],
+                funding_authorization: sample_authorization_unchecked(),
+                side: OrderSide::Buy,
+                order_type: crate::OrderType::LimitBatch,
+                relay_mode: RelayMode::SelfRelay,
+                liquidity_curve: None,
+                liquidity_provider_band_attribution: None,
+                limit_price: 400,
+                order_amount: 111,
+                min_fill: 111,
+                time_in_force: crate::TimeInForce::CurrentBatchOnly,
+                expiry_epoch: 12,
+                order_nonce: 21,
+                parent_order_commitment: "0x0".into(),
+                parent_child_index: 0,
+                parent_secret_commitment: "0x0".into(),
+                parent_cancel_authority: "0x0".into(),
+                parent_authorization_secret: "0x0".into(),
+                auditor_view_allowed: false,
+                recipient_owner_public_key: "ab".repeat(32),
+                recipient_spend_authority: sample_spend_authority(),
+                recipient_withdraw_authority: output_note.withdraw_authority.clone(),
+                recipient_residual_withdraw_authority: "0xccd".into(),
+                filled_amount: 111,
+                output_note,
+                residual_note: None,
+            }],
+        )
+        .expect("settlement witness");
+        witness.liquidity_position_witnesses = vec![lp_witness];
+
+        let serialized = build_stwo_serialized_input(&witness).expect("serialized input");
+        let mut index = 1 + STWO_SETTLEMENT_HEADER_FIELD_COUNT;
+        for _ in 0..87 {
+            let _ = read_serialized_span(&serialized, &mut index);
+        }
+        let liquidity_position_transition_kinds = read_serialized_span(&serialized, &mut index);
+        let _liquidity_position_consumed_commitments =
+            read_serialized_span(&serialized, &mut index);
+        let _liquidity_position_nullifiers = read_serialized_span(&serialized, &mut index);
+        let _liquidity_position_output_commitments = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_prior_fields = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_output_fields = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_sides = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_filled_base_amounts = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_clearing_prices = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_price_base_scales = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_market_reference_prices =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_market_confirmation_prices =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_market_observed_at_unix_ms =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_market_current_time_unix_ms =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_oracle_guard_ids = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_oracle_guard_max_staleness_ms =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_oracle_guard_max_divergence_bps =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_position_ids = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_key_lows = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_key_highs = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_prior_commitments =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_output_commitments =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_path_counts = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_path_values = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_state_path_directions =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_lifecycle_signature_rs =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_lifecycle_signature_ss =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_lifecycle_base_amounts =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_lifecycle_quote_amounts =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_counts = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_note_commitments =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_asset_ids = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_amounts = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_owner_keys =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_spend_authorities =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_withdraw_authorities =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_blindings = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_nonces = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_open_input_metadata_commitments =
+            read_serialized_span(&serialized, &mut index);
+        let liquidity_position_lifecycle_output_counts =
+            read_serialized_span(&serialized, &mut index);
+
+        assert_eq!(liquidity_position_transition_kinds, vec!["0x1".to_string()]);
+        assert_eq!(liquidity_position_prior_fields.len(), 27);
+        assert_eq!(liquidity_position_output_fields.len(), 27);
+        assert_eq!(liquidity_position_prior_fields[1], "0x101");
+        assert_eq!(liquidity_position_prior_fields[8], "0x3e8");
+        assert_eq!(liquidity_position_output_fields[8], "0x379");
+        assert_eq!(liquidity_position_output_fields[9], "0xad70");
+        assert_eq!(liquidity_position_sides, vec!["0x1".to_string()]);
+        assert_eq!(
+            liquidity_position_filled_base_amounts,
+            vec!["0x6f".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_clearing_prices,
+            vec!["0x190".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_price_base_scales,
+            vec!["0x1".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_market_reference_prices,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_market_confirmation_prices,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_market_observed_at_unix_ms,
+            vec!["0x1".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_market_current_time_unix_ms,
+            vec!["0x1".to_string()]
+        );
+        assert_eq!(liquidity_position_oracle_guard_ids, vec!["0x0".to_string()]);
+        assert_eq!(
+            liquidity_position_oracle_guard_max_staleness_ms,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_oracle_guard_max_divergence_bps,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_state_position_ids,
+            vec!["0x101".to_string()]
+        );
+        assert_eq!(liquidity_position_state_key_lows, vec!["0x101".to_string()]);
+        assert_eq!(liquidity_position_state_key_highs, vec!["0x0".to_string()]);
+        assert_eq!(liquidity_position_state_prior_commitments.len(), 1);
+        assert_eq!(liquidity_position_state_output_commitments.len(), 1);
+        assert_eq!(
+            liquidity_position_state_path_counts,
+            vec!["0x80".to_string()]
+        );
+        assert_eq!(liquidity_position_state_path_values.len(), 128);
+        assert_eq!(liquidity_position_state_path_directions.len(), 128);
+        assert_eq!(
+            liquidity_position_lifecycle_signature_rs,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_lifecycle_signature_ss,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_lifecycle_base_amounts,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_lifecycle_quote_amounts,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(
+            liquidity_position_open_input_counts,
+            vec!["0x0".to_string()]
+        );
+        assert!(liquidity_position_open_input_note_commitments.is_empty());
+        assert!(liquidity_position_open_input_asset_ids.is_empty());
+        assert!(liquidity_position_open_input_amounts.is_empty());
+        assert!(liquidity_position_open_input_owner_keys.is_empty());
+        assert!(liquidity_position_open_input_spend_authorities.is_empty());
+        assert!(liquidity_position_open_input_withdraw_authorities.is_empty());
+        assert!(liquidity_position_open_input_blindings.is_empty());
+        assert!(liquidity_position_open_input_nonces.is_empty());
+        assert!(liquidity_position_open_input_metadata_commitments.is_empty());
+        assert_eq!(
+            liquidity_position_lifecycle_output_counts,
+            vec!["0x0".to_string()]
+        );
+        assert_eq!(witness.new_liquidity_position_root, new_position_root);
+
+        let compact =
+            build_liquidity_position_serialized_input(&witness).expect("compact LP input");
+        assert_eq!(compact[0], format!("0x{:x}", compact.len() - 1));
+        assert_eq!(compact[1], "0x7");
+        assert!(compact.len() < serialized.len());
+
+        let mut compact_index = 8;
+        let compact_transition_kinds = read_serialized_span(&compact, &mut compact_index);
+        let compact_consumed_commitments = read_serialized_span(&compact, &mut compact_index);
+        let compact_nullifiers = read_serialized_span(&compact, &mut compact_index);
+        let compact_output_commitments = read_serialized_span(&compact, &mut compact_index);
+        assert_eq!(compact_transition_kinds, vec!["0x1".to_string()]);
+        assert_eq!(compact_consumed_commitments.len(), 1);
+        assert_eq!(compact_nullifiers.len(), 1);
+        assert_eq!(compact_output_commitments.len(), 1);
+
+        let mut tampered = witness.clone();
+        tampered.new_liquidity_position_root = "0x123".into();
+        let error = build_liquidity_position_serialized_input(&tampered)
+            .expect_err("tampered compact LP root rejected");
+        assert!(matches!(error, ProtocolError::Crypto(message) if message.contains("reconstruct")));
+    }
+
+    #[test]
     fn stwo_serialized_input_rejects_consumed_note_without_prior_root_membership() {
         let funding_note = sample_note("USDC", 44_400, 44);
         let output_note = sample_note("STRK", 104, 45);
@@ -9496,12 +11214,13 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            prior_liquidity_position_root: "0x0".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
+            new_liquidity_position_root: "0x0".into(),
             clearing_price: 321,
             price_base_scale: 1,
             taker_fee_bps: 4,
-            maker_fee_bps: 0,
             relay_fee_bps: 0,
             protocol_fee_recipient: "zylith-protocol-treasury".into(),
             relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -9514,6 +11233,7 @@ mod tests {
                 nullifier: funding_nullifier.clone(),
             }],
             renewal_child_uses: vec![],
+            liquidity_position_transitions: vec![],
             fees: vec![],
             output_notes: vec![OutputNoteRecord {
                 note_commitment: output_note.commitment().expect("output note commitment"),
@@ -9541,18 +11261,17 @@ mod tests {
             AssetId("USDC".into()),
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-missing-membership".into()),
-                funding_note,
-                funding_notes: vec![],
+                funding_note: funding_note.clone(),
+                funding_notes: vec![funding_note],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
-                funding_nullifier,
-                funding_nullifiers: vec![],
+                funding_nullifier: funding_nullifier.clone(),
+                funding_nullifiers: vec![funding_nullifier],
                 funding_authorization: sample_authorization_unchecked(),
-                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
-                maker_curve: None,
-                maker_band_attribution: None,
+                liquidity_curve: None,
+                liquidity_provider_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -9954,12 +11673,13 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 321,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "recipient-asset-owner".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -9974,6 +11694,7 @@ mod tests {
                         nullifier: funding_nullifier.clone(),
                     }],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![FeeEntry {
                         asset_id: AssetId("STRK".into()),
                         amount: 7,
@@ -10003,18 +11724,17 @@ mod tests {
             AssetId("USDC".into()),
             vec![MatchedOrderWitness {
                 order_commitment: crate::OrderCommitment("order-asset-owner".into()),
-                funding_note,
-                funding_notes: vec![],
+                funding_note: funding_note.clone(),
+                funding_notes: vec![funding_note],
                 funding_note_ref: transcript.consumed_inputs[0].note_commitment.clone(),
-                funding_nullifier,
-                funding_nullifiers: vec![],
+                funding_nullifier: funding_nullifier.clone(),
+                funding_nullifiers: vec![funding_nullifier],
                 funding_authorization: sample_authorization_unchecked(),
-                managed_maker_authorization: None,
                 side: OrderSide::Buy,
                 order_type: crate::OrderType::LimitBatch,
                 relay_mode: RelayMode::SelfRelay,
-                maker_curve: None,
-                maker_band_attribution: None,
+                liquidity_curve: None,
+                liquidity_provider_band_attribution: None,
                 limit_price: 400,
                 order_amount: 111,
                 min_fill: 10,
@@ -10044,17 +11764,17 @@ mod tests {
         let owner_key = encode_starknet_felt("owner-public-key", &owner_public_key);
 
         let mut index = 1;
-        index += 36;
+        index += STWO_SETTLEMENT_HEADER_FIELD_COUNT;
 
         let _matched_order_commitments = read_serialized_span(&serialized, &mut index);
         let _matched_fill_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_sides = read_serialized_span(&serialized, &mut index);
         let matched_order_types = read_serialized_span(&serialized, &mut index);
         let matched_relay_modes = read_serialized_span(&serialized, &mut index);
-        let matched_maker_curve_commitments = read_serialized_span(&serialized, &mut index);
-        let matched_maker_curve_point_counts = read_serialized_span(&serialized, &mut index);
-        let matched_maker_curve_prices = read_serialized_span(&serialized, &mut index);
-        let matched_maker_curve_base_amounts = read_serialized_span(&serialized, &mut index);
+        let matched_liquidity_curve_commitments = read_serialized_span(&serialized, &mut index);
+        let matched_liquidity_curve_point_counts = read_serialized_span(&serialized, &mut index);
+        let matched_liquidity_curve_prices = read_serialized_span(&serialized, &mut index);
+        let matched_liquidity_curve_base_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_limit_prices = read_serialized_span(&serialized, &mut index);
         let _matched_order_amounts = read_serialized_span(&serialized, &mut index);
         let _matched_min_fills = read_serialized_span(&serialized, &mut index);
@@ -10140,6 +11860,13 @@ mod tests {
         let _renewal_cancel_sparse_path_counts = read_serialized_span(&serialized, &mut index);
         let _renewal_cancel_sparse_path_values = read_serialized_span(&serialized, &mut index);
         let _renewal_cancel_sparse_path_directions = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_transition_kinds = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_consumed_commitments = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_nullifiers = read_serialized_span(&serialized, &mut index);
+        let liquidity_position_output_commitments = read_serialized_span(&serialized, &mut index);
+        for _ in 0..36 {
+            let _ = read_serialized_span(&serialized, &mut index);
+        }
         let _output_note_commitments = read_serialized_span(&serialized, &mut index);
         let output_note_asset_ids = read_serialized_span(&serialized, &mut index);
         let _output_note_amounts = read_serialized_span(&serialized, &mut index);
@@ -10149,10 +11876,13 @@ mod tests {
         assert_eq!(serialized[15], quote_asset);
         assert_eq!(matched_order_types, vec!["0x0".to_string()]);
         assert_eq!(matched_relay_modes, vec!["0x0".to_string()]);
-        assert_eq!(matched_maker_curve_commitments, vec!["0x0".to_string()]);
-        assert_eq!(matched_maker_curve_point_counts, vec!["0x0".to_string()]);
-        assert!(matched_maker_curve_prices.is_empty());
-        assert!(matched_maker_curve_base_amounts.is_empty());
+        assert_eq!(matched_liquidity_curve_commitments, vec!["0x0".to_string()]);
+        assert_eq!(
+            matched_liquidity_curve_point_counts,
+            vec!["0x0".to_string()]
+        );
+        assert!(matched_liquidity_curve_prices.is_empty());
+        assert!(matched_liquidity_curve_base_amounts.is_empty());
         assert_eq!(matched_time_in_force, vec!["0x0".to_string()]);
         assert_eq!(matched_expiry_epochs, vec!["0x16".to_string()]);
         assert_eq!(matched_order_nonces, vec!["0x21".to_string()]);
@@ -10173,6 +11903,10 @@ mod tests {
         assert!(note_membership_path_values.is_empty());
         assert!(note_membership_path_directions.is_empty());
         assert_eq!(note_membership_suffix_counts, vec!["0x0".to_string()]);
+        assert!(liquidity_position_transition_kinds.is_empty());
+        assert!(liquidity_position_consumed_commitments.is_empty());
+        assert!(liquidity_position_nullifiers.is_empty());
+        assert!(liquidity_position_output_commitments.is_empty());
         assert_eq!(matched_funding_note_asset_ids, vec![quote_asset.clone()]);
         assert_eq!(matched_output_note_asset_ids, vec![base_asset.clone()]);
         assert_eq!(output_note_asset_ids, vec![base_asset.clone()]);
@@ -10246,12 +11980,13 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 145,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "zylith-protocol-treasury".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -10264,6 +11999,7 @@ mod tests {
                         nullifier: private_order.order.funding_nullifier.clone(),
                     }],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![FeeEntry {
                         asset_id: AssetId("STRK".into()),
                         amount: 3,
@@ -10293,17 +12029,16 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: order_commitment.clone(),
                 funding_note: private_order.funding_note.clone(),
-                funding_notes: vec![],
+                funding_notes: private_order.funding_notes.clone(),
                 funding_note_ref: funding_note_commitment.clone(),
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
-                funding_nullifiers: vec![],
+                funding_nullifiers: vec![private_order.order.funding_nullifier.clone()],
                 funding_authorization: private_order.funding_authorization.clone(),
-                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
-                maker_curve: private_order.order.maker_curve.clone(),
-                maker_band_attribution: None,
+                liquidity_curve: private_order.order.liquidity_curve.clone(),
+                liquidity_provider_band_attribution: None,
                 limit_price: private_order.order.limit_price,
                 order_amount: private_order.order.amount,
                 min_fill: private_order.order.min_fill,
@@ -10341,9 +12076,8 @@ mod tests {
                 order_commitment: order_commitment.clone(),
                 order: private_order.order.clone(),
                 funding_note: private_order.funding_note.clone(),
-                funding_notes: vec![],
+                funding_notes: private_order.funding_notes.clone(),
                 funding_authorization: private_order.funding_authorization.clone(),
-                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
             }],
         )
         .expect("admission serialized input");
@@ -10358,10 +12092,10 @@ mod tests {
         let sides = read_serialized_span(&serialized, &mut index);
         let order_types = read_serialized_span(&serialized, &mut index);
         let relay_modes = read_serialized_span(&serialized, &mut index);
-        let maker_curve_commitments = read_serialized_span(&serialized, &mut index);
-        let maker_curve_point_counts = read_serialized_span(&serialized, &mut index);
-        let maker_curve_prices = read_serialized_span(&serialized, &mut index);
-        let maker_curve_base_amounts = read_serialized_span(&serialized, &mut index);
+        let liquidity_curve_commitments = read_serialized_span(&serialized, &mut index);
+        let liquidity_curve_point_counts = read_serialized_span(&serialized, &mut index);
+        let liquidity_curve_prices = read_serialized_span(&serialized, &mut index);
+        let liquidity_curve_base_amounts = read_serialized_span(&serialized, &mut index);
         let limit_prices = read_serialized_span(&serialized, &mut index);
         let order_amounts = read_serialized_span(&serialized, &mut index);
         let min_fills = read_serialized_span(&serialized, &mut index);
@@ -10389,18 +12123,6 @@ mod tests {
         let funding_note_owner_keys = read_serialized_span(&serialized, &mut index);
         let funding_authorization_rs = read_serialized_span(&serialized, &mut index);
         let funding_authorization_ss = read_serialized_span(&serialized, &mut index);
-        let managed_authorization_modes = read_serialized_span(&serialized, &mut index);
-        let managed_delegate_public_keys = read_serialized_span(&serialized, &mut index);
-        let managed_allow_buy = read_serialized_span(&serialized, &mut index);
-        let managed_allow_sell = read_serialized_span(&serialized, &mut index);
-        let managed_max_epoch_base = read_serialized_span(&serialized, &mut index);
-        let managed_min_prices = read_serialized_span(&serialized, &mut index);
-        let managed_max_prices = read_serialized_span(&serialized, &mut index);
-        let managed_valid_from_epochs = read_serialized_span(&serialized, &mut index);
-        let managed_valid_until_epochs = read_serialized_span(&serialized, &mut index);
-        let managed_policy_nonces = read_serialized_span(&serialized, &mut index);
-        let managed_owner_authorization_rs = read_serialized_span(&serialized, &mut index);
-        let managed_owner_authorization_ss = read_serialized_span(&serialized, &mut index);
         let funding_nullifiers = read_serialized_span(&serialized, &mut index);
         let recipient_owner_keys = read_serialized_span(&serialized, &mut index);
         let recipient_spend_authorities = read_serialized_span(&serialized, &mut index);
@@ -10411,10 +12133,10 @@ mod tests {
         assert_eq!(sides, vec!["0x0".to_string()]);
         assert_eq!(order_types, vec!["0x0".to_string()]);
         assert_eq!(relay_modes, vec!["0x0".to_string()]);
-        assert_eq!(maker_curve_commitments, vec!["0x0".to_string()]);
-        assert_eq!(maker_curve_point_counts, vec!["0x0".to_string()]);
-        assert!(maker_curve_prices.is_empty());
-        assert!(maker_curve_base_amounts.is_empty());
+        assert_eq!(liquidity_curve_commitments, vec!["0x0".to_string()]);
+        assert_eq!(liquidity_curve_point_counts, vec!["0x0".to_string()]);
+        assert!(liquidity_curve_prices.is_empty());
+        assert!(liquidity_curve_base_amounts.is_empty());
         assert_eq!(limit_prices, vec!["0x91".to_string()]);
         assert_eq!(order_amounts, vec!["0x3e8".to_string()]);
         assert_eq!(min_fills, vec!["0x64".to_string()]);
@@ -10460,18 +12182,6 @@ mod tests {
             funding_authorization_ss,
             vec![private_order.funding_authorization.signature_s]
         );
-        assert_eq!(managed_authorization_modes, vec!["0x0".to_string()]);
-        assert_eq!(managed_delegate_public_keys, vec!["0x0".to_string()]);
-        assert_eq!(managed_allow_buy, vec!["0x0".to_string()]);
-        assert_eq!(managed_allow_sell, vec!["0x0".to_string()]);
-        assert_eq!(managed_max_epoch_base, vec!["0x0".to_string()]);
-        assert_eq!(managed_min_prices, vec!["0x0".to_string()]);
-        assert_eq!(managed_max_prices, vec!["0x0".to_string()]);
-        assert_eq!(managed_valid_from_epochs, vec!["0x0".to_string()]);
-        assert_eq!(managed_valid_until_epochs, vec!["0x0".to_string()]);
-        assert_eq!(managed_policy_nonces, vec!["0x0".to_string()]);
-        assert_eq!(managed_owner_authorization_rs, vec!["0x0".to_string()]);
-        assert_eq!(managed_owner_authorization_ss, vec!["0x0".to_string()]);
         assert_eq!(
             funding_nullifiers,
             vec![private_order.order.funding_nullifier.0]
@@ -10512,12 +12222,13 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 145,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "zylith-protocol-treasury".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -10530,6 +12241,7 @@ mod tests {
                         nullifier: private_order.order.funding_nullifier.clone(),
                     }],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![FeeEntry {
                         asset_id: AssetId("STRK".into()),
                         amount: 3,
@@ -10559,17 +12271,16 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: order_commitment.clone(),
                 funding_note: private_order.funding_note.clone(),
-                funding_notes: vec![],
+                funding_notes: private_order.funding_notes.clone(),
                 funding_note_ref: funding_note_commitment,
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
-                funding_nullifiers: vec![],
+                funding_nullifiers: vec![private_order.order.funding_nullifier.clone()],
                 funding_authorization: private_order.funding_authorization.clone(),
-                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
-                maker_curve: private_order.order.maker_curve.clone(),
-                maker_band_attribution: None,
+                liquidity_curve: private_order.order.liquidity_curve.clone(),
+                liquidity_provider_band_attribution: None,
                 limit_price: private_order.order.limit_price,
                 order_amount: private_order.order.amount,
                 min_fill: private_order.order.min_fill,
@@ -10603,11 +12314,10 @@ mod tests {
         .expect("witness");
         let orders = [AuctionOrderWitness {
             order_commitment,
-            order: private_order.order,
-            funding_note: private_order.funding_note,
-            funding_notes: vec![],
-            funding_authorization: private_order.funding_authorization,
-            managed_maker_authorization: private_order.managed_maker_authorization,
+            order: private_order.order.clone(),
+            funding_note: private_order.funding_note.clone(),
+            funding_notes: private_order.funding_notes.clone(),
+            funding_authorization: private_order.funding_authorization.clone(),
         }];
         let admission_root = auction_admission_root(&witness, &orders).expect("admission root");
         let admission =
@@ -10648,18 +12358,20 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 0,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "zylith-protocol-treasury".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
                     matched_orders: vec![],
                     consumed_inputs: vec![],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![],
                     output_notes: vec![],
                     output_note_preimages: vec![],
@@ -10691,8 +12403,8 @@ mod tests {
         assert_eq!(settlement_payload[0], "0x1");
         assert_eq!(settlement_payload[15], "0x0");
         assert_eq!(settlement_payload[16], "0x1");
-        assert_eq!(settlement_payload[19], "0x0");
-        assert_eq!(settlement_payload[22], "0x0");
+        assert_eq!(settlement_payload[18], "0x0");
+        assert_eq!(settlement_payload[21], "0x0");
 
         let mut admission_vector_count = 0;
         while index < serialized.len() {
@@ -10715,18 +12427,20 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            prior_liquidity_position_root: "0x0".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
+            new_liquidity_position_root: "0x0".into(),
             clearing_price: 0,
             price_base_scale: 1,
             taker_fee_bps: 4,
-            maker_fee_bps: 0,
             relay_fee_bps: 0,
             protocol_fee_recipient: "zylith-protocol-treasury".into(),
             relay_fee_recipient: "zylith-renewal-relay".into(),
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
+            liquidity_position_transitions: vec![],
             fees: vec![],
             output_notes: vec![],
             output_note_preimages: vec![],
@@ -10858,12 +12572,13 @@ mod tests {
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    prior_liquidity_position_root: "0x0".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
+                    new_liquidity_position_root: "0x0".into(),
                     clearing_price: 145,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
-                    maker_fee_bps: 0,
                     relay_fee_bps: 0,
                     protocol_fee_recipient: "zylith-protocol-treasury".into(),
                     relay_fee_recipient: "zylith-renewal-relay".into(),
@@ -10876,6 +12591,7 @@ mod tests {
                         nullifier: private_order.order.funding_nullifier.clone(),
                     }],
                     renewal_child_uses: vec![],
+                    liquidity_position_transitions: vec![],
                     fees: vec![FeeEntry {
                         asset_id: AssetId("STRK".into()),
                         amount: 3,
@@ -10905,17 +12621,16 @@ mod tests {
             vec![MatchedOrderWitness {
                 order_commitment: order_commitment.clone(),
                 funding_note: private_order.funding_note.clone(),
-                funding_notes: vec![],
+                funding_notes: private_order.funding_notes.clone(),
                 funding_note_ref: funding_note_commitment,
                 funding_nullifier: private_order.order.funding_nullifier.clone(),
-                funding_nullifiers: vec![],
+                funding_nullifiers: vec![private_order.order.funding_nullifier.clone()],
                 funding_authorization: private_order.funding_authorization.clone(),
-                managed_maker_authorization: private_order.managed_maker_authorization.clone(),
                 side: private_order.order.side.clone(),
                 order_type: private_order.order.order_type.clone(),
                 relay_mode: private_order.order.relay_mode.clone(),
-                maker_curve: private_order.order.maker_curve.clone(),
-                maker_band_attribution: None,
+                liquidity_curve: private_order.order.liquidity_curve.clone(),
+                liquidity_provider_band_attribution: None,
                 limit_price: private_order.order.limit_price,
                 order_amount: private_order.order.amount,
                 min_fill: private_order.order.min_fill,
@@ -10951,67 +12666,15 @@ mod tests {
             &witness,
             &[AuctionOrderWitness {
                 order_commitment,
-                order: private_order.order,
-                funding_note: private_order.funding_note,
-                funding_notes: vec![],
-                funding_authorization: private_order.funding_authorization,
-                managed_maker_authorization: private_order.managed_maker_authorization,
+                order: private_order.order.clone(),
+                funding_note: private_order.funding_note.clone(),
+                funding_notes: private_order.funding_notes.clone(),
+                funding_authorization: private_order.funding_authorization.clone(),
             }],
         )
         .expect_err("wrong order batch domain rejected");
 
         assert!(matches!(error, ProtocolError::Crypto(message) if message.contains("batch_id")));
-    }
-
-    #[test]
-    fn managed_maker_authorization_accepts_a_policy_bounded_curve() {
-        let payload = sample_managed_private_order();
-        validate_private_order_authorization(&payload).expect("managed maker authorization");
-    }
-
-    #[test]
-    fn managed_maker_authorization_rejects_output_redirection() {
-        let mut payload = sample_managed_private_order();
-        payload.order.recipient_withdraw_authority = "0x9876".into();
-        let order_commitment = payload
-            .order
-            .commitment()
-            .expect("mutated order commitment");
-        payload.funding_authorization =
-            sign_order_authorization("0x123456", &order_commitment).expect("delegate signature");
-
-        let error = validate_private_order_authorization(&payload)
-            .expect_err("delegated output redirection must fail");
-        assert!(format!("{error}").contains("output authority"));
-    }
-
-    #[test]
-    fn managed_maker_authorization_rejects_an_oversized_curve() {
-        let mut payload = sample_managed_private_order();
-        payload.order.amount = 1_001;
-        payload.order.maker_curve.as_mut().unwrap().points[2].base_amount = 401;
-        let order_commitment = payload
-            .order
-            .commitment()
-            .expect("mutated order commitment");
-        payload.funding_authorization =
-            sign_order_authorization("0x123456", &order_commitment).expect("delegate signature");
-
-        let error = validate_private_order_authorization(&payload)
-            .expect_err("oversized delegated curve must fail");
-        assert!(format!("{error}").contains("epoch size"));
-    }
-
-    #[test]
-    fn managed_maker_authorization_rejects_the_wrong_delegate() {
-        let mut payload = sample_managed_private_order();
-        let order_commitment = payload.order.commitment().expect("order commitment");
-        payload.funding_authorization =
-            sign_order_authorization("0x654321", &order_commitment).expect("wrong signature");
-
-        let error = validate_private_order_authorization(&payload)
-            .expect_err("wrong delegated key must fail");
-        assert!(format!("{error}").contains("authorized delegate"));
     }
 
     fn sample_order() -> OrderIntent {
@@ -11023,7 +12686,7 @@ mod tests {
             side: OrderSide::Buy,
             order_type: crate::OrderType::LimitBatch,
             relay_mode: RelayMode::SelfRelay,
-            maker_curve: None,
+            liquidity_curve: None,
             limit_price: 145,
             amount: 1000,
             min_fill: 100,
@@ -11052,75 +12715,9 @@ mod tests {
 
         PrivateOrderPayload {
             funding_authorization: sample_authorization_for_order(&order),
-            managed_maker_authorization: None,
-            funding_note,
-            funding_notes: Vec::new(),
+            funding_note: funding_note.clone(),
+            funding_notes: vec![funding_note],
             order,
-        }
-    }
-
-    fn sample_managed_private_order() -> PrivateOrderPayload {
-        let funding_note = sample_note("USDC", 200_000, 7);
-        let mut order = sample_order();
-        order.order_type = crate::OrderType::MakerCurve;
-        order.maker_curve = Some(crate::HiddenMakerCurve {
-            points: vec![
-                crate::MakerCurvePoint {
-                    price: 140,
-                    base_amount: 300,
-                },
-                crate::MakerCurvePoint {
-                    price: 145,
-                    base_amount: 300,
-                },
-                crate::MakerCurvePoint {
-                    price: 150,
-                    base_amount: 400,
-                },
-            ],
-        });
-        order.limit_price = 150;
-        order.amount = 1_000;
-        order.min_fill = 1;
-        order.funding_note_ref = funding_note.commitment().expect("funding note commitment");
-        let delegate_private_key = felt_from_hex_str("0x123456").expect("delegate key");
-        let policy = crate::ManagedMakerPolicy {
-            version: crate::types::MANAGED_MAKER_POLICY_VERSION,
-            delegate_public_key: felt_hex(&get_public_key(&delegate_private_key)),
-            pair_id: order.pair_id.clone(),
-            allow_buy: true,
-            allow_sell: false,
-            max_epoch_base: 1_000,
-            min_price: 130,
-            max_price: 160,
-            valid_from_epoch: 40,
-            valid_until_epoch: 50,
-            relay_mode: order.relay_mode.clone(),
-            parent_order_commitment: order.parent_order_commitment.clone(),
-            recipient_owner_public_key: order.recipient_owner_public_key.clone(),
-            recipient_spend_authority: order.recipient_spend_authority.clone(),
-            recipient_withdraw_authority: order.recipient_withdraw_authority.clone(),
-            recipient_residual_withdraw_authority: order
-                .recipient_residual_withdraw_authority
-                .clone(),
-            auditor_view_allowed: order.auditor_view_allowed,
-            policy_nonce: 9,
-        };
-        let owner_authorization =
-            sign_managed_maker_policy_authorization(&sample_spend_auth_key(), &policy)
-                .expect("owner policy signature");
-        let order_commitment = order.commitment().expect("order commitment");
-        let funding_authorization =
-            sign_order_authorization("0x123456", &order_commitment).expect("delegate signature");
-        PrivateOrderPayload {
-            order,
-            funding_note,
-            funding_notes: Vec::new(),
-            funding_authorization,
-            managed_maker_authorization: Some(crate::ManagedMakerAuthorization {
-                policy,
-                owner_authorization,
-            }),
         }
     }
 
