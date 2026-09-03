@@ -3,74 +3,68 @@ export type PaymasterConfig = {
   chainId: string;
   accountAddress: string;
   privateKey: string;
-  privacySignerClassHash: string | null;
+  privacySignerClassHash: string;
   allowedContracts: Set<string>;
+  approvalSpenders: Set<string>;
   allowedEntrypoints: Set<string>;
   proofRequiredEntrypoints: Set<string>;
-  withdrawalAmountBuckets: Set<string>;
-  allowDirectWithdrawalRelays: boolean;
   bindHost: string;
   port: number;
   maxBodyBytes: number;
   allowedOrigins: Set<string>;
-  allowedOriginPatterns: RegExp[];
   signerLimitPerMinute: number;
   trustProxyHeaders: boolean;
   trustedProxyCidrs: string[];
-  internalApiToken: string | null;
+  internalApiToken: string;
   submissionLogPath: string | null;
 };
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
 const DEFAULT_SIGNER_LIMIT_PER_MINUTE = 20;
+const STARKNET_FIELD_PRIME =
+  3618502788666131213697322783095070105623107215331596699973092056135872020481n;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfig {
-  const rpcUrl = requiredEnv(env, "ZYLITH_PAYMASTER_RPC_URL");
-  const chainId = normalizeFelt(requiredEnv(env, "ZYLITH_PAYMASTER_CHAIN_ID"));
-  const accountAddress = normalizeFelt(requiredEnv(env, "ZYLITH_PAYMASTER_ACCOUNT_ADDRESS"));
+  const rpcUrl = requiredServiceUrl(env, "ZYLITH_PAYMASTER_RPC_URL");
+  const chainId = normalizeNonZeroFelt(requiredEnv(env, "ZYLITH_PAYMASTER_CHAIN_ID"));
+  const accountAddress = normalizeNonZeroFelt(requiredEnv(env, "ZYLITH_PAYMASTER_ACCOUNT_ADDRESS"));
   const privateKey = requiredEnv(env, "ZYLITH_PAYMASTER_PRIVATE_KEY");
-  const privacySignerClassHash = optionalFelt(env.ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH);
-  const allowedContracts = parseFeltSet(
-    env.ZYLITH_PAYMASTER_ALLOWED_CONTRACTS ?? env.ZYLITH_PRIVACY_POOL_ADDRESS
+  const privacySignerClassHash = normalizeNonZeroFelt(
+    requiredEnv(env, "ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH")
   );
-  const allowedEntrypoints = parseNameSet(
-    env.ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS ?? "apply_actions"
-  );
+  const allowedContracts = parseFeltSet(requiredEnv(env, "ZYLITH_PAYMASTER_ALLOWED_CONTRACTS"));
+  const approvalSpenders = parseFeltSet(requiredEnv(env, "ZYLITH_PAYMASTER_APPROVAL_SPENDERS"));
+  const allowedEntrypoints = parseNameSet(requiredEnv(env, "ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS"));
   const proofRequiredEntrypoints = parseOptionalNameSet(
-    env.ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS ??
-      "apply_actions,submit_settlement_with_proof_facts,withdraw_settlement_output_with_proof_facts"
+    requiredEnv(env, "ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS")
   );
-  const withdrawalAmountBuckets = parseAmountBucketSet(env.ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS);
-  const allowDirectWithdrawalRelays = parseBool(env.ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS, false);
-  const allowedOriginRules = parseOriginRules(env.ZYLITH_PAYMASTER_ALLOWED_ORIGINS);
+  const allowedOrigins = parseOrigins(env.ZYLITH_PAYMASTER_ALLOWED_ORIGINS);
+  const internalApiToken =
+    env.ZYLITH_PAYMASTER_INTERNAL_TOKEN?.trim() ||
+    env.ZYLITH_CONTROL_PLANE_TOKEN?.trim() ||
+    "";
   const trustProxyHeaders = parseBool(env.ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS, false);
   const trustedProxyCidrs = parseCsv(
     env.ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS ?? env.ZYLITH_TRUSTED_PROXY_CIDRS
   );
 
   if (allowedContracts.size === 0) {
-    throw new Error(
-      "ZYLITH_PAYMASTER_ALLOWED_CONTRACTS or ZYLITH_PRIVACY_POOL_ADDRESS must be configured"
-    );
+    throw new Error("ZYLITH_PAYMASTER_ALLOWED_CONTRACTS must be configured");
   }
-  if (allowDirectWithdrawalRelays && withdrawalAmountBuckets.size === 0) {
-    throw new Error(
-      "ZYLITH_PAYMASTER_WITHDRAWAL_BUCKETS is required when ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS=true"
-    );
+  if (approvalSpenders.size === 0) {
+    throw new Error("ZYLITH_PAYMASTER_APPROVAL_SPENDERS must be configured");
   }
-  if (
-    allowDirectWithdrawalRelays &&
-    !parseBool(env.ZYLITH_PAYMASTER_ACK_DIRECT_WITHDRAWAL_SPONSORSHIP_RISK, false)
-  ) {
-    throw new Error(
-      "ZYLITH_PAYMASTER_ACK_DIRECT_WITHDRAWAL_SPONSORSHIP_RISK=true is required when ZYLITH_PAYMASTER_ALLOW_DIRECT_WITHDRAWALS=true"
-    );
+  if (allowedOrigins.size === 0) {
+    throw new Error("ZYLITH_PAYMASTER_ALLOWED_ORIGINS must contain at least one exact origin");
   }
   if (trustProxyHeaders && trustedProxyCidrs.length === 0) {
     throw new Error(
       "ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS or ZYLITH_TRUSTED_PROXY_CIDRS is required when ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS=true"
     );
+  }
+  if (!internalApiToken) {
+    throw new Error("ZYLITH_PAYMASTER_INTERNAL_TOKEN or ZYLITH_CONTROL_PLANE_TOKEN is required");
   }
 
   return {
@@ -80,10 +74,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     privateKey,
     privacySignerClassHash,
     allowedContracts,
+    approvalSpenders,
     allowedEntrypoints,
     proofRequiredEntrypoints,
-    withdrawalAmountBuckets,
-    allowDirectWithdrawalRelays,
     bindHost: env.ZYLITH_PAYMASTER_HOST ?? "127.0.0.1",
     port: parsePositiveInt(env.ZYLITH_PAYMASTER_PORT, DEFAULT_PORT, "ZYLITH_PAYMASTER_PORT"),
     maxBodyBytes: parsePositiveInt(
@@ -91,8 +84,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_MAX_BODY_BYTES,
       "ZYLITH_PAYMASTER_MAX_BODY_BYTES"
     ),
-    allowedOrigins: allowedOriginRules.exact,
-    allowedOriginPatterns: allowedOriginRules.patterns,
+    allowedOrigins,
     signerLimitPerMinute: parsePositiveInt(
       env.ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE,
       DEFAULT_SIGNER_LIMIT_PER_MINUTE,
@@ -100,16 +92,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     ),
     trustProxyHeaders,
     trustedProxyCidrs,
-    internalApiToken: env.ZYLITH_PAYMASTER_INTERNAL_TOKEN?.trim() ||
-      env.ZYLITH_CONTROL_PLANE_TOKEN?.trim() ||
-      null,
+    internalApiToken,
     submissionLogPath: env.ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH?.trim() || "state/submissions.json"
   };
-}
-
-function optionalFelt(value: string | undefined): string | null {
-  const trimmed = value?.trim();
-  return trimmed ? normalizeFelt(trimmed) : null;
 }
 
 export function normalizeFelt(value: string): string {
@@ -118,14 +103,18 @@ export function normalizeFelt(value: string): string {
     throw new Error("felt value cannot be empty");
   }
 
+  let parsed: bigint;
   if (/^0x[0-9a-fA-F]+$/.test(trimmed)) {
-    return `0x${BigInt(trimmed).toString(16)}`;
+    parsed = BigInt(trimmed);
+  } else if (/^[0-9]+$/.test(trimmed)) {
+    parsed = BigInt(trimmed);
+  } else {
+    throw new Error(`invalid felt value: ${value}`);
   }
-  if (/^[0-9]+$/.test(trimmed)) {
-    return `0x${BigInt(trimmed).toString(16)}`;
+  if (parsed >= STARKNET_FIELD_PRIME) {
+    throw new Error(`invalid felt value: ${value}`);
   }
-
-  throw new Error(`invalid felt value: ${value}`);
+  return `0x${parsed.toString(16)}`;
 }
 
 function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
@@ -136,14 +125,37 @@ function requiredEnv(env: NodeJS.ProcessEnv, key: string): string {
   return value;
 }
 
+function requiredServiceUrl(env: NodeJS.ProcessEnv, key: string): string {
+  const value = requiredEnv(env, key);
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${key} must be a valid http(s) URL`);
+  }
+  if (parsed.protocol === "https:") return value;
+  if (parsed.protocol === "http:" && isLocalServiceHost(parsed.hostname)) {
+    return value;
+  }
+  throw new Error(`${key} must use https outside local development`);
+}
+
 function parseFeltSet(value: string | undefined): Set<string> {
   return new Set(
     (value ?? "")
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean)
-      .map(normalizeFelt)
+      .map(normalizeNonZeroFelt)
   );
+}
+
+function normalizeNonZeroFelt(value: string): string {
+  const normalized = normalizeFelt(value);
+  if (normalized === "0x0") {
+    throw new Error("felt value cannot be zero");
+  }
+  return normalized;
 }
 
 function parseNameSet(value: string): Set<string> {
@@ -166,40 +178,29 @@ function parseOptionalNameSet(value: string): Set<string> {
   );
 }
 
-function parseAmountBucketSet(value: string | undefined): Set<string> {
-  return new Set(
-    (value ?? "")
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean)
-      .map((item) => {
-        if (/^0x[0-9a-fA-F]+$/.test(item)) {
-          return BigInt(item).toString();
-        }
-        if (/^[0-9]+$/.test(item)) {
-          return BigInt(item).toString();
-        }
-        throw new Error(`invalid withdrawal amount bucket: ${item}`);
-      })
-  );
-}
-
 function parseBool(value: string | undefined, defaultValue: boolean): boolean {
   if (value === undefined || value.trim() === "") return defaultValue;
   return ["1", "true", "TRUE", "yes", "YES"].includes(value.trim());
 }
 
-function parseOriginRules(value: string | undefined): { exact: Set<string>; patterns: RegExp[] } {
+function parseOrigins(value: string | undefined): Set<string> {
   const exact = new Set<string>();
-  const patterns: RegExp[] = [];
   for (const item of (value ?? "").split(",").map((entry) => entry.trim()).filter(Boolean)) {
     if (item.includes("*")) {
-      patterns.push(wildcardOriginPattern(item));
-    } else {
-      exact.add(item);
+      throw new Error("ZYLITH_PAYMASTER_ALLOWED_ORIGINS must contain exact origins only");
     }
+    exact.add(item);
   }
-  return { exact, patterns };
+  return exact;
+}
+
+function isLocalServiceHost(hostname: string): boolean {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname === "[::1]"
+  );
 }
 
 function parseCsv(value: string | undefined): string[] {
@@ -207,14 +208,6 @@ function parseCsv(value: string | undefined): string[] {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
-}
-
-function wildcardOriginPattern(value: string): RegExp {
-  const escaped = value
-    .split("*")
-    .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, "\\$&"))
-    .join("[^/]*");
-  return new RegExp(`^${escaped}$`);
 }
 
 function parsePositiveInt(value: string | undefined, defaultValue: number, key: string): number {

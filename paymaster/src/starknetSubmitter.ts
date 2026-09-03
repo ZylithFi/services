@@ -86,6 +86,14 @@ const defaultRuntime: StarknetRuntime = {
 const PAYMASTER_SUBMISSION_RETRY_ATTEMPTS = 3;
 const PAYMASTER_NONCE_RETRY_DELAY_MS = 1_500;
 const PAYMASTER_DEPLOY_RETRY_ATTEMPTS = 5;
+const PAYMASTER_RPC_TIMEOUT_MS = 30_000;
+const PAYMASTER_RPC_MAX_RESPONSE_BYTES = 1_000_000;
+const DEFAULT_PAYMASTER_L1_GAS_FLOOR = 0n;
+const DEFAULT_PAYMASTER_L1_DATA_GAS_FLOOR = 8_000n;
+const DEFAULT_PAYMASTER_L2_GAS_FLOOR = 180_000_000n;
+const PAYMASTER_GAS_PRICE_MULTIPLIER = 2n;
+const STARKNET_STRK_TOKEN_ADDRESS =
+  "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
 export type SubmitterDeps = {
   runtime?: StarknetRuntime;
@@ -190,9 +198,6 @@ export async function relayPrivacyProofSignerCall(
   config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "privacySignerClassHash">,
   deps: SubmitterDeps = {}
 ): Promise<ExecuteOutsideResponse> {
-  if (!config.privacySignerClassHash) {
-    throw new Error("privacy proof signer relay is not configured");
-  }
   const runtime = deps.runtime ?? defaultRuntime;
   const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
   const deployed = await deployedClassHash(provider, request.account_address);
@@ -231,8 +236,10 @@ export async function submitProofBearingOutsideExecution(
   config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey">,
   deps: SubmitterDeps = {}
 ): Promise<ExecuteOutsideResponse> {
+  if (!request.proof || !request.proof_facts || request.proof_facts.length === 0) {
+    throw new Error("proof and proof_facts are required for paymaster execution");
+  }
   const runtime = deps.runtime ?? defaultRuntime;
-  const fetchImpl = deps.fetchImpl ?? fetch;
   const calls = request.outside_transaction
     ? (runtime.outsideExecution.buildExecuteFromOutsideCall(
         request.outside_transaction as OutsideTransaction
@@ -347,7 +354,7 @@ async function submitPaymasterCallsOnce(
     });
   }
 
-  const response = await fetchImpl(config.rpcUrl, {
+  const rpc = await rpcRequestJson(fetchImpl, config.rpcUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -362,13 +369,8 @@ async function submitPaymasterCallsOnce(
     })
   });
 
-  if (!response.ok) {
-    throw new Error(`Starknet RPC returned HTTP ${response.status}`);
-  }
-
-  const rpc = (await response.json()) as unknown as RpcResponse;
   if ("error" in rpc && rpc.error) {
-    throw new Error(`Starknet RPC rejected proof-bearing invoke: ${JSON.stringify(rpc.error)}`);
+    throw new Error(`Starknet RPC rejected proof-bearing invoke: ${rpcErrorSummary(rpc.error)}`);
   }
 
   if (!("result" in rpc)) {
@@ -450,7 +452,7 @@ async function estimateProofBearingInvokeResourceBounds(input: {
     });
   }
 
-  const response = await input.fetchImpl(input.config.rpcUrl, {
+  const rpc = await rpcRequestJson(input.fetchImpl, input.config.rpcUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json"
@@ -467,13 +469,15 @@ async function estimateProofBearingInvokeResourceBounds(input: {
     })
   });
 
-  if (!response.ok) {
-    throw new Error(`Starknet RPC returned HTTP ${response.status}`);
-  }
-
-  const rpc = (await response.json()) as RpcResponse;
   if ("error" in rpc && rpc.error) {
-    throw new Error(`Starknet RPC rejected proof-bearing fee estimate: ${JSON.stringify(rpc.error)}`);
+    if (
+      input.proof &&
+      input.proofFacts &&
+      (await shouldFallbackProofBearingFeeEstimate(rpc.error, input))
+    ) {
+      return fallbackProofBearingResourceBounds(input.fetchImpl, input.config.rpcUrl);
+    }
+    throw new Error(`Starknet RPC rejected proof-bearing fee estimate: ${rpcErrorSummary(rpc.error)}`);
   }
 
   const estimateResult = "result" in rpc ? (rpc.result as unknown) : undefined;
@@ -488,11 +492,477 @@ async function estimateProofBearingInvokeResourceBounds(input: {
   try {
     return resourceBoundsFromRpc(resourceBounds);
   } catch (error) {
-    const snippet = JSON.stringify(resourceBounds).slice(0, 500);
     throw new Error(
-      `failed to parse proof-bearing fee estimate resource bounds: ${error instanceof Error ? error.message : String(error)}; response=${snippet}`
+      `failed to parse proof-bearing fee estimate resource bounds: ${sanitizeErrorText(error instanceof Error ? error.message : String(error))}`
     );
   }
+}
+
+async function fallbackProofBearingResourceBounds(
+  fetchImpl: typeof fetch,
+  rpcUrl: string
+): Promise<ResourceBoundsLike> {
+  const rpc = await rpcRequestJson(fetchImpl, rpcUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "starknet_getBlockWithTxHashes",
+      params: {
+        block_id: "latest"
+      }
+    })
+  });
+
+  if ("error" in rpc && rpc.error) {
+    throw new Error(`Starknet RPC rejected fallback gas-price query: ${rpcErrorSummary(rpc.error)}`);
+  }
+  if (!("result" in rpc)) {
+    throw new Error("Starknet RPC fallback gas-price response did not include result");
+  }
+
+  return {
+    l1_gas: {
+      max_amount: DEFAULT_PAYMASTER_L1_GAS_FLOOR,
+      max_price_per_unit: gasPriceBound(rpc.result, "l1_gas_price")
+    },
+    l2_gas: {
+      max_amount: DEFAULT_PAYMASTER_L2_GAS_FLOOR,
+      max_price_per_unit: gasPriceBound(rpc.result, "l2_gas_price")
+    },
+    l1_data_gas: {
+      max_amount: DEFAULT_PAYMASTER_L1_DATA_GAS_FLOOR,
+      max_price_per_unit: gasPriceBound(rpc.result, "l1_data_gas_price")
+    }
+  };
+}
+
+async function shouldFallbackProofBearingFeeEstimate(
+  error: unknown,
+  input: {
+    calls: Call[];
+    config: Pick<PaymasterConfig, "rpcUrl" | "accountAddress">;
+    fetchImpl: typeof fetch;
+  }
+): Promise<boolean> {
+  if (!error || typeof error !== "object") return false;
+  const record = error as Record<string, unknown>;
+  const code = String(record.code ?? "");
+  const message = String(record.message ?? "");
+  const data = record.data;
+  if (hasMeaningfulRpcErrorData(data)) {
+    return (
+      isInsufficientErc20AllowanceEstimateError(data) &&
+      (await transferFromActionsAreFunded(input.fetchImpl, input.config.rpcUrl, input.calls)) &&
+      (await poolApplyActionsFeeIsFunded(
+        input.fetchImpl,
+        input.config.rpcUrl,
+        input.calls,
+        input.config.accountAddress
+      ))
+    );
+  }
+  if (code === "41" && /transaction execution error/i.test(message)) return true;
+  return /PROOF_FACTS_MISSING|EMPTY_PROOF_FACTS/i.test(message);
+}
+
+function isInsufficientErc20AllowanceEstimateError(data: unknown): boolean {
+  return /insufficient erc20 allowance/i.test(JSON.stringify(data));
+}
+
+type TransferFromAction = {
+  from: string;
+  token: string;
+  amount: bigint;
+  spender: string;
+};
+
+async function transferFromActionsAreFunded(
+  fetchImpl: typeof fetch,
+  rpcUrl: string,
+  calls: Call[]
+): Promise<boolean> {
+  const actions = extractTransferFromActions(calls);
+  if (!actions || actions.length === 0) {
+    console.error(JSON.stringify({
+      event: "paymaster_transfer_preflight_failed",
+      reason: actions ? "no_transfer_from_actions" : "unparsed_apply_actions",
+      call_count: calls.length,
+      entrypoint: calls[0]?.entrypoint ?? null,
+      calldata_count: Array.isArray(calls[0]?.calldata) ? calls[0].calldata.length : null
+    }));
+    return false;
+  }
+  const totals = new Map<string, TransferFromAction>();
+  for (const action of actions) {
+    const key = `${toRpcFelt(action.from)}:${toRpcFelt(action.token)}:${toRpcFelt(action.spender)}`;
+    const existing = totals.get(key);
+    if (existing) {
+      existing.amount += action.amount;
+    } else {
+      totals.set(key, { ...action });
+    }
+  }
+  for (const action of totals.values()) {
+    const [balance, allowance] = await Promise.all([
+      starknetCallU256(fetchImpl, rpcUrl, action.token, "balance_of", [
+        action.from
+      ]),
+      starknetCallU256(fetchImpl, rpcUrl, action.token, "allowance", [
+        action.from,
+        action.spender
+      ])
+    ]);
+    if (balance < action.amount || allowance < action.amount) {
+      console.error(JSON.stringify({
+        event: "paymaster_transfer_preflight_failed",
+        reason: balance < action.amount ? "insufficient_balance" : "insufficient_allowance",
+        from: shortFelt(action.from),
+        token: shortFelt(action.token),
+        spender: shortFelt(action.spender),
+        amount: action.amount.toString(),
+        balance: balance.toString(),
+        allowance: allowance.toString()
+      }));
+      return false;
+    }
+  }
+  return true;
+}
+
+async function poolApplyActionsFeeIsFunded(
+  fetchImpl: typeof fetch,
+  rpcUrl: string,
+  calls: Call[],
+  paymasterAddress: string
+): Promise<boolean> {
+  if (calls.length !== 1 || calls[0]?.entrypoint !== "apply_actions") return false;
+  const poolAddress = calls[0].contractAddress;
+  const feeAmount = await starknetCallFelt(fetchImpl, rpcUrl, poolAddress, "get_fee_amount", []);
+  if (feeAmount === 0n) return true;
+  const [balance, allowance] = await Promise.all([
+    starknetCallU256(fetchImpl, rpcUrl, STARKNET_STRK_TOKEN_ADDRESS, "balance_of", [
+      paymasterAddress
+    ]),
+    starknetCallU256(fetchImpl, rpcUrl, STARKNET_STRK_TOKEN_ADDRESS, "allowance", [
+      paymasterAddress,
+      poolAddress
+    ])
+  ]);
+  if (balance < feeAmount || allowance < feeAmount) {
+    console.error(JSON.stringify({
+      event: "paymaster_transfer_preflight_failed",
+      reason: balance < feeAmount ? "insufficient_pool_fee_balance" : "insufficient_pool_fee_allowance",
+      owner: shortFelt(paymasterAddress),
+      token: shortFelt(STARKNET_STRK_TOKEN_ADDRESS),
+      spender: shortFelt(poolAddress),
+      amount: feeAmount.toString(),
+      balance: balance.toString(),
+      allowance: allowance.toString()
+    }));
+    return false;
+  }
+  return true;
+}
+
+function shortFelt(value: string): string {
+  const felt = toRpcFelt(value);
+  return felt.length <= 18 ? felt : `${felt.slice(0, 10)}...${felt.slice(-6)}`;
+}
+
+function extractTransferFromActions(calls: Call[]): TransferFromAction[] | null {
+  if (calls.length !== 1) return null;
+  const call = calls[0];
+  if (!call) return null;
+  if (call.entrypoint !== "apply_actions") return null;
+  if (!Array.isArray(call.calldata)) return null;
+  const calldata = call.calldata.map((value: unknown) => toRpcFelt(value));
+  if (calldata.length === 0) return null;
+  const count = Number(toBigIntFelt(calldata[0]));
+  if (!Number.isSafeInteger(count) || count < 0) return null;
+  const actions: TransferFromAction[] = [];
+  let offset = 1;
+  for (let index = 0; index < count; index += 1) {
+    if (offset >= calldata.length) return null;
+    const variant = Number(toBigIntFelt(calldata[offset]));
+    if (!Number.isSafeInteger(variant) || variant < 0) return null;
+    if (variant === 0) {
+      if (offset + 2 >= calldata.length) return null;
+      const spanLength = Number(toBigIntFelt(calldata[offset + 2]));
+      if (!Number.isSafeInteger(spanLength) || spanLength < 0) return null;
+      offset += 3 + spanLength;
+      continue;
+    }
+    if (variant === 1 || variant === 6) {
+      offset += variant === 1 ? 5 : 4;
+      continue;
+    }
+    if (variant === 2 || variant === 3) {
+      if (offset + 3 >= calldata.length) return null;
+      if (variant === 2) {
+        const from = calldata[offset + 1];
+        const token = calldata[offset + 2];
+        const amount = calldata[offset + 3];
+        if (!from || !token || !amount) return null;
+        actions.push({
+          from,
+          token,
+          amount: toBigIntFelt(amount),
+          spender: call.contractAddress
+        });
+      }
+      offset += 4;
+      continue;
+    }
+    if (variant === 4) {
+      offset += 6;
+      continue;
+    }
+    if (variant === 5 || variant === 7) {
+      offset += variant === 5 ? 7 : 6;
+      continue;
+    }
+    if (variant === 8 || variant === 9) {
+      offset += variant === 8 ? 3 : 2;
+      continue;
+    }
+    if (variant === 10 || variant === 11) {
+      if (offset + 2 >= calldata.length) return null;
+      const spanLength = Number(toBigIntFelt(calldata[offset + 2]));
+      if (!Number.isSafeInteger(spanLength) || spanLength < 0) return null;
+      offset += 3 + spanLength;
+      continue;
+    }
+    return null;
+  }
+  return hasValidScreeningSuffix(calldata, offset) ? actions : null;
+}
+
+function hasValidScreeningSuffix(calldata: string[], offset: number): boolean {
+  if (offset === calldata.length) return true;
+  if (offset >= calldata.length) return false;
+  const variant = Number(toBigIntFelt(calldata[offset]));
+  if (!Number.isSafeInteger(variant) || variant < 0) return false;
+  if (variant === 1) return offset + 1 === calldata.length;
+  if (variant === 0) return offset + 4 === calldata.length;
+  return false;
+}
+
+async function starknetCallU256(
+  fetchImpl: typeof fetch,
+  rpcUrl: string,
+  contractAddress: string,
+  entrypoint: "allowance" | "balance_of",
+  calldata: string[]
+): Promise<bigint> {
+  const rpc = await rpcRequestJson(fetchImpl, rpcUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "starknet_call",
+      params: {
+        request: {
+          contract_address: toRpcFelt(contractAddress),
+          entry_point_selector: toRpcFelt(selector.getSelectorFromName(entrypoint)),
+          calldata: calldata.map((value) => toRpcFelt(value))
+        },
+        block_id: "latest"
+      }
+    })
+  });
+  if ("error" in rpc && rpc.error) {
+    throw new Error(`Starknet RPC rejected ${entrypoint}: ${rpcErrorSummary(rpc.error)}`);
+  }
+  const result = "result" in rpc ? rpc.result : null;
+  if (!Array.isArray(result) || result.length < 2) {
+    throw new Error(`Starknet RPC ${entrypoint} response did not include u256 result`);
+  }
+  return toBigIntFelt(result[0]) + (toBigIntFelt(result[1]) << 128n);
+}
+
+async function starknetCallFelt(
+  fetchImpl: typeof fetch,
+  rpcUrl: string,
+  contractAddress: string,
+  entrypoint: string,
+  calldata: string[]
+): Promise<bigint> {
+  const rpc = await rpcRequestJson(fetchImpl, rpcUrl, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "starknet_call",
+      params: {
+        request: {
+          contract_address: toRpcFelt(contractAddress),
+          entry_point_selector: toRpcFelt(selector.getSelectorFromName(entrypoint)),
+          calldata: calldata.map((value) => toRpcFelt(value))
+        },
+        block_id: "latest"
+      }
+    })
+  });
+  if ("error" in rpc && rpc.error) {
+    throw new Error(`Starknet RPC rejected ${entrypoint}: ${rpcErrorSummary(rpc.error)}`);
+  }
+  const result = "result" in rpc ? rpc.result : null;
+  if (!Array.isArray(result) || result.length < 1) {
+    throw new Error(`Starknet RPC ${entrypoint} response did not include felt result`);
+  }
+  return toBigIntFelt(result[0]);
+}
+
+function hasMeaningfulRpcErrorData(data: unknown): boolean {
+  if (data === null || data === undefined) return false;
+  if (typeof data === "string") return data.trim().length > 0;
+  if (Array.isArray(data)) return data.length > 0;
+  if (typeof data === "object") return Object.keys(data).length > 0;
+  return true;
+}
+
+function rpcErrorSummary(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return sanitizeErrorText(String(error));
+  }
+  const record = error as Record<string, unknown>;
+  const code = record.code;
+  const message = record.message;
+  const data = record.data;
+  const parts: string[] = [];
+  if (typeof code === "number" || typeof code === "string") {
+    parts.push(`code=${sanitizeErrorText(String(code))}`);
+  }
+  if (typeof message === "string" && message.trim()) {
+    parts.push(`message=${sanitizeErrorText(message)}`);
+  }
+  if (typeof data === "string" && data.trim()) {
+    parts.push(`data=${sanitizeErrorText(data)}`);
+  } else if (hasMeaningfulRpcErrorData(data)) {
+    parts.push(`data=${sanitizeErrorText(JSON.stringify(data))}`);
+  }
+  return parts.length > 0 ? parts.join(" ") : "redacted_rpc_error";
+}
+
+function sanitizeErrorText(value: string): string {
+  return value
+    .replace(/0x[0-9a-fA-F]{33,}/g, "<felt>")
+    .replace(/\b[0-9]{32,}\b/g, "<number>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+}
+
+function gasPriceBound(block: unknown, field: string): bigint {
+  if (!block || typeof block !== "object") {
+    throw new Error("Starknet RPC fallback gas-price result is invalid");
+  }
+  const raw = (block as Record<string, unknown>)[field];
+  if (!raw || typeof raw !== "object") {
+    throw new Error(`Starknet RPC fallback gas-price result is missing ${field}`);
+  }
+  const record = raw as Record<string, unknown>;
+  const price = toBigIntFelt(record.price_in_fri ?? record.priceInFri);
+  return price > 0n ? price * PAYMASTER_GAS_PRICE_MULTIPLIER : 1n;
+}
+
+async function rpcRequestJson(
+  fetchImpl: typeof fetch,
+  url: string,
+  init: RequestInit
+): Promise<RpcResponse> {
+  const controller = new AbortController();
+  let rejectTimeout: ((error: Error) => void) | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject;
+  });
+  const timeout = setTimeout(() => {
+    const error = new Error("Starknet RPC request timed out");
+    controller.abort(error);
+    rejectTimeout?.(error);
+  }, PAYMASTER_RPC_TIMEOUT_MS);
+  try {
+    const response = await Promise.race([
+      fetchImpl(url, { ...init, signal: controller.signal }),
+      timeoutPromise
+    ]);
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error(`Starknet RPC returned HTTP ${response.status}`);
+    }
+    const contentLength = response.headers.get("content-length");
+    if (
+      contentLength &&
+      Number.isSafeInteger(Number(contentLength)) &&
+      Number(contentLength) > PAYMASTER_RPC_MAX_RESPONSE_BYTES
+    ) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new Error("Starknet RPC response body is too large");
+    }
+    if (!response.body) {
+      throw new Error("Starknet RPC response body is empty");
+    }
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const next = await Promise.race([reader.read(), timeoutPromise]);
+        if (next.done) break;
+        totalBytes += next.value.byteLength;
+        if (totalBytes > PAYMASTER_RPC_MAX_RESPONSE_BYTES) {
+          throw new Error("Starknet RPC response body is too large");
+        }
+        chunks.push(next.value);
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      throw new Error("Starknet RPC returned invalid JSON");
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Starknet RPC returned an invalid response object");
+    }
+    return parsed as RpcResponse;
+  } catch (error) {
+    if (isAbortLikeError(error)) {
+      throw new Error("Starknet RPC request timed out");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  const message =
+    error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return (
+    (error instanceof Error && /abort|timed out|timeout/i.test(`${error.name} ${message}`)) ||
+    /signal is aborted|aborted without reason|operation was aborted/i.test(message)
+  );
 }
 
 function signatureToHexArray(value: unknown): string[] {

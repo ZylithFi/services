@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -69,6 +69,107 @@ describe("SubmissionStore", () => {
 
     expect(result.transaction_hash).toBe("0xfirst");
   });
+
+  it("waits for one shared initial load before accepting concurrent requests", async () => {
+    const path = await tempPath();
+    await new SubmissionStore(path).runOnce(request, async () => ({
+      transaction_hash: "0xfirst"
+    }));
+    const restarted = new SubmissionStore(path);
+    let submits = 0;
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        restarted.runOnce(request, async () => {
+          submits += 1;
+          return { transaction_hash: "0xduplicate" };
+        })
+      )
+    );
+
+    expect(submits).toBe(0);
+    expect(results.every((result) => result.transaction_hash === "0xfirst")).toBe(true);
+  });
+
+  it("can retry loading after a malformed log is repaired", async () => {
+    const path = await tempPath();
+    const store = new SubmissionStore(path);
+    await writeFile(path, "{ invalid json");
+    await expect(store.get(request)).rejects.toThrow();
+    await writeFile(path, JSON.stringify([submissionRecord("0xfirst")]));
+
+    const result = await store.runOnce(request, async () => ({
+      transaction_hash: "0xduplicate"
+    }));
+
+    expect(result.transaction_hash).toBe("0xfirst");
+  });
+
+  it("rejects replay log records with unsupported fields", async () => {
+    const path = await tempPath();
+    await writeFile(path, JSON.stringify([{ ...submissionRecord("0xfirst"), unexpected_extra: true }]));
+
+    await expect(new SubmissionStore(path).get(request)).rejects.toThrow(
+      "unsupported field unexpected_extra"
+    );
+  });
+
+  it("prunes expired replay records when loading after restart", async () => {
+    const path = await tempPath();
+    await writeFile(path, JSON.stringify([submissionRecord("0xexpired", 1)]));
+    const store = new SubmissionStore(path);
+    let submits = 0;
+
+    const result = await store.runOnce(request, async () => {
+      submits += 1;
+      return { transaction_hash: "0xfresh" };
+    });
+
+    expect(submits).toBe(1);
+    expect(result.transaction_hash).toBe("0xfresh");
+  });
+
+  it("rejects an oversized replay log before reading it into memory", async () => {
+    const path = await tempPath();
+    const handle = await open(path, "w");
+    try {
+      await handle.truncate(64 * 1024 * 1024 + 1);
+    } finally {
+      await handle.close();
+    }
+
+    await expect(new SubmissionStore(path).get(request)).rejects.toThrow(
+      "submission log is too large"
+    );
+  });
+
+  it("serializes concurrent snapshots so restart retains every submission", async () => {
+    const path = await tempPath();
+    const store = new SubmissionStore(path);
+    const firstRequest = requestWithNonce("0xa");
+    const secondRequest = requestWithNonce("0xb");
+    await Promise.all([
+      store.runOnce(firstRequest, async () => ({ transaction_hash: "0xfirst" })),
+      store.runOnce(secondRequest, async () => ({ transaction_hash: "0xsecond" }))
+    ]);
+
+    const restarted = new SubmissionStore(path);
+    let submits = 0;
+    const [first, second] = await Promise.all([
+      restarted.runOnce(firstRequest, async () => {
+        submits += 1;
+        return { transaction_hash: "0xduplicate-first" };
+      }),
+      restarted.runOnce(secondRequest, async () => {
+        submits += 1;
+        return { transaction_hash: "0xduplicate-second" };
+      })
+    ]);
+
+    expect(submits).toBe(0);
+    expect(first.transaction_hash).toBe("0xfirst");
+    expect(second.transaction_hash).toBe("0xsecond");
+  });
 });
 
 async function tempPath(): Promise<string> {
@@ -101,3 +202,26 @@ const request: ExecuteOutsideRequest = {
   proof: "proof-bytes",
   proof_facts: ["0x1"]
 };
+
+function requestWithNonce(nonce: string): ExecuteOutsideRequest {
+  return {
+    ...request,
+    outside_transaction: {
+      ...request.outside_transaction!,
+      outsideExecution: {
+        ...request.outside_transaction!.outsideExecution,
+        nonce
+      }
+    }
+  };
+}
+
+function submissionRecord(transactionHash: string, submittedAtUnixMs = Date.now()) {
+  return {
+    key: "0x777:0x9",
+    signer_address: "0x777",
+    outside_nonce: "0x9",
+    transaction_hash: transactionHash,
+    submitted_at_unix_ms: submittedAtUnixMs
+  };
+}

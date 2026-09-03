@@ -9,6 +9,7 @@ authors.workspace = true
 axum = { version = "0.8", features = ["macros"] }
 ipnet = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

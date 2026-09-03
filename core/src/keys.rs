@@ -1,4 +1,3 @@
-use bip39::{Language, Mnemonic};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -50,33 +49,17 @@ impl RecoverySeed {
         hex::encode(self.0)
     }
 
-    pub fn to_mnemonic(&self) -> Result<String, ProtocolError> {
-        Mnemonic::from_entropy_in(Language::English, &self.0)
-            .map(|mnemonic| mnemonic.to_string())
-            .map_err(|error| ProtocolError::InvalidRecoveryPhrase(error.to_string()))
-    }
-
     pub fn from_hex(encoded: &str) -> Result<Self, ProtocolError> {
-        let decoded = hex::decode(encoded)?;
+        let mut decoded = hex::decode(encoded)?;
         if decoded.len() != 32 {
-            return Err(ProtocolError::InvalidSeedLength(decoded.len()));
+            let len = decoded.len();
+            decoded.zeroize();
+            return Err(ProtocolError::InvalidSeedLength(len));
         }
 
         let mut seed = [0_u8; 32];
         seed.copy_from_slice(&decoded);
-        Ok(Self(seed))
-    }
-
-    pub fn from_mnemonic(phrase: &str) -> Result<Self, ProtocolError> {
-        let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
-            .map_err(|error| ProtocolError::InvalidRecoveryPhrase(error.to_string()))?;
-        let entropy = mnemonic.to_entropy();
-        if entropy.len() != 32 {
-            return Err(ProtocolError::InvalidSeedLength(entropy.len()));
-        }
-
-        let mut seed = [0_u8; 32];
-        seed.copy_from_slice(&entropy);
+        decoded.zeroize();
         Ok(Self(seed))
     }
 }
@@ -112,19 +95,24 @@ mod tests {
     }
 
     #[test]
-    fn mnemonic_roundtrip_is_stable_and_uses_24_words() {
-        let seed = RecoverySeed([11_u8; 32]);
-        let phrase = seed.to_mnemonic().expect("mnemonic");
-        assert_eq!(phrase.split_whitespace().count(), 24);
-        let decoded = RecoverySeed::from_mnemonic(&phrase).expect("seed from phrase");
-        assert_eq!(seed, decoded);
-    }
-
-    #[test]
     fn key_derivation_is_deterministic() {
         let seed = RecoverySeed([7_u8; 32]);
         let keys_a = derive_user_keys(&seed);
         let keys_b = derive_user_keys(&seed);
         assert_eq!(keys_a, keys_b);
+    }
+
+    #[test]
+    fn debug_redacts_seed_and_user_keys() {
+        let seed = RecoverySeed([7_u8; 32]);
+        let keys = derive_user_keys(&seed);
+        let seed_debug = format!("{seed:?}");
+        let keys_debug = format!("{keys:?}");
+
+        assert!(seed_debug.contains("<redacted>"));
+        assert!(!seed_debug.contains("7, 7"));
+        assert!(keys_debug.contains("<redacted>"));
+        assert!(!keys_debug.contains(&hex::encode(keys.spend_auth_key)));
+        assert!(!keys_debug.contains(&hex::encode(keys.withdraw_auth_key)));
     }
 }

@@ -23,7 +23,6 @@ try {
 
 const samples = parseSamples(body);
 const failures = [];
-const warnings = [];
 
 if (samples.length < expectedSamples) {
   failures.push(`expected at least ${expectedSamples} samples, found ${samples.length}`);
@@ -50,7 +49,7 @@ for (const sample of samples) {
   if (sample.health?.strict_mode !== true) failures.push(`sample ${sample.index} strict mode is not enabled`);
   if (sample.health?.worker_enabled !== true) failures.push(`sample ${sample.index} worker is not enabled`);
   if (sample.health?.max_package_slots < 86_400) {
-    failures.push(`sample ${sample.index} max package slots below 90d window: ${sample.health?.max_package_slots}`);
+    failures.push(`sample ${sample.index} max package slots below 20d at 20s window: ${sample.health?.max_package_slots}`);
   }
   if (sample.ready?.status !== "ready") failures.push(`sample ${sample.index} readiness status is not ready`);
   if (sample.ready?.store_ok !== true) failures.push(`sample ${sample.index} durable store is not ok`);
@@ -60,22 +59,13 @@ for (const sample of samples) {
 
 if (samples.length > 0) {
   const last = samples[samples.length - 1];
-  if (last.missedSlots > 0) warnings.push(`latest missed slots is ${last.missedSlots}; accepted only if historical and non-increasing`);
+  if (last.missedSlots > 0) failures.push(`latest missed slots is ${last.missedSlots}`);
 }
 
 if (failures.length > 0) {
   console.error("relay soak audit failed");
   for (const failure of failures) console.error(`- ${failure}`);
-  if (warnings.length > 0) {
-    console.error("warnings");
-    for (const warning of warnings) console.error(`- ${warning}`);
-  }
   process.exit(1);
-}
-
-if (warnings.length > 0) {
-  console.error("relay soak audit warnings");
-  for (const warning of warnings) console.error(`- ${warning}`);
 }
 
 const first = samples[0];

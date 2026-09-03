@@ -1,9 +1,9 @@
 import { AddressInfo } from "node:net";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PaymasterConfig } from "./config.js";
-import { createPaymasterServer } from "./server.js";
+import { FixedWindowRateLimiter, SubmissionQueues, createPaymasterServer } from "./server.js";
 import type { StarknetRuntime } from "./starknetSubmitter.js";
 import type { ExecuteOutsideRequest } from "./types.js";
 
@@ -86,6 +86,46 @@ describe("paymaster server", () => {
     expect(body).not.toContain("0x777");
   });
 
+  it("redacts private calldata and proof material from server error logs", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const privateFelt = `0x${"a".repeat(64)}`;
+    const server = createPaymasterServer(config(), {
+      fetchImpl: fakeRpcFetch(),
+      runtime: fakeRuntime({
+        buildInvocationError: new Error(
+          `rpc failed {"calldata":["${privateFelt}"],"signature":["${privateFelt}"],"proof":"proof-bytes","proof_facts":["${privateFelt}"]}`
+        )
+      })
+    });
+    servers.push(server);
+    const url = await listen(server);
+
+    try {
+      const response = await postRequest(url, request);
+
+      expect(response.status).toBe(400);
+      const responseBody = await response.json() as { error?: string };
+      const logged = consoleError.mock.calls.map((call) => String(call[0])).join("\n");
+      const entry = JSON.parse(String(consoleError.mock.calls[0]?.[0] ?? "{}")) as {
+        error?: string;
+      };
+      expect(entry.error).toContain('"calldata":[...]');
+      expect(entry.error).toContain('"signature":[...]');
+      expect(entry.error).toContain('"proof":"<redacted>"');
+      expect(entry.error).toContain('"proof_facts":[...]');
+      expect(responseBody.error).toContain('"calldata":[...]');
+      expect(responseBody.error).toContain('"signature":[...]');
+      expect(responseBody.error).toContain('"proof":"<redacted>"');
+      expect(responseBody.error).toContain('"proof_facts":[...]');
+      expect(logged).not.toContain(privateFelt);
+      expect(logged).not.toContain("proof-bytes");
+      expect(JSON.stringify(responseBody)).not.toContain(privateFelt);
+      expect(JSON.stringify(responseBody)).not.toContain("proof-bytes");
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it("rejects disallowed origins before paying for work", async () => {
     const server = createPaymasterServer(config());
     servers.push(server);
@@ -104,33 +144,33 @@ describe("paymaster server", () => {
     expect(response.headers.get("access-control-allow-origin")).toBeNull();
   });
 
-  it("allows configured wildcard preview origins", async () => {
-    const server = createPaymasterServer(
-      {
-        ...config(),
-        allowedOriginPatterns: [/^https:\/\/[a-z0-9-]+\.vercel\.app$/]
-      },
-      {
-        fetchImpl: fakeRpcFetch(),
-        runtime: fakeRuntime()
-      }
-    );
+  it("rejects non-JSON and oversized request bodies before validation", async () => {
+    const server = createPaymasterServer({
+      ...config(),
+      maxBodyBytes: 32
+    });
     servers.push(server);
     const url = await listen(server);
 
-    const response = await fetch(`${url}/execute-outside`, {
+    const wrongType = await fetch(`${url}/execute-outside`, {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain",
+        origin: "https://app.example"
+      },
+      body: "{}"
+    });
+    expect(wrongType.status).toBe(415);
+
+    const oversized = await fetch(`${url}/execute-outside`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        origin: "https://zylith-git-main-tanctl.vercel.app"
+        origin: "https://app.example"
       },
-      body: JSON.stringify(request)
+      body: JSON.stringify({ padding: "x".repeat(64) })
     });
-
-    expect(response.status).toBe(200);
-    expect(response.headers.get("access-control-allow-origin")).toBe(
-      "https://zylith-git-main-tanctl.vercel.app"
-    );
+    expect(oversized.status).toBe(413);
   });
 
   it("serializes submissions through the paymaster account", async () => {
@@ -235,6 +275,74 @@ describe("paymaster server", () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
   });
 
+  it("uses valid forwarded client IPs only from trusted proxies", async () => {
+    const server = createPaymasterServer(
+      {
+        ...config(),
+        signerLimitPerMinute: 1,
+        trustProxyHeaders: true,
+        trustedProxyCidrs: ["127.0.0.1/32"]
+      },
+      {
+        fetchImpl: fakeRpcFetch(),
+        runtime: fakeRuntime()
+      }
+    );
+    servers.push(server);
+    const url = await listen(server);
+
+    const responses: Response[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      responses.push(
+        await fetch(`${url}/execute-outside`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "https://app.example",
+            "x-forwarded-for": `203.0.113.${index + 1}`
+          },
+          body: JSON.stringify(requestWithSigner(index))
+        })
+      );
+    }
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200]);
+  });
+
+  it("ignores malformed forwarded IP headers even from trusted proxies", async () => {
+    const server = createPaymasterServer(
+      {
+        ...config(),
+        signerLimitPerMinute: 1,
+        trustProxyHeaders: true,
+        trustedProxyCidrs: ["127.0.0.1/32"]
+      },
+      {
+        fetchImpl: fakeRpcFetch(),
+        runtime: fakeRuntime()
+      }
+    );
+    servers.push(server);
+    const url = await listen(server);
+
+    const responses: Response[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      responses.push(
+        await fetch(`${url}/execute-outside`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            origin: "https://app.example",
+            "x-forwarded-for": `not-an-ip-${index}`
+          },
+          body: JSON.stringify(requestWithSigner(index))
+        })
+      );
+    }
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
+  });
+
   it("relays privacy signer approvals without process-local ensure state", async () => {
     const server = createPaymasterServer(config(), {
       fetchImpl: fakeRpcFetch(),
@@ -295,6 +403,71 @@ describe("paymaster server", () => {
   });
 });
 
+describe("paymaster in-memory bounds", () => {
+  it("removes expired rate-limit subjects during periodic sweeps", () => {
+    const limiter = new FixedWindowRateLimiter(10);
+    for (let index = 0; index < 100; index += 1) {
+      limiter.check(`signer:${index}`, 1);
+    }
+    expect(limiter.size).toBe(100);
+
+    limiter.check("signer:fresh", 120_001);
+
+    expect(limiter.size).toBe(1);
+  });
+
+  it("removes completed submission queues without breaking serialization", async () => {
+    const queues = new SubmissionQueues();
+    const order: number[] = [];
+    const first = queues.enqueue("paymaster", async () => {
+      order.push(1);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      order.push(2);
+    });
+    const second = queues.enqueue("paymaster", async () => {
+      order.push(3);
+    });
+
+    await Promise.all([first, second]);
+    await Promise.resolve();
+
+    expect(order).toEqual([1, 2, 3]);
+    expect(queues.size).toBe(0);
+    expect(queues.pending).toBe(0);
+  });
+
+  it("rejects work when the global submission backlog is full", async () => {
+    const queues = new SubmissionQueues(1);
+    let release: () => void = () => {
+      throw new Error("queue task did not start");
+    };
+    let markStarted: () => void = () => {
+      throw new Error("queue task start barrier was not initialized");
+    };
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const first = queues.enqueue(
+      "paymaster",
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+          markStarted();
+        })
+    );
+    await started;
+
+    expect(queues.pending).toBe(1);
+    expect(() => queues.enqueue("paymaster", async () => undefined)).toThrow(
+      "paymaster submission queue is full"
+    );
+
+    release();
+    await first;
+    expect(queues.pending).toBe(0);
+  });
+});
+
 function config(): PaymasterConfig {
   return {
     rpcUrl: "https://rpc.example",
@@ -303,15 +476,13 @@ function config(): PaymasterConfig {
     privateKey: "0xkey",
     privacySignerClassHash: "0xabc",
     allowedContracts: new Set(["0x123"]),
+    approvalSpenders: new Set(["0x123"]),
     allowedEntrypoints: new Set(["apply_actions"]),
     proofRequiredEntrypoints: new Set(["apply_actions"]),
-    withdrawalAmountBuckets: new Set(),
-    allowDirectWithdrawalRelays: false,
     bindHost: "127.0.0.1",
     port: 0,
     maxBodyBytes: 1_000_000,
     allowedOrigins: new Set(["https://app.example"]),
-    allowedOriginPatterns: [],
     signerLimitPerMinute: 20,
     trustProxyHeaders: false,
     trustedProxyCidrs: [],
@@ -404,7 +575,23 @@ const request: ExecuteOutsideRequest = {
   proof_facts: ["0x1"]
 };
 
-function fakeRuntime(): StarknetRuntime {
+function requestWithSigner(index: number): ExecuteOutsideRequest {
+  const signer = `0x${(0x770 + index).toString(16)}`;
+  return {
+    ...request,
+    signer_address: signer,
+    outside_transaction: {
+      ...request.outside_transaction,
+      signerAddress: signer,
+      outsideExecution: {
+        ...request.outside_transaction.outsideExecution,
+        nonce: `0x${(0x90 + index).toString(16)}`
+      }
+    }
+  };
+}
+
+function fakeRuntime(options: { buildInvocationError?: Error } = {}): StarknetRuntime {
   return {
     RpcProvider: class {
       constructor(_options: { nodeUrl: string }) {}
@@ -439,6 +626,7 @@ function fakeRuntime(): StarknetRuntime {
       }
 
       async buildInvocation() {
+        if (options.buildInvocationError) throw options.buildInvocationError;
         return {
           contractAddress: "0xabc",
           calldata: ["1"],

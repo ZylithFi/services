@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "network": "mainnet",
+  "description": "Production reference-price policy. Zylith uses Binance spot book midpoint as the private-crossing benchmark, validates it against independent CEX books, and forbids prior Zylith clearing prices as a fallback.",
+  "reference_engine": {
+    "primary": "binance-book-midpoint",
+    "primary_cex_source": "binance",
+    "required_cex_sources": [
+      "binance",
+      "coinbase",
+      "kraken"
+    ],
+    "min_cex_sources": 3
+  },
+  "residual_completion": {
+    "primary": "avnu",
+    "mode": "aggregate-exact-output-private-executor",
+    "purpose": "Executable completion of aggregate residual obligations after private crossing. AVNU quotes are not reference-price inputs."
+  },
+  "global_policy": {
+    "max_staleness_ms": 5000,
+    "min_sources": 3,
+    "max_source_spread_bps": 20,
+    "max_divergence_bps": 50,
+    "reference_envelope_bps": 15,
+    "large_move_policy": "require-confirmation-widen-size-reduce-or-halt",
+    "forbidden_fallbacks": [
+      "last-cleared-price",
+      "single-exchange-only",
+      "fixed-price"
+    ]
+  },
+  "pairs": {
+    "STRK/USDC": {
+      "primary": "binance-midpoint:STRKUSDC:bookTicker",
+      "confirmations": [
+        "coinbase:STRK-USD:book",
+        "kraken:STRKUSD:book"
+      ],
+      "min_independent_sources": 3
+    },
+    "ETH/USDC": {
+      "primary": "binance-midpoint:ETHUSDC:bookTicker",
+      "confirmations": [
+        "coinbase:ETH-USD:book",
+        "kraken:ETHUSD:book"
+      ],
+      "min_independent_sources": 3
+    },
+    "strkBTC/USDC": {
+      "primary": "binance-midpoint:BTCUSDC:bookTicker with strkBTC wrapper parity",
+      "confirmations": [
+        "coinbase:BTC-USD:book",
+        "kraken:BTCUSD:book"
+      ],
+      "min_independent_sources": 3,
+      "assumption": "strkBTC must stay within wrapper-parity policy against BTC references; divergence beyond policy halts rather than clipping."
+    },
+    "STRK/ETH": {
+      "primary": "binance-midpoint:STRKUSDT divided by binance:ETHUSDT",
+      "confirmations": [
+        "coinbase:STRK-USD divided by coinbase:ETH-USD",
+        "kraken:STRKUSD divided by kraken:ETHUSD"
+      ],
+      "min_independent_sources": 3
+    },
+    "STRK/strkBTC": {
+      "primary": "binance-midpoint:STRKUSDT divided by binance:BTCUSDT with strkBTC wrapper parity",
+      "confirmations": [
+        "coinbase:STRK-USD divided by coinbase:BTC-USD",
+        "kraken:STRKUSD divided by kraken:BTCUSD"
+      ],
+      "min_independent_sources": 3,
+      "assumption": "BTC/USD confirmations sanity-check strkBTC wrapper parity; a live XSTRKBTC or wrapper-parity check is mandatory."
+    },
+    "WBTC/strkBTC": {
+      "primary": "binance-midpoint:BTCUSDT:bookTicker with WBTC/strkBTC wrapper parity",
+      "confirmations": [
+        "coinbase:BTC-USD:book",
+        "kraken:BTCUSD:book"
+      ],
+      "min_independent_sources": 3,
+      "max_divergence_bps": 25,
+      "assumption": "WBTC and strkBTC should price near parity; divergence beyond policy halts rather than clipping."
+    },
+    "USDC/USDT": {
+      "primary": "binance-midpoint:USDCUSDT:bookTicker",
+      "confirmations": [
+        "coinbase:USDT-USDC:book-inverse",
+        "kraken:USDCUSD and kraken:USDTUSD"
+      ],
+      "min_independent_sources": 3,
+      "max_divergence_bps": 20
+    }
+  }
+}

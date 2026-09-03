@@ -3,6 +3,7 @@ import { selector } from "starknet";
 
 import type { PaymasterConfig } from "./config.js";
 import {
+  validateEnsurePrivacySignerRequest,
   validateExecuteOutsideRequest,
   validateRelayPrivacySignerRequest
 } from "./validation.js";
@@ -14,16 +15,12 @@ const config: Pick<
   | "allowedEntrypoints"
   | "chainId"
   | "proofRequiredEntrypoints"
-  | "withdrawalAmountBuckets"
-  | "allowDirectWithdrawalRelays"
 > = {
   accountAddress: "0xabc",
   chainId: "0x534e5f5345504f4c4941",
   allowedContracts: new Set(["0x123"]),
   allowedEntrypoints: new Set(["apply_actions"]),
   proofRequiredEntrypoints: new Set(["apply_actions"]),
-  withdrawalAmountBuckets: new Set(),
-  allowDirectWithdrawalRelays: false
 };
 
 describe("validateExecuteOutsideRequest", () => {
@@ -34,6 +31,37 @@ describe("validateExecuteOutsideRequest", () => {
     expect(validated.paymaster_address).toBe("0xabc");
     expect(validated.call.contract_address).toBe("0x123");
     expect(validated.proof_facts).toEqual(["0x1"]);
+  });
+
+  it("rejects unknown execute-outside request fields", () => {
+    const request = baseRequest() as ReturnType<typeof baseRequest> & { unsupported_payload?: string };
+    request.unsupported_payload = "unexpected";
+
+    expect(() => validateExecuteOutsideRequest(request, config, 1_700_000_000)).toThrow(
+      "request.unsupported_payload is not supported"
+    );
+  });
+
+  it("rejects unknown nested execute-outside fields", () => {
+    const request = baseRequest();
+    (request.call as { unsupported_selector?: string }).unsupported_selector = "unexpected";
+    expect(() => validateExecuteOutsideRequest(request, config, 1_700_000_000)).toThrow(
+      "call.unsupported_selector is not supported"
+    );
+
+    const outsideRequest = baseRequest();
+    (outsideRequest.outside_transaction.outsideExecution as { unsupported_window?: string }).unsupported_window =
+      "unexpected";
+    expect(() => validateExecuteOutsideRequest(outsideRequest, config, 1_700_000_000)).toThrow(
+      "outside_transaction.outsideExecution.unsupported_window is not supported"
+    );
+
+    const callRequest = baseRequest();
+    (callRequest.outside_transaction.outsideExecution.calls[0] as { unsupported_call?: string })
+      .unsupported_call = "unexpected";
+    expect(() => validateExecuteOutsideRequest(callRequest, config, 1_700_000_000)).toThrow(
+      "outsideExecution.calls[0].unsupported_call is not supported"
+    );
   });
 
   it("rejects an outside execution whose signed call differs from the payload call", () => {
@@ -97,137 +125,37 @@ describe("validateExecuteOutsideRequest", () => {
     expect(validated.outside_transaction).toBeUndefined();
   });
 
-  it("accepts direct proof-bearing nullifier-consuming withdrawal relays", () => {
+  it("rejects direct settlement relays even when settlement is allowlisted", () => {
     const request = baseRequest();
-    request.call.entrypoint = "withdraw_settlement_output_with_proof_facts";
-    request.call.calldata = ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7", "0x64"];
+    request.call.entrypoint = "submit_settlement_with_proof_facts";
+    request.call.calldata = ["0x1", "0x2", "0x3"];
     delete (request as { outside_transaction?: unknown }).outside_transaction;
 
-    const withdrawalConfig = {
+    const settlementConfig = {
       ...config,
-      allowedEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
-      proofRequiredEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
-      withdrawalAmountBuckets: new Set(["100"]),
-      allowDirectWithdrawalRelays: true
+      allowedEntrypoints: new Set(["submit_settlement_with_proof_facts"]),
+      proofRequiredEntrypoints: new Set(["submit_settlement_with_proof_facts"]),
     };
-    const validated = validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000);
 
-    expect(validated.call.entrypoint).toBe("withdraw_settlement_output_with_proof_facts");
-    expect(validated.outside_transaction).toBeUndefined();
+    expect(() =>
+      validateExecuteOutsideRequest(request, settlementConfig, 1_700_000_000)
+    ).toThrow("direct paymaster relay requires proof facts for supported direct calls");
   });
 
-  it("rejects direct proof-bearing withdrawal relays when sponsorship is disabled", () => {
+  it("rejects direct proof-bearing calls outside the supported entrypoint set", () => {
     const request = baseRequest();
-    request.call.entrypoint = "withdraw_settlement_output_with_proof_facts";
+    request.call.entrypoint = "unsupported_private_call";
     request.call.calldata = ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x7", "0x64"];
     delete (request as { outside_transaction?: unknown }).outside_transaction;
 
-    const withdrawalConfig = {
+    const unsupportedEntrypointConfig = {
       ...config,
-      allowedEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
-      proofRequiredEntrypoints: new Set(["withdraw_settlement_output_with_proof_facts"]),
-      withdrawalAmountBuckets: new Set(["100"]),
-      allowDirectWithdrawalRelays: false
+      allowedEntrypoints: new Set(["unsupported_private_call"]),
+      proofRequiredEntrypoints: new Set(["unsupported_private_call"]),
     };
     expect(() =>
-      validateExecuteOutsideRequest(request, withdrawalConfig, 1_700_000_000)
-    ).toThrow("direct withdrawal relay sponsorship is disabled");
-  });
-
-  it("accepts direct renewal parent cancellation relays", () => {
-    const request = baseRequest();
-    request.call.entrypoint = "cancel_renewal_parent_marker";
-    request.call.calldata = validRenewalCancelCalldata();
-    delete (request as { outside_transaction?: unknown }).outside_transaction;
-    delete (request as { proof?: unknown }).proof;
-    delete (request as { proof_facts?: unknown }).proof_facts;
-
-    const cancelConfig = {
-      ...config,
-      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
-      proofRequiredEntrypoints: new Set<string>()
-    };
-    const validated = validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000);
-
-    expect(validated.call.entrypoint).toBe("cancel_renewal_parent_marker");
-    expect(validated.outside_transaction).toBeUndefined();
-  });
-
-  it("rejects malformed direct renewal parent cancellation relays", () => {
-    const request = baseRequest();
-    request.call.entrypoint = "cancel_renewal_parent_marker";
-    request.call.calldata = ["0x111", "0x222"];
-    delete (request as { outside_transaction?: unknown }).outside_transaction;
-    delete (request as { proof?: unknown }).proof;
-    delete (request as { proof_facts?: unknown }).proof_facts;
-
-    const cancelConfig = {
-      ...config,
-      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
-      proofRequiredEntrypoints: new Set<string>()
-    };
-    expect(() => validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000)).toThrow(
-      "renewal cancellation calldata is invalid"
-    );
-  });
-
-  it("rejects direct renewal cancellations with bad sparse proof shape", () => {
-    const request = baseRequest();
-    request.call.entrypoint = "cancel_renewal_parent_marker";
-    request.call.calldata = [
-      "0x111",
-      "0x222",
-      "0x111",
-      "0x0",
-      "0x1",
-      "0x999",
-      "0x0",
-      "0x333",
-      "0x444"
-    ];
-    delete (request as { outside_transaction?: unknown }).outside_transaction;
-    delete (request as { proof?: unknown }).proof;
-    delete (request as { proof_facts?: unknown }).proof_facts;
-
-    const cancelConfig = {
-      ...config,
-      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
-      proofRequiredEntrypoints: new Set<string>()
-    };
-    expect(() => validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000)).toThrow(
-      "renewal cancellation merkle path length is invalid"
-    );
-  });
-
-  it("rejects direct renewal cancellations with zero marker or signature", () => {
-    const request = baseRequest();
-    request.call.entrypoint = "cancel_renewal_parent_marker";
-    request.call.calldata = validRenewalCancelCalldata();
-    request.call.calldata[0] = "0x0";
-    delete (request as { outside_transaction?: unknown }).outside_transaction;
-    delete (request as { proof?: unknown }).proof;
-    delete (request as { proof_facts?: unknown }).proof_facts;
-
-    const cancelConfig = {
-      ...config,
-      allowedEntrypoints: new Set(["cancel_renewal_parent_marker"]),
-      proofRequiredEntrypoints: new Set<string>()
-    };
-    expect(() => validateExecuteOutsideRequest(request, cancelConfig, 1_700_000_000)).toThrow(
-      "renewal cancellation marker cannot be zero"
-    );
-
-    const zeroSig = baseRequest();
-    zeroSig.call.entrypoint = "cancel_renewal_parent_marker";
-    zeroSig.call.calldata = validRenewalCancelCalldata();
-    zeroSig.call.calldata[7] = "0x0";
-    delete (zeroSig as { outside_transaction?: unknown }).outside_transaction;
-    delete (zeroSig as { proof?: unknown }).proof;
-    delete (zeroSig as { proof_facts?: unknown }).proof_facts;
-
-    expect(() => validateExecuteOutsideRequest(zeroSig, cancelConfig, 1_700_000_000)).toThrow(
-      "renewal cancellation signature cannot be zero"
-    );
+      validateExecuteOutsideRequest(request, unsupportedEntrypointConfig, 1_700_000_000)
+    ).toThrow("call entrypoint is not supported by paymaster");
   });
 
   it("rejects direct relays for unsupported entrypoints", () => {
@@ -248,6 +176,34 @@ describe("validateExecuteOutsideRequest", () => {
       "call entrypoint is not supported by paymaster"
     );
   });
+
+  it("rejects supported entrypoints that are not configured as proof-required", () => {
+    const request = baseRequest();
+    const unsafeConfig = {
+      ...config,
+      proofRequiredEntrypoints: new Set<string>(),
+    };
+
+    expect(() =>
+      validateExecuteOutsideRequest(request, unsafeConfig, 1_700_000_000)
+    ).toThrow("supported paymaster entrypoint must be proof-required");
+  });
+});
+
+describe("validateEnsurePrivacySignerRequest", () => {
+  it("rejects unknown signer deployment fields", () => {
+    expect(() =>
+      validateEnsurePrivacySignerRequest(
+        {
+          signer_public_key: "0x1",
+          salt: "0x2",
+          class_hash: "0x123",
+          unsupported_owner: "0xabc",
+        },
+        { privacySignerClassHash: "0x123" }
+      )
+    ).toThrow("request.unsupported_owner is not supported");
+  });
 });
 
 describe("validateRelayPrivacySignerRequest", () => {
@@ -264,11 +220,31 @@ describe("validateRelayPrivacySignerRequest", () => {
         signature_r: "0xa",
         signature_s: "0xb"
       },
-      { allowedContracts: new Set(["0x123", "0x456"]) }
+      { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
     );
 
     expect(validated.account_address).toBe("0x777");
     expect(validated.calls[0]?.entrypoint).toBe("approve");
+  });
+
+  it("rejects unknown signer relay request fields", () => {
+    expect(() =>
+      validateRelayPrivacySignerRequest(
+        {
+          account_address: "0x777",
+          calls: [{
+            contract_address: "0x456",
+            entrypoint: "approve",
+            calldata: ["0x123", "0x64", "0x0"]
+          }],
+          nonce: "0x999",
+          signature_r: "0xa",
+          signature_s: "0xb",
+          unsupported_paymaster_hint: "unexpected",
+        },
+        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
+      )
+    ).toThrow("request.unsupported_paymaster_hint is not supported");
   });
 
   it("rejects signer relays that approve an unallowlisted spender", () => {
@@ -285,7 +261,26 @@ describe("validateRelayPrivacySignerRequest", () => {
           signature_r: "0xa",
           signature_s: "0xb"
         },
-        { allowedContracts: new Set(["0x123", "0x456"]) }
+        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
+      )
+    ).toThrow("token approve spender is not allowlisted");
+  });
+
+  it("does not allow token contracts themselves as approval spenders", () => {
+    expect(() =>
+      validateRelayPrivacySignerRequest(
+        {
+          account_address: "0x777",
+          calls: [{
+            contract_address: "0x456",
+            entrypoint: "approve",
+            calldata: ["0x456", "0x64", "0x0"]
+          }],
+          nonce: "0x999",
+          signature_r: "0xa",
+          signature_s: "0xb"
+        },
+        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
       )
     ).toThrow("token approve spender is not allowlisted");
   });
@@ -311,7 +306,7 @@ describe("validateRelayPrivacySignerRequest", () => {
           signature_r: "0xa",
           signature_s: "0xb"
         },
-        { allowedContracts: new Set(["0x123", "0x456"]) }
+        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
       )
     ).toThrow("privacy signer relay requires exactly one call");
   });
@@ -330,7 +325,7 @@ describe("validateRelayPrivacySignerRequest", () => {
           signature_r: "0xa",
           signature_s: "0xb"
         },
-        { allowedContracts: new Set(["0x123", "0x456"]) }
+        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
       )
     ).toThrow("privacy signer relay only supports token approve");
   });
@@ -367,17 +362,4 @@ function baseRequest() {
     proof: "proof-bytes",
     proof_facts: ["0x1"]
   };
-}
-
-function validRenewalCancelCalldata(): string[] {
-  return [
-    "0x111",
-    "0x222",
-    "0x111",
-    "0x0",
-    "0x0",
-    "0x0",
-    "0x333",
-    "0x444"
-  ];
 }

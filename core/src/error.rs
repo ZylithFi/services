@@ -6,8 +6,6 @@ pub enum ProtocolError {
     Hex(#[from] hex::FromHexError),
     #[error("invalid seed length: expected 32 bytes, got {0}")]
     InvalidSeedLength(usize),
-    #[error("invalid recovery phrase: {0}")]
-    InvalidRecoveryPhrase(String),
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("utf8 decoding failed: {0}")]

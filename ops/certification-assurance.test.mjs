@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
@@ -150,20 +150,6 @@ class ProtocolModel {
     if (inputValue !== outputValue) throw new Error("consolidation value is not conserved");
     this.addOutputs(outputs);
     this.noteRoot += 1;
-    this.nullifierRoot += 1;
-    this.assertConserved();
-  }
-
-  withdraw(outputId, nullifier) {
-    this.assertNoPendingRootTransition();
-    if (this.withdrawnOutputs.has(outputId)) throw new Error("output already withdrawn");
-    if (this.consumedNullifiers.has(nullifier)) throw new Error("duplicate nullifier");
-    const amount = this.outputNotes.get(outputId);
-    if (amount === undefined) throw new Error("unknown output note");
-    this.outputNotes.delete(outputId);
-    this.withdrawnOutputs.add(outputId);
-    this.consumedNullifiers.add(nullifier);
-    this.escrow -= amount;
     this.nullifierRoot += 1;
     this.assertConserved();
   }
@@ -335,8 +321,9 @@ test("FV-001/FV-002/FV-003 bounded model preserves assets and rejects nullifier/
       nullifiers: ["nullifier-a"],
     })
   );
-  model.withdraw("output-a", "withdraw-nullifier-a");
-  assertRejects(() => model.withdraw("output-a", "withdraw-nullifier-a-2"));
+  model.stageStrk20Exit("output-a", "withdraw-nullifier-a", "exit-a");
+  assertRejects(() => model.stageStrk20Exit("output-a", "withdraw-nullifier-a-2", "exit-b"));
+  model.claimStrk20Exit("exit-a", "open-note-a");
   model.assertConserved();
 });
 
@@ -363,7 +350,7 @@ test("FV-002 mutation rejects duplicate nullifier inside one settlement", () => 
   );
 });
 
-test("FV-003 STRK20 staged exits preserve custody and reject cross-path replay", () => {
+test("FV-003 STRK20 staged exits preserve custody and reject replay", () => {
   const claimPath = new ProtocolModel();
   claimPath.deposit("deposit-a", 100n);
   claimPath.settle("batch-a", {
@@ -374,24 +361,12 @@ test("FV-003 STRK20 staged exits preserve custody and reject cross-path replay",
   claimPath.stageStrk20Exit("output-a", "withdraw-nullifier-a", "exit-a");
   assert.equal(claimPath.escrow, 100n);
   assert.equal(claimPath.liveValue(), 100n);
-  assertRejects(() => claimPath.withdraw("output-a", "withdraw-nullifier-b"));
   assertRejects(() => claimPath.stageStrk20Exit("output-a", "withdraw-nullifier-c", "exit-b"));
   claimPath.claimStrk20Exit("exit-a", "open-note-a");
   assert.equal(claimPath.escrow, 0n);
   assert.equal(claimPath.liveValue(), 0n);
   assertRejects(() => claimPath.claimStrk20Exit("exit-a", "open-note-b"));
   claimPath.assertConserved();
-
-  const normalPath = new ProtocolModel();
-  normalPath.deposit("deposit-a", 100n);
-  normalPath.settle("batch-a", {
-    inputs: ["deposit-a"],
-    outputs: { "output-a": 100n },
-    nullifiers: ["settlement-nullifier-a"],
-  });
-  normalPath.withdraw("output-a", "withdraw-nullifier-a");
-  assertRejects(() => normalPath.stageStrk20Exit("output-a", "withdraw-nullifier-b", "exit-a"));
-  normalPath.assertConserved();
 });
 
 test("FV-004/FV-008 bounded model rejects root-transition interleaving and stale maintenance", () => {
@@ -494,12 +469,15 @@ test("FV-004/FV-006 bounded aggregate model rejects stale, duplicate, and reorde
 test("FV-005 fee-root accounting model includes each nonzero fee row exactly once", () => {
   const rows = [
     { domain: "protocol", asset: "USDC", recipient: "treasury", amount: 4n },
-    { domain: "relay", asset: "USDC", recipient: "relay", amount: 2n },
+    { domain: "protocol", asset: "ETH", recipient: "treasury", amount: 2n },
     { domain: "padding", asset: "USDC", recipient: "0x0", amount: 0n },
   ];
   const root = feeRoot(rows);
-  assert.notEqual(root, feeRoot(rows.map((row) => (row.domain === "relay" ? { ...row, amount: 1n } : row))));
-  assert.notEqual(root, feeRoot(rows.map((row) => (row.domain === "relay" ? { ...row, asset: "STRK" } : row))));
+  assert.notEqual(
+    root,
+    feeRoot(rows.map((row) => (row.asset === "ETH" ? { ...row, amount: 1n } : row)))
+  );
+  assert.notEqual(root, feeRoot(rows.map((row) => (row.asset === "ETH" ? { ...row, asset: "STRK" } : row))));
   assert.notEqual(
     root,
     feeRoot(rows.map((row) => (row.domain === "protocol" ? { ...row, recipient: "attacker" } : row)))
@@ -512,7 +490,7 @@ test("FV-005 fee-root accounting model includes each nonzero fee row exactly onc
 test("FV-005 mutation rejects duplicate, omitted, and nonzero padding fee rows", () => {
   const rows = [
     { domain: "protocol", asset: "USDC", recipient: "treasury", amount: 4n },
-    { domain: "relay", asset: "USDC", recipient: "relay", amount: 2n },
+    { domain: "protocol", asset: "ETH", recipient: "treasury", amount: 2n },
     { domain: "padding", asset: "USDC", recipient: "0x0", amount: 0n },
   ];
   const expected = feeRoot(rows);
@@ -521,7 +499,7 @@ test("FV-005 mutation rejects duplicate, omitted, and nonzero padding fee rows",
 
   for (const mutation of [
     [...rows, rows[0]],
-    rows.filter((row) => row.domain !== "relay"),
+    rows.filter((row) => row.asset !== "ETH"),
     rows.map((row) => (row.domain === "padding" ? { ...row, amount: 1n } : row)),
     rows.map((row) => (row.domain === "protocol" ? { ...row, recipient: "attacker" } : row)),
   ]) {
@@ -532,7 +510,7 @@ test("FV-005 mutation rejects duplicate, omitted, and nonzero padding fee rows",
 test("FV-006 vector-suite manifest covers required cross-language binding surfaces", () => {
   const source = readAllSourceText();
   const required = [
-    ["order commitment", ["order_commitments_are_deterministic", "builds_private_order_submission_from_seed_and_funding_note"]],
+    ["order commitment", ["order_commitments_are_deterministic", "builds_private_order_submission_from_seed_and_funding_notes"]],
     ["note commitment", ["note_commitments_are_deterministic", "output_note_root_rejects_duplicate_commitments"]],
     ["nullifier derivation", ["nullifier_derivation_uses_note_secret", "nullifier_proof_message_hash_binds_statement_roots"]],
     [
@@ -545,7 +523,7 @@ test("FV-006 vector-suite manifest covers required cross-language binding surfac
     ["withdrawal message hash", ["settlement_output_withdrawal_hash_is_chain_verifier_and_adapter_bound", "withdrawal_message_hash_matches_native_payload_binding"]],
     ["relay package hash", ["renewal_relay_package_authorization_round_trips", "verifies_renewal_relay_package_commitment_and_authorization"]],
     ["recovery auth tag", ["recovery_auth_tag_matches_client_vector", "recovery_snapshot_roundtrip_uses_seed_bound_auth"]],
-    ["fee root", ["fee_root_separates_protocol_and_relay_rows", "auction_verifier_rejects_wrong_fee_root_at_settlement"]],
+    ["fee root", ["fee_root_separates_protocol_asset_rows", "auction_verifier_rejects_wrong_fee_root_at_settlement"]],
     ["output bundle ref", ["output_recovery_bundle_rejects_mismatched_bundle_ref", "transcript_shape_policy_recomputes_output_bundle_commitment"]],
   ];
   for (const [surface, tests] of required) {
@@ -590,11 +568,10 @@ test("FV-009/FV-010 route inventory keeps public and internal data boundaries cl
     ],
     "indexer/src/main.rs": [
       "/health",
+      "/api/deposits/confirmations",
       "/api/deposits/range/{start}/{end}",
-      "/api/deposits/{funding_commitment}",
       "/api/batches/{batch_id}/transcript",
       "/api/internal/batches/{batch_id}/transcript",
-      "/api/withdrawals/{note_commitment}",
     ],
     "renewal_relayer/src/main.rs": [
       "/health",
@@ -645,7 +622,6 @@ test("ROUTE-001 public route schema denylist rejects private response types", ()
     ["prover/src/main.rs", "get_public_proof_job"],
     ["prover/src/main.rs", "list_public_proof_jobs"],
     ["indexer/src/main.rs", "list_confirmed_deposits_range"],
-    ["indexer/src/main.rs", "get_confirmed_deposit"],
     ["indexer/src/main.rs", "list_archived_transcripts"],
     ["indexer/src/main.rs", "get_archived_transcript"],
     ["indexer/src/main.rs", "get_archived_output_bundle"],
@@ -667,39 +643,36 @@ test("ROUTE-001 public route schema denylist rejects private response types", ()
 test("ROUTE-002 generated backend route inventory has explicit privacy classification", () => {
   const expectedRoutes = {
     "coordinator/src/main.rs": [
-      "/api/attribution/{batch_id}/{maker_public_key}",
       "/api/batches",
       "/api/batches/current",
+      "/api/batches/submittable",
       "/api/batches/transcripts",
       "/api/batches/{batch_id}",
       "/api/batches/{batch_id}/output-bundle",
       "/api/batches/{batch_id}/transcript",
+      "/api/internal/batches/proof-work",
       "/api/internal/batches/{batch_id}/artifacts",
       "/api/internal/batches/{batch_id}/orders",
       "/api/internal/batches/{batch_id}/settled-at",
       "/api/internal/batches/{batch_id}/transcript",
       "/api/internal/batches/{batch_id}/witness",
       "/api/internal/metrics",
+      "/api/internal/multi-pair-settlements/{group_id}/artifacts",
       "/api/internal/renewal/cancel-markers",
-      "/api/maker/batches/{batch_id}",
-      "/api/maker/orders",
-      "/api/maker/orders/cancel",
-      "/api/maker/orders/{order_commitment}",
       "/api/orders",
       "/api/orders/cancel",
       "/api/pairs/{base}/{quote}/batches/current",
+      "/api/pairs/{base}/{quote}/batches/submittable",
       "/api/recovery/{account_id}/artifacts",
       "/api/recovery/{account_id}/artifacts/range/{start_sequence}/{end_sequence}",
-      "/api/recovery/{account_id}/settlement-reports/{batch_id}",
       "/api/renewal/cancel-markers",
       "/api/renewal/cancel-markers/{cancel_marker}",
       "/api/renewal/cancel-witness/{cancel_marker}",
       "/api/settlement-reports/{batch_id}",
-      "/attribution/{batch_id}/{maker_public_key}",
+      "/api/wallet-vaults/{wallet_auth_id}",
       "/health",
     ],
     "indexer/src/main.rs": [
-      "/api/attribution/{batch_id}/{maker_public_key}",
       "/api/batches/artifact-bundles",
       "/api/batches/artifact-bundles/epochs/{start_epoch}/{end_epoch}",
       "/api/batches/artifacts",
@@ -709,25 +682,26 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
       "/api/batches/{batch_id}/transcript",
       "/api/deposits/confirmations",
       "/api/deposits/range/{start}/{end}",
-      "/api/deposits/{funding_commitment}",
       "/api/internal/batches/root-history/epochs/{start_epoch}/{end_epoch}",
       "/api/internal/batches/{batch_id}/artifacts",
       "/api/internal/batches/{batch_id}/settled-at",
       "/api/internal/batches/{batch_id}/transcript",
+      "/api/internal/multi-pair-settlements/{group_id}/artifacts",
       "/api/internal/sync/deposits",
-      "/api/internal/sync/withdrawals",
       "/api/privacy/artifact-aggregation-policy",
       "/api/privacy/claim-window-policy",
       "/api/privacy/withdrawal-amount-bucket-policy",
-      "/api/withdrawals/range/{start}/{end}",
-      "/api/withdrawals/{note_commitment}",
-      "/attribution/{batch_id}/{maker_public_key}",
       "/health",
     ],
     "prover/src/main.rs": [
       "/api/internal/batches/{batch_id}/prepare",
       "/api/internal/health",
       "/api/internal/metrics",
+      "/api/internal/multi-pair-netting/plan",
+      "/api/internal/multi-pair-settlement-plans/{group_id}",
+      "/api/internal/multi-pair-settlement-witnesses/{group_id}",
+      "/api/internal/multi-pair-settlements/{group_id}/prepare",
+      "/api/internal/multi-pair-settlements/{group_id}/submit",
       "/api/internal/onchain-submissions/{batch_id}",
       "/api/internal/onchain-submissions/{batch_id}/refresh",
       "/api/internal/proof-aggregation-manifests/epochs/{start_epoch}/{end_epoch}",
@@ -777,11 +751,201 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
       assert.match(source, /starts_with\("\/api\/internal\/"\)[\s\S]*require_internal_auth/);
     }
   }
-  assert.match(readSource("coordinator/src/main.rs"), /starts_with\("\/api\/maker\/"\)[\s\S]*require_internal_auth/);
+  assert.doesNotMatch(readSource("coordinator/src/main.rs"), /\/api\/liquidity\//);
   assert.match(readSource("renewal_relayer/src/main.rs"), /async fn metrics\([\s\S]*require_internal_auth/);
   assert.match(readSource("renewal_relayer/src/main.rs"), /async fn ops_summary\([\s\S]*require_internal_auth/);
   assert.match(readSource("renewal_relayer/src/main.rs"), /async fn ops_alerts\([\s\S]*require_internal_auth/);
   assert.match(readSource("renewal_relayer/src/main.rs"), /async fn trigger_tick\([\s\S]*require_internal_auth/);
+});
+
+test("ROUTE-003 generated public and capability route schema snapshot stays redacted", () => {
+  const expectedPublicReturns = {
+    "coordinator/src/main.rs": {
+      list_batches: "Result<Json<Vec<PublicBatchSummary>>, StatusCode>",
+      current_batch: "Result<Json<PublicBatchSummary>, StatusCode>",
+      submittable_batch: "Result<Json<PublicBatchSummary>, StatusCode>",
+      get_batch: "Result<Json<PublicBatchSummary>, StatusCode>",
+      get_published_transcript: "Result<Json<PublicSettlementTranscript>, StatusCode>",
+      list_published_transcripts: "Result<Json<Vec<PublicSettlementTranscript>>, StatusCode>",
+      get_published_output_bundle: "Result<Json<zylith_core::OutputCiphertextBundle>, StatusCode>",
+    },
+    "prover/src/main.rs": {
+      public_auction_keys: "Result<Json<PrivateExecutionKeyRegistry>, StatusCode>",
+      public_auction_keys_fingerprint: "Result<Json<serde_json::Value>, StatusCode>",
+      get_public_proof_job: "Result<Json<PublicProofJobStatus>, StatusCode>",
+      list_public_proof_jobs: "Result<Json<Vec<PublicProofJobStatus>>, StatusCode>",
+    },
+    "indexer/src/main.rs": {
+      list_confirmed_deposits_range: "Result<Json<DepositActivationRecordList>, StatusCode>",
+      get_archived_transcript: "Result<Json<PublicSettlementTranscript>, StatusCode>",
+      list_archived_transcripts: "Result<Json<Vec<PublicSettlementTranscript>>, StatusCode>",
+      get_archived_output_bundle: "Result<Json<OutputCiphertextBundle>, StatusCode>",
+    },
+  };
+  for (const [file, handlers] of Object.entries(expectedPublicReturns)) {
+    const source = readSource(file);
+    for (const [handler, expectedReturn] of Object.entries(handlers)) {
+      assert.equal(rustFunctionReturnType(source, handler), expectedReturn, `${file}:${handler} schema drifted`);
+    }
+  }
+
+  assert.equal(
+    rustFunctionReturnType(readSource("coordinator/src/main.rs"), "query_private_settlement_report_by_batch"),
+    "Result<Json<PrivateSettlementReport>, StatusCode>",
+    "settlement report route must remain capability-scoped and not be treated as a public artifact",
+  );
+
+  const coreTypes = readSource("core/src/types.rs");
+  const publicTranscript = extractRustStruct(coreTypes, "PublicSettlementTranscript");
+  for (const field of [
+    "matched_orders",
+    "consumed_inputs",
+    "output_notes",
+    "output_note_preimages",
+    "order_execution_reports",
+    "output_recovery_records",
+  ]) {
+    assert(!new RegExp(`\\b${field}\\b`).test(publicTranscript), `public transcript exposes ${field}`);
+  }
+  const privateReportQuery = sourceAround(coreTypes, "struct PrivateSettlementReportQuery", 120);
+  assert.match(privateReportQuery, /deny_unknown_fields/);
+  const privateReport = extractRustStruct(coreTypes, "PrivateSettlementReport");
+  assert.match(privateReport, /\bmatched_order_count_bucket\b/);
+  assert.doesNotMatch(privateReport, /\bmatched_order_count\b/);
+  const publicProofJob = extractRustStruct(readSource("prover/src/main.rs"), "PublicProofJobStatus");
+  assert.doesNotMatch(publicProofJob, /\breuse_count\b/);
+  assert.doesNotMatch(publicProofJob, /\bsettlement_witness\b/);
+  assert.doesNotMatch(publicProofJob, /\bprivate_order_payload\b/);
+  const publicDeposits = extractRustStruct(coreTypes, "DepositActivationRecord");
+  assert.doesNotMatch(publicDeposits, /\b(asset_id|amount|note_commitment)\b/);
+});
+
+test("SURFACE-002 generated ABI, env, and proof-input drift checks stay current", () => {
+  const auctionVerifier = readSource("contracts/src/auction_verifier.cairo");
+  assert.deepEqual(extractCairoInterfaceFunctions(auctionVerifier, "IAuctionVerifier"), [
+    "propose_admin",
+    "accept_admin",
+    "set_pause_guardian",
+    "pause",
+    "unpause",
+    "lock_operational_config",
+    "set_authorized_settlement_account",
+    "set_proof_program",
+    "set_statement_proof_program_hash",
+    "statement_proof_program_hash",
+    "lock_proof_program",
+    "set_proof_validity_blocks",
+    "set_expected_starknet_os_config_hash",
+    "set_shielded_asset_adapter",
+    "set_deposit_root_registrar",
+    "set_output_claim_delay_seconds",
+    "set_protocol_fee_recipient",
+    "propose_protocol_fee_recipient",
+    "execute_protocol_fee_recipient",
+    "set_pair_fee_config",
+    "propose_pair_fee_config",
+    "execute_pair_fee_config",
+    "cancel_renewal_parent_marker",
+    "activate_deposit_root",
+    "record_admission_root_with_proof_facts",
+    "record_auction_result_with_proof_facts",
+    "record_multi_pair_solution_with_proof_facts",
+    "record_nullifier_roots_with_proof_facts",
+    "record_renewal_roots_with_proof_facts",
+    "record_settlement_order_with_proof_facts",
+    "record_settlement_input_membership_with_proof_facts",
+    "record_settlement_output_recovery_with_proof_facts",
+    "clear_unsettled_root_transition",
+    "submit_note_consolidation_with_proof_facts",
+    "submit_settlement_with_proof_facts",
+    "submit_multi_pair_settlement_with_proof_facts",
+    "submit_aggregate_settlements_with_proof_facts",
+    "withdraw_settlement_output_to_strk20_with_proof_facts",
+    "is_batch_settled",
+    "is_consolidation_settled",
+    "is_multi_pair_group_settled",
+    "verified_multi_pair_settlement_transcript",
+    "verified_admission_root",
+    "verified_auction_transcript",
+    "verified_multi_pair_solution",
+    "output_note_root",
+    "current_settlement_roots",
+    "renewal_cancel_marker_recorded",
+    "pair_fee_config",
+    "pending_pair_fee_config",
+    "admin_address",
+    "pending_admin_address",
+    "admin_transfer_pending",
+    "pause_guardian_address",
+    "is_paused",
+    "proof_program_is_locked",
+    "protocol_fee_recipient",
+    "pending_protocol_fee_recipient",
+    "note_root_transition_count",
+    "note_root_transition",
+    "settlement_proof_message_hash",
+    "note_consolidation_proof_message_hash",
+    "withdrawal_proof_message_hash",
+    "multi_pair_proof_message_hash",
+    "multi_pair_settlement_proof_message_hash",
+  ]);
+  assert.match(auctionVerifier, /fn set_pause_guardian[\s\S]*assert\(!guardian\.is_zero\(\), 'BAD_GUARDIAN'\)/);
+  for (const removedAbi of ["withdraw_settlement_output_to_l2", "withdraw_fee", "set_fee_ledger"]) {
+    assert.doesNotMatch(auctionVerifier, new RegExp(`\\b${removedAbi}\\b`));
+  }
+
+  const envCorpus = [
+    "coordinator/src/main.rs",
+    "prover/src/main.rs",
+    "indexer/src/main.rs",
+    "renewal_relayer/src/main.rs",
+    "paymaster/src/config.ts",
+    "core/src/auth.rs",
+  ].map(readSource).join("\n");
+  const envNames = extractEnvNames(envCorpus);
+  for (const envName of [
+    "ZYLITH_STARKNET_CHAIN_ID",
+    "ZYLITH_CONTROL_PLANE_TOKEN",
+    "ZYLITH_COORDINATOR_TRUSTED_PROXY_CIDRS",
+    "ZYLITH_PROVER_TRUSTED_PROXY_CIDRS",
+    "ZYLITH_INDEXER_TRUSTED_PROXY_CIDRS",
+    "ZYLITH_RENEWAL_RELAY_TRUSTED_PROXY_CIDRS",
+    "ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS",
+    "ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS",
+    "ZYLITH_PROVER_MAX_STORED_PRIVATE_PAYLOADS",
+    "ZYLITH_NATIVE_TX_PROVER_URL",
+    "ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS",
+    "ZYLITH_PAYMASTER_INTERNAL_TOKEN",
+    "ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN",
+    "ZYLITH_AUCTION_VERIFIER_ADDRESS",
+    "ZYLITH_SHIELDED_ASSET_ADAPTER_ADDRESS",
+  ]) {
+    assert(envNames.includes(envName), `${envName} drifted out of service env surface`);
+  }
+  const crypto = readSource("core/src/crypto.rs");
+  for (const bindingSurface of [
+    "build_stwo_serialized_input",
+    "settlement_consumed_nullifier_root",
+    "root_only_settlement_commitments",
+    "build_note_consolidation_serialized_input",
+    "note_consolidation_commitment",
+    "stwo_serialized_input_includes_expected_sections",
+    "admission_serialized_input_binds_full_order_preimages",
+    "note_consolidation_serialization_and_submission_plan_bind_roots",
+  ]) {
+    assert(crypto.includes(bindingSurface), `proof input surface missing ${bindingSurface}`);
+  }
+  const prover = readSource("prover/src/main.rs");
+  for (const nativeSurface of [
+    "build_native_proof_program_calldata",
+    "native_proof_program_calldata_prefixes_verifier_address",
+  ]) {
+    assert(prover.includes(nativeSurface), `native proof input surface missing ${nativeSurface}`);
+  }
+  assert.match(
+    readSource("ops/production-readiness-check.mjs"),
+    /deployment manifest chain_id must match ZYLITH_STARKNET_CHAIN_ID/,
+  );
 });
 
 test("LOG-001 backend log statements do not name private payload fields", () => {
@@ -816,6 +980,30 @@ test("LOG-001 backend log statements do not name private payload fields", () => 
   assert.deepEqual(failures, []);
 });
 
+test("LOG-002 runtime log redaction and retention controls are test-backed", () => {
+  const source = [
+    "coordinator/src/main.rs",
+    "prover/src/main.rs",
+    "renewal_relayer/src/main.rs",
+    "paymaster/src/server.test.ts",
+    "paymaster/src/starknetSubmitter.test.ts",
+    "paymaster/src/submissionStore.test.ts",
+  ].map(readSource).join("\n");
+  for (const testOrControl of [
+    "redacts private calldata and proof material from server error logs",
+    "native_request_redaction_removes_private_witness_calldata",
+    "native_prover_request_redaction_removes_nested_private_calldata",
+    "native_prover_error_sanitizer_redacts_private_like_payloads",
+    "default_private_payload_retention_is_short_operational_window",
+    "prune_private_order_payloads",
+    "batch_store_retention_prunes_old_empty_history_but_keeps_active_and_proof_work",
+    "prune_store_removes_expired_packages_and_cancel_tombstones",
+    "prunes expired replay records when loading after restart",
+  ]) {
+    assert(source.includes(testOrControl), `runtime log or retention coverage missing ${testOrControl}`);
+  }
+});
+
 test("LOAD-001 rate-limit model isolates peer-IP subjects under abusive load", () => {
   const limiter = new TokenBucketLimiter(60);
   for (let i = 0; i < 60; i += 1) assert(limiter.allow("203.0.113.1"));
@@ -829,6 +1017,31 @@ test("LOAD-002 trusted proxy model rejects spoofed forwarded-for subjects", () =
   assert.equal(rateLimitSubject({ peer: "198.51.100.4", forwardedFor: "10.0.0.9", trustedCidrs: [] }), "198.51.100.4");
   assert.equal(rateLimitSubject({ peer: "198.51.100.4", forwardedFor: "10.0.0.9", trustedCidrs: ["198.51.100.0/24"] }), "10.0.0.9");
   assert.equal(rateLimitSubject({ peer: "203.0.113.4", forwardedFor: "10.0.0.9", trustedCidrs: ["198.51.100.0/24"] }), "203.0.113.4");
+});
+
+test("LOAD-003 service route tests cover public rate limits and trusted proxy abuse", () => {
+  const source = [
+    "coordinator/src/main.rs",
+    "prover/src/main.rs",
+    "indexer/src/main.rs",
+    "renewal_relayer/src/main.rs",
+    "paymaster/src/server.test.ts",
+  ].map(readSource).join("\n");
+  for (const testName of [
+    "public_batch_reads_are_rate_limited",
+    "renewal_cancel_public_reads_are_rate_limited",
+    "rate_limit_subject_uses_forwarded_headers_only_from_trusted_proxy_cidrs",
+    "public_proof_job_reads_are_rate_limited",
+    "rate_limit_subject_uses_peer_ip_without_trusted_proxy_cidr",
+    "rate_limit_subject_uses_forwarded_ip_only_from_trusted_cidr",
+    "trusted_proxy_rate_limit_subject_ignores_untrusted_forwarded_headers",
+    "trusted_proxy_rate_limit_subject_accepts_forwarded_headers_from_trusted_cidr",
+    "ignores forwarded IP headers from untrusted direct clients",
+    "uses valid forwarded client IPs only from trusted proxies",
+    "ignores malformed forwarded IP headers even from trusted proxies",
+  ]) {
+    assert(source.includes(testName), `load/proxy abuse coverage missing ${testName}`);
+  }
 });
 
 test("DEP-001 Zylith funding bridge activation is custody-bound and does not expose note secrets", () => {
@@ -962,15 +1175,37 @@ function readSource(path) {
 }
 
 function extractRustStruct(source, name) {
-  const match = source.match(new RegExp(`pub struct ${name} \\{([\\s\\S]*?)\\n\\}`));
+  const match = source.match(new RegExp(`(?:pub\\s+)?struct ${name} \\{([\\s\\S]*?)\\n\\}`));
   assert(match, `${name} must exist`);
   return match[1];
+}
+
+function sourceAround(source, marker, lineCount) {
+  const index = source.indexOf(marker);
+  assert.notEqual(index, -1, `${marker} must exist`);
+  return source.slice(Math.max(0, index - 300), index + lineCount * 80);
 }
 
 function rustFunctionReturnType(source, name) {
   const match = source.match(new RegExp(`async fn ${name}\\b[\\s\\S]*?\\)\\s*->\\s*([^\\{]+)\\{`));
   assert(match, `${name} return type must be discoverable from source`);
   return match[1].replace(/\s+/g, " ").trim();
+}
+
+function extractCairoInterfaceFunctions(source, name) {
+  const match = source.match(new RegExp(`pub trait ${name}<[\\s\\S]*?\\{([\\s\\S]*?)\\n\\}`));
+  assert(match, `${name} interface must exist`);
+  return [...match[1].matchAll(/\bfn\s+([A-Za-z0-9_]+)\b/g)].map((entry) => entry[1]);
+}
+
+function extractEnvNames(source) {
+  return [
+    ...new Set([
+      ...[...source.matchAll(/"((?:ZYLITH|SN)_[A-Z0-9_]+)"/g)].map((match) => match[1]),
+      ...[...source.matchAll(/\benv\.((?:ZYLITH|SN)_[A-Z0-9_]+)\b/g)].map((match) => match[1]),
+      ...[...source.matchAll(/\bprocess\.env\.((?:ZYLITH|SN)_[A-Z0-9_]+)\b/g)].map((match) => match[1]),
+    ]),
+  ].sort();
 }
 
 function extractRustRouteInventory(file) {
@@ -986,9 +1221,9 @@ function extractPaymasterRouteInventory() {
 function classifyRoute(file, route) {
   if (route === "/health" || route === "/ready") return "public-health";
   if (route.startsWith("/api/internal/")) return "internal-control-plane";
-  if (file === "coordinator/src/main.rs" && route.startsWith("/api/maker/")) return "internal-maker";
-  if (file === "prover/src/main.rs" && route.startsWith("/api/private/")) return "hosted-private-payload";
+  if (file === "prover/src/main.rs" && route.startsWith("/api/private/")) return "private-proof-payload";
   if (file === "prover/src/main.rs" && route.startsWith("/api/public/")) return "public-redacted";
+  if (file === "coordinator/src/main.rs" && route.startsWith("/api/wallet-vaults/")) return "wallet-vault-authenticated";
   if (route.startsWith("/api/recovery/") || route.startsWith("/api/settlement-reports/")) return "recovery-authenticated";
   if (route.startsWith("/api/renewal/cancel-")) return "public-renewal-state";
   if (route.includes("/attribution/")) return "public-delayed-attribution";
@@ -998,7 +1233,7 @@ function classifyRoute(file, route) {
   if (file === "renewal_relayer/src/main.rs" && route.startsWith("/packages")) return "package-authenticated";
   if (route.startsWith("/api/privacy/")) return "public-policy";
   if (route.startsWith("/api/batches") || route.startsWith("/api/pairs/")) return "public-artifact";
-  if (route.startsWith("/api/deposits") || route.startsWith("/api/withdrawals")) return "public-chain-index";
+  if (route.startsWith("/api/deposits")) return "public-chain-index";
   if (route.startsWith("/api/orders")) return "public-order-ingress";
   return null;
 }
