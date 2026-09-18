@@ -22,22 +22,23 @@ use axum::{
     routing::{get, post},
 };
 use reqwest::Client;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use starknet_rust_core::utils::get_selector_from_name;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{
     Batch, BatchId, BatchOrderSet, BatchStatus, BatchSummary, CONTROL_PLANE_TOKEN_ENV,
     CoordinatorStatus, OrderCancellationAccepted, OrderCancellationRequest,
     OrderIngressClientTelemetry, OrderShareBundle, OrderSubmission, OrderSubmissionAccepted,
     PairId, PrivateSettlementOutputRecoveryRecord, PrivateSettlementReport,
-    PrivateSettlementReportQuery, ProductConfig, PublicBatchSummary, PublicSettlementTranscript,
-    PublishedBatchArtifacts, PublishedMultiPairBatchArtifacts, RecoveryArtifact,
-    RecoveryArtifactList, RecoveryArtifactUpload, RenewalCancelMarkerList,
-    RenewalCancelMarkerRecord, SettlementTimestampUpdate, SubmittedOrderRecord,
-    artifact_epoch_bucket_end, artifact_epoch_bucket_start, count_bucket_label,
-    derive_order_cancellation_tag, extract_bearer_token,
+    PrivateSettlementReportQuery, ProductConfig, ProofWorkClaimRequest, ProofWorkClaimResponse,
+    ProofWorkLeaseRequest, PublicBatchSummary, PublicSettlementTranscript, PublishedBatchArtifacts,
+    PublishedMultiPairBatchArtifacts, RecoveryArtifact, RecoveryArtifactList,
+    RecoveryArtifactUpload, RenewalCancelMarkerList, RenewalCancelMarkerRecord,
+    SettlementTimestampUpdate, SubmittedOrderRecord, artifact_epoch_bucket_end,
+    artifact_epoch_bucket_start, count_bucket_label, derive_order_cancellation_tag,
+    extract_bearer_token,
     hash::{
         encode_starknet_felt, normalize_felt_hex, ordered_felt_list_commitment,
         tagged_commitment_sha256, tagged_field_hex, tagged_sha256_hex,
@@ -69,7 +70,7 @@ where
     }
 }
 
-const DEFAULT_BATCH_WINDOW_MS: u64 = 20 * 1_000;
+const DEFAULT_BATCH_WINDOW_MS: u64 = 10 * 1_000;
 // Hosted renewal automation may submit child slots ahead of the currently
 // submittable epoch. Keep that lookahead materialized so exact batch lookups
 // and coordinator submissions never 404 for authorized slots.
@@ -78,7 +79,7 @@ const OPEN_ACCEPTING_BATCHES_PER_PAIR: usize = HOSTED_RENEWAL_SLOT_LOOKAHEAD_EPO
 const DEFAULT_PUBLIC_BATCH_LIST_LIMIT: usize = 512;
 const MAX_PUBLIC_BATCH_LIST_LIMIT: usize = 4_096;
 const BATCH_STORE_RETAIN_RECENT_PER_PAIR: usize = MAX_PUBLIC_BATCH_LIST_LIMIT;
-const MIN_BATCH_SUBMISSION_SAFETY_BUFFER_MS: u64 = 5_000;
+const MIN_BATCH_SUBMISSION_SAFETY_BUFFER_MS: u64 = 1_000;
 const MAX_BATCH_SUBMISSION_SAFETY_BUFFER_MS: u64 = 15_000;
 const BATCH_SUBMISSION_SAFETY_BUFFER_BPS: u64 = 2_000;
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
@@ -87,8 +88,7 @@ const DEFAULT_RECOVERY_STORE_PATH: &str = "coordinator/recovery_artifacts.dev.js
 const DEFAULT_ARTIFACT_STORE_PATH: &str = "coordinator/published_batch_artifacts.dev.json";
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
-const DEFAULT_PAIR_IDS: &str =
-    "STRK/USDC,ETH/USDC,strkBTC/USDC,STRK/ETH,STRK/strkBTC,WBTC/strkBTC,USDC/USDT";
+const DEFAULT_PAIR_IDS: &str = "STRK/USDC,ETH/USDC,STRK/ETH,USDC/USDT";
 const PRODUCT_PAIRS_ENV: &str = "ZYLITH_PRODUCT_PAIRS";
 const COORDINATOR_PAIR_IDS_ENV: &str = "ZYLITH_COORDINATOR_PAIRS";
 const BATCH_WINDOW_MS_ENV: &str = "ZYLITH_BATCH_WINDOW_MS";
@@ -120,14 +120,21 @@ const ARTIFACT_DELAY_MAX_EPOCHS_ENV: &str = "ZYLITH_ARTIFACT_DELAY_MAX_EPOCHS";
 const ARTIFACT_EPOCH_BUCKET_SIZE_ENV: &str = "ZYLITH_ARTIFACT_EPOCH_BUCKET_SIZE";
 const STARKNET_RPC_URL_ENV: &str = "ZYLITH_STARKNET_RPC_URL";
 const AUCTION_VERIFIER_ADDRESS_ENV: &str = "ZYLITH_AUCTION_VERIFIER_ADDRESS";
+const PROOF_WORK_LEASES_NAMESPACE: &str = "proof_work_leases";
+const MIN_PROOF_WORK_LEASE_MS: u64 = 60_000;
+const MAX_PROOF_WORK_LEASE_MS: u64 = 60 * 60_000;
+const MAX_PROOF_WORK_LEASE_BATCHES: usize = 128;
 
 #[derive(Clone)]
 struct AppState {
     batches: Arc<RwLock<BTreeMap<String, BatchRecord>>>,
+    batch_transition_lock: Arc<AsyncMutex<()>>,
+    proof_work_leases: Arc<RwLock<BTreeMap<String, ProofWorkClaimResponse>>>,
     batch_store_path: Option<Arc<PathBuf>>,
     product_config: Arc<ProductConfig>,
     recovery_artifacts: Arc<RwLock<BTreeMap<String, RecoveryAccountRecord>>>,
     wallet_vaults: Arc<RwLock<BTreeMap<String, WalletVaultBundleRecord>>>,
+    recovery_store_transition_lock: Arc<AsyncMutex<()>>,
     recovery_store_path: Option<Arc<PathBuf>>,
     published_batch_artifacts: Arc<RwLock<BTreeMap<String, PublishedBatchArtifacts>>>,
     published_multi_pair_batch_artifacts:
@@ -211,14 +218,14 @@ struct StarknetBlock {
     timestamp: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct BatchRecord {
     batch: Batch,
     order_count: u64,
     orders: Vec<SubmittedOrderRecord>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct BatchStoreFile {
     batches_by_id: BTreeMap<String, BatchRecord>,
 }
@@ -823,10 +830,13 @@ fn build_app_with_config(
         .unwrap_or_default();
     let app_state = AppState {
         batches: Arc::new(RwLock::new(loaded_batches)),
+        batch_transition_lock: Arc::new(AsyncMutex::new(())),
+        proof_work_leases: Arc::new(RwLock::new(BTreeMap::new())),
         batch_store_path: batch_store_path.map(Arc::new),
         product_config: Arc::new(product_config),
         recovery_artifacts: Arc::new(RwLock::new(recovery_store.accounts_by_id)),
         wallet_vaults: Arc::new(RwLock::new(recovery_store.wallet_vaults_by_auth_id)),
+        recovery_store_transition_lock: Arc::new(AsyncMutex::new(())),
         recovery_store_path: recovery_store_path.map(Arc::new),
         published_batch_artifacts: Arc::new(RwLock::new(
             published_artifact_store.artifacts_by_batch,
@@ -890,7 +900,15 @@ fn build_app_with_config(
         )
         .route(
             "/api/internal/batches/proof-work",
-            get(list_internal_proof_work_batches),
+            get(list_internal_proof_work_batches).post(claim_internal_proof_work),
+        )
+        .route(
+            "/api/internal/batches/proof-work/renew",
+            post(renew_internal_proof_work),
+        )
+        .route(
+            "/api/internal/batches/proof-work/release",
+            post(release_internal_proof_work),
         )
         .route(
             "/api/internal/batches/{batch_id}/orders",
@@ -911,10 +929,6 @@ fn build_app_with_config(
         .route(
             "/api/internal/batches/{batch_id}/settled-at",
             post(mark_published_batch_settled),
-        )
-        .route(
-            "/api/internal/batches/{batch_id}/witness",
-            get(get_published_witness),
         )
         .route(
             "/api/recovery/{account_id}/artifacts",
@@ -973,10 +987,10 @@ async fn internal_route_auth_middleware(
 }
 
 async fn health(State(state): State<AppState>) -> Json<CoordinatorStatus> {
-    let mut batches = state.batches.write().await;
-    if let Err(status) = advance_batch_lifecycle_durably(&state, &mut batches) {
+    if let Err(status) = advance_batch_lifecycle_durably(&state).await {
         eprintln!("coordinator health failed to persist batch lifecycle: {status}");
     }
+    let batches = state.batches.read().await;
     let current_batch_id =
         current_open_batch_for_default_pair(&state.product_config, batches.values())
             .map(|record| record.batch.batch_id.clone());
@@ -1020,8 +1034,8 @@ async fn list_batches(
     Query(query): Query<ListBatchesQuery>,
 ) -> Result<Json<Vec<PublicBatchSummary>>, StatusCode> {
     enforce_public_rate_limit(&state, &headers, peer, "batches-list")?;
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
     let limit = public_batch_list_limit(query.limit);
     let status_filter = query.status.as_deref().map(public_batch_status_filter);
     Ok(Json(public_batch_summaries_limited(
@@ -1043,8 +1057,8 @@ async fn current_batch(
     headers: HeaderMap,
 ) -> Result<Json<PublicBatchSummary>, StatusCode> {
     enforce_public_rate_limit(&state, &headers, peer, "batch-current")?;
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
     current_open_batch_for_default_pair(&state.product_config, batches.values())
         .map(public_summary_from_record)
         .map(Json)
@@ -1057,8 +1071,8 @@ async fn submittable_batch(
     headers: HeaderMap,
 ) -> Result<Json<PublicBatchSummary>, StatusCode> {
     enforce_public_rate_limit(&state, &headers, peer, "batch-submittable")?;
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
     let default_pair = state
         .product_config
         .enabled_pairs()
@@ -1083,8 +1097,8 @@ async fn current_pair_batch(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
 
     current_open_batch_for_pair(batches.values(), &pair_id)
         .map(public_summary_from_record)
@@ -1104,8 +1118,8 @@ async fn submittable_pair_batch(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
 
     submittable_open_batch_for_pair(batches.values(), &pair_id, state.batch_window_ms)
         .map(public_summary_from_record)
@@ -1120,8 +1134,8 @@ async fn get_batch(
     Path(batch_id): Path<String>,
 ) -> Result<Json<PublicBatchSummary>, StatusCode> {
     enforce_public_rate_limit(&state, &headers, peer, "batch-get")?;
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
     batches
         .get(&batch_id)
         .map(public_summary_from_record)
@@ -1135,8 +1149,8 @@ async fn get_batch_orders(
     Path(batch_id): Path<String>,
 ) -> Result<Json<BatchOrderSet>, StatusCode> {
     require_internal_auth(&state, &headers)?;
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
     let record = batches.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(BatchOrderSet {
@@ -1151,8 +1165,8 @@ async fn list_internal_proof_work_batches(
     Query(query): Query<ListBatchesQuery>,
 ) -> Result<Json<Vec<BatchSummary>>, StatusCode> {
     require_internal_auth(&state, &headers)?;
-    let mut batches = state.batches.write().await;
-    advance_batch_lifecycle_durably(&state, &mut batches)?;
+    advance_batch_lifecycle_durably(&state).await?;
+    let batches = state.batches.read().await;
     let limit = public_batch_list_limit(query.limit);
     let status_filter = query
         .status
@@ -1164,6 +1178,127 @@ async fn list_internal_proof_work_batches(
         limit,
         &status_filter,
     )))
+}
+
+async fn claim_internal_proof_work(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProofWorkClaimRequest>,
+) -> Result<Json<ProofWorkClaimResponse>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    validate_proof_work_claim_request(&request)?;
+    {
+        advance_batch_lifecycle_durably(&state).await?;
+        let batches = state.batches.read().await;
+        for batch_id in &request.batch_ids {
+            let record = batches.get(&batch_id.0).ok_or(StatusCode::NOT_FOUND)?;
+            if record.orders.is_empty()
+                || !matches!(
+                    record.batch.status,
+                    BatchStatus::Closed | BatchStatus::Clearing
+                )
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
+    }
+
+    let now = now_unix_ms();
+    let token_payload = serde_json::to_vec(&serde_json::json!({
+        "work_id": request.work_id,
+        "batch_ids": request.batch_ids,
+        "worker_id": request.worker_id,
+        "claim_nonce": request.claim_nonce,
+    }))
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let claim = ProofWorkClaimResponse {
+        work_id: request.work_id,
+        batch_ids: request.batch_ids,
+        worker_id: request.worker_id,
+        claim_token: tagged_sha256_hex("zylith/proof-work-claim-v1", &token_payload),
+        expires_at_unix_ms: now.saturating_add(request.lease_ms),
+    };
+    claim_proof_work_lease(&state, claim, now).await.map(Json)
+}
+
+async fn renew_internal_proof_work(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProofWorkLeaseRequest>,
+) -> Result<Json<ProofWorkClaimResponse>, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    validate_proof_work_lease_request(&request)?;
+    renew_proof_work_lease(&state, request, now_unix_ms())
+        .await
+        .map(Json)
+}
+
+async fn release_internal_proof_work(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProofWorkLeaseRequest>,
+) -> Result<StatusCode, StatusCode> {
+    require_internal_auth(&state, &headers)?;
+    validate_proof_work_lease_request(&request)?;
+    release_proof_work_lease(&state, request).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_proof_work_claim_request(request: &ProofWorkClaimRequest) -> Result<(), StatusCode> {
+    validate_proof_work_identity(
+        &request.work_id,
+        &request.batch_ids,
+        &request.worker_id,
+        request.lease_ms,
+    )?;
+    if request.claim_nonce.len() < 32 || request.claim_nonce.len() > 256 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn validate_proof_work_lease_request(request: &ProofWorkLeaseRequest) -> Result<(), StatusCode> {
+    validate_proof_work_identity(
+        &request.work_id,
+        &request.batch_ids,
+        &request.worker_id,
+        request.lease_ms,
+    )?;
+    if request.claim_token.len() != 64
+        || !request
+            .claim_token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+fn validate_proof_work_identity(
+    work_id: &str,
+    batch_ids: &[BatchId],
+    worker_id: &str,
+    lease_ms: u64,
+) -> Result<(), StatusCode> {
+    if work_id.trim().is_empty()
+        || work_id.len() > 256
+        || worker_id.trim().is_empty()
+        || worker_id.len() > 256
+        || batch_ids.is_empty()
+        || batch_ids.len() > MAX_PROOF_WORK_LEASE_BATCHES
+        || !(MIN_PROOF_WORK_LEASE_MS..=MAX_PROOF_WORK_LEASE_MS).contains(&lease_ms)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut unique = BTreeSet::new();
+    if batch_ids
+        .iter()
+        .any(|batch_id| batch_id.0.trim().is_empty() || !unique.insert(batch_id.0.as_str()))
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
 }
 
 async fn get_published_transcript(
@@ -1463,17 +1598,6 @@ async fn verify_published_multi_pair_batch_artifact(
     }
 }
 
-async fn get_published_witness(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(batch_id): Path<String>,
-) -> Result<Json<zylith_core::SettlementWitness>, StatusCode> {
-    require_internal_auth(&state, &headers)?;
-    let artifacts = state.published_batch_artifacts.read().await;
-    let published = artifacts.get(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(published.settlement_witness.clone()))
-}
-
 async fn get_renewal_cancel_witness(
     State(state): State<AppState>,
     PeerAddress(peer): PeerAddress,
@@ -1639,6 +1763,9 @@ async fn publish_batch_artifacts(
     if request.transcript.batch_id.0 != batch_id || request.output_bundle.batch_id.0 != batch_id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    request
+        .validate_redacted()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let expected_shape =
         zylith_core::validate_transcript_shape_policy(&request.transcript, &request.output_bundle)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1701,6 +1828,9 @@ async fn publish_multi_pair_batch_artifacts(
     if request.transcript.group_id.0 != group_id || request.output_bundle.batch_id.0 != group_id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    request
+        .validate_redacted()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let expected_shape = zylith_core::validate_multi_pair_transcript_shape_policy(
         &request.transcript,
         &request.output_bundle,
@@ -1718,12 +1848,13 @@ async fn publish_multi_pair_batch_artifacts(
     let settled_at_unix_ms = verify_published_multi_pair_batch_artifact(&state, &request).await?;
     request.settled_at_unix_ms = Some(settled_at_unix_ms);
 
-    {
-        let mut batches = state.batches.write().await;
-        for binding in &request.transcript.batch_bindings {
-            mark_batch_settled_durably(&state, &mut batches, &binding.batch_id.0)?;
-        }
-    }
+    let settled_batch_ids = request
+        .transcript
+        .batch_bindings
+        .iter()
+        .map(|binding| binding.batch_id.0.clone())
+        .collect::<Vec<_>>();
+    mark_batches_settled_durably(&state, &settled_batch_ids).await?;
 
     let artifacts = state.published_batch_artifacts.read().await;
     let mut multi_pair_artifacts = state.published_multi_pair_batch_artifacts.write().await;
@@ -1783,17 +1914,13 @@ async fn mark_published_batch_settled(
         if existing_settled_at != settled_at_unix_ms {
             return Err(StatusCode::CONFLICT);
         }
-        let mut batches = state.batches.write().await;
-        mark_batch_settled_durably(&state, &mut batches, &batch_id)?;
+        mark_batch_settled_durably(&state, &batch_id).await?;
         return Ok(Json(published_snapshot));
     }
     let settled_at_unix_ms =
         verify_settlement_timestamp_update(&state, &published_snapshot, &request).await?;
 
-    {
-        let mut batches = state.batches.write().await;
-        mark_batch_settled_durably(&state, &mut batches, &batch_id)?;
-    }
+    mark_batch_settled_durably(&state, &batch_id).await?;
 
     let mut artifacts = state.published_batch_artifacts.write().await;
     let markers = state.renewal_cancel_markers.read().await;
@@ -2351,20 +2478,22 @@ async fn upload_wallet_vault_bundle(
     if request.updated_at_unix_ms == 0 {
         request.updated_at_unix_ms = now_unix_ms();
     }
-    let recovery_artifacts = state.recovery_artifacts.read().await;
-    let mut wallet_vaults = state.wallet_vaults.write().await;
-    if wallet_vaults
-        .get(&wallet_auth_id)
-        .is_some_and(|existing| request.updated_at_unix_ms <= existing.updated_at_unix_ms)
+    let _transition_guard = state.recovery_store_transition_lock.lock().await;
     {
-        return Err(StatusCode::CONFLICT);
+        let wallet_vaults = state.wallet_vaults.read().await;
+        if wallet_vaults
+            .get(&wallet_auth_id)
+            .is_some_and(|existing| request.updated_at_unix_ms <= existing.updated_at_unix_ms)
+        {
+            return Err(StatusCode::CONFLICT);
+        }
     }
-    let mut candidate = wallet_vaults.clone();
-    candidate.insert(wallet_auth_id, request.clone());
-    if let Some(path) = state.recovery_store_path.as_deref() {
-        persist_recovery_store_file(path, &recovery_artifacts, &candidate)?;
-    }
-    *wallet_vaults = candidate;
+    persist_wallet_vault_upsert_if_configured(&state, &wallet_auth_id, &request).await?;
+    state
+        .wallet_vaults
+        .write()
+        .await
+        .insert(wallet_auth_id, request.clone());
     Ok(Json(request))
 }
 
@@ -2685,9 +2814,14 @@ async fn upload_recovery_artifact(
 
     let provided_auth_tag = require_recovery_auth_header(&headers)?;
     let artifact = request.artifact;
-    let mut recovery_artifacts = state.recovery_artifacts.write().await;
-    let mut candidate = recovery_artifacts.clone();
-    let account = candidate.entry(account_id).or_default();
+    let _transition_guard = state.recovery_store_transition_lock.lock().await;
+    let mut account = state
+        .recovery_artifacts
+        .read()
+        .await
+        .get(&account_id)
+        .cloned()
+        .unwrap_or_default();
     if let Some(expected) = &account.recovery_auth_tag {
         if !zylith_core::constant_time_eq(expected, &provided_auth_tag) {
             return Err(StatusCode::UNAUTHORIZED);
@@ -2718,11 +2852,12 @@ async fn upload_recovery_artifact(
         .artifacts
         .sort_by_key(|entry| (entry.sequence, entry.created_at_unix_ms));
 
-    if let Some(path) = state.recovery_store_path.as_deref() {
-        let wallet_vaults = state.wallet_vaults.read().await;
-        persist_recovery_store_file(path, &candidate, &wallet_vaults)?;
-    }
-    *recovery_artifacts = candidate;
+    persist_recovery_account_upsert_if_configured(&state, &account_id, &account).await?;
+    state
+        .recovery_artifacts
+        .write()
+        .await
+        .insert(account_id, account);
 
     Ok(Json(artifact))
 }
@@ -2779,18 +2914,9 @@ async fn submit_order_inner(
     let accepted_at_unix_ms = now_unix_ms();
     let order_bundle = coordinator_order_bundle_for_storage(&state, request.order_bundle)?;
 
-    let mut batches = state.batches.write().await;
-    let mut candidate = batches.clone();
-    let enabled_pairs = state.product_config.enabled_pairs();
-    advance_batch_lifecycle(
-        &mut candidate,
-        &state.product_config,
-        &enabled_pairs,
-        state.batch_window_ms,
-        state.batch_epoch_offset,
-        state.batch_close_jitter_ms,
-        state.heartbeat_cover_secret.as_str(),
-    )?;
+    let _transition_guard = state.batch_transition_lock.lock().await;
+    advance_batch_lifecycle_durably_locked(&state).await?;
+    let batches = state.batches.read().await;
     if state
         .product_config
         .enabled_pair(&order_bundle.pair_id)
@@ -2803,7 +2929,7 @@ async fn submit_order_inner(
     if order_bundle.batch_id.0 != batch_key {
         return Err(StatusCode::CONFLICT);
     }
-    let record = candidate.get_mut(&batch_key).ok_or(StatusCode::CONFLICT)?;
+    let record = batches.get(&batch_key).ok_or(StatusCode::CONFLICT)?;
 
     if record.batch.status != BatchStatus::Open {
         return Err(StatusCode::CONFLICT);
@@ -2819,35 +2945,39 @@ async fn submit_order_inner(
     if state.max_orders_per_batch > 0 && record.orders.len() as u64 >= state.max_orders_per_batch {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    let accepted = if let Some(existing) = record
+    if let Some(existing) = record
         .orders
         .iter()
         .find(|order| order.order_bundle.order_commitment == order_bundle.order_commitment)
     {
-        OrderSubmissionAccepted {
+        return Ok(Json(OrderSubmissionAccepted {
             batch_id: record.batch.batch_id.clone(),
             order_commitment: existing.order_bundle.order_commitment.clone(),
             accepted_at_unix_ms: existing.received_at_unix_ms,
-        }
-    } else {
-        record.order_count += 1;
-        record.orders.push(SubmittedOrderRecord {
-            received_at_unix_ms: accepted_at_unix_ms,
-            order_bundle: order_bundle.clone(),
-        });
-        refresh_batch_commitments(
-            record,
-            &state.product_config,
-            state.heartbeat_cover_secret.as_str(),
-        )?;
-        OrderSubmissionAccepted {
-            batch_id: record.batch.batch_id.clone(),
-            order_commitment: order_bundle.order_commitment,
-            accepted_at_unix_ms,
-        }
+        }));
+    }
+
+    let mut updated = record.clone();
+    updated.order_count += 1;
+    updated.orders.push(SubmittedOrderRecord {
+        received_at_unix_ms: accepted_at_unix_ms,
+        order_bundle: order_bundle.clone(),
+    });
+    refresh_batch_commitments(
+        &mut updated,
+        &state.product_config,
+        state.heartbeat_cover_secret.as_str(),
+    )?;
+    let accepted = OrderSubmissionAccepted {
+        batch_id: updated.batch.batch_id.clone(),
+        order_commitment: order_bundle.order_commitment,
+        accepted_at_unix_ms,
     };
-    persist_batch_store_if_configured(&state, &candidate)?;
-    *batches = candidate;
+    let json_store_snapshot = batch_json_store_snapshot_if_required(&state, &batches);
+    drop(batches);
+    persist_single_batch_upsert_if_configured(&state, json_store_snapshot, &batch_key, &updated)
+        .await?;
+    state.batches.write().await.insert(batch_key, updated);
 
     Ok(Json(accepted))
 }
@@ -2893,21 +3023,11 @@ async fn cancel_order_inner(
     state: AppState,
     request: OrderCancellationRequest,
 ) -> Result<Json<OrderCancellationAccepted>, StatusCode> {
-    let mut batches = state.batches.write().await;
-    let mut candidate = batches.clone();
-    let enabled_pairs = state.product_config.enabled_pairs();
-    advance_batch_lifecycle(
-        &mut candidate,
-        &state.product_config,
-        &enabled_pairs,
-        state.batch_window_ms,
-        state.batch_epoch_offset,
-        state.batch_close_jitter_ms,
-        state.heartbeat_cover_secret.as_str(),
-    )?;
-    let record = candidate
-        .get_mut(&request.batch_id.0)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let batch_key = request.batch_id.0.clone();
+    let _transition_guard = state.batch_transition_lock.lock().await;
+    advance_batch_lifecycle_durably_locked(&state).await?;
+    let batches = state.batches.read().await;
+    let record = batches.get(&batch_key).ok_or(StatusCode::NOT_FOUND)?;
 
     if record.batch.status != BatchStatus::Open {
         return Err(StatusCode::CONFLICT);
@@ -2931,10 +3051,11 @@ async fn cancel_order_inner(
         })
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    record.orders.remove(order_index);
-    record.order_count = record.orders.len() as u64;
+    let mut updated = record.clone();
+    updated.orders.remove(order_index);
+    updated.order_count = updated.orders.len() as u64;
     refresh_batch_commitments(
-        record,
+        &mut updated,
         &state.product_config,
         state.heartbeat_cover_secret.as_str(),
     )?;
@@ -2943,8 +3064,11 @@ async fn cancel_order_inner(
         order_commitment: request.order_commitment,
         cancelled_at_unix_ms: now_unix_ms(),
     };
-    persist_batch_store_if_configured(&state, &candidate)?;
-    *batches = candidate;
+    let json_store_snapshot = batch_json_store_snapshot_if_required(&state, &batches);
+    drop(batches);
+    persist_single_batch_upsert_if_configured(&state, json_store_snapshot, &batch_key, &updated)
+        .await?;
+    state.batches.write().await.insert(batch_key, updated);
 
     Ok(Json(accepted))
 }
@@ -3029,11 +3153,10 @@ fn internal_proof_work_batch_summaries_limited<'a>(
         .map(summary_from_record)
         .collect::<Vec<BatchSummary>>();
     summaries.sort_by(|left, right| {
-        right
-            .close_time_unix_ms
-            .cmp(&left.close_time_unix_ms)
-            .then_with(|| right.epoch_id.cmp(&left.epoch_id))
-            .then_with(|| right.batch_id.0.cmp(&left.batch_id.0))
+        left.close_time_unix_ms
+            .cmp(&right.close_time_unix_ms)
+            .then_with(|| left.epoch_id.cmp(&right.epoch_id))
+            .then_with(|| left.batch_id.0.cmp(&right.batch_id.0))
     });
     summaries.truncate(limit);
     summaries
@@ -3569,11 +3692,14 @@ fn advance_batch_lifecycle(
     Ok(changed)
 }
 
-fn advance_batch_lifecycle_durably(
-    state: &AppState,
-    batches: &mut BTreeMap<String, BatchRecord>,
-) -> Result<bool, StatusCode> {
-    let mut candidate = batches.clone();
+async fn advance_batch_lifecycle_durably(state: &AppState) -> Result<bool, StatusCode> {
+    let _transition_guard = state.batch_transition_lock.lock().await;
+    advance_batch_lifecycle_durably_locked(state).await
+}
+
+async fn advance_batch_lifecycle_durably_locked(state: &AppState) -> Result<bool, StatusCode> {
+    let before = state.batches.read().await.clone();
+    let mut candidate = before.clone();
     let enabled_pairs = state.product_config.enabled_pairs();
     let changed = advance_batch_lifecycle(
         &mut candidate,
@@ -3585,32 +3711,39 @@ fn advance_batch_lifecycle_durably(
         state.heartbeat_cover_secret.as_str(),
     )?;
     if changed {
-        persist_batch_store_if_configured(state, &candidate)?;
-        *batches = candidate;
+        persist_batch_store_transition_if_configured(state, &before, &candidate).await?;
+        *state.batches.write().await = candidate;
     }
     Ok(changed)
 }
 
-fn mark_batch_settled_durably(
+async fn mark_batches_settled_durably(
     state: &AppState,
-    batches: &mut BTreeMap<String, BatchRecord>,
-    batch_id: &str,
+    batch_ids: &[String],
 ) -> Result<(), StatusCode> {
-    let Some(record) = batches.get(batch_id) else {
-        return Ok(());
-    };
-    if record.batch.status == BatchStatus::Settled {
+    let _transition_guard = state.batch_transition_lock.lock().await;
+    let before = state.batches.read().await.clone();
+    if batch_ids.iter().all(|batch_id| {
+        before
+            .get(batch_id)
+            .is_none_or(|record| record.batch.status == BatchStatus::Settled)
+    }) {
         return Ok(());
     }
-    let mut candidate = batches.clone();
-    let record = candidate
-        .get_mut(batch_id)
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    record.batch.status = BatchStatus::Settled;
+    let mut candidate = before.clone();
+    for batch_id in batch_ids {
+        if let Some(record) = candidate.get_mut(batch_id) {
+            record.batch.status = BatchStatus::Settled;
+        }
+    }
     prune_batch_store_for_retention(&mut candidate);
-    persist_batch_store_if_configured(state, &candidate)?;
-    *batches = candidate;
+    persist_batch_store_transition_if_configured(state, &before, &candidate).await?;
+    *state.batches.write().await = candidate;
     Ok(())
+}
+
+async fn mark_batch_settled_durably(state: &AppState, batch_id: &str) -> Result<(), StatusCode> {
+    mark_batches_settled_durably(state, &[batch_id.to_owned()]).await
 }
 
 fn prune_batch_store_for_retention(batches: &mut BTreeMap<String, BatchRecord>) -> bool {
@@ -3932,14 +4065,71 @@ fn load_batch_store(path: &FsPath) -> BTreeMap<String, BatchRecord> {
         .unwrap_or_else(|error| panic!("failed to parse batch store {}: {error}", path.display()))
 }
 
-fn persist_batch_store_if_configured(
+async fn persist_batch_store_transition_if_configured(
+    state: &AppState,
+    before: &BTreeMap<String, BatchRecord>,
+    after: &BTreeMap<String, BatchRecord>,
+) -> Result<(), StatusCode> {
+    let Some(path) = state
+        .batch_store_path
+        .as_ref()
+        .map(|path| path.as_ref().clone())
+    else {
+        return Ok(());
+    };
+    if is_sqlite_store(&path) {
+        let (upserts, deletions) = sqlite_record_changes(before, after);
+        return tokio::task::spawn_blocking(move || {
+            persist_sqlite_record_changes(&path, "batches", &upserts, &deletions)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    let after = after.clone();
+    tokio::task::spawn_blocking(move || persist_batch_store(&path, &after))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+async fn persist_single_batch_upsert_if_configured(
+    state: &AppState,
+    current_json_store: Option<BTreeMap<String, BatchRecord>>,
+    batch_id: &str,
+    updated: &BatchRecord,
+) -> Result<(), StatusCode> {
+    let Some(path) = state
+        .batch_store_path
+        .as_ref()
+        .map(|path| path.as_ref().clone())
+    else {
+        return Ok(());
+    };
+    if is_sqlite_store(&path) {
+        let batch_id = batch_id.to_owned();
+        let updated = updated.clone();
+        return tokio::task::spawn_blocking(move || {
+            persist_sqlite_record_upsert(&path, "batches", &batch_id, &updated)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let mut candidate = current_json_store.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    candidate.insert(batch_id.to_owned(), updated.clone());
+    tokio::task::spawn_blocking(move || persist_batch_store(&path, &candidate))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+fn batch_json_store_snapshot_if_required(
     state: &AppState,
     batches: &BTreeMap<String, BatchRecord>,
-) -> Result<(), StatusCode> {
-    if let Some(path) = state.batch_store_path.as_deref() {
-        persist_batch_store(path, batches)?;
-    }
-    Ok(())
+) -> Option<BTreeMap<String, BatchRecord>> {
+    state
+        .batch_store_path
+        .as_deref()
+        .filter(|path| !is_sqlite_store(path))
+        .map(|_| batches.clone())
 }
 
 fn persist_batch_store(
@@ -3990,8 +4180,8 @@ fn load_recovery_store_file(path: &FsPath) -> RecoveryStoreFile {
 }
 
 fn load_published_batch_artifacts_store_file(path: &FsPath) -> PublishedBatchArtifactsStoreFile {
-    if is_sqlite_store(path) {
-        return PublishedBatchArtifactsStoreFile {
+    let store = if is_sqlite_store(path) {
+        PublishedBatchArtifactsStoreFile {
             artifacts_by_batch: load_sqlite_records(path, "published_batch_artifacts")
                 .unwrap_or_else(|error| {
                     panic!(
@@ -4006,20 +4196,41 @@ fn load_published_batch_artifacts_store_file(path: &FsPath) -> PublishedBatchArt
             .unwrap_or_default(),
             renewal_cancel_markers: load_sqlite_records(path, "renewal_cancel_markers")
                 .unwrap_or_default(),
+        }
+    } else {
+        let contents = read_json_store(path, "published batch artifacts")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let Some(contents) = contents else {
+            return PublishedBatchArtifactsStoreFile::default();
         };
-    }
-    let contents = read_json_store(path, "published batch artifacts")
-        .unwrap_or_else(|error| panic!("{error}"));
-    let Some(contents) = contents else {
-        return PublishedBatchArtifactsStoreFile::default();
+
+        serde_json::from_str::<PublishedBatchArtifactsStoreFile>(&contents).unwrap_or_else(
+            |error| {
+                panic!(
+                    "failed to parse published batch artifacts store {}: {error}",
+                    path.display()
+                )
+            },
+        )
     };
 
-    serde_json::from_str::<PublishedBatchArtifactsStoreFile>(&contents).unwrap_or_else(|error| {
-        panic!(
-            "failed to parse published batch artifacts store {}: {error}",
-            path.display()
-        )
-    })
+    for artifact in store.artifacts_by_batch.values() {
+        artifact.validate_redacted().unwrap_or_else(|error| {
+            panic!(
+                "published batch artifacts store {} contains private witness data: {error}",
+                path.display()
+            )
+        });
+    }
+    for artifact in store.multi_pair_artifacts_by_group.values() {
+        artifact.validate_redacted().unwrap_or_else(|error| {
+            panic!(
+                "published multi-pair artifacts store {} contains private witness data: {error}",
+                path.display()
+            )
+        });
+    }
+    store
 }
 
 #[cfg(test)]
@@ -4054,6 +4265,70 @@ fn persist_recovery_store_file(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     atomic_write(path, &encoded)
+}
+
+async fn persist_recovery_account_upsert_if_configured(
+    state: &AppState,
+    account_id: &str,
+    account: &RecoveryAccountRecord,
+) -> Result<(), StatusCode> {
+    let Some(path) = state
+        .recovery_store_path
+        .as_ref()
+        .map(|path| path.as_ref().clone())
+    else {
+        return Ok(());
+    };
+    if is_sqlite_store(&path) {
+        let account_id = account_id.to_owned();
+        let account = account.clone();
+        return tokio::task::spawn_blocking(move || {
+            persist_sqlite_record_upsert(&path, "recovery_accounts", &account_id, &account)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let mut accounts = state.recovery_artifacts.read().await.clone();
+    accounts.insert(account_id.to_owned(), account.clone());
+    let wallet_vaults = state.wallet_vaults.read().await.clone();
+    tokio::task::spawn_blocking(move || {
+        persist_recovery_store_file(&path, &accounts, &wallet_vaults)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+}
+
+async fn persist_wallet_vault_upsert_if_configured(
+    state: &AppState,
+    wallet_auth_id: &str,
+    bundle: &WalletVaultBundleRecord,
+) -> Result<(), StatusCode> {
+    let Some(path) = state
+        .recovery_store_path
+        .as_ref()
+        .map(|path| path.as_ref().clone())
+    else {
+        return Ok(());
+    };
+    if is_sqlite_store(&path) {
+        let wallet_auth_id = wallet_auth_id.to_owned();
+        let bundle = bundle.clone();
+        return tokio::task::spawn_blocking(move || {
+            persist_sqlite_record_upsert(&path, "wallet_vault_bundles", &wallet_auth_id, &bundle)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let recovery_artifacts = state.recovery_artifacts.read().await.clone();
+    let mut wallet_vaults = state.wallet_vaults.read().await.clone();
+    wallet_vaults.insert(wallet_auth_id.to_owned(), bundle.clone());
+    tokio::task::spawn_blocking(move || {
+        persist_recovery_store_file(&path, &recovery_artifacts, &wallet_vaults)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 fn read_json_store(path: &FsPath, label: &str) -> Result<Option<String>, String> {
@@ -4166,6 +4441,295 @@ fn open_sqlite_store(path: &FsPath) -> rusqlite::Result<Connection> {
     Ok(connection)
 }
 
+async fn claim_proof_work_lease(
+    state: &AppState,
+    claim: ProofWorkClaimResponse,
+    now: u64,
+) -> Result<ProofWorkClaimResponse, StatusCode> {
+    if let Some(path) = state
+        .batch_store_path
+        .as_ref()
+        .map(|path| path.as_ref().clone())
+        .filter(|path| is_sqlite_store(path))
+    {
+        return tokio::task::spawn_blocking(move || {
+            sqlite_claim_proof_work_lease(&path, claim, now)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let mut leases = state.proof_work_leases.write().await;
+    let existing = claim
+        .batch_ids
+        .iter()
+        .filter_map(|batch_id| leases.get(&batch_id.0))
+        .filter(|lease| lease.expires_at_unix_ms > now)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(first) = existing.first() {
+        if existing.len() == claim.batch_ids.len()
+            && existing.iter().all(|lease| lease == first)
+            && proof_work_claim_identity_matches(first, &claim)
+        {
+            return Ok(first.clone());
+        }
+        return Err(StatusCode::CONFLICT);
+    }
+    for batch_id in &claim.batch_ids {
+        leases.insert(batch_id.0.clone(), claim.clone());
+    }
+    Ok(claim)
+}
+
+async fn renew_proof_work_lease(
+    state: &AppState,
+    request: ProofWorkLeaseRequest,
+    now: u64,
+) -> Result<ProofWorkClaimResponse, StatusCode> {
+    if let Some(path) = state
+        .batch_store_path
+        .as_ref()
+        .map(|path| path.as_ref().clone())
+        .filter(|path| is_sqlite_store(path))
+    {
+        return tokio::task::spawn_blocking(move || {
+            sqlite_renew_proof_work_lease(&path, request, now)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let mut leases = state.proof_work_leases.write().await;
+    let current = current_memory_proof_work_lease(&leases, &request, now)?;
+    let renewed = ProofWorkClaimResponse {
+        expires_at_unix_ms: now.saturating_add(request.lease_ms),
+        ..current
+    };
+    for batch_id in &request.batch_ids {
+        leases.insert(batch_id.0.clone(), renewed.clone());
+    }
+    Ok(renewed)
+}
+
+async fn release_proof_work_lease(
+    state: &AppState,
+    request: ProofWorkLeaseRequest,
+) -> Result<(), StatusCode> {
+    if let Some(path) = state
+        .batch_store_path
+        .as_ref()
+        .map(|path| path.as_ref().clone())
+        .filter(|path| is_sqlite_store(path))
+    {
+        return tokio::task::spawn_blocking(move || {
+            sqlite_release_proof_work_lease(&path, request)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let mut leases = state.proof_work_leases.write().await;
+    current_memory_proof_work_lease(&leases, &request, 0)?;
+    for batch_id in &request.batch_ids {
+        leases.remove(&batch_id.0);
+    }
+    Ok(())
+}
+
+fn current_memory_proof_work_lease(
+    leases: &BTreeMap<String, ProofWorkClaimResponse>,
+    request: &ProofWorkLeaseRequest,
+    require_unexpired_at: u64,
+) -> Result<ProofWorkClaimResponse, StatusCode> {
+    let mut current = None;
+    for batch_id in &request.batch_ids {
+        let lease = leases.get(&batch_id.0).ok_or(StatusCode::CONFLICT)?;
+        if !proof_work_lease_request_matches(lease, request)
+            || (require_unexpired_at > 0 && lease.expires_at_unix_ms <= require_unexpired_at)
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        if current.as_ref().is_some_and(|existing| existing != lease) {
+            return Err(StatusCode::CONFLICT);
+        }
+        current = Some(lease.clone());
+    }
+    current.ok_or(StatusCode::CONFLICT)
+}
+
+fn proof_work_claim_identity_matches(
+    left: &ProofWorkClaimResponse,
+    right: &ProofWorkClaimResponse,
+) -> bool {
+    left.work_id == right.work_id
+        && left.batch_ids == right.batch_ids
+        && left.worker_id == right.worker_id
+        && left.claim_token == right.claim_token
+}
+
+fn proof_work_lease_request_matches(
+    lease: &ProofWorkClaimResponse,
+    request: &ProofWorkLeaseRequest,
+) -> bool {
+    lease.work_id == request.work_id
+        && lease.batch_ids == request.batch_ids
+        && lease.worker_id == request.worker_id
+        && lease.claim_token == request.claim_token
+}
+
+fn sqlite_claim_proof_work_lease(
+    path: &FsPath,
+    claim: ProofWorkClaimResponse,
+    now: u64,
+) -> Result<ProofWorkClaimResponse, StatusCode> {
+    let mut connection = open_sqlite_store(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing = sqlite_proof_work_leases(&transaction, &claim.batch_ids)?;
+    let active = existing
+        .iter()
+        .filter_map(|lease| lease.as_ref())
+        .filter(|lease| lease.expires_at_unix_ms > now)
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(first) = active.first() {
+        if active.len() == claim.batch_ids.len()
+            && active.iter().all(|lease| lease == first)
+            && proof_work_claim_identity_matches(first, &claim)
+        {
+            transaction
+                .commit()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Ok(first.clone());
+        }
+        return Err(StatusCode::CONFLICT);
+    }
+    sqlite_upsert_proof_work_lease(&transaction, &claim)?;
+    transaction
+        .commit()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(claim)
+}
+
+fn sqlite_renew_proof_work_lease(
+    path: &FsPath,
+    request: ProofWorkLeaseRequest,
+    now: u64,
+) -> Result<ProofWorkClaimResponse, StatusCode> {
+    let mut connection = open_sqlite_store(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing = sqlite_proof_work_leases(&transaction, &request.batch_ids)?;
+    let current = consistent_sqlite_proof_work_lease(existing, &request, Some(now))?;
+    let renewed = ProofWorkClaimResponse {
+        expires_at_unix_ms: now.saturating_add(request.lease_ms),
+        ..current
+    };
+    sqlite_upsert_proof_work_lease(&transaction, &renewed)?;
+    transaction
+        .commit()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(renewed)
+}
+
+fn sqlite_release_proof_work_lease(
+    path: &FsPath,
+    request: ProofWorkLeaseRequest,
+) -> Result<(), StatusCode> {
+    let mut connection = open_sqlite_store(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let existing = sqlite_proof_work_leases(&transaction, &request.batch_ids)?;
+    consistent_sqlite_proof_work_lease(existing, &request, None)?;
+    for batch_id in &request.batch_ids {
+        transaction
+            .execute(
+                "DELETE FROM coordinator_records WHERE namespace = ?1 AND record_key = ?2",
+                rusqlite::params![PROOF_WORK_LEASES_NAMESPACE, batch_id.0],
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn sqlite_proof_work_leases(
+    transaction: &rusqlite::Transaction<'_>,
+    batch_ids: &[BatchId],
+) -> Result<Vec<Option<ProofWorkClaimResponse>>, StatusCode> {
+    batch_ids
+        .iter()
+        .map(|batch_id| {
+            let value = transaction
+                .query_row(
+                    "SELECT value_json FROM coordinator_records WHERE namespace = ?1 AND record_key = ?2",
+                    rusqlite::params![PROOF_WORK_LEASES_NAMESPACE, batch_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            value
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+fn consistent_sqlite_proof_work_lease(
+    existing: Vec<Option<ProofWorkClaimResponse>>,
+    request: &ProofWorkLeaseRequest,
+    require_unexpired_at: Option<u64>,
+) -> Result<ProofWorkClaimResponse, StatusCode> {
+    let mut current = None;
+    for lease in existing {
+        let lease = lease.ok_or(StatusCode::CONFLICT)?;
+        if !proof_work_lease_request_matches(&lease, request)
+            || require_unexpired_at.is_some_and(|now| lease.expires_at_unix_ms <= now)
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        if current.as_ref().is_some_and(|known| known != &lease) {
+            return Err(StatusCode::CONFLICT);
+        }
+        current = Some(lease);
+    }
+    current.ok_or(StatusCode::CONFLICT)
+}
+
+fn sqlite_upsert_proof_work_lease(
+    transaction: &rusqlite::Transaction<'_>,
+    lease: &ProofWorkClaimResponse,
+) -> Result<(), StatusCode> {
+    let value_json = serde_json::to_string(lease).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let updated_at_unix_ms = now_unix_ms() as i64;
+    for batch_id in &lease.batch_ids {
+        transaction
+            .execute(
+                "INSERT INTO coordinator_records
+                    (namespace, record_key, value_json, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace, record_key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                rusqlite::params![
+                    PROOF_WORK_LEASES_NAMESPACE,
+                    batch_id.0,
+                    value_json,
+                    updated_at_unix_ms
+                ],
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(())
+}
+
 fn load_sqlite_records<T: DeserializeOwned>(
     path: &FsPath,
     namespace: &str,
@@ -4206,6 +4770,97 @@ fn persist_sqlite_records<T: Serialize>(
         .transaction()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     persist_sqlite_records_in_transaction(&transaction, namespace, records)?;
+    transaction
+        .commit()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn persist_sqlite_record_upsert<T: Serialize>(
+    path: &FsPath,
+    namespace: &str,
+    key: &str,
+    value: &T,
+) -> Result<(), StatusCode> {
+    let mut records = BTreeMap::new();
+    records.insert(key.to_owned(), value);
+    persist_sqlite_record_changes(path, namespace, &records, &[])
+}
+
+#[cfg(test)]
+fn persist_sqlite_record_transition<T: Serialize + PartialEq>(
+    path: &FsPath,
+    namespace: &str,
+    before: &BTreeMap<String, T>,
+    after: &BTreeMap<String, T>,
+) -> Result<(), StatusCode> {
+    let upserts = after
+        .iter()
+        .filter(|(key, value)| before.get(*key).is_none_or(|existing| existing != *value))
+        .collect::<BTreeMap<_, _>>();
+    let deletions = before
+        .keys()
+        .filter(|key| !after.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    persist_sqlite_record_changes(path, namespace, &upserts, &deletions)
+}
+
+fn sqlite_record_changes<T: Clone + PartialEq>(
+    before: &BTreeMap<String, T>,
+    after: &BTreeMap<String, T>,
+) -> (BTreeMap<String, T>, Vec<String>) {
+    let upserts = after
+        .iter()
+        .filter(|(key, value)| before.get(*key).is_none_or(|existing| existing != *value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let deletions = before
+        .keys()
+        .filter(|key| !after.contains_key(*key))
+        .cloned()
+        .collect();
+    (upserts, deletions)
+}
+
+fn persist_sqlite_record_changes<K, T>(
+    path: &FsPath,
+    namespace: &str,
+    upserts: &BTreeMap<K, T>,
+    deletions: &[String],
+) -> Result<(), StatusCode>
+where
+    K: AsRef<str> + Ord,
+    T: Serialize,
+{
+    let mut connection = open_sqlite_store(path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let updated_at_unix_ms = now_unix_ms() as i64;
+    for (key, value) in upserts {
+        let key = key.as_ref();
+        let value_json =
+            serde_json::to_string(value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        transaction
+            .execute(
+                "INSERT INTO coordinator_records
+                    (namespace, record_key, value_json, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace, record_key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                rusqlite::params![namespace, key, value_json, updated_at_unix_ms],
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    for key in deletions {
+        transaction
+            .execute(
+                "DELETE FROM coordinator_records WHERE namespace = ?1 AND record_key = ?2",
+                rusqlite::params![namespace, key],
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
     transaction
         .commit()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -4298,7 +4953,8 @@ fn atomic_write(path: &FsPath, contents: &str) -> Result<(), StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchRecord, BatchTimingConfig, DEFAULT_BATCH_WINDOW_MS, MAX_JSON_STORE_BYTES,
+        BatchRecord, BatchTimingConfig, CoordinatorHardeningConfig, CoordinatorStoreConfig,
+        DEFAULT_BATCH_WINDOW_MS, DEFAULT_PAIR_IDS, MAX_JSON_STORE_BYTES,
         MAX_PUBLIC_TRANSCRIPT_BATCH_IDS, MAX_STARKNET_RPC_RESPONSE_BYTES, OrderIngressConfig,
         RenewalCancelWitnessResponse, SubmittedOrderRecord, WALLET_VAULT_AUTH_HEADER,
         WALLET_VAULT_ID_DOMAIN, WalletVaultBundleRecord, build_app_with_config,
@@ -4306,6 +4962,7 @@ mod tests {
         deterministic_batch_close_jitter_ms, effective_public_artifact_delay_epochs, empty_batch,
         load_batch_store, load_published_batch_artifacts_store_file, load_recovery_store,
         load_recovery_store_file, now_unix_ms, persist_batch_store, persist_recovery_store,
+        persist_sqlite_record_transition, persist_sqlite_record_upsert,
         product_config_from_pair_sources, service_http_client, submittable_open_batch_for_pair,
     };
     use axum::http::StatusCode;
@@ -4697,6 +5354,198 @@ mod tests {
             Some("auth-tag")
         );
         assert_eq!(load_batch_store(&path).len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_proof_work_leases_are_atomic_renewable_and_token_bound() {
+        let path = std::env::temp_dir().join(format!(
+            "zylith-coordinator-proof-lease-{}-{}.sqlite",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let batch_ids = vec![BatchId("batch-a".into()), BatchId("batch-b".into())];
+        let first = zylith_core::ProofWorkClaimResponse {
+            work_id: "group-a".into(),
+            batch_ids: batch_ids.clone(),
+            worker_id: "worker-a".into(),
+            claim_token: "a".repeat(64),
+            expires_at_unix_ms: 120_000,
+        };
+
+        let claimed = super::sqlite_claim_proof_work_lease(&path, first.clone(), 1)
+            .expect("first worker claims all member batches");
+        assert_eq!(claimed, first);
+        assert_eq!(
+            super::sqlite_claim_proof_work_lease(&path, first.clone(), 2)
+                .expect("idempotent claim"),
+            first
+        );
+
+        let competing = zylith_core::ProofWorkClaimResponse {
+            worker_id: "worker-b".into(),
+            claim_token: "b".repeat(64),
+            ..first.clone()
+        };
+        assert_eq!(
+            super::sqlite_claim_proof_work_lease(&path, competing.clone(), 3),
+            Err(StatusCode::CONFLICT)
+        );
+
+        let lease_request = zylith_core::ProofWorkLeaseRequest {
+            work_id: first.work_id.clone(),
+            batch_ids: batch_ids.clone(),
+            worker_id: first.worker_id.clone(),
+            claim_token: first.claim_token.clone(),
+            lease_ms: 60_000,
+        };
+        let renewed = super::sqlite_renew_proof_work_lease(&path, lease_request.clone(), 80_000)
+            .expect("owner renews claim");
+        assert_eq!(renewed.expires_at_unix_ms, 140_000);
+
+        let mut wrong_release = lease_request.clone();
+        wrong_release.claim_token = "c".repeat(64);
+        assert_eq!(
+            super::sqlite_release_proof_work_lease(&path, wrong_release),
+            Err(StatusCode::CONFLICT)
+        );
+        super::sqlite_release_proof_work_lease(&path, lease_request).expect("owner releases claim");
+        assert_eq!(
+            super::sqlite_claim_proof_work_lease(&path, competing.clone(), 4)
+                .expect("next worker can claim after release"),
+            competing
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_batch_transition_only_rewrites_changed_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "zylith-coordinator-transition-{}-{}.sqlite",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let product_config =
+            ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product config");
+        let pair = PairId("STRK/USDC".into());
+        let mut before = BTreeMap::new();
+        for epoch in [7_u64, 8] {
+            before.insert(
+                format!("strk-usdc-{epoch}"),
+                BatchRecord {
+                    batch: empty_batch(
+                        &product_config,
+                        &pair,
+                        epoch,
+                        now_unix_ms(),
+                        DEFAULT_BATCH_WINDOW_MS,
+                        0,
+                        "test-heartbeat-cover-secret",
+                    )
+                    .expect("construct test batch"),
+                    order_count: epoch,
+                    orders: Vec::new(),
+                },
+            );
+        }
+        persist_batch_store(&path, &before).expect("persist initial batch rows");
+
+        let row_metadata = |key: &str| {
+            let connection = super::open_sqlite_store(&path).expect("open sqlite store");
+            connection
+                .query_row(
+                    "SELECT value_json, updated_at_unix_ms
+                     FROM coordinator_records
+                     WHERE namespace = 'batches' AND record_key = ?1",
+                    [key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("load batch row metadata")
+        };
+        let changed_before = row_metadata("strk-usdc-7");
+        let unchanged_before = row_metadata("strk-usdc-8");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let mut after = before.clone();
+        after
+            .get_mut("strk-usdc-7")
+            .expect("changed batch")
+            .order_count += 1;
+        persist_sqlite_record_transition(&path, "batches", &before, &after)
+            .expect("persist batch transition");
+
+        let changed_after = row_metadata("strk-usdc-7");
+        let unchanged_after = row_metadata("strk-usdc-8");
+        assert_ne!(changed_after.0, changed_before.0);
+        assert!(changed_after.1 > changed_before.1);
+        assert_eq!(unchanged_after, unchanged_before);
+        assert_eq!(load_batch_store(&path), after);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_single_batch_upsert_does_not_scan_or_rewrite_siblings() {
+        let path = std::env::temp_dir().join(format!(
+            "zylith-coordinator-single-upsert-{}-{}.sqlite",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let product_config =
+            ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product config");
+        let pair = PairId("STRK/USDC".into());
+        let mut batches = BTreeMap::new();
+        for epoch in [7_u64, 8] {
+            batches.insert(
+                format!("strk-usdc-{epoch}"),
+                BatchRecord {
+                    batch: empty_batch(
+                        &product_config,
+                        &pair,
+                        epoch,
+                        now_unix_ms(),
+                        DEFAULT_BATCH_WINDOW_MS,
+                        0,
+                        "test-heartbeat-cover-secret",
+                    )
+                    .expect("construct test batch"),
+                    order_count: epoch,
+                    orders: Vec::new(),
+                },
+            );
+        }
+        persist_batch_store(&path, &batches).expect("persist initial batch rows");
+        let sibling_before = super::open_sqlite_store(&path)
+            .expect("open sqlite store")
+            .query_row(
+                "SELECT value_json, updated_at_unix_ms
+                 FROM coordinator_records
+                 WHERE namespace = 'batches' AND record_key = 'strk-usdc-8'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("load sibling metadata");
+
+        let mut updated = batches.get("strk-usdc-7").expect("batch").clone();
+        updated.order_count = 99;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        persist_sqlite_record_upsert(&path, "batches", "strk-usdc-7", &updated)
+            .expect("upsert one row");
+
+        let loaded = load_batch_store(&path);
+        assert_eq!(loaded.get("strk-usdc-7").expect("updated").order_count, 99);
+        assert_eq!(loaded.get("strk-usdc-8"), batches.get("strk-usdc-8"));
+        let sibling_after = super::open_sqlite_store(&path)
+            .expect("open sqlite store")
+            .query_row(
+                "SELECT value_json, updated_at_unix_ms
+                 FROM coordinator_records
+                 WHERE namespace = 'batches' AND record_key = 'strk-usdc-8'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("load sibling metadata");
+        assert_eq!(sibling_after, sibling_before);
         let _ = fs::remove_file(path);
     }
 
@@ -5398,7 +6247,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_proof_work_batches_are_recent_nonempty_and_exact() {
+    fn internal_proof_work_batches_are_oldest_nonempty_and_exact() {
         let product = ProductConfig::from_enabled_pair_ids_csv("STRK/USDC").expect("product");
         let pair = PairId("STRK/USDC".into());
         let mut records = Vec::new();
@@ -5414,10 +6263,7 @@ mod tests {
             )
             .expect("construct batch");
             batch.close_time_unix_ms = epoch * 1_000;
-            batch.status = match epoch {
-                1 => BatchStatus::Open,
-                _ => BatchStatus::Closed,
-            };
+            batch.status = BatchStatus::Closed;
             let order_bundle = OrderShareBundle {
                 order_commitment: zylith_core::OrderCommitment(format!("0x{epoch:x}")),
                 cancellation_auth_tag: format!("cancel-{epoch}"),
@@ -5430,15 +6276,11 @@ mod tests {
             };
             records.push(BatchRecord {
                 batch,
-                order_count: if epoch == 2 { 0 } else { 1 },
-                orders: if epoch == 2 {
-                    Vec::new()
-                } else {
-                    vec![SubmittedOrderRecord {
-                        received_at_unix_ms: now_unix_ms(),
-                        order_bundle,
-                    }]
-                },
+                order_count: 1,
+                orders: vec![SubmittedOrderRecord {
+                    received_at_unix_ms: now_unix_ms(),
+                    order_bundle,
+                }],
             });
         }
 
@@ -5448,8 +6290,10 @@ mod tests {
             &[BatchStatus::Closed, BatchStatus::Clearing],
         );
 
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].epoch_id, 3);
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries[0].epoch_id, 1);
+        assert_eq!(summaries[1].epoch_id, 2);
+        assert_eq!(summaries[2].epoch_id, 3);
         assert_eq!(summaries[0].order_count, 1);
         assert_ne!(summaries[0].order_commitment_root, "");
     }
@@ -5475,7 +6319,7 @@ mod tests {
             "test-heartbeat-cover-secret",
         )
         .expect("construct test batch");
-        batch_one.close_time_unix_ms = now + 4_000;
+        batch_one.close_time_unix_ms = now + 1_500;
         let mut batch_two = empty_batch(
             &product,
             &pair,
@@ -6283,7 +7127,27 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_endpoint_removes_matching_open_order() {
-        let app = build_app_with_paths(None, None, None, None);
+        let app = build_app_with_config(
+            CoordinatorStoreConfig {
+                batch_store_path: None,
+                recovery_store_path: None,
+                published_batch_artifacts_store_path: None,
+            },
+            None,
+            ProductConfig::from_enabled_pair_ids_csv(DEFAULT_PAIR_IDS).expect("default product"),
+            BatchTimingConfig {
+                // Keep this assertion independent from wall-clock scheduling
+                // while the production coordinator remains a 10-second batch.
+                window_ms: 120_000,
+                epoch_offset: 0,
+                close_jitter_ms: 0,
+            },
+            OrderIngressConfig {
+                receipt_secrets: vec!["test-receipt-secret".into()],
+            },
+            CoordinatorHardeningConfig::default(),
+        )
+        .expect("test coordinator app should build");
         let batch = submittable_test_batch(&app, "STRK/USDC").await;
         let mut submission = OrderSubmission {
             order_bundle: OrderShareBundle {
@@ -6656,7 +7520,12 @@ mod tests {
             pair_id: PairId("STRK/USDC".into()),
             batch_epoch: 42,
             order_commitment_root: "0x111".into(),
+            admission_root: "0x211".into(),
             encrypted_order_set_commitment: "0x222".into(),
+            reference_price_attestation_commitment: "0x511".into(),
+            reference_price_signer: "0x611".into(),
+            reference_price_observed_at_unix_ms: 1_000,
+            reference_price_valid_until_unix_ms: 6_000,
             base_asset_id: zylith_core::AssetId("STRK".into()),
             quote_asset_id: zylith_core::AssetId("USDC".into()),
             price_base_scale: 1,
@@ -6672,15 +7541,18 @@ mod tests {
         let transcript = zylith_core::MultiPairSettlementTranscript {
             group_id: BatchId(group_id.into()),
             batch_epoch: 42,
+            auction_verifier_address: "0x123".into(),
             batch_bindings: vec![member_binding.clone()],
             prior_note_root: "0x0".into(),
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            new_note_root: "0x1".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             protocol_fee_recipient: "0x999".into(),
             multi_pair_commitment: "0x777".into(),
+            external_match_settlements: vec![],
             matched_orders: vec![zylith_core::MatchedOrder {
                 order_commitment: order_commitment.clone(),
                 filled_amount: 10,
@@ -6704,47 +7576,6 @@ mod tests {
                 ciphertext_count_bucket: "0".into(),
                 padded_ciphertext_count: 0,
                 ciphertexts: vec![],
-            },
-            settlement_witness: zylith_core::MultiPairSettlementWitness {
-                group_id: BatchId(group_id.into()),
-                batch_epoch: 42,
-                batch_bindings: vec![member_binding.clone()],
-                transcript_commitment: "0x888".into(),
-                auction_verifier_address: "0x1".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                protocol_fee_recipient: "0x999".into(),
-                multi_pair_problem: zylith_core::MultiPairOptimalityProblem {
-                    chosen: zylith_core::MultiPairFeasibilityProblem {
-                        batch_id: BatchId(group_id.into()),
-                        fills: vec![],
-                        asset_deltas: vec![],
-                    },
-                    eligible_order_commitments: vec![],
-                    objective_weights: vec![],
-                    candidate_solutions: vec![],
-                },
-                multi_pair_commitment: "0x777".into(),
-                matched_orders: transcript.matched_orders.clone(),
-                matched_order_witnesses: vec![],
-                consumed_inputs: vec![],
-                note_membership_witnesses: vec![],
-                nullifier_history: vec![],
-                nullifier_sparse_witnesses: vec![],
-                renewal_history: vec![],
-                renewal_child_sparse_witnesses: vec![],
-                renewal_cancel_sparse_witnesses: vec![],
-                renewal_child_uses: vec![],
-                fees: vec![],
-                output_notes: vec![output_note],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: vec![],
-                output_ciphertext_bundle_ref: "0x555".into(),
             },
             published_at_unix_ms: 1,
             settled_at_unix_ms: Some(2),
@@ -6890,12 +7721,18 @@ mod tests {
                 batch_id: zylith_core::BatchId(batch_id.into()),
                 pair_id: zylith_core::PairId("STRK/USDC".into()),
                 batch_epoch: 9,
+                auction_verifier_address: "0x123".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x511".into(),
+                reference_price_signer: "0x611".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
@@ -6919,49 +7756,6 @@ mod tests {
                 multi_pair_commitment: "0x0".into(),
             },
             output_bundle,
-            settlement_witness: zylith_core::SettlementWitness {
-                batch_id: zylith_core::BatchId(batch_id.into()),
-                pair_id: zylith_core::PairId("STRK/USDC".into()),
-                batch_epoch: 9,
-                order_commitment_root: "0x111".into(),
-                encrypted_order_set_commitment: "0x222".into(),
-                transcript_commitment: "transcript-commitment".into(),
-                auction_verifier_address: "0x0".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                clearing_price: 145,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                protocol_fee_recipient: "zylith-protocol-treasury".into(),
-                base_asset_id: zylith_core::AssetId("STRK".into()),
-                quote_asset_id: zylith_core::AssetId("USDC".into()),
-                matched_orders: vec![],
-                matched_order_witnesses: vec![],
-                consumed_inputs: vec![],
-                note_membership_witnesses: vec![],
-                nullifier_history: vec![],
-                nullifier_sparse_witnesses: vec![],
-                renewal_history: vec![],
-                renewal_child_sparse_witnesses: vec![],
-                renewal_cancel_sparse_witnesses: vec![],
-                renewal_child_uses: vec![],
-                fees: vec![],
-                output_notes: vec![zylith_core::OutputNoteRecord {
-                    note_commitment: zylith_core::NoteCommitment("0x4567".into()),
-                    asset_id: zylith_core::AssetId("STRK".into()),
-                    amount: 999,
-                    withdraw_authority: "0x123".into(),
-                }],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![output_recovery_record.clone()],
-                output_recovery_dummy_commitments,
-                output_ciphertext_bundle_ref: output_bundle_ref.clone(),
-                multi_pair_commitment: "0x0".into(),
-            },
             published_at_unix_ms: now_unix_ms(),
             settled_at_unix_ms: Some(1_778_661_520_000_u64),
             settlement_transaction_hash: None,
@@ -6994,6 +7788,46 @@ mod tests {
             }],
             transcript_shape: None,
         };
+
+        let mut legacy_wire_value =
+            serde_json::to_value(&published).expect("serialize published artifacts");
+        legacy_wire_value["settlement_witness"] = serde_json::json!({});
+        assert!(
+            serde_json::from_value::<PublishedBatchArtifacts>(legacy_wire_value).is_err(),
+            "published artifact schema must reject legacy full-witness payloads",
+        );
+
+        let mut leaking = published.clone();
+        leaking
+            .transcript
+            .output_note_preimages
+            .push(zylith_core::Note {
+                asset_id: zylith_core::AssetId("STRK".into()),
+                amount: 999,
+                owner_public_key: "11".repeat(32),
+                spend_authority: "0x1".into(),
+                withdraw_authority: "0x123".into(),
+                blinding: "0x2".into(),
+                nonce: 1,
+                metadata_commitment: "0x0".into(),
+            });
+        let leaking_response = app
+            .clone()
+            .oneshot(
+                auth_request(
+                    Request::builder()
+                        .uri(format!("/api/internal/batches/{batch_id}/artifacts"))
+                        .method(Method::POST),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&leaking).expect("serialize leaking artifacts"),
+                ))
+                .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(leaking_response.status(), StatusCode::BAD_REQUEST);
 
         let response = app
             .clone()
@@ -7502,10 +8336,6 @@ mod tests {
             (
                 Method::POST,
                 "/api/internal/batches/batch-strk-usdc-1/settled-at",
-            ),
-            (
-                Method::GET,
-                "/api/internal/batches/batch-strk-usdc-1/witness",
             ),
             (Method::GET, "/api/internal/renewal/cancel-markers"),
         ];

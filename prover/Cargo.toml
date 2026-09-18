@@ -6,6 +6,7 @@ version.workspace = true
 authors.workspace = true
 
 [dependencies]
+aes-gcm = "0.10"
 axum = "0.8"
 bhttp = "0.7"
 hex = "0.4"
@@ -15,6 +16,7 @@ p256 = { version = "0.13", features = ["ecdh"] }
 rand_core = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 reqwest_013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -16,11 +16,13 @@ expectNot("ZYLITH_PROVER_EMERGENCY_PAUSED", "true", "prover is currently paused"
 
 checkRequired("ZYLITH_PROVER_STRICT");
 expectValue("ZYLITH_PROVER_STRICT", "true", "prover strict mode must be enabled in production");
+checkHexKey("ZYLITH_PROVER_DATA_KEY_HEX", 32);
 checkRequired("ZYLITH_PROVER_WORKER_SUBMIT_ONCHAIN");
 expectValue("ZYLITH_PROVER_WORKER_SUBMIT_ONCHAIN", "true", "prover worker must submit proofs on-chain in production");
 checkCsv("ZYLITH_COORDINATOR_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_PROVER_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_INDEXER_ALLOWED_ORIGINS");
+checkSqlitePath("ZYLITH_INDEXER_ARTIFACT_PATH");
 checkCsv("ZYLITH_PAYMASTER_ALLOWED_ORIGINS");
 checkCsv("ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS");
 
@@ -31,14 +33,16 @@ checkPositiveInt("ZYLITH_RENEWAL_RELAY_MAX_BODY_BYTES", 1, 128_000_000);
 checkPositiveInt("ZYLITH_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE", 1, 600);
 checkPositiveInt("ZYLITH_PROVER_PRIVATE_INGRESS_RATE_LIMIT_PER_MINUTE", 1, 600);
 checkPositiveInt("ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE", 1, 120);
+checkPositiveInt("ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY", 1, 10_000);
 checkPositiveInt("ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE", 1, 600);
 checkPositiveInt("ZYLITH_PROVER_MAX_STORED_PRIVATE_PAYLOADS", 1, 250_000);
 checkPositiveInt("ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS", 60_000, 86_400_000);
 checkPositiveInt("ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS", 86_400_000, 31_536_000_000);
 checkPositiveInt("ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS", 86_400, 100_000);
 checkPositiveInt("ZYLITH_COORDINATOR_MAX_ORDERS_PER_BATCH", 1, 10_000);
+checkPositiveBigInt("ZYLITH_MAX_ORDER_AMOUNT");
 checkCsv("ZYLITH_PRODUCT_PAIRS");
-checkExactInt("ZYLITH_BATCH_WINDOW_MS", 20_000);
+checkExactInt("ZYLITH_BATCH_WINDOW_MS", 10_000);
 checkExactInt("ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS", 14);
 checkExactInt("ZYLITH_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS", 36);
 checkPositiveInt("ZYLITH_ARTIFACT_EPOCH_BUCKET_SIZE", 1, 64);
@@ -83,7 +87,9 @@ checkFelt("ZYLITH_SETTLEMENT_ACCOUNT_ADDRESS");
 checkFelt("ZYLITH_BATCH_REGISTRAR_ACCOUNT_ADDRESS");
 checkDistinctRoles([
   "ZYLITH_PROTOCOL_ADMIN_ADDRESS",
+  "ZYLITH_PAUSE_GUARDIAN_ADDRESS",
   "ZYLITH_PROTOCOL_TREASURY_ADDRESS",
+  "ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS",
   "ZYLITH_SETTLEMENT_ACCOUNT_ADDRESS",
   "ZYLITH_BATCH_REGISTRAR_ACCOUNT_ADDRESS",
   "ZYLITH_PAYMASTER_ACCOUNT_ADDRESS",
@@ -165,6 +171,21 @@ function checkFeeKey(name, defaultValue) {
   }
   if (current.toLowerCase() === defaultValue.toLowerCase()) {
     failures.push(`${name} must not use the development default`);
+  }
+}
+
+function checkHexKey(name, byteLength) {
+  const current = value(name);
+  if (!current) {
+    failures.push(`${name} is required`);
+    return;
+  }
+  const encoded = current.replace(/^0x/i, "");
+  if (
+    encoded.length !== byteLength * 2 ||
+    !/^[0-9a-fA-F]+$/.test(encoded)
+  ) {
+    failures.push(`${name} must be exactly ${byteLength} bytes of hexadecimal`);
   }
 }
 
@@ -345,6 +366,17 @@ function checkFelt(name) {
   }
 }
 
+function checkSqlitePath(name) {
+  const current = value(name);
+  if (!current) {
+    failures.push(`${name} is required`);
+    return;
+  }
+  if (!/\.(?:db|sqlite|sqlite3)$/i.test(current)) {
+    failures.push(`${name} must point to a .db, .sqlite, or .sqlite3 store`);
+  }
+}
+
 function checkPositiveInt(name, min, max) {
   const current = value(name);
   if (!current) {
@@ -354,6 +386,21 @@ function checkPositiveInt(name, min, max) {
   const parsed = Number(current);
   if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
     failures.push(`${name} must be an integer in [${min}, ${max}]`);
+  }
+}
+
+function checkPositiveBigInt(name) {
+  const current = value(name);
+  if (!current) {
+    failures.push(`${name} is required`);
+    return;
+  }
+  try {
+    if (!/^[0-9]+$/.test(current) || BigInt(current) <= 0n) {
+      failures.push(`${name} must be a positive base-10 integer`);
+    }
+  } catch {
+    failures.push(`${name} must be a positive base-10 integer`);
   }
 }
 
@@ -419,7 +466,8 @@ function checkDeploymentManifest() {
     }
   }
   const manifestSignature = value("ZYLITH_DEPLOYMENT_MANIFEST_SIGNATURE");
-  const manifestSigner = value("ZYLITH_DEPLOYMENT_MANIFEST_SIGNER_PUBLIC_KEY_PEM");
+  const manifestSigner = value("ZYLITH_DEPLOYMENT_MANIFEST_SIGNER_PUBLIC_KEY_PEM")
+    ?.replaceAll("\\n", "\n");
   if (!manifestSignature) {
     failures.push("ZYLITH_DEPLOYMENT_MANIFEST_SIGNATURE is required");
   }
@@ -466,12 +514,19 @@ function checkDeploymentManifest() {
   const requiredPairs = {
     "STRK/USDC": 4,
     "ETH/USDC": 4,
-    "strkBTC/USDC": 4,
     "STRK/ETH": 4,
-    "STRK/strkBTC": 4,
-    "WBTC/strkBTC": 1,
     "USDC/USDT": 1,
   };
+  for (const pair of ["strkBTC/USDC", "STRK/strkBTC", "WBTC/strkBTC"]) {
+    if (manifest.product?.pairs?.[pair]?.enabled) {
+      failures.push(`product.pairs.${pair} must remain disabled until independent wrapper parity is authenticated`);
+    }
+  }
+  for (const [pair, pairConfig] of Object.entries(manifest.product?.pairs || {})) {
+    if (typeof pairConfig?.external_match_enabled !== "boolean") {
+      failures.push(`product.pairs.${pair}.external_match_enabled must be boolean`);
+    }
+  }
   for (const asset of requiredAssets) {
     checkManifestNonZero(manifest.token_addresses?.[asset], `token_addresses.${asset}`);
     const assetConfig = manifest.product?.assets?.[asset];
@@ -491,6 +546,9 @@ function checkDeploymentManifest() {
     if (!pairConfig?.enabled) {
       failures.push(`product.pairs.${pair} must be enabled`);
       continue;
+    }
+    if (pairConfig.external_match_enabled !== true) {
+      failures.push(`product.pairs.${pair}.external_match_enabled must be true`);
     }
     if (pairConfig.taker_fee_bps !== taker) {
       failures.push(`product.pairs.${pair}.taker_fee_bps must be ${taker}`);
@@ -532,6 +590,14 @@ function checkDeploymentManifest() {
   for (const [key, current] of Object.entries(manifest.contracts || {})) {
     checkManifestNonZero(current, `contracts.${key}`);
   }
+  checkManifestNonZero(
+    manifest.contracts?.external_match_executor,
+    "contracts.external_match_executor",
+  );
+  checkManifestNonZero(
+    manifest.contracts?.ekubo_external_match_router,
+    "contracts.ekubo_external_match_router",
+  );
   for (const key of [
     "proof_program_address",
     "proof_program_hash",
@@ -548,6 +614,7 @@ function checkDeploymentManifest() {
     "withdrawal_proof_program_hash",
     "multi_pair_proof_program_hash",
     "multi_pair_settlement_proof_program_hash",
+    "external_match_authorization_proof_program_hash",
     "settlement_statement_program_address",
     "settlement_note_fee_statement_program_address",
     "settlement_order_statement_program_address",
@@ -561,11 +628,18 @@ function checkDeploymentManifest() {
     "auction_result_statement_program_address",
     "multi_pair_statement_program_address",
     "multi_pair_settlement_statement_program_address",
+    "external_match_authorization_statement_program_address",
     "proof_account_address",
     "settlement_account_address",
   ]) {
     checkManifestNonZero(manifest.proof?.[key], `proof.${key}`);
   }
+  checkManifestFeltDistinct(
+    manifest.proof?.proof_account_address,
+    manifest.proof?.settlement_account_address,
+    "proof.proof_account_address",
+    "proof.settlement_account_address",
+  );
   const statementProofHashes = manifest.proof?.statement_proof_program_hashes || {};
   for (const [statementKind, proofField] of [
     ["ADMISSION", "admission_proof_program_hash"],
@@ -587,6 +661,7 @@ function checkDeploymentManifest() {
     ["WITHDRAWAL", "withdrawal_proof_program_hash"],
     ["MULTI_PAIR", "multi_pair_proof_program_hash"],
     ["MULTI_PAIR_SETTLEMENT", "multi_pair_settlement_proof_program_hash"],
+    ["EXTERNAL_MATCH_AUTH", "external_match_authorization_proof_program_hash"],
   ]) {
     const mapValue = statementProofHashes[statementKind];
     checkManifestNonZero(mapValue, `proof.statement_proof_program_hashes.${statementKind}`);
@@ -714,19 +789,22 @@ function checkReferencePricePolicy() {
   if (String(policy.reference_engine?.primary_cex_source ?? "").trim().toLowerCase() !== "binance") {
     failures.push("reference price policy reference_engine.primary_cex_source must be binance");
   }
-  const requiredCexSources = Array.isArray(policy.reference_engine?.required_cex_sources)
-    ? policy.reference_engine.required_cex_sources.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean)
+  const allowedCexSources = Array.isArray(policy.reference_engine?.allowed_cex_sources)
+    ? policy.reference_engine.allowed_cex_sources.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean)
     : [];
-  for (const required of ["binance", "coinbase", "kraken"]) {
-    if (!requiredCexSources.includes(required)) {
-      failures.push(`reference price policy reference_engine.required_cex_sources must include ${required}`);
+  for (const required of ["binance", "coinbase", "kraken", "okx"]) {
+    if (!allowedCexSources.includes(required)) {
+      failures.push(`reference price policy reference_engine.allowed_cex_sources must include ${required}`);
     }
   }
   if (Number(policy.reference_engine?.min_cex_sources ?? 0) < 3) {
     failures.push("reference price policy reference_engine.min_cex_sources must be at least 3");
   }
-  if (policy.residual_completion?.primary !== "avnu") {
-    failures.push("reference price policy residual_completion.primary must be avnu");
+  if (policy.external_matcher?.request_type !== "ExternalMatchRequest") {
+    failures.push("reference price policy external_matcher.request_type must be ExternalMatchRequest");
+  }
+  if (policy.external_matcher?.mode !== "searcher-midpoint-fill") {
+    failures.push("reference price policy external_matcher.mode must be searcher-midpoint-fill");
   }
   const forbidden = (policy.global_policy?.forbidden_fallbacks || []).map((entry) => String(entry).toLowerCase());
   for (const required of ["last-cleared-price", "fixed-price", "single-exchange-only"]) {
@@ -737,9 +815,20 @@ function checkReferencePricePolicy() {
   if (policy.global_policy?.large_move_policy !== "require-confirmation-widen-size-reduce-or-halt") {
     failures.push("reference price policy global_policy.large_move_policy must require confirmation, widening, size reduction, or halt");
   }
-  const requiredPairs = ["STRK/USDC", "ETH/USDC", "strkBTC/USDC", "STRK/ETH", "STRK/strkBTC", "WBTC/strkBTC", "USDC/USDT"];
+  const requiredPairs = ["STRK/USDC", "ETH/USDC", "STRK/ETH", "USDC/USDT"];
   const minSources = Number(policy.global_policy?.min_sources ?? 0);
   if (minSources < 3) failures.push("reference price policy global_policy.min_sources must be at least 3");
+  const expectedGlobalPolicy = {
+    max_staleness_ms: 5000,
+    max_source_spread_bps: 20,
+    max_divergence_bps: 30,
+    reference_envelope_bps: 15,
+  };
+  for (const [field, expected] of Object.entries(expectedGlobalPolicy)) {
+    if (Number(policy.global_policy?.[field]) !== expected) {
+      failures.push(`reference price policy global_policy.${field} must be ${expected}`);
+    }
+  }
   for (const pair of requiredPairs) {
     const pairPolicy = policy.pairs?.[pair];
     if (!pairPolicy) {
@@ -757,15 +846,25 @@ function checkReferencePricePolicy() {
     if (uniqueConfirmations.size !== confirmations.length) {
       failures.push(`reference price policy ${pair}.confirmations must be unique independent sources`);
     }
+    const confirmationVenues = confirmations.map((entry) => String(entry).trim().toLowerCase().split(":", 1)[0]);
+    if (new Set(confirmationVenues).size !== confirmationVenues.length) {
+      failures.push(`reference price policy ${pair}.confirmations must use distinct CEX venues`);
+    }
     const cexConfirmations = confirmations.filter((entry) => /^(coinbase|kraken|okx):/i.test(String(entry).trim()));
     if (cexConfirmations.length < 2) {
       failures.push(`reference price policy ${pair}.confirmations must include at least two non-Binance CEX book confirmations`);
     }
-    if (confirmations.some((entry) => /^(binance|avnu|ekubo|pragma):/i.test(String(entry).trim()))) {
-      failures.push(`reference price policy ${pair}.confirmations must not use Binance, AVNU, Ekubo, or Pragma as confirmation inputs`);
+    if (confirmations.some((entry) => !/^(coinbase|kraken|okx):/i.test(String(entry).trim()))) {
+      failures.push(`reference price policy ${pair}.confirmations must use only independent non-Binance CEX book inputs`);
+    }
+    if (confirmationVenues.some((venue) => !allowedCexSources.includes(venue))) {
+      failures.push(`reference price policy ${pair}.confirmations must use allowed CEX sources`);
     }
     if (Number(pairPolicy.min_independent_sources ?? 0) < minSources) {
       failures.push(`reference price policy ${pair}.min_independent_sources must be >= global_policy.min_sources`);
+    }
+    if (pair === "USDC/USDT" && Number(pairPolicy.max_divergence_bps) !== 20) {
+      failures.push("reference price policy USDC/USDT.max_divergence_bps must be 20");
     }
     const serialized = JSON.stringify(pairPolicy).toLowerCase();
     if (serialized.includes("last-cleared") || serialized.includes("last cleared") || serialized.includes("\"fixed\"")) {
@@ -821,6 +920,15 @@ function checkManifestFeltEquals(current, expected, label, expectedLabel) {
   if (!normalizedCurrent || !normalizedExpected) return;
   if (normalizedCurrent !== normalizedExpected) {
     failures.push(`${label} must match ${expectedLabel}`);
+  }
+}
+
+function checkManifestFeltDistinct(current, other, label, otherLabel) {
+  const normalizedCurrent = normalizeFeltText(current);
+  const normalizedOther = normalizeFeltText(other);
+  if (!normalizedCurrent || !normalizedOther) return;
+  if (normalizedCurrent === normalizedOther) {
+    failures.push(`${label} must be distinct from ${otherLabel}`);
   }
 }
 

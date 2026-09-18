@@ -2,6 +2,8 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { isIP } from "node:net";
+import { mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 
 import type { PaymasterConfig } from "./config.js";
 import type { SubmitterDeps } from "./starknetSubmitter.js";
@@ -29,6 +31,10 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
   const clientRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute * 3);
   const submissionQueues = new SubmissionQueues(PAYMASTER_MAX_PENDING_SUBMISSIONS);
   const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
+  const signerDeploymentBudget = new SignerDeploymentBudget(
+    config.signerDeploymentLimitPerDay,
+    config.signerDeploymentLogPath
+  );
   const metrics = new PaymasterMetrics();
 
   return createServer(async (request, response) => {
@@ -64,9 +70,17 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
           const body = JSON.parse(rawBody) as unknown;
           const validated = validateEnsurePrivacySignerRequest(body, config);
           enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
-          return submissionQueues.enqueue(config.accountAddress, () =>
-            ensurePrivacyProofSignerContract(validated, config, deps)
-          );
+          return submissionQueues.enqueue(config.accountAddress, async () => {
+            const release = await signerDeploymentBudget.reserve();
+            try {
+              const result = await ensurePrivacyProofSignerContract(validated, config, deps);
+              if (!result.deployed) await release();
+              return result;
+            } catch (error) {
+              await release();
+              throw error;
+            }
+          });
         });
         sendJson(request, response, 200, result);
         return;
@@ -404,6 +418,9 @@ function statusForError(message: string): number {
   if (message.includes("rate limit")) {
     return 429;
   }
+  if (message.includes("deployment budget exhausted")) {
+    return 429;
+  }
   return 400;
 }
 
@@ -526,6 +543,119 @@ export class FixedWindowRateLimiter {
   get size(): number {
     return this.buckets.size;
   }
+}
+
+type SignerDeploymentBudgetRecord = {
+  utc_day: string;
+  reserved: number;
+};
+
+/**
+ * Deployment is the only paymaster route without a user-owned nonce. Keep a
+ * durable daily budget so rotating keys/IPs cannot turn the paymaster into an
+ * unbounded deployment faucet. Reservations are released when no deployment
+ * was needed or submission failed.
+ */
+export class SignerDeploymentBudget {
+  private loaded = false;
+  private loadPromise: Promise<void> | null = null;
+  private record: SignerDeploymentBudgetRecord = { utc_day: utcDay(), reserved: 0 };
+  private persistTail: Promise<void> = Promise.resolve();
+
+  constructor(private readonly limitPerDay: number, private readonly path: string | null) {
+    if (!Number.isSafeInteger(limitPerDay) || limitPerDay <= 0) {
+      throw new Error("signer deployment limit must be a positive integer");
+    }
+  }
+
+  async reserve(): Promise<() => Promise<void>> {
+    await this.load();
+    this.rotateIfNeeded();
+    if (this.record.reserved >= this.limitPerDay) {
+      throw new Error("privacy signer deployment budget exhausted");
+    }
+    const reservationDay = this.record.utc_day;
+    this.record.reserved += 1;
+    await this.persist();
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      this.rotateIfNeeded();
+      if (this.record.utc_day !== reservationDay) return;
+      this.record.reserved = Math.max(0, this.record.reserved - 1);
+      await this.persist();
+    };
+  }
+
+  private async load(): Promise<void> {
+    if (this.loaded) return;
+    if (this.loadPromise) return this.loadPromise;
+    this.loadPromise = this.loadFromDisk();
+    try {
+      await this.loadPromise;
+      this.loaded = true;
+    } finally {
+      this.loadPromise = null;
+    }
+  }
+
+  private async loadFromDisk(): Promise<void> {
+    if (!this.path) return;
+    let body: string;
+    try {
+      const metadata = await stat(this.path);
+      if (metadata.size > 8_192) throw new Error("signer deployment budget file is too large");
+      body = await readFile(this.path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    const parsed = JSON.parse(body) as Partial<SignerDeploymentBudgetRecord>;
+    if (
+      typeof parsed.utc_day !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(parsed.utc_day) ||
+      !Number.isSafeInteger(parsed.reserved) ||
+      (parsed.reserved ?? 0) < 0 ||
+      (parsed.reserved ?? 0) > this.limitPerDay
+    ) {
+      throw new Error("signer deployment budget file is invalid");
+    }
+    this.record = { utc_day: parsed.utc_day, reserved: parsed.reserved as number };
+    this.rotateIfNeeded();
+  }
+
+  private rotateIfNeeded(): void {
+    const today = utcDay();
+    if (this.record.utc_day !== today) this.record = { utc_day: today, reserved: 0 };
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.path) return;
+    const snapshot = JSON.stringify(this.record) + "\n";
+    this.persistTail = this.persistTail.then(async () => {
+      await mkdir(dirname(this.path!), { recursive: true });
+      const tempPath = `${this.path}.${process.pid}.tmp`;
+      const handle = await open(tempPath, "w");
+      try {
+        await handle.writeFile(snapshot, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await rename(tempPath, this.path!);
+      } catch (error) {
+        await unlink(tempPath).catch(() => undefined);
+        throw error;
+      }
+    });
+    return this.persistTail;
+  }
+}
+
+function utcDay(now = new Date()): string {
+  return now.toISOString().slice(0, 10);
 }
 
 export class SubmissionQueues {

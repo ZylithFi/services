@@ -3,7 +3,12 @@ import { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { PaymasterConfig } from "./config.js";
-import { FixedWindowRateLimiter, SubmissionQueues, createPaymasterServer } from "./server.js";
+import {
+  FixedWindowRateLimiter,
+  SignerDeploymentBudget,
+  SubmissionQueues,
+  createPaymasterServer
+} from "./server.js";
 import type { StarknetRuntime } from "./starknetSubmitter.js";
 import type { ExecuteOutsideRequest } from "./types.js";
 
@@ -404,6 +409,30 @@ describe("paymaster server", () => {
 });
 
 describe("paymaster in-memory bounds", () => {
+  it("enforces the signer deployment budget and releases reservations", async () => {
+    const budget = new SignerDeploymentBudget(1, null);
+    const release = await budget.reserve();
+    await expect(budget.reserve()).rejects.toThrow(/budget exhausted/);
+    await release();
+    await expect(budget.reserve()).resolves.toBeTypeOf("function");
+  });
+
+  it("does not release a previous day's reservation from today's budget", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-16T23:59:00Z"));
+      const budget = new SignerDeploymentBudget(1, null);
+      const releaseYesterday = await budget.reserve();
+
+      vi.setSystemTime(new Date("2026-09-17T00:01:00Z"));
+      await budget.reserve();
+      await releaseYesterday();
+      await expect(budget.reserve()).rejects.toThrow(/budget exhausted/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("removes expired rate-limit subjects during periodic sweeps", () => {
     const limiter = new FixedWindowRateLimiter(10);
     for (let index = 0; index < 100; index += 1) {
@@ -484,10 +513,12 @@ function config(): PaymasterConfig {
     maxBodyBytes: 1_000_000,
     allowedOrigins: new Set(["https://app.example"]),
     signerLimitPerMinute: 20,
+    signerDeploymentLimitPerDay: 100,
     trustProxyHeaders: false,
     trustedProxyCidrs: [],
     internalApiToken: "test-paymaster-token",
-    submissionLogPath: null
+    submissionLogPath: null,
+    signerDeploymentLogPath: null
   };
 }
 

@@ -2,13 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     env, fs,
-    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,9 +18,10 @@ use axum::{
     routing::{get, post},
 };
 use ipnet::IpNet;
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use starknet_rust_core::utils::get_selector_from_name;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use zylith_core::{
     ARTIFACT_AGGREGATION_POLICY_VERSION, ArtifactAggregationPolicy, CONTROL_PLANE_TOKEN_ENV,
@@ -40,8 +37,6 @@ use zylith_core::{
     multi_pair_root_only_settlement_commitments, multi_pair_settlement_transcript_commitment,
     root_only_settlement_commitments, settlement_transcript_commitment, transcript_shape_metadata,
 };
-
-static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct PeerAddress(Option<SocketAddr>);
@@ -71,8 +66,8 @@ const DEFAULT_DEPLOYMENT_MANIFEST_PATH: &str = concat!(
     "/../client/public/deployment.json"
 );
 const DEFAULT_COMMITMENT_REGISTRY_ADDRESS: &str = "";
-const DEFAULT_ARTIFACT_ARCHIVE_PATH: &str = "indexer/published_batch_artifacts.dev.json";
-const DEFAULT_BATCH_WINDOW_MS: u64 = 20_000;
+const DEFAULT_ARTIFACT_ARCHIVE_PATH: &str = "indexer/published_batch_artifacts.sqlite";
+const DEFAULT_BATCH_WINDOW_MS: u64 = 10_000;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS: u64 = 14;
 const DEFAULT_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS: u64 = 36;
 const DEFAULT_ARTIFACT_EPOCH_BUCKET_SIZE: u64 = 8;
@@ -95,7 +90,8 @@ const DEPOSIT_SYNC_ROLLBACK_WINDOW: u64 = 64;
 const DEFAULT_HTTP_CLIENT_TIMEOUT_SECS: u64 = 30;
 const MAX_STARKNET_RPC_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DEPLOYMENT_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_ARTIFACT_STORE_BYTES: u64 = 256 * 1024 * 1024;
+const BATCH_ARTIFACT_NAMESPACE: &str = "published_batch_artifacts";
+const MULTI_PAIR_ARTIFACT_NAMESPACE: &str = "published_multi_pair_artifacts";
 
 #[derive(Clone)]
 struct AppState {
@@ -110,6 +106,7 @@ struct AppState {
     published_batch_artifacts: Arc<RwLock<BTreeMap<String, PublishedBatchArtifacts>>>,
     published_multi_pair_batch_artifacts:
         Arc<RwLock<BTreeMap<String, PublishedMultiPairBatchArtifacts>>>,
+    artifact_publication_lock: Arc<AsyncMutex<()>>,
     artifact_archive_path: Option<Arc<PathBuf>>,
     internal_api_token: Option<Arc<String>>,
     batch_window_ms: u64,
@@ -189,8 +186,7 @@ struct StarknetBlock {
     timestamp: u64,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Default)]
 struct PublishedBatchArtifactsStoreFile {
     artifacts_by_batch: BTreeMap<String, PublishedBatchArtifacts>,
     multi_pair_artifacts_by_group: BTreeMap<String, PublishedMultiPairBatchArtifacts>,
@@ -233,6 +229,7 @@ async fn main() -> Result<(), String> {
     let published_artifact_store = artifact_archive_path
         .as_deref()
         .map(load_published_batch_artifacts_store_file)
+        .transpose()?
         .unwrap_or_default();
     let state = AppState {
         rpc_url: load_rpc_url()?,
@@ -249,6 +246,7 @@ async fn main() -> Result<(), String> {
         published_multi_pair_batch_artifacts: Arc::new(RwLock::new(
             published_artifact_store.multi_pair_artifacts_by_group,
         )),
+        artifact_publication_lock: Arc::new(AsyncMutex::new(())),
         artifact_archive_path: artifact_archive_path.map(Arc::new),
         internal_api_token: Some(Arc::new(load_required_control_plane_token(
             "zylith-indexer",
@@ -619,33 +617,37 @@ fn is_configured_felt(value: &str) -> bool {
     normalize_felt_hex(value).is_ok_and(|normalized| normalized != "0x0")
 }
 
-fn load_published_batch_artifacts_store_file(path: &FsPath) -> PublishedBatchArtifactsStoreFile {
-    let contents = match read_utf8_file_limited(path, MAX_ARTIFACT_STORE_BYTES) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return PublishedBatchArtifactsStoreFile::default();
-        }
-        Err(error) => {
-            panic!(
-                "failed to read published batch artifacts store {}: {error}",
+fn load_published_batch_artifacts_store_file(
+    path: &FsPath,
+) -> Result<PublishedBatchArtifactsStoreFile, String> {
+    let store = PublishedBatchArtifactsStoreFile {
+        artifacts_by_batch: load_artifact_records(path, BATCH_ARTIFACT_NAMESPACE)?,
+        multi_pair_artifacts_by_group: load_artifact_records(path, MULTI_PAIR_ARTIFACT_NAMESPACE)?,
+    };
+    for artifact in store.artifacts_by_batch.values() {
+        artifact.validate_redacted().map_err(|error| {
+            format!(
+                "published batch artifacts store {} contains private witness data: {error}",
                 path.display()
             )
-        }
-    };
-
-    serde_json::from_str::<PublishedBatchArtifactsStoreFile>(&contents).unwrap_or_else(|error| {
-        panic!(
-            "failed to parse published batch artifacts store {}: {error}",
-            path.display()
-        )
-    })
+        })?;
+    }
+    for artifact in store.multi_pair_artifacts_by_group.values() {
+        artifact.validate_redacted().map_err(|error| {
+            format!(
+                "published multi-pair artifacts store {} contains private witness data: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(store)
 }
 
 #[cfg(test)]
 fn load_published_batch_artifacts_store(
     path: &FsPath,
-) -> BTreeMap<String, PublishedBatchArtifacts> {
-    load_published_batch_artifacts_store_file(path).artifacts_by_batch
+) -> Result<BTreeMap<String, PublishedBatchArtifacts>, String> {
+    load_published_batch_artifacts_store_file(path).map(|store| store.artifacts_by_batch)
 }
 
 fn read_utf8_file_limited(path: &FsPath, max_bytes: u64) -> std::io::Result<String> {
@@ -659,56 +661,104 @@ fn read_utf8_file_limited(path: &FsPath, max_bytes: u64) -> std::io::Result<Stri
     fs::read_to_string(path)
 }
 
-fn persist_published_batch_artifacts_store(
-    path: &FsPath,
-    artifacts: &BTreeMap<String, PublishedBatchArtifacts>,
-    multi_pair_artifacts: &BTreeMap<String, PublishedMultiPairBatchArtifacts>,
-) -> Result<(), StatusCode> {
-    let encoded = serde_json::to_string_pretty(&PublishedBatchArtifactsStoreFile {
-        artifacts_by_batch: artifacts.clone(),
-        multi_pair_artifacts_by_group: multi_pair_artifacts.clone(),
-    })
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    atomic_write(path, &encoded)
+fn is_sqlite_artifact_store(path: &FsPath) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "db" | "sqlite" | "sqlite3"))
 }
 
-fn atomic_write(path: &FsPath, contents: &str) -> Result<(), StatusCode> {
+fn open_artifact_store(path: &FsPath) -> Result<Connection, String> {
+    if !is_sqlite_artifact_store(path) {
+        return Err(format!(
+            "ZYLITH_INDEXER_ARTIFACT_PATH must point to a .db, .sqlite, or .sqlite3 store: {}",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create artifact store directory {}: {error}",
+                parent.display()
+            )
+        })?;
     }
-    let file_name = path.file_name().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let temp_path = path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    let mut temp_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if temp_file
-        .write_all(contents.as_bytes())
-        .and_then(|_| temp_file.sync_all())
-        .is_err()
-    {
-        drop(temp_file);
-        let _ = fs::remove_file(&temp_path);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    let connection = Connection::open(path)
+        .map_err(|error| format!("failed to open artifact store {}: {error}", path.display()))?;
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA busy_timeout=5000;
+             CREATE TABLE IF NOT EXISTS artifact_records (
+                 namespace TEXT NOT NULL,
+                 record_key TEXT NOT NULL,
+                 value_json TEXT NOT NULL,
+                 updated_at_unix_ms INTEGER NOT NULL,
+                 PRIMARY KEY (namespace, record_key)
+             ) WITHOUT ROWID;",
+        )
+        .map_err(|error| format!("failed to initialize artifact store: {error}"))?;
+    Ok(connection)
+}
+
+fn load_artifact_records<T: DeserializeOwned>(
+    path: &FsPath,
+    namespace: &str,
+) -> Result<BTreeMap<String, T>, String> {
+    let connection = open_artifact_store(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT record_key, value_json
+             FROM artifact_records
+             WHERE namespace = ?1
+             ORDER BY record_key",
+        )
+        .map_err(|error| format!("failed to prepare artifact load: {error}"))?;
+    let rows = statement
+        .query_map(params![namespace], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("failed to query artifact store: {error}"))?;
+    let mut records = BTreeMap::new();
+    for row in rows {
+        let (key, value_json) =
+            row.map_err(|error| format!("failed to read artifact row: {error}"))?;
+        let value = serde_json::from_str(&value_json)
+            .map_err(|error| format!("artifact {namespace}/{key} is invalid: {error}"))?;
+        records.insert(key, value);
     }
-    drop(temp_file);
-    fs::rename(&temp_path, path).map_err(|_| {
-        let _ = fs::remove_file(&temp_path);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-    Ok(())
+    Ok(records)
+}
+
+async fn persist_artifact_record<T: Serialize>(
+    path: PathBuf,
+    namespace: &'static str,
+    key: String,
+    value: &T,
+) -> Result<(), StatusCode> {
+    let value_json = serde_json::to_string(value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tokio::task::spawn_blocking(move || {
+        let connection = open_artifact_store(&path).map_err(|error| {
+            eprintln!("artifact store open failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        connection
+            .execute(
+                "INSERT INTO artifact_records (namespace, record_key, value_json, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace, record_key) DO UPDATE SET
+                     value_json = excluded.value_json,
+                     updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![namespace, key, value_json, now_unix_ms().min(i64::MAX as u64) as i64],
+            )
+            .map_err(|error| {
+                eprintln!("artifact store upsert failed: {error}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
 }
 
 fn published_batch_artifact_summary(
@@ -725,7 +775,7 @@ fn published_batch_artifact_summary(
         batch_epoch: published.transcript.batch_epoch,
         published_at_unix_ms: published.published_at_unix_ms,
         settled_at_unix_ms: published.settled_at_unix_ms,
-        transcript_commitment: published.settlement_witness.transcript_commitment.clone(),
+        transcript_commitment: settlement_transcript_commitment(&published.transcript).ok()?,
         output_bundle_ref: published.transcript.output_ciphertext_bundle_ref.clone(),
         output_note_root: roots.output_note_root,
         bundle_commitment: published.output_bundle.bundle_commitment.clone(),
@@ -1604,6 +1654,9 @@ async fn publish_batch_artifacts(
     if request.transcript.batch_id.0 != batch_id || request.output_bundle.batch_id.0 != batch_id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    request
+        .validate_redacted()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let expected_shape =
         zylith_core::validate_transcript_shape_policy(&request.transcript, &request.output_bundle)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1619,10 +1672,15 @@ async fn publish_batch_artifacts(
     let settled_at_unix_ms = verify_published_batch_artifact(&state, &request).await?;
     request.settled_at_unix_ms = Some(settled_at_unix_ms);
 
-    let mut artifacts = state.published_batch_artifacts.write().await;
-    let mut candidate = artifacts.clone();
-    let response = if let Some(existing) = candidate.get(&batch_id) {
-        if published_artifact_fingerprint(existing).map_err(|_| StatusCode::BAD_REQUEST)?
+    let _publication_guard = state.artifact_publication_lock.lock().await;
+    let existing = state
+        .published_batch_artifacts
+        .read()
+        .await
+        .get(&batch_id)
+        .cloned();
+    let response = if let Some(mut existing) = existing {
+        if published_artifact_fingerprint(&existing).map_err(|_| StatusCode::BAD_REQUEST)?
             != published_artifact_fingerprint(&request).map_err(|_| StatusCode::BAD_REQUEST)?
         {
             return Err(StatusCode::CONFLICT);
@@ -1632,23 +1690,30 @@ async fn publish_batch_artifacts(
         {
             return Err(StatusCode::CONFLICT);
         }
-        let existing = candidate.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
         if existing.settled_at_unix_ms.is_none() {
             existing.settled_at_unix_ms = Some(settled_at_unix_ms);
             existing.settlement_transaction_hash = request.settlement_transaction_hash.clone();
             existing.settlement_contract_address = request.settlement_contract_address.clone();
         }
-        existing.clone()
+        existing
     } else {
-        candidate.insert(batch_id, request.clone());
         request
     };
 
     if let Some(path) = state.artifact_archive_path.as_deref() {
-        let multi_pair_artifacts = state.published_multi_pair_batch_artifacts.read().await;
-        persist_published_batch_artifacts_store(path, &candidate, &multi_pair_artifacts)?;
+        persist_artifact_record(
+            path.to_path_buf(),
+            BATCH_ARTIFACT_NAMESPACE,
+            batch_id.clone(),
+            &response,
+        )
+        .await?;
     }
-    *artifacts = candidate;
+    state
+        .published_batch_artifacts
+        .write()
+        .await
+        .insert(batch_id, response.clone());
 
     Ok(Json(response))
 }
@@ -1663,6 +1728,9 @@ async fn publish_multi_pair_batch_artifacts(
     if request.transcript.group_id.0 != group_id || request.output_bundle.batch_id.0 != group_id {
         return Err(StatusCode::BAD_REQUEST);
     }
+    request
+        .validate_redacted()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let expected_shape = zylith_core::validate_multi_pair_transcript_shape_policy(
         &request.transcript,
         &request.output_bundle,
@@ -1680,11 +1748,15 @@ async fn publish_multi_pair_batch_artifacts(
     let settled_at_unix_ms = verify_published_multi_pair_batch_artifact(&state, &request).await?;
     request.settled_at_unix_ms = Some(settled_at_unix_ms);
 
-    let artifacts = state.published_batch_artifacts.read().await;
-    let mut multi_pair_artifacts = state.published_multi_pair_batch_artifacts.write().await;
-    let mut candidate = multi_pair_artifacts.clone();
-    let response = if let Some(existing) = candidate.get(&group_id) {
-        if multi_pair_published_artifact_fingerprint(existing)
+    let _publication_guard = state.artifact_publication_lock.lock().await;
+    let existing = state
+        .published_multi_pair_batch_artifacts
+        .read()
+        .await
+        .get(&group_id)
+        .cloned();
+    let response = if let Some(mut existing) = existing {
+        if multi_pair_published_artifact_fingerprint(&existing)
             .map_err(|_| StatusCode::BAD_REQUEST)?
             != multi_pair_published_artifact_fingerprint(&request)
                 .map_err(|_| StatusCode::BAD_REQUEST)?
@@ -1696,22 +1768,30 @@ async fn publish_multi_pair_batch_artifacts(
         {
             return Err(StatusCode::CONFLICT);
         }
-        let existing = candidate.get_mut(&group_id).ok_or(StatusCode::NOT_FOUND)?;
         if existing.settled_at_unix_ms.is_none() {
             existing.settled_at_unix_ms = Some(settled_at_unix_ms);
             existing.settlement_transaction_hash = request.settlement_transaction_hash.clone();
             existing.settlement_contract_address = request.settlement_contract_address.clone();
         }
-        existing.clone()
+        existing
     } else {
-        candidate.insert(group_id, request.clone());
         request
     };
 
     if let Some(path) = state.artifact_archive_path.as_deref() {
-        persist_published_batch_artifacts_store(path, &artifacts, &candidate)?;
+        persist_artifact_record(
+            path.to_path_buf(),
+            MULTI_PAIR_ARTIFACT_NAMESPACE,
+            group_id.clone(),
+            &response,
+        )
+        .await?;
     }
-    *multi_pair_artifacts = candidate;
+    state
+        .published_multi_pair_batch_artifacts
+        .write()
+        .await
+        .insert(group_id, response.clone());
 
     Ok(Json(response))
 }
@@ -1745,9 +1825,14 @@ async fn mark_published_batch_settled(
     let settled_at_unix_ms =
         verify_settlement_timestamp_update(&state, &published_snapshot, &request).await?;
 
-    let mut artifacts = state.published_batch_artifacts.write().await;
-    let mut candidate = artifacts.clone();
-    let published = candidate.get_mut(&batch_id).ok_or(StatusCode::NOT_FOUND)?;
+    let _publication_guard = state.artifact_publication_lock.lock().await;
+    let mut published = state
+        .published_batch_artifacts
+        .read()
+        .await
+        .get(&batch_id)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
     published.settled_at_unix_ms = Some(settled_at_unix_ms);
     published.settlement_transaction_hash = request
         .transaction_hash
@@ -1757,13 +1842,21 @@ async fn mark_published_batch_settled(
         .settlement_contract_address
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    let response = published.clone();
-
+    let response = published;
     if let Some(path) = state.artifact_archive_path.as_deref() {
-        let multi_pair_artifacts = state.published_multi_pair_batch_artifacts.read().await;
-        persist_published_batch_artifacts_store(path, &candidate, &multi_pair_artifacts)?;
+        persist_artifact_record(
+            path.to_path_buf(),
+            BATCH_ARTIFACT_NAMESPACE,
+            batch_id.clone(),
+            &response,
+        )
+        .await?;
     }
-    *artifacts = candidate;
+    state
+        .published_batch_artifacts
+        .write()
+        .await
+        .insert(batch_id, response.clone());
 
     Ok(Json(response))
 }
@@ -2419,15 +2512,16 @@ fn normalize_required_felt(value: &str) -> Result<String, StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, DEFAULT_BATCH_WINDOW_MS, DEFAULT_INDEXER_MAX_BODY_BYTES,
-        DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE, DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS,
-        DEPOSIT_SYNC_ROLLBACK_WINDOW, MAX_ARTIFACT_STORE_BYTES, MAX_PUBLIC_HISTORY_RANGE_SPAN,
-        MAX_PUBLIC_TRANSCRIPT_BATCH_IDS, MAX_STARKNET_RPC_RESPONSE_BYTES, RateLimiter,
-        build_app_with_state, decode_bounded_json, deposit_sync_start_index,
-        effective_public_artifact_delay_epochs, is_configured_felt, latest_public_history_window,
-        load_commitment_registry_address, load_published_batch_artifacts_store, load_rpc_url,
-        normalize_hex, now_unix_ms, parse_deployment_manifest, parse_hex_u64, rate_limit_subject,
-        selector_hex, service_http_client, validate_public_history_range,
+        AppState, BATCH_ARTIFACT_NAMESPACE, DEFAULT_BATCH_WINDOW_MS,
+        DEFAULT_INDEXER_MAX_BODY_BYTES, DEFAULT_INDEXER_PUBLIC_RATE_LIMIT_PER_MINUTE,
+        DEFAULT_MAX_DEPOSIT_CONFIRMATION_COMMITMENTS, DEPOSIT_SYNC_ROLLBACK_WINDOW,
+        MAX_PUBLIC_HISTORY_RANGE_SPAN, MAX_PUBLIC_TRANSCRIPT_BATCH_IDS,
+        MAX_STARKNET_RPC_RESPONSE_BYTES, RateLimiter, build_app_with_state, decode_bounded_json,
+        deposit_sync_start_index, effective_public_artifact_delay_epochs, is_configured_felt,
+        latest_public_history_window, load_commitment_registry_address,
+        load_published_batch_artifacts_store, load_rpc_url, normalize_hex, now_unix_ms,
+        open_artifact_store, parse_deployment_manifest, parse_hex_u64, persist_artifact_record,
+        rate_limit_subject, selector_hex, service_http_client, validate_public_history_range,
     };
     use axum::{
         body::{Body, to_bytes},
@@ -2439,15 +2533,14 @@ mod tests {
         net::SocketAddr,
         sync::{Arc, Mutex},
     };
-    use tokio::sync::RwLock;
+    use tokio::sync::{Mutex as AsyncMutex, RwLock};
     use tower::util::ServiceExt;
     use zylith_core::{
         AssetId, BatchId, ConsumedInput, DepositActivationRecord, DepositSyncStatus,
-        MultiPairFeasibilityProblem, MultiPairOptimalityProblem, MultiPairSettlementTranscript,
-        MultiPairSettlementWitness, NoteCommitment, Nullifier, NullifierHistoryBatch,
+        MultiPairSettlementTranscript, NoteCommitment, Nullifier, NullifierHistoryBatch,
         OutputCiphertextBundle, OutputNoteRecord, PairId, PublishedBatchArtifacts,
-        PublishedMultiPairBatchArtifacts, SettlementTranscript, SettlementWitness,
-        multi_pair_settlement_transcript_commitment, settlement_nullifier_root_after_history,
+        PublishedMultiPairBatchArtifacts, SettlementTranscript,
+        settlement_nullifier_root_after_history,
     };
 
     const TEST_INTERNAL_TOKEN: &str = "indexer-test-token";
@@ -2481,49 +2574,41 @@ mod tests {
         server.abort();
     }
 
-    #[test]
-    fn artifact_store_rejects_oversized_unknown_and_missing_current_shapes() {
-        let oversized_path = std::env::temp_dir().join(format!(
-            "zylith-indexer-oversized-artifacts-{}-{}.json",
+    #[tokio::test]
+    async fn artifact_store_is_incremental_sqlite_and_rejects_invalid_storage() {
+        let path = std::env::temp_dir().join(format!(
+            "zylith-indexer-artifacts-{}-{}.sqlite",
             std::process::id(),
             now_unix_ms()
         ));
-        let file = fs::File::create(&oversized_path).expect("create oversized artifact store");
-        file.set_len(MAX_ARTIFACT_STORE_BYTES + 1)
-            .expect("size oversized artifact store");
-        assert!(
-            std::panic::catch_unwind(|| load_published_batch_artifacts_store(&oversized_path))
-                .is_err()
-        );
-        fs::remove_file(&oversized_path).expect("remove oversized artifact store");
-
-        let unknown_path = std::env::temp_dir().join(format!(
-            "zylith-indexer-unknown-artifacts-{}-{}.json",
-            std::process::id(),
-            now_unix_ms()
-        ));
-        fs::write(
-            &unknown_path,
-            r#"{"artifacts_by_batch":{},"unsupported_extra":[]}"#,
+        let artifact = sample_published_artifact("batch-sqlite-round-trip", 7);
+        persist_artifact_record(
+            path.clone(),
+            BATCH_ARTIFACT_NAMESPACE,
+            "batch-sqlite-round-trip".into(),
+            &artifact,
         )
-        .expect("write unknown artifact store");
-        assert!(
-            std::panic::catch_unwind(|| load_published_batch_artifacts_store(&unknown_path))
-                .is_err()
-        );
-        fs::remove_file(unknown_path).expect("remove unknown artifact store");
+        .await
+        .expect("persist artifact row");
+        let loaded = load_published_batch_artifacts_store(&path).expect("load artifact store");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["batch-sqlite-round-trip"].transcript.batch_epoch, 7);
 
-        let missing_path = std::env::temp_dir().join(format!(
-            "zylith-indexer-missing-artifacts-{}-{}.json",
-            std::process::id(),
-            now_unix_ms()
-        ));
-        fs::write(&missing_path, r#"{}"#).expect("write missing artifact store");
-        assert!(
-            std::panic::catch_unwind(|| load_published_batch_artifacts_store(&missing_path))
-                .is_err()
-        );
-        fs::remove_file(missing_path).expect("remove missing artifact store");
+        let invalid_extension = path.with_extension("json");
+        assert!(load_published_batch_artifacts_store(&invalid_extension).is_err());
+
+        let connection = open_artifact_store(&path).expect("open artifact store");
+        connection
+            .execute(
+                "UPDATE artifact_records SET value_json = 'not-json' WHERE namespace = ?1",
+                rusqlite::params![BATCH_ARTIFACT_NAMESPACE],
+            )
+            .expect("corrupt artifact row");
+        assert!(load_published_batch_artifacts_store(&path).is_err());
+        drop(connection);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     fn sample_published_artifact(batch_id: &str, batch_epoch: u64) -> PublishedBatchArtifacts {
@@ -2540,13 +2625,19 @@ mod tests {
         let transcript = MultiPairSettlementTranscript {
             group_id: BatchId(group_id.into()),
             batch_epoch,
+            auction_verifier_address: "0x123".into(),
             batch_bindings: vec![
                 zylith_core::MultiPairSettlementBatchBinding {
                     batch_id: BatchId("batch-strk-usdc-11".into()),
                     pair_id: PairId("STRK/USDC".into()),
                     batch_epoch,
                     order_commitment_root: "0x111".into(),
+                    admission_root: "0x211".into(),
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x511".into(),
+                    reference_price_signer: "0x611".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     base_asset_id: AssetId("STRK".into()),
                     quote_asset_id: AssetId("USDC".into()),
                     price_base_scale: 1,
@@ -2557,7 +2648,12 @@ mod tests {
                     pair_id: PairId("ETH/USDC".into()),
                     batch_epoch,
                     order_commitment_root: "0x333".into(),
+                    admission_root: "0x433".into(),
                     encrypted_order_set_commitment: "0x444".into(),
+                    reference_price_attestation_commitment: "0x533".into(),
+                    reference_price_signer: "0x611".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     base_asset_id: AssetId("ETH".into()),
                     quote_asset_id: AssetId("USDC".into()),
                     price_base_scale: 1,
@@ -2568,10 +2664,12 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            new_note_root: "0x1".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             protocol_fee_recipient: "zylith-protocol-fees".into(),
             multi_pair_commitment: "0x5151".into(),
+            external_match_settlements: vec![],
             matched_orders: vec![],
             consumed_inputs: vec![],
             renewal_child_uses: vec![],
@@ -2591,54 +2689,9 @@ mod tests {
                 .collect(),
             output_ciphertext_bundle_ref: output_bundle.bundle_commitment.clone(),
         };
-        let transcript_commitment = multi_pair_settlement_transcript_commitment(&transcript)
-            .expect("transcript commitment");
         PublishedMultiPairBatchArtifacts {
             transcript: transcript.clone(),
             output_bundle,
-            settlement_witness: MultiPairSettlementWitness {
-                group_id: transcript.group_id.clone(),
-                batch_epoch,
-                batch_bindings: transcript.batch_bindings.clone(),
-                transcript_commitment,
-                auction_verifier_address: "0x0".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root: "0x0".into(),
-                new_renewal_root: "0x0".into(),
-                protocol_fee_recipient: transcript.protocol_fee_recipient.clone(),
-                multi_pair_problem: MultiPairOptimalityProblem {
-                    chosen: MultiPairFeasibilityProblem {
-                        batch_id: transcript.group_id.clone(),
-                        fills: vec![],
-                        asset_deltas: vec![],
-                    },
-                    eligible_order_commitments: vec![],
-                    objective_weights: vec![],
-                    candidate_solutions: vec![],
-                },
-                multi_pair_commitment: transcript.multi_pair_commitment.clone(),
-                matched_orders: vec![],
-                matched_order_witnesses: vec![],
-                consumed_inputs: vec![],
-                note_membership_witnesses: vec![],
-                nullifier_history: vec![],
-                nullifier_sparse_witnesses: vec![],
-                renewal_history: vec![],
-                renewal_child_sparse_witnesses: vec![],
-                renewal_cancel_sparse_witnesses: vec![],
-                renewal_child_uses: vec![],
-                fees: vec![],
-                output_notes: vec![],
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments: transcript
-                    .output_recovery_dummy_commitments
-                    .clone(),
-                output_ciphertext_bundle_ref: transcript.output_ciphertext_bundle_ref.clone(),
-            },
             published_at_unix_ms: now_unix_ms(),
             settled_at_unix_ms: Some(1),
             settlement_transaction_hash: None,
@@ -2815,12 +2868,18 @@ mod tests {
                 batch_id: BatchId(batch_id.into()),
                 pair_id: pair_id.clone(),
                 batch_epoch,
+                auction_verifier_address: "0x123".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x511".into(),
+                reference_price_signer: "0x611".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: new_nullifier_root.clone(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
@@ -2839,44 +2898,6 @@ mod tests {
                 multi_pair_commitment: "0x0".into(),
             },
             output_bundle,
-            settlement_witness: SettlementWitness {
-                batch_id: BatchId(batch_id.into()),
-                pair_id,
-                batch_epoch,
-                order_commitment_root: "0x111".into(),
-                encrypted_order_set_commitment: "0x222".into(),
-                transcript_commitment: "transcript-commitment".into(),
-                auction_verifier_address: "0x0".into(),
-                prior_note_root: "0x0".into(),
-                prior_nullifier_root: "0x0".into(),
-                prior_renewal_root: "0x0".into(),
-                prior_fee_root: "0x0".into(),
-                new_nullifier_root,
-                new_renewal_root: "0x0".into(),
-                clearing_price: 145,
-                price_base_scale: 1,
-                taker_fee_bps: 4,
-                protocol_fee_recipient: "zylith-protocol-fees".into(),
-                base_asset_id: AssetId("STRK".into()),
-                quote_asset_id: AssetId("USDC".into()),
-                matched_orders: vec![],
-                matched_order_witnesses: vec![],
-                consumed_inputs,
-                note_membership_witnesses: vec![],
-                nullifier_history: vec![],
-                nullifier_sparse_witnesses: vec![],
-                renewal_history: vec![],
-                renewal_child_sparse_witnesses: vec![],
-                renewal_cancel_sparse_witnesses: vec![],
-                renewal_child_uses: vec![],
-                fees: vec![],
-                output_notes,
-                output_note_preimages: vec![],
-                output_recovery_records: vec![],
-                output_recovery_dummy_commitments,
-                output_ciphertext_bundle_ref: output_bundle_ref,
-                multi_pair_commitment: "0x0".into(),
-            },
             published_at_unix_ms: now_unix_ms(),
             settled_at_unix_ms: None,
             settlement_transaction_hash: None,
@@ -2948,7 +2969,7 @@ mod tests {
 
     #[test]
     fn deployment_manifest_parser_accepts_public_and_live_wrapped_shapes() {
-        let public_manifest = include_str!("../../client/public/deployment.example.json");
+        let public_manifest = include_str!("../../core/testdata/deployment.example.json");
 
         let live_manifest = format!(
             r#"{{
@@ -3016,6 +3037,7 @@ mod tests {
             last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: Arc::new(RwLock::new(artifacts)),
             published_multi_pair_batch_artifacts: Arc::new(RwLock::new(multi_pair_artifacts)),
+            artifact_publication_lock: Arc::new(AsyncMutex::new(())),
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
@@ -3229,6 +3251,7 @@ mod tests {
             last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: Arc::new(RwLock::new(artifacts)),
             published_multi_pair_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
+            artifact_publication_lock: Arc::new(AsyncMutex::new(())),
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
@@ -3453,6 +3476,7 @@ mod tests {
             last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
             published_multi_pair_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
+            artifact_publication_lock: Arc::new(AsyncMutex::new(())),
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
@@ -3559,7 +3583,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_persistence_failure_does_not_publish_live_state() {
         let path = std::env::temp_dir().join(format!(
-            "zylith-indexer-artifact-persist-failure-{}-{}.json",
+            "zylith-indexer-artifact-persist-failure-{}-{}.sqlite",
             std::process::id(),
             now_unix_ms()
         ));
@@ -3578,6 +3602,7 @@ mod tests {
             last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: artifacts.clone(),
             published_multi_pair_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
+            artifact_publication_lock: Arc::new(AsyncMutex::new(())),
             artifact_archive_path: Some(Arc::new(path.clone())),
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,
@@ -3643,6 +3668,7 @@ mod tests {
             last_successful_sync_unix_ms: Arc::new(RwLock::new(0)),
             published_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
             published_multi_pair_batch_artifacts: Arc::new(RwLock::new(BTreeMap::new())),
+            artifact_publication_lock: Arc::new(AsyncMutex::new(())),
             artifact_archive_path: None,
             internal_api_token: Some(Arc::new(TEST_INTERNAL_TOKEN.into())),
             batch_window_ms: DEFAULT_BATCH_WINDOW_MS,

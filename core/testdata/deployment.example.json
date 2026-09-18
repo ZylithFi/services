@@ -11,6 +11,8 @@
     "batch_registry": "0x0",
     "shielded_asset_adapter": "0x0",
     "privacy_deposit_bridge": "0x0",
+    "external_match_executor": "0x0",
+    "ekubo_external_match_router": "0x0",
     "auction_verifier": "0x0"
   },
   "token_addresses": {
@@ -56,7 +58,8 @@
         "min_trade_amount": "1000000000000000",
         "enabled_pairs": [
           "ETH/USDC",
-          "STRK/ETH"
+          "STRK/ETH",
+          "strkBTC/ETH"
         ]
       },
       "USDC": {
@@ -75,11 +78,11 @@
         "asset_id": "strkBTC",
         "token_address": "0x0",
         "rail_token_address": "0x0",
-        "min_trade_amount": "100000",
+        "min_trade_amount": "1000000000000000",
         "enabled_pairs": [
           "strkBTC/USDC",
-          "STRK/strkBTC",
-          "WBTC/strkBTC"
+          "strkBTC/ETH",
+          "STRK/strkBTC"
         ]
       },
       "WBTC": {
@@ -87,9 +90,7 @@
         "token_address": "0x0",
         "rail_token_address": "0x0",
         "min_trade_amount": "100000",
-        "enabled_pairs": [
-          "WBTC/strkBTC"
-        ]
+        "enabled_pairs": []
       },
       "USDT": {
         "asset_id": "USDT",
@@ -133,8 +134,8 @@
       },
       "strkBTC": {
         "asset_id": "strkBTC",
-        "min_trade_amount": "100000",
-        "decimals": 8,
+        "min_trade_amount": "1000000000000000",
+        "decimals": 18,
         "enabled": true,
         "token_address": "0x0",
         "erc20_behavior": "vanilla-exact-delta",
@@ -167,7 +168,7 @@
         "min_order_amount": "1000000000000000000",
         "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 4,
-        "relay_fee_bps": 0,
+        "external_match_enabled": true,
         "enabled": true,
         "heartbeat_cover_price": "1"
       },
@@ -178,7 +179,7 @@
         "min_order_amount": "1000000000000000",
         "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 4,
-        "relay_fee_bps": 0,
+        "external_match_enabled": true,
         "enabled": true,
         "heartbeat_cover_price": "1"
       },
@@ -186,10 +187,21 @@
         "pair_id": "strkBTC/USDC",
         "base_asset_id": "strkBTC",
         "quote_asset_id": "USDC",
-        "min_order_amount": "100000",
-        "price_base_scale": "100000000",
+        "min_order_amount": "1000000000000000",
+        "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 4,
-        "relay_fee_bps": 0,
+        "external_match_enabled": true,
+        "enabled": true,
+        "heartbeat_cover_price": "1"
+      },
+      "strkBTC/ETH": {
+        "pair_id": "strkBTC/ETH",
+        "base_asset_id": "strkBTC",
+        "quote_asset_id": "ETH",
+        "min_order_amount": "1000000000000000",
+        "price_base_scale": "1000000000000000000",
+        "taker_fee_bps": 4,
+        "external_match_enabled": true,
         "enabled": true,
         "heartbeat_cover_price": "1"
       },
@@ -200,7 +212,7 @@
         "min_order_amount": "1000000000000000000",
         "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 4,
-        "relay_fee_bps": 0,
+        "external_match_enabled": true,
         "enabled": true,
         "heartbeat_cover_price": "1"
       },
@@ -211,7 +223,7 @@
         "min_order_amount": "1000000000000000000",
         "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 4,
-        "relay_fee_bps": 0,
+        "external_match_enabled": true,
         "enabled": true,
         "heartbeat_cover_price": "1"
       },
@@ -222,8 +234,8 @@
         "min_order_amount": "100000",
         "price_base_scale": "100000000",
         "taker_fee_bps": 1,
-        "relay_fee_bps": 0,
-        "enabled": true,
+        "external_match_enabled": false,
+        "enabled": false,
         "heartbeat_cover_price": "1"
       },
       "USDC/USDT": {
@@ -233,7 +245,7 @@
         "min_order_amount": "1000000",
         "price_base_scale": "1000000",
         "taker_fee_bps": 1,
-        "relay_fee_bps": 0,
+        "external_match_enabled": true,
         "enabled": true,
         "heartbeat_cover_price": "1"
       }
@@ -247,7 +259,6 @@
     "auction_statement_type": 2,
     "auction_statement_schema": 1,
     "settlement_entrypoint": "submit_settlement_with_proof_facts",
-    "proof_entrypoint": "compile_settlement_proof",
     "proof_program_address": "0x0",
     "proof_program_hash": "0x0",
     "statement_proof_program_hashes": {
@@ -255,7 +266,6 @@
       "AUCTION_RESULT": "0x0",
       "NULLIFIER": "0x0",
       "RENEWAL": "0x0",
-      "LIQUIDITY_POSITION": "0x0",
       "SETTLEMENT_ORDER": "0x0",
       "SETTLEMENT_INPUT_MEMBERSHIP": "0x0",
       "SETTLEMENT_OUTPUT_RECOVERY": "0x0",
@@ -263,13 +273,14 @@
       "NOTE_CONSOLIDATION": "0x0",
       "AGGREGATE_SETTLEMENT": "0x0",
       "WITHDRAWAL": "0x0",
-      "MULTI_PAIR": "0x0"
+      "MULTI_PAIR": "0x0",
+      "MULTI_PAIR_SETTLEMENT": "0x0",
+      "EXTERNAL_MATCH_AUTH": "0x0"
     },
     "admission_proof_program_hash": "0x0",
     "auction_result_proof_program_hash": "0x0",
     "nullifier_proof_program_hash": "0x0",
     "renewal_proof_program_hash": "0x0",
-    "liquidity_position_proof_program_hash": "0x0",
     "settlement_order_proof_program_hash": "0x0",
     "settlement_input_membership_proof_program_hash": "0x0",
     "settlement_output_recovery_proof_program_hash": "0x0",
@@ -278,16 +289,19 @@
     "aggregate_settlement_proof_program_hash": "0x0",
     "withdrawal_proof_program_hash": "0x0",
     "multi_pair_proof_program_hash": "0x0",
+    "multi_pair_settlement_proof_program_hash": "0x0",
+    "external_match_authorization_proof_program_hash": "0x0",
     "starknet_os_config_hash": "0x0",
     "settlement_statement_program_address": "0x0",
     "settlement_note_fee_statement_program_address": "0x0",
     "settlement_order_statement_program_address": "0x0",
     "settlement_input_membership_statement_program_address": "0x0",
     "settlement_output_recovery_statement_program_address": "0x0",
-    "liquidity_position_statement_program_address": "0x0",
     "admission_statement_program_address": "0x0",
     "auction_result_statement_program_address": "0x0",
     "multi_pair_statement_program_address": "0x0",
+    "multi_pair_settlement_statement_program_address": "0x0",
+    "external_match_authorization_statement_program_address": "0x0",
     "proof_account_address": "0x0",
     "settlement_account_address": "0x0",
     "deposit_root_registrar_address": "0x0",
@@ -311,11 +325,10 @@
   },
   "roles": {
     "protocol_fee_recipient": "0x0",
-    "relay_fee_recipient": "0x0",
     "pause_guardian_address": "0x0"
   },
   "runtime": {
-    "batch_window_ms": 20000,
+    "batch_window_ms": 10000,
     "public_artifact_delay_min_epochs": 14,
     "public_artifact_delay_max_epochs": 36,
     "artifact_epoch_bucket_size": 8,

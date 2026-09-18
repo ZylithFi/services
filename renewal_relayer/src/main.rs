@@ -6869,7 +6869,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_long_window_tick_uses_due_slot_index_after_restart() {
         let start_epoch = 10_000;
-        let twenty_day_slots_at_20s_epochs = 20 * 24 * 60 * 60 / 20;
+        let ten_day_slots_at_10s_epochs = 10 * 24 * 60 * 60 / 10;
         let (coordinator_url, coordinator_shutdown) =
             spawn_mock_coordinator_for_batch("STRK-USDC-10000", start_epoch).await;
         let (prover_url, prover_shutdown) = spawn_mock_prover().await;
@@ -6878,7 +6878,7 @@ mod tests {
             coordinator_url,
             prover_url,
             start_epoch,
-            twenty_day_slots_at_20s_epochs,
+            ten_day_slots_at_10s_epochs,
         );
         package.relay_mode = Some(RelayMode::SelfRelay);
         refresh_test_package_commitment(&mut package);

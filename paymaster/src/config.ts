@@ -13,15 +13,18 @@ export type PaymasterConfig = {
   maxBodyBytes: number;
   allowedOrigins: Set<string>;
   signerLimitPerMinute: number;
+  signerDeploymentLimitPerDay: number;
   trustProxyHeaders: boolean;
   trustedProxyCidrs: string[];
   internalApiToken: string;
   submissionLogPath: string | null;
+  signerDeploymentLogPath: string | null;
 };
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
 const DEFAULT_SIGNER_LIMIT_PER_MINUTE = 20;
+const DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_DAY = 100;
 const STARKNET_FIELD_PRIME =
   3618502788666131213697322783095070105623107215331596699973092056135872020481n;
 
@@ -90,10 +93,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_SIGNER_LIMIT_PER_MINUTE,
       "ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE"
     ),
+    signerDeploymentLimitPerDay: parsePositiveInt(
+      env.ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY,
+      DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_DAY,
+      "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY"
+    ),
     trustProxyHeaders,
     trustedProxyCidrs,
     internalApiToken,
-    submissionLogPath: env.ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH?.trim() || "state/submissions.json"
+    submissionLogPath: env.ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH?.trim() || "state/submissions.json",
+    signerDeploymentLogPath:
+      env.ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LOG_PATH?.trim() || "state/signer-deployments.json"
   };
 }
 

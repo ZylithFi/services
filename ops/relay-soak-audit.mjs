@@ -49,7 +49,7 @@ for (const sample of samples) {
   if (sample.health?.strict_mode !== true) failures.push(`sample ${sample.index} strict mode is not enabled`);
   if (sample.health?.worker_enabled !== true) failures.push(`sample ${sample.index} worker is not enabled`);
   if (sample.health?.max_package_slots < 86_400) {
-    failures.push(`sample ${sample.index} max package slots below 20d at 20s window: ${sample.health?.max_package_slots}`);
+    failures.push(`sample ${sample.index} max package slots below 10d at 10s window: ${sample.health?.max_package_slots}`);
   }
   if (sample.ready?.status !== "ready") failures.push(`sample ${sample.index} readiness status is not ready`);
   if (sample.ready?.store_ok !== true) failures.push(`sample ${sample.index} durable store is not ok`);

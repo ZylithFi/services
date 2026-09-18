@@ -1,4 +1,4 @@
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 WORKDIR /src
 COPY Cargo.lock ./
 COPY core ./core
@@ -16,7 +16,7 @@ RUN printf '%s\n' \
   > Cargo.toml
 RUN cargo build --release -p zylith-renewal-relayer
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 RUN useradd --system --create-home --home-dir /var/lib/zylith-renewal-relayer zylith \
   && apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \

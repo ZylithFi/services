@@ -553,7 +553,6 @@ test("FV-009/FV-010 route inventory keeps public and internal data boundaries cl
       "/api/batches/{batch_id}/transcript",
       "/api/batches/{batch_id}/output-bundle",
       "/api/internal/batches/{batch_id}/orders",
-      "/api/internal/batches/{batch_id}/witness",
       "/api/orders",
       "/api/orders/cancel",
     ],
@@ -621,6 +620,7 @@ test("ROUTE-001 public route schema denylist rejects private response types", ()
     ["prover/src/main.rs", "public_auction_keys_fingerprint"],
     ["prover/src/main.rs", "get_public_proof_job"],
     ["prover/src/main.rs", "list_public_proof_jobs"],
+    ["prover/src/main.rs", "public_reference_price_attestation"],
     ["indexer/src/main.rs", "list_confirmed_deposits_range"],
     ["indexer/src/main.rs", "list_archived_transcripts"],
     ["indexer/src/main.rs", "get_archived_transcript"],
@@ -651,11 +651,12 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
       "/api/batches/{batch_id}/output-bundle",
       "/api/batches/{batch_id}/transcript",
       "/api/internal/batches/proof-work",
+      "/api/internal/batches/proof-work/release",
+      "/api/internal/batches/proof-work/renew",
       "/api/internal/batches/{batch_id}/artifacts",
       "/api/internal/batches/{batch_id}/orders",
       "/api/internal/batches/{batch_id}/settled-at",
       "/api/internal/batches/{batch_id}/transcript",
-      "/api/internal/batches/{batch_id}/witness",
       "/api/internal/metrics",
       "/api/internal/multi-pair-settlements/{group_id}/artifacts",
       "/api/internal/renewal/cancel-markers",
@@ -695,6 +696,8 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
     ],
     "prover/src/main.rs": [
       "/api/internal/batches/{batch_id}/prepare",
+      "/api/internal/external-match/authorization",
+      "/api/internal/external-match/authorize-onchain",
       "/api/internal/health",
       "/api/internal/metrics",
       "/api/internal/multi-pair-netting/plan",
@@ -721,6 +724,7 @@ test("ROUTE-002 generated backend route inventory has explicit privacy classific
       "/api/public/auction-keys/fingerprint",
       "/api/public/proof-jobs",
       "/api/public/proof-jobs/{batch_id}",
+      "/api/public/reference-prices/attestation",
       "/health",
     ],
     "renewal_relayer/src/main.rs": [
@@ -837,9 +841,12 @@ test("SURFACE-002 generated ABI, env, and proof-input drift checks stay current"
     "set_proof_validity_blocks",
     "set_expected_starknet_os_config_hash",
     "set_shielded_asset_adapter",
+    "set_external_match_executor",
+    "external_match_executor_address",
     "set_deposit_root_registrar",
     "set_output_claim_delay_seconds",
     "set_protocol_fee_recipient",
+    "set_reference_price_signer",
     "propose_protocol_fee_recipient",
     "execute_protocol_fee_recipient",
     "set_pair_fee_config",
@@ -850,6 +857,9 @@ test("SURFACE-002 generated ABI, env, and proof-input drift checks stay current"
     "record_admission_root_with_proof_facts",
     "record_auction_result_with_proof_facts",
     "record_multi_pair_solution_with_proof_facts",
+    "authorize_external_match_requests_with_proof_facts",
+    "external_match_authorization_root",
+    "close_external_match_request",
     "record_nullifier_roots_with_proof_facts",
     "record_renewal_roots_with_proof_facts",
     "record_settlement_order_with_proof_facts",
@@ -880,9 +890,11 @@ test("SURFACE-002 generated ABI, env, and proof-input drift checks stay current"
     "is_paused",
     "proof_program_is_locked",
     "protocol_fee_recipient",
+    "reference_price_signer",
     "pending_protocol_fee_recipient",
     "note_root_transition_count",
     "note_root_transition",
+    "note_root_transition_page",
     "settlement_proof_message_hash",
     "note_consolidation_proof_message_hash",
     "withdrawal_proof_message_hash",
@@ -909,6 +921,7 @@ test("SURFACE-002 generated ABI, env, and proof-input drift checks stay current"
     "ZYLITH_COORDINATOR_TRUSTED_PROXY_CIDRS",
     "ZYLITH_PROVER_TRUSTED_PROXY_CIDRS",
     "ZYLITH_INDEXER_TRUSTED_PROXY_CIDRS",
+    "ZYLITH_INDEXER_ARTIFACT_PATH",
     "ZYLITH_RENEWAL_RELAY_TRUSTED_PROXY_CIDRS",
     "ZYLITH_PAYMASTER_TRUSTED_PROXY_CIDRS",
     "ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS",
@@ -1094,6 +1107,63 @@ test("DEP-001 Zylith funding bridge activation is custody-bound and does not exp
   assert.match(indexer, /DepositActivationRecordList/);
 });
 
+test("DEP-002 external match settlement is registered and bridge-custody bound", () => {
+  const bridge = readSource("contracts/src/privacy_deposit_bridge.cairo");
+  const executor = readSource("contracts/src/external_match_executor.cairo");
+  const core = readSource("core/src/external_match.rs");
+  const matcher = readSource("zylith_matcher/src/lib.rs");
+  const matcherMain = readSource("zylith_matcher/src/main.rs");
+  const ekuboRouter = readSource("contracts/src/ekubo_external_match_router.cairo");
+  const deploy = readSource("scripts/deploy_sepolia.sh");
+
+  assert.match(executor, /fn\s+register_authorized_external_match_requests\b/);
+  assert.doesNotMatch(executor, /fn\s+register_external_match_request\b/);
+  assert.match(executor, /fn\s+settle_external_match_fill\b/);
+  assert.match(executor, /assert_registrar\(@self\)/);
+  assert.match(executor, /UNKNOWN_REQUEST/);
+  assert.match(executor, /REQUEST_OVERFILLED/);
+  assert.match(executor, /REQUEST_EXPIRED/);
+  assert.match(executor, /reference_midpoint_price/);
+  assert.match(executor, /settle_external_match_asset_swap\(/);
+  assert.match(executor, /fn\s+request_count\b/);
+  assert.match(executor, /fn\s+request_ids\b/);
+  assert.match(executor, /fn\s+external_match_request\b/);
+
+  assert.match(bridge, /fn\s+set_external_match_executor\b/);
+  assert.match(bridge, /fn\s+settle_external_match_asset_swap\b/);
+  assert.match(bridge, /assert_external_match_executor\(@self\)/);
+  assert.match(bridge, /OUTPUT_DELTA/);
+  assert.match(bridge, /INPUT_DELTA/);
+  assert.match(bridge, /escrowed_asset_amounts\.write\(input_asset_id/);
+  assert.match(bridge, /escrowed_asset_amounts\.write\(output_asset_id/);
+
+  assert.match(core, /build_external_match_authorization_call/);
+  assert.match(core, /authorize_external_match_requests_with_proof_facts/);
+  assert.match(matcher, /settle_external_match_fill/);
+  assert.match(matcher, /ExternalMatchRequestSnapshot/);
+  assert.match(matcher, /build_route_quote_request/);
+  assert.match(matcher, /max_route_age_ms/);
+  assert.match(matcher, /SkipReason::StaleRoutes/);
+  assert.match(matcher, /require_atomic_venue_calls/);
+  assert.match(matcher, /SkipReason::NoExecutionCalls/);
+  assert.match(matcher, /fetch_onchain_external_match_requests/);
+  assert.match(matcher, /quote_ekubo_routes/);
+  assert.match(matcher, /minimum_onchain_profit_quote_amount/);
+  assert.match(matcher, /validate_execution_plan_contracts/);
+  assert.match(matcherMain, /chain-execute-once/);
+  assert.match(matcherMain, /execute_v3/);
+  assert.match(matcherMain, /serve-ekubo/);
+  assert.match(ekuboRouter, /impl\s+LockerImpl\s+of\s+IEkuboLocker/);
+  assert.match(ekuboRouter, /fn\s+execute_external_match\b/);
+  assert.match(ekuboRouter, /PROFIT_TOO_LOW/);
+  assert.match(ekuboRouter, /BASE_BALANCE_DELTA/);
+  assert.match(deploy, /declare_contract ExternalMatchExecutor/);
+  assert.match(deploy, /declare_contract EkuboExternalMatchRouter/);
+  assert.match(deploy, /set_external_match_executor/);
+  assert.match(deploy, /external_match_executor/);
+  assert.match(deploy, /ekubo_external_match_router/);
+});
+
 function assertPositiveAmount(amount) {
   if (BigInt(amount) <= 0n) throw new Error("amount must be positive");
 }
@@ -1175,9 +1245,14 @@ function readSource(path) {
 }
 
 function extractRustStruct(source, name) {
-  const match = source.match(new RegExp(`(?:pub\\s+)?struct ${name} \\{([\\s\\S]*?)\\n\\}`));
-  assert(match, `${name} must exist`);
-  return match[1];
+  const markers = [`pub struct ${name} {`, `struct ${name} {`];
+  const start = markers
+    .map((marker) => source.indexOf(marker))
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0];
+  assert.notEqual(start, undefined, `${name} must exist`);
+  const openingBrace = source.indexOf("{", start);
+  return balancedBlock(source, openingBrace + 1, name);
 }
 
 function sourceAround(source, marker, lineCount) {
@@ -1187,15 +1262,32 @@ function sourceAround(source, marker, lineCount) {
 }
 
 function rustFunctionReturnType(source, name) {
-  const match = source.match(new RegExp(`async fn ${name}\\b[\\s\\S]*?\\)\\s*->\\s*([^\\{]+)\\{`));
-  assert(match, `${name} return type must be discoverable from source`);
-  return match[1].replace(/\s+/g, " ").trim();
+  const start = source.indexOf(`async fn ${name}`);
+  assert.notEqual(start, -1, `${name} return type must be discoverable from source`);
+  const arrow = source.indexOf("->", start);
+  const openingBrace = source.indexOf("{", arrow);
+  assert(arrow >= 0 && openingBrace >= 0, `${name} return type must be discoverable from source`);
+  return source.slice(arrow + 2, openingBrace).replace(/\s+/g, " ").trim();
 }
 
 function extractCairoInterfaceFunctions(source, name) {
-  const match = source.match(new RegExp(`pub trait ${name}<[\\s\\S]*?\\{([\\s\\S]*?)\\n\\}`));
-  assert(match, `${name} interface must exist`);
-  return [...match[1].matchAll(/\bfn\s+([A-Za-z0-9_]+)\b/g)].map((entry) => entry[1]);
+  const start = source.indexOf(`pub trait ${name}`);
+  assert.notEqual(start, -1, `${name} interface must exist`);
+  const openingBrace = source.indexOf("{", start);
+  assert(openingBrace >= 0, `${name} interface must exist`);
+  const body = balancedBlock(source, openingBrace + 1, name);
+  return [...body.matchAll(/\bfn\s+([A-Za-z0-9_]+)\b/g)].map((entry) => entry[1]);
+}
+
+function balancedBlock(source, bodyStart, label) {
+  let depth = 1;
+  for (let index = bodyStart; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] !== "}") continue;
+    depth -= 1;
+    if (depth === 0) return source.slice(bodyStart, index);
+  }
+  assert.fail(`${label} has an unterminated block`);
 }
 
 function extractEnvNames(source) {

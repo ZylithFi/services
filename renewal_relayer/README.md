@@ -140,7 +140,7 @@ Package submission uses the public order route after private ingress acceptance.
 | `ZYLITH_RENEWAL_RELAY_INTERNAL_TOKEN` | yes | Bearer token for internal tick trigger access. |
 | `ZYLITH_RENEWAL_RELAY_PROVER_CONTROL_TOKEN` | yes | Bearer token for the prover proof-job status route used by reused-funding guards. |
 | `ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS` | yes | Comma-separated browser origins allowed to register packages. |
-| `ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS` | no | Upper bound for accepted package size. Default supports about 20d at 20s epochs. |
+| `ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS` | no | Upper bound for accepted package size. Default supports about 10d at 10s epochs. |
 | `ZYLITH_RENEWAL_RELAY_RETRY_BACKOFF_MS` | no | Failed-slot retry backoff. |
 | `ZYLITH_RENEWAL_RELAY_MAX_ATTEMPTS` | no | Max failed submission attempts per slot. |
 | `ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE` | no | Package API rate limit per caller. |

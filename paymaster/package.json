@@ -16,6 +16,11 @@
     "@types/node": "^24.13.2",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "esbuild": "0.28.1",
+    "nanoid": "3.3.19",
+    "postcss": "8.5.28"
   }
 }

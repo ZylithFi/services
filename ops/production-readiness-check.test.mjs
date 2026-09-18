@@ -14,6 +14,14 @@ test("production readiness accepts a hardened minimal configuration", () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test("production readiness requires an incremental SQLite indexer artifact store", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_INDEXER_ARTIFACT_PATH = "/var/lib/zylith/indexer-artifacts.json";
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_INDEXER_ARTIFACT_PATH must point to a \.db, \.sqlite, or \.sqlite3 store/);
+});
+
 test("production readiness accepts separate native proof account with explicit private key", () => {
   const { env } = fixtureEnv();
   env.ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS = "0x999";
@@ -29,6 +37,22 @@ test("production readiness rejects separate native proof account without private
   const result = runReadiness(env);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /ZYLITH_NATIVE_PROOF_PRIVATE_KEY/);
+});
+
+test("production readiness rejects shared proof and settlement roles", () => {
+  const { env, manifest } = fixtureEnv();
+  env.ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS = env.ZYLITH_SETTLEMENT_ACCOUNT_ADDRESS;
+  manifest.proof.proof_account_address = manifest.proof.settlement_account_address;
+  writeManifest(env, manifest);
+
+  const result = runReadiness(env);
+
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /ZYLITH_(?:NATIVE_PROOF|SETTLEMENT)_ACCOUNT_ADDRESS must be distinct/,
+  );
+  assert.match(result.stderr, /proof\.proof_account_address must be distinct/);
 });
 
 test("production readiness rejects missing base Starknet executor signer", () => {
@@ -57,6 +81,19 @@ test("production readiness rejects prover worker without on-chain submission", (
   assert.match(result.stderr, /ZYLITH_PROVER_WORKER_SUBMIT_ONCHAIN/);
 });
 
+test("production readiness requires an exact 32-byte prover data key", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_PROVER_DATA_KEY_HEX = "ab";
+  let result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_PROVER_DATA_KEY_HEX must be exactly 32 bytes/);
+
+  delete env.ZYLITH_PROVER_DATA_KEY_HEX;
+  result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_PROVER_DATA_KEY_HEX is required/);
+});
+
 test("production readiness rejects paymaster proxy trust without trusted CIDRs", () => {
   const { env } = fixtureEnv();
   env.ZYLITH_PAYMASTER_TRUST_PROXY_HEADERS = "true";
@@ -65,6 +102,16 @@ test("production readiness rejects paymaster proxy trust without trusted CIDRs",
   const result = runReadiness(env);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /PAYMASTER_TRUSTED_PROXY_CIDRS/);
+});
+
+test("production readiness rejects an unbounded privacy signer deployment budget", () => {
+  const { env } = fixtureEnv();
+  delete env.ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY;
+
+  const result = runReadiness(env);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY/);
 });
 
 test("production readiness rejects coordinator proxy trust without trusted CIDRs", () => {
@@ -167,7 +214,7 @@ test("production readiness rejects incomplete reference price policy", () => {
   policy.pairs["STRK/USDC"].confirmations = ["last-cleared-price"];
   policy.pairs["STRK/ETH"].confirmations = [
     "coinbase:STRK-USD divided by coinbase:ETH-USD",
-    "coinbase:STRK-USD divided by coinbase:ETH-USD",
+    "coinbase:STRK-USDT divided by coinbase:ETH-USDT",
   ];
   policy.global_policy.large_move_policy = "clip-to-previous-price";
   writeFileSync(policyPath, JSON.stringify(policy, null, 2));
@@ -180,7 +227,35 @@ test("production readiness rejects incomplete reference price policy", () => {
   assert.match(result.stderr, /reference price policy STRK\/USDC\.confirmations must include at least two independent non-Binance confirmations/);
   assert.match(result.stderr, /reference price policy STRK\/USDC\.confirmations must include at least two non-Binance CEX book confirmations/);
   assert.match(result.stderr, /reference price policy STRK\/USDC must not include last-cleared/);
-  assert.match(result.stderr, /reference price policy STRK\/ETH\.confirmations must be unique independent sources/);
+  assert.match(result.stderr, /reference price policy STRK\/ETH\.confirmations must use distinct CEX venues/);
+});
+
+test("production readiness rejects a policy without the external matcher request invariant", () => {
+  const { env } = fixtureEnv();
+  const policyPath = join(mkdtempSync(join(tmpdir(), "zylith-price-policy-")), "policy.json");
+  const policy = JSON.parse(readFileSync("ops/config/reference-price-sources.mainnet.json", "utf8"));
+  policy.external_matcher.mode = "wallet-directed-public-swap";
+  writeFileSync(policyPath, JSON.stringify(policy));
+  env.ZYLITH_REFERENCE_PRICE_POLICY_PATH = policyPath;
+
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /external_matcher\.mode must be searcher-midpoint-fill/);
+});
+
+test("production readiness rejects reference policy thresholds that drift from runtime", () => {
+  const { env } = fixtureEnv();
+  const policyPath = join(mkdtempSync(join(tmpdir(), "zylith-price-policy-")), "policy.json");
+  const policy = JSON.parse(readFileSync("ops/config/reference-price-sources.mainnet.json", "utf8"));
+  policy.global_policy.max_divergence_bps = 50;
+  policy.pairs["USDC/USDT"].max_divergence_bps = 30;
+  writeFileSync(policyPath, JSON.stringify(policy));
+  env.ZYLITH_REFERENCE_PRICE_POLICY_PATH = policyPath;
+
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /global_policy\.max_divergence_bps must be 30/);
+  assert.match(result.stderr, /USDC\/USDT\.max_divergence_bps must be 20/);
 });
 
 test("production readiness rejects unresolved high severity audit findings", () => {
@@ -218,6 +293,14 @@ test("production readiness rejects invalid deployment manifest signature", () =>
   const result = runReadiness(env);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /deployment manifest signature/);
+});
+
+test("production readiness accepts an environment-escaped manifest signer PEM", () => {
+  const { env } = fixtureEnv();
+  env.ZYLITH_DEPLOYMENT_MANIFEST_SIGNER_PUBLIC_KEY_PEM =
+    env.ZYLITH_DEPLOYMENT_MANIFEST_SIGNER_PUBLIC_KEY_PEM.replaceAll("\n", "\\n");
+  const result = runReadiness(env);
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test("production readiness rejects manifest chain id mismatch", () => {
@@ -260,6 +343,28 @@ test("production readiness rejects invalid private funding manifest config", () 
   assert.match(result.stderr, /funding\.starknet_privacy\.bridge_adapter must match contracts\.privacy_deposit_bridge/);
   assert.match(result.stderr, /contracts\.shielded_asset_adapter must match contracts\.privacy_deposit_bridge/);
   assert.match(result.stderr, /funding\.starknet_privacy\.proof_signer_class_hash must be configured/);
+});
+
+test("production readiness accepts external matcher pairs without wallet executor pins", () => {
+  const { env, manifest } = fixtureEnv();
+  manifest.product.pairs["ETH/USDC"].external_match_enabled = true;
+  writeManifest(env, manifest);
+
+  const result = runReadiness(env);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("production readiness rejects an enabled pair without external matching", () => {
+  const { env, manifest } = fixtureEnv();
+  manifest.product.pairs["ETH/USDC"].external_match_enabled = false;
+  writeManifest(env, manifest);
+
+  const result = runReadiness(env);
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /product\.pairs\.ETH\/USDC\.external_match_enabled must be true/,
+  );
 });
 
 test("production readiness rejects deployment JSON drift from the signed manifest", () => {
@@ -336,10 +441,12 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     ZYLITH_TRUSTED_INGRESS_RECEIPT_PREVIOUS_SECRETS: "b".repeat(32),
     ZYLITH_HEARTBEAT_COVER_SECRET: "c".repeat(32),
     ZYLITH_PROVER_STRICT: "true",
+    ZYLITH_PROVER_DATA_KEY_HEX: "18".repeat(32),
     ZYLITH_PROVER_WORKER_SUBMIT_ONCHAIN: "true",
     ZYLITH_COORDINATOR_ALLOWED_ORIGINS: "https://app.zylith.fi",
     ZYLITH_PROVER_ALLOWED_ORIGINS: "https://app.zylith.fi",
     ZYLITH_INDEXER_ALLOWED_ORIGINS: "https://app.zylith.fi",
+    ZYLITH_INDEXER_ARTIFACT_PATH: join(dir, "indexer-artifacts.sqlite"),
     ZYLITH_PAYMASTER_ALLOWED_ORIGINS: "https://app.zylith.fi",
     ZYLITH_RENEWAL_RELAY_ALLOWED_ORIGINS: "https://app.zylith.fi",
     ZYLITH_COORDINATOR_MAX_BODY_BYTES: "1000000",
@@ -349,14 +456,16 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     ZYLITH_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE: "60",
     ZYLITH_PROVER_PRIVATE_INGRESS_RATE_LIMIT_PER_MINUTE: "60",
     ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE: "60",
+    ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY: "100",
     ZYLITH_RENEWAL_RELAY_RATE_LIMIT_PER_MINUTE: "60",
     ZYLITH_PROVER_MAX_STORED_PRIVATE_PAYLOADS: "1000",
     ZYLITH_PRIVATE_PAYLOAD_RETENTION_MS: "60000",
     ZYLITH_RENEWAL_RELAY_PACKAGE_RETENTION_MS: "86400000",
     ZYLITH_RENEWAL_RELAY_MAX_PACKAGE_SLOTS: "86400",
     ZYLITH_COORDINATOR_MAX_ORDERS_PER_BATCH: "100",
-    ZYLITH_PRODUCT_PAIRS: "STRK/USDC,ETH/USDC,strkBTC/USDC,STRK/ETH,STRK/strkBTC,WBTC/strkBTC,USDC/USDT",
-    ZYLITH_BATCH_WINDOW_MS: "20000",
+    ZYLITH_MAX_ORDER_AMOUNT: "100000000000000000000000000",
+    ZYLITH_PRODUCT_PAIRS: "STRK/USDC,ETH/USDC,STRK/ETH,USDC/USDT",
+    ZYLITH_BATCH_WINDOW_MS: "10000",
     ZYLITH_PUBLIC_ARTIFACT_DELAY_MIN_EPOCHS: "14",
     ZYLITH_PUBLIC_ARTIFACT_DELAY_MAX_EPOCHS: "36",
     ZYLITH_ARTIFACT_EPOCH_BUCKET_SIZE: "8",
@@ -365,7 +474,8 @@ function fixtureEnv({ proofOverrides = {} } = {}) {
     VITE_ZYLITH_INGRESS_KEY_REGISTRY_PIN: "pin",
     ZYLITH_NATIVE_PROOF_PROGRAM_ADDRESS: "0x101",
     ZYLITH_NATIVE_PROOF_PROGRAM_HASH: "0x102",
-    ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS: "0x205",
+    ZYLITH_NATIVE_PROOF_ACCOUNT_ADDRESS: "0x209",
+    ZYLITH_NATIVE_PROOF_PRIVATE_KEY: "17".repeat(32),
     ZYLITH_NATIVE_TX_PROVER_URL: "https://prover.zylith.fi",
     ZYLITH_NATIVE_SETTLEMENT_STATEMENT_PROGRAM_ADDRESS: "0x104",
     ZYLITH_NATIVE_NULLIFIER_STATEMENT_PROGRAM_ADDRESS: "0x105",
@@ -431,10 +541,7 @@ function fixtureManifest(proofOverrides) {
   const pairs = {
     "STRK/USDC": ["STRK", "USDC", 4],
     "ETH/USDC": ["ETH", "USDC", 4],
-    "strkBTC/USDC": ["strkBTC", "USDC", 4],
     "STRK/ETH": ["STRK", "ETH", 4],
-    "STRK/strkBTC": ["STRK", "strkBTC", 4],
-    "WBTC/strkBTC": ["WBTC", "strkBTC", 1],
     "USDC/USDT": ["USDC", "USDT", 1],
   };
   return {
@@ -449,6 +556,8 @@ function fixtureManifest(proofOverrides) {
       commitment_registry: "0x403",
       shielded_asset_adapter: "0x405",
       privacy_deposit_bridge: "0x405",
+      external_match_executor: "0x406",
+      ekubo_external_match_router: "0x407",
     },
     token_addresses: Object.fromEntries(
       requiredAssets.map((asset, index) => [asset, `0x${(0x500 + index).toString(16)}`]),
@@ -481,6 +590,7 @@ function fixtureManifest(proofOverrides) {
             quote_asset_id: quote,
             enabled: true,
             taker_fee_bps: taker,
+            external_match_enabled: true,
           },
         ]),
       ),
@@ -525,6 +635,7 @@ function fixtureManifest(proofOverrides) {
       withdrawal_proof_program_hash: "0x70c",
       multi_pair_proof_program_hash: "0x70d",
       multi_pair_settlement_proof_program_hash: "0x70e",
+      external_match_authorization_proof_program_hash: "0x70f",
       statement_proof_program_hashes: {
         ADMISSION: "0x701",
         AUCTION_RESULT: "0x702",
@@ -539,6 +650,7 @@ function fixtureManifest(proofOverrides) {
         WITHDRAWAL: "0x70c",
         MULTI_PAIR: "0x70d",
         MULTI_PAIR_SETTLEMENT: "0x70e",
+        EXTERNAL_MATCH_AUTH: "0x70f",
       },
       settlement_statement_program_address: "0x603",
       settlement_note_fee_statement_program_address: "0x610",
@@ -553,6 +665,7 @@ function fixtureManifest(proofOverrides) {
       auction_result_statement_program_address: "0x609",
       multi_pair_statement_program_address: "0x60a",
       multi_pair_settlement_statement_program_address: "0x60b",
+      external_match_authorization_statement_program_address: "0x60c",
       proof_account_address: "0x608",
       settlement_account_address: "0x609",
       native_tx_prover_url: "https://prover.zylith.fi",

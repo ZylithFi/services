@@ -21,19 +21,20 @@ use crate::{
     AssetId, AuctionOrderWitness, BatchId, BatchSummary, ConsumedInput, DecryptedOrderShare,
     DepositCallArguments, DepositIntent, DepositSubmissionPlan, EncryptedBlob,
     EncryptedRecoveryPayload, ExecutionPreference, FundingRailKind, MatchedOrderWitness,
-    MultiPairAssetDelta, MultiPairAssetDeltaDirection, MultiPairAssetDeltaSource, MultiPairFill,
-    MultiPairMatchedOrderWitness, MultiPairObjectiveWeight, MultiPairOptimalityProblem,
-    MultiPairRootOnlySettlementCommitments, MultiPairSettlementBatchBinding,
-    MultiPairSettlementCallArguments, MultiPairSettlementSubmissionPlan,
-    MultiPairSettlementTranscript, MultiPairSettlementWitness, Note, NoteCommitment,
-    NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan, NoteConsolidationWitness,
-    NoteMembershipKind, NoteMembershipWitness, Nullifier, NullifierHistoryBatch,
-    NullifierSparseUpdateWitness, OrderCommitment, OrderIngressReceipt,
+    MultiPairAdmissionOrderSummary, MultiPairAssetDelta, MultiPairAssetDeltaDirection,
+    MultiPairAssetDeltaSource, MultiPairCandidateSetProblem, MultiPairFill,
+    MultiPairMatchedOrderWitness, MultiPairObjectiveWeight, MultiPairRootOnlySettlementCommitments,
+    MultiPairSettlementBatchBinding, MultiPairSettlementCallArguments,
+    MultiPairSettlementSubmissionPlan, MultiPairSettlementTranscript, MultiPairSettlementWitness,
+    Note, NoteCommitment, NoteConsolidationCallArguments, NoteConsolidationSubmissionPlan,
+    NoteConsolidationWitness, NoteMembershipKind, NoteMembershipWitness, Nullifier,
+    NullifierHistoryBatch, NullifierSparseUpdateWitness, OrderCommitment, OrderIngressReceipt,
     OrderIngressReceiptAttestation, OrderIntent, OrderShare, OrderShareBundle, OrderSide,
     OrderSubmission, OrderType, OutputNoteMerkleProof, OutputNoteRecord, OutputRecoveryRecord,
     OwnedOutputNotePayload, PairId, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyRegistry,
     PrivateOrderPayload, ProtocolError, RecoveryArtifact, RecoveryArtifactKind, RecoverySeed,
-    RelayMode, RenewalChildUse, RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
+    ReferencePriceAttestation, ReferencePriceEnvelope, RelayMode, RenewalChildUse,
+    RenewalParentCancelCallArguments, RenewalParentCancelPlanRequest,
     RenewalParentCancelSubmissionPlan, RenewalStateHistoryBatch, RootOnlySettlementCommitments,
     SettlementCallArguments, SettlementOutputWithdrawalCallArguments,
     SettlementOutputWithdrawalSubmissionPlan, SettlementOutputWithdrawalWitness,
@@ -41,8 +42,8 @@ use crate::{
     derive_user_keys,
     hash::{
         domain_felt, domain_felt_hex, encode_starknet_felt, felt_from_hex_str, felt_hex,
-        normalize_felt_hex, poseidon_chain_hex, tagged_commitment_sha256, tagged_field_hex,
-        tagged_sha256_bytes, tagged_sha256_hex,
+        normalize_felt_hex, ordered_felt_list_commitment, poseidon_chain_hex,
+        tagged_commitment_sha256, tagged_field_hex, tagged_sha256_bytes, tagged_sha256_hex,
     },
     types::{
         MAX_ORDER_FUNDING_INPUTS, NOTE_RECOGNITION_ALGORITHM, OUTPUT_NOTE_PLAINTEXT_PADDED_LEN,
@@ -72,6 +73,187 @@ const OUTPUT_NOTE_LEAF_DOMAIN_HEX: &str =
     "0x0f0c89949c6cba4ac7f170f7f00809b458b997f2e394481c7ab58cc68aa49b3";
 const OUTPUT_NOTE_NODE_DOMAIN_HEX: &str =
     "0x03c6998f476a618431be1c1764a6724f13c0739be395bab4c1217bc0a65b2ee7";
+const NOTE_ACCUMULATOR_LEAF_DOMAIN_HEX: &str = "0x7a796c6974685f6e6f74655f6163635f6c6561665f7631";
+const NOTE_ACCUMULATOR_NODE_DOMAIN_HEX: &str = "0x7a796c6974685f6e6f74655f6163635f6e6f64655f7631";
+pub const NOTE_ACCUMULATOR_DEPTH: usize = 32;
+const NOTE_ACCUMULATOR_CAPACITY: u64 = 1_u64 << NOTE_ACCUMULATOR_DEPTH;
+pub type NoteAccumulatorMembershipProof = (Vec<String>, Vec<String>);
+
+#[derive(Clone, Debug)]
+pub struct NoteAccumulatorTree {
+    batch_roots: Vec<String>,
+    levels: Vec<Vec<Felt>>,
+    roots_after_each_append: Vec<String>,
+    leaf_count_by_root: BTreeMap<String, usize>,
+}
+
+impl Default for NoteAccumulatorTree {
+    fn default() -> Self {
+        Self {
+            batch_roots: Vec::new(),
+            levels: vec![Vec::new(); NOTE_ACCUMULATOR_DEPTH + 1],
+            roots_after_each_append: Vec::new(),
+            leaf_count_by_root: BTreeMap::new(),
+        }
+    }
+}
+
+impl NoteAccumulatorTree {
+    pub fn from_batch_roots(batch_roots: &[String]) -> Result<Self, ProtocolError> {
+        let mut tree = Self::default();
+        for batch_root in batch_roots {
+            tree.append(batch_root)?;
+        }
+        Ok(tree)
+    }
+
+    pub fn len(&self) -> usize {
+        self.batch_roots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.batch_roots.is_empty()
+    }
+
+    pub fn root(&self) -> String {
+        self.roots_after_each_append
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "0x0".into())
+    }
+
+    pub fn batch_roots(&self) -> &[String] {
+        &self.batch_roots
+    }
+
+    pub fn roots_after_each_append(&self) -> &[String] {
+        &self.roots_after_each_append
+    }
+
+    pub fn leaf_count_at_root(&self, root: &str) -> Result<Option<usize>, ProtocolError> {
+        let root = normalize_felt_hex(root)?;
+        if root == "0x0" {
+            return Ok(Some(0));
+        }
+        Ok(self.leaf_count_by_root.get(&root).copied())
+    }
+
+    pub fn batch_roots_at_root(&self, root: &str) -> Result<Option<&[String]>, ProtocolError> {
+        let Some(leaf_count) = self.leaf_count_at_root(root)? else {
+            return Ok(None);
+        };
+        Ok(Some(&self.batch_roots[..leaf_count]))
+    }
+
+    pub fn append(&mut self, batch_root: &str) -> Result<String, ProtocolError> {
+        if (self.batch_roots.len() as u64) >= NOTE_ACCUMULATOR_CAPACITY {
+            return Err(ProtocolError::Crypto(
+                "note accumulator capacity exceeded".into(),
+            ));
+        }
+        let batch_root = normalize_felt_hex(batch_root)?;
+        let leaf = note_accumulator_leaf(felt_from_hex_str(&batch_root)?)?;
+        self.batch_roots.push(batch_root);
+        self.levels[0].push(leaf);
+
+        let mut node_index = self.batch_roots.len() - 1;
+        for level in 0..NOTE_ACCUMULATOR_DEPTH {
+            let parent_index = node_index / 2;
+            let child_index = parent_index * 2;
+            let left = self.levels[level]
+                .get(child_index)
+                .copied()
+                .unwrap_or(Felt::ZERO);
+            let right = self.levels[level]
+                .get(child_index + 1)
+                .copied()
+                .unwrap_or(Felt::ZERO);
+            let parent = note_accumulator_node(left, right, level)?;
+            if parent_index == self.levels[level + 1].len() {
+                self.levels[level + 1].push(parent);
+            } else {
+                self.levels[level + 1][parent_index] = parent;
+            }
+            node_index = parent_index;
+        }
+
+        let root = felt_hex(&self.levels[NOTE_ACCUMULATOR_DEPTH][0]);
+        self.roots_after_each_append.push(root.clone());
+        if self
+            .leaf_count_by_root
+            .insert(root.clone(), self.batch_roots.len())
+            .is_some()
+        {
+            return Err(ProtocolError::Crypto(
+                "note accumulator produced a duplicate historical root".into(),
+            ));
+        }
+        Ok(root)
+    }
+
+    pub fn root_after_append(&self, batch_root: &str) -> Result<String, ProtocolError> {
+        if (self.batch_roots.len() as u64) >= NOTE_ACCUMULATOR_CAPACITY {
+            return Err(ProtocolError::Crypto(
+                "note accumulator capacity exceeded".into(),
+            ));
+        }
+        let mut carry =
+            note_accumulator_leaf(felt_from_hex_str(&normalize_felt_hex(batch_root)?)?)?;
+        let mut node_index = self.batch_roots.len();
+        for level in 0..NOTE_ACCUMULATOR_DEPTH {
+            carry = if node_index & 1 == 1 {
+                let left = self.levels[level]
+                    .get(node_index - 1)
+                    .copied()
+                    .ok_or_else(|| {
+                        ProtocolError::Crypto(
+                            "note accumulator index is internally inconsistent".into(),
+                        )
+                    })?;
+                note_accumulator_node(left, carry, level)?
+            } else {
+                note_accumulator_node(carry, Felt::ZERO, level)?
+            };
+            node_index >>= 1;
+        }
+        Ok(felt_hex(&carry))
+    }
+
+    pub fn membership_proofs(
+        &self,
+        leaf_indices: &[usize],
+    ) -> Result<Vec<NoteAccumulatorMembershipProof>, ProtocolError> {
+        if leaf_indices
+            .iter()
+            .any(|index| *index >= self.batch_roots.len())
+        {
+            return Err(ProtocolError::Crypto(
+                "note accumulator leaf index is out of bounds".into(),
+            ));
+        }
+        let mut proofs = Vec::with_capacity(leaf_indices.len());
+        for leaf_index in leaf_indices {
+            let mut index = *leaf_index;
+            let mut path = Vec::with_capacity(NOTE_ACCUMULATOR_DEPTH);
+            let mut directions = Vec::with_capacity(NOTE_ACCUMULATOR_DEPTH);
+            for level in 0..NOTE_ACCUMULATOR_DEPTH {
+                let sibling = self.levels[level]
+                    .get(index ^ 1)
+                    .copied()
+                    .unwrap_or(Felt::ZERO);
+                path.push(felt_hex(&sibling));
+                directions.push(if index & 1 == 1 {
+                    "0x1".into()
+                } else {
+                    "0x0".into()
+                });
+                index >>= 1;
+            }
+            proofs.push((path, directions));
+        }
+        Ok(proofs)
+    }
+}
 const EMPTY_OUTPUT_NOTE_ROOT_DOMAIN_HEX: &str =
     "0x0279c22958925b34e81138c0d651a82cdbfd3287fa3de370e021a7201b4ce30b";
 const OUTPUT_RECOVERY_STREAM_DOMAIN_HEX: &str = "0x7a796c6974685f6f75745f73747265616d5f7631";
@@ -100,6 +282,7 @@ const MULTI_PAIR_SETTLEMENT_PROOF_MESSAGE_DOMAIN_HEX: &str =
 const MULTI_PAIR_WITNESS_DIGEST_DOMAIN_HEX: &str = "0x7a796c6974685f6d706169725f696e5f7631";
 const ADMISSION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f7631";
 const AUCTION_RESULT_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f6175637265735f7631";
+const REFERENCE_PRICE_ATTESTATION_DOMAIN_TAG: &str = "zylith/reference-price-attestation-v1";
 const NOTE_CONSOLIDATION_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f636f6e736f6c5f7631";
 const WITHDRAWAL_PROOF_MESSAGE_DOMAIN_HEX: &str = "0x7a796c6974685f77697468647261775f7631";
 const ADMISSION_ROOT_DOMAIN_HEX: &str = "0x7a796c6974685f61646d69745f726f6f745f7631";
@@ -119,13 +302,225 @@ fn aes_nonce_from_slice(bytes: &[u8]) -> Result<Nonce<U12>, ProtocolError> {
         .map_err(|_| ProtocolError::Crypto("aes-gcm nonce must be 12 bytes".into()))?;
     Ok(nonce.into())
 }
+
+pub fn reference_price_source_set_commitment<T: Serialize>(
+    sources: &T,
+) -> Result<String, ProtocolError> {
+    tagged_field_hex("zylith/reference-price-source-set-v1", sources)
+}
+
+pub fn reference_price_attestation_commitment(
+    attestation: &ReferencePriceAttestation,
+) -> Result<String, ProtocolError> {
+    let envelope = &attestation.envelope;
+    let mut state = poseidon_hash(
+        domain_felt(REFERENCE_PRICE_ATTESTATION_DOMAIN_TAG),
+        felt_from_hex_str(&normalize_felt_hex(&attestation.auction_verifier_address)?)?,
+    );
+    for field in [
+        encode_starknet_felt("pair-id", &envelope.pair_id.0),
+        encode_asset_id(&envelope.base_asset_id.0),
+        encode_asset_id(&envelope.quote_asset_id.0),
+        encode_u128(envelope.midpoint_price),
+        encode_u128(envelope.lower_price),
+        encode_u128(envelope.upper_price),
+        encode_u128(envelope.price_base_scale),
+        encode_usize(envelope.source_count),
+        encode_u64(envelope.observed_at_unix_ms),
+        encode_u64(attestation.valid_until_unix_ms),
+        normalize_felt_hex(&attestation.source_set_commitment)?,
+        encode_u64(attestation.nonce),
+        normalize_felt_hex(&attestation.signer_public_key)?,
+    ] {
+        state = poseidon_hash(state, felt_from_hex_str(&field)?);
+    }
+    Ok(felt_hex(&state))
+}
+
+pub fn sign_reference_price_attestation(
+    signer_private_key: &str,
+    auction_verifier_address: &str,
+    envelope: ReferencePriceEnvelope,
+    source_set_commitment: &str,
+    valid_until_unix_ms: u64,
+    nonce: u64,
+) -> Result<ReferencePriceAttestation, ProtocolError> {
+    if valid_until_unix_ms <= envelope.observed_at_unix_ms {
+        return Err(ProtocolError::Crypto(
+            "reference price attestation expiry must follow observation time".into(),
+        ));
+    }
+    let private_key = felt_from_hex_str(&normalize_felt_hex(signer_private_key)?)?;
+    if private_key == Felt::ZERO {
+        return Err(ProtocolError::Crypto(
+            "reference price attestation key cannot be zero".into(),
+        ));
+    }
+    let signer_public_key = starknet_crypto::get_public_key(&private_key);
+    let mut attestation = ReferencePriceAttestation {
+        envelope,
+        auction_verifier_address: normalize_felt_hex(auction_verifier_address)?,
+        source_set_commitment: normalize_felt_hex(source_set_commitment)?,
+        valid_until_unix_ms,
+        nonce,
+        signer_public_key: felt_hex(&signer_public_key),
+        signature: crate::SpendAuthorization {
+            signature_r: "0x0".into(),
+            signature_s: "0x0".into(),
+        },
+    };
+    let message = felt_from_hex_str(&reference_price_attestation_commitment(&attestation)?)?;
+    let k = rfc6979_generate_k(&message, &private_key, None);
+    let signature = sign(&private_key, &message, &k).map_err(|error| {
+        ProtocolError::Crypto(format!(
+            "reference price attestation signing failed: {error}"
+        ))
+    })?;
+    attestation.signature = crate::SpendAuthorization {
+        signature_r: felt_hex(&signature.r),
+        signature_s: felt_hex(&signature.s),
+    };
+    Ok(attestation)
+}
+
+pub fn verify_reference_price_attestation(
+    attestation: &ReferencePriceAttestation,
+    expected_signer_public_key: &str,
+    expected_auction_verifier_address: &str,
+    now_unix_ms: u64,
+) -> Result<bool, ProtocolError> {
+    if normalize_felt_hex(&attestation.signer_public_key)?
+        != normalize_felt_hex(expected_signer_public_key)?
+        || normalize_felt_hex(&attestation.auction_verifier_address)?
+            != normalize_felt_hex(expected_auction_verifier_address)?
+        || attestation.envelope.observed_at_unix_ms > now_unix_ms
+        || attestation.valid_until_unix_ms < now_unix_ms
+        || attestation.valid_until_unix_ms <= attestation.envelope.observed_at_unix_ms
+    {
+        return Ok(false);
+    }
+    let public_key = felt_from_hex_str(&normalize_felt_hex(&attestation.signer_public_key)?)?;
+    let message = felt_from_hex_str(&reference_price_attestation_commitment(attestation)?)?;
+    let signature_r = felt_from_hex_str(&normalize_felt_hex(&attestation.signature.signature_r)?)?;
+    let signature_s = felt_from_hex_str(&normalize_felt_hex(&attestation.signature.signature_s)?)?;
+    if public_key == Felt::ZERO || signature_r == Felt::ZERO || signature_s == Felt::ZERO {
+        return Ok(false);
+    }
+    verify(&public_key, &message, &signature_r, &signature_s).map_err(|error| {
+        ProtocolError::Crypto(format!(
+            "reference price attestation verify failed: {error}"
+        ))
+    })
+}
+
+struct ReferencePriceAttestationBinding<'a> {
+    commitment: &'a str,
+    signer: &'a str,
+    verifier: &'a str,
+    pair_id: &'a PairId,
+    base_asset_id: &'a AssetId,
+    quote_asset_id: &'a AssetId,
+    price_base_scale: u128,
+    observed_at_unix_ms: u64,
+    valid_until_unix_ms: u64,
+    clearing_price: u128,
+}
+
+fn validate_reference_price_attestation_binding(
+    attestation: &ReferencePriceAttestation,
+    expected: ReferencePriceAttestationBinding<'_>,
+) -> Result<(), ProtocolError> {
+    let envelope = &attestation.envelope;
+    if envelope.pair_id != *expected.pair_id
+        || envelope.base_asset_id != *expected.base_asset_id
+        || envelope.quote_asset_id != *expected.quote_asset_id
+        || envelope.price_base_scale != expected.price_base_scale
+        || envelope.observed_at_unix_ms != expected.observed_at_unix_ms
+        || envelope.midpoint_price == 0
+        || envelope.lower_price == 0
+        || envelope.lower_price > envelope.midpoint_price
+        || envelope.midpoint_price > envelope.upper_price
+        || envelope.source_count < 3
+        || (expected.clearing_price != 0
+            && (expected.clearing_price < envelope.lower_price
+                || expected.clearing_price > envelope.upper_price))
+        || attestation.valid_until_unix_ms != expected.valid_until_unix_ms
+        || normalize_felt_hex(&attestation.signer_public_key)?
+            != normalize_felt_hex(expected.signer)?
+        || reference_price_attestation_commitment(attestation)?
+            != normalize_felt_hex(expected.commitment)?
+        || !verify_reference_price_attestation(
+            attestation,
+            expected.signer,
+            expected.verifier,
+            envelope.observed_at_unix_ms,
+        )?
+    {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "settlement reference-price attestation is invalid or does not bind the clearing price"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_multi_pair_objective_price_binding(
+    binding: &MultiPairSettlementBatchBinding,
+    envelope: &ReferencePriceEnvelope,
+    weights: &[MultiPairObjectiveWeight],
+) -> Result<(), ProtocolError> {
+    let base = weights
+        .iter()
+        .find(|weight| weight.asset_id == binding.base_asset_id)
+        .ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(format!(
+                "missing objective weight for base asset {}",
+                binding.base_asset_id.0
+            ))
+        })?;
+    let quote = weights
+        .iter()
+        .find(|weight| weight.asset_id == binding.quote_asset_id)
+        .ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(format!(
+                "missing objective weight for quote asset {}",
+                binding.quote_asset_id.0
+            ))
+        })?;
+    let left = base
+        .numerator
+        .checked_mul(quote.denominator)
+        .and_then(|value| value.checked_mul(binding.price_base_scale))
+        .ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(
+                "multi-pair reference-price objective ratio overflow".into(),
+            )
+        })?;
+    let right = envelope
+        .midpoint_price
+        .checked_mul(base.denominator)
+        .and_then(|value| value.checked_mul(quote.numerator))
+        .ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(
+                "multi-pair reference-price objective ratio overflow".into(),
+            )
+        })?;
+    if left != right {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair objective weights do not bind reference midpoint for {}",
+            binding.pair_id.0
+        )));
+    }
+    Ok(())
+}
 const SETTLEMENT_STATEMENT_TYPE_TAG: u64 = 1;
 const MULTI_PAIR_SETTLEMENT_STATEMENT_TYPE_TAG: u64 = 9;
-const STWO_SETTLEMENT_HEADER_FIELD_COUNT: usize = 33;
-const STWO_MULTI_PAIR_SETTLEMENT_HEADER_FIELD_COUNT: usize = 27;
+const STWO_SETTLEMENT_HEADER_FIELD_COUNT: usize = 46;
+const STWO_MULTI_PAIR_SETTLEMENT_HEADER_FIELD_COUNT: usize = 29;
 const ADMISSION_STATEMENT_TYPE_TAG: u64 = 3;
 const AUCTION_RESULT_STATEMENT_TYPE_TAG: u64 = 4;
 const MULTI_PAIR_STATEMENT_TYPE_TAG: u64 = 8;
+const EXTERNAL_MATCH_AUTHORIZATION_STATEMENT_TYPE_TAG: u64 = 10;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -2046,6 +2441,10 @@ pub fn settlement_transcript_commitment(
     state = poseidon_hash(state, Felt::from(transcript.batch_epoch));
     state = poseidon_hash(
         state,
+        felt_from_hex_str(&normalize_felt_hex(&transcript.auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
         felt_from_hex_str(&normalize_batch_order_commitment_root(
             &transcript.order_commitment_root,
         )?)?,
@@ -2055,6 +2454,24 @@ pub fn settlement_transcript_commitment(
         felt_from_hex_str(&normalize_encrypted_order_set_commitment(
             &transcript.encrypted_order_set_commitment,
         )?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(
+            &transcript.reference_price_attestation_commitment,
+        )?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&normalize_felt_hex(&transcript.reference_price_signer)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        Felt::from(transcript.reference_price_observed_at_unix_ms),
+    );
+    state = poseidon_hash(
+        state,
+        Felt::from(transcript.reference_price_valid_until_unix_ms),
     );
     state = poseidon_hash(state, Felt::from(transcript.clearing_price));
     state = poseidon_hash(state, Felt::from(transcript.price_base_scale));
@@ -2138,7 +2555,12 @@ pub fn root_only_settlement_commitments(
         }),
     )?;
 
-    let new_note_root = settlement_state_transition_root(&prior_note_root, &output_note_root)?;
+    let new_note_root = normalize_felt_hex(&transcript.new_note_root)?;
+    if new_note_root == prior_note_root {
+        return Err(ProtocolError::Crypto(
+            "settlement transcript note accumulator root did not advance".into(),
+        ));
+    }
     let mut new_nullifier_root = normalize_felt_hex(&transcript.new_nullifier_root)?;
     if transcript.consumed_inputs.is_empty() && new_nullifier_root == "0x0" {
         new_nullifier_root = prior_nullifier_root.clone();
@@ -2221,7 +2643,12 @@ pub fn multi_pair_root_only_settlement_commitments(
             ])
         }),
     )?;
-    let new_note_root = settlement_state_transition_root(&prior_note_root, &output_note_root)?;
+    let new_note_root = normalize_felt_hex(&transcript.new_note_root)?;
+    if new_note_root == prior_note_root {
+        return Err(ProtocolError::Crypto(
+            "multi-pair transcript note accumulator root did not advance".into(),
+        ));
+    }
     let mut new_nullifier_root = normalize_felt_hex(&transcript.new_nullifier_root)?;
     if transcript.consumed_inputs.is_empty() && new_nullifier_root == "0x0" {
         new_nullifier_root = prior_nullifier_root.clone();
@@ -2274,6 +2701,10 @@ pub fn multi_pair_settlement_transcript_commitment(
     state = poseidon_hash(state, Felt::from(transcript.batch_epoch));
     state = poseidon_hash(
         state,
+        felt_from_hex_str(&normalize_felt_hex(&transcript.auction_verifier_address)?)?,
+    );
+    state = poseidon_hash(
+        state,
         felt_from_hex_str(&normalize_felt_hex(&roots.batch_binding_root)?)?,
     );
     state = poseidon_hash(
@@ -2289,6 +2720,12 @@ pub fn multi_pair_settlement_transcript_commitment(
     state = poseidon_hash(
         state,
         felt_from_hex_str(&normalize_felt_hex(&transcript.multi_pair_commitment)?)?,
+    );
+    state = poseidon_hash(
+        state,
+        felt_from_hex_str(&crate::external_match_settlement_commitment(
+            &transcript.external_match_settlements,
+        )?)?,
     );
     for root in [
         roots.prior_note_root,
@@ -2322,6 +2759,11 @@ fn validate_multi_pair_settlement_transcript_shape(
     if transcript.batch_epoch == 0 {
         return Err(ProtocolError::InvalidSettlementProof(
             "multi-pair settlement batch_epoch must be non-zero".into(),
+        ));
+    }
+    if normalize_felt_hex(&transcript.auction_verifier_address)? == "0x0" {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair settlement requires a non-zero auction verifier address".into(),
         ));
     }
     if transcript.batch_bindings.is_empty() {
@@ -2382,7 +2824,36 @@ fn validate_multi_pair_batch_binding(
         )));
     }
     normalize_batch_order_commitment_root(&binding.order_commitment_root)?;
+    let admission_root = normalize_felt_hex(&binding.admission_root)?;
+    if admission_root == "0x0" {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair batch binding {index} has zero admission root"
+        )));
+    }
     normalize_encrypted_order_set_commitment(&binding.encrypted_order_set_commitment)?;
+    if normalize_felt_hex(&binding.reference_price_attestation_commitment)? == "0x0" {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair batch binding {index} has zero reference-price attestation commitment"
+        )));
+    }
+    if normalize_felt_hex(&binding.reference_price_signer)? == "0x0" {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair batch binding {index} has zero reference-price signer"
+        )));
+    }
+    if binding.reference_price_valid_until_unix_ms == 0 {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair batch binding {index} has zero reference-price expiry"
+        )));
+    }
+    if binding.reference_price_observed_at_unix_ms == 0
+        || binding.reference_price_observed_at_unix_ms
+            >= binding.reference_price_valid_until_unix_ms
+    {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair batch binding {index} has an invalid reference-price observation window"
+        )));
+    }
     Ok(())
 }
 
@@ -2398,7 +2869,12 @@ pub fn multi_pair_batch_binding_root(
                 encode_starknet_felt("pair-id", &binding.pair_id.0),
                 encode_u64(binding.batch_epoch),
                 normalize_batch_order_commitment_root(&binding.order_commitment_root)?,
+                normalize_felt_hex(&binding.admission_root)?,
                 normalize_encrypted_order_set_commitment(&binding.encrypted_order_set_commitment)?,
+                normalize_felt_hex(&binding.reference_price_attestation_commitment)?,
+                normalize_felt_hex(&binding.reference_price_signer)?,
+                encode_u64(binding.reference_price_observed_at_unix_ms),
+                encode_u64(binding.reference_price_valid_until_unix_ms),
                 encode_asset_id(&binding.base_asset_id.0),
                 encode_asset_id(&binding.quote_asset_id.0),
                 encode_u128(binding.price_base_scale),
@@ -2421,6 +2897,11 @@ struct NoteConsolidationRootFields {
 fn note_consolidation_root_fields(
     witness: &NoteConsolidationWitness,
 ) -> Result<NoteConsolidationRootFields, ProtocolError> {
+    if !witness.consolidation_id.0.starts_with("consolidation-") {
+        return Err(ProtocolError::Crypto(
+            "note consolidation id must use the consolidation- namespace".into(),
+        ));
+    }
     if witness.input_notes.is_empty() {
         return Err(ProtocolError::Crypto(
             "note consolidation must consume at least one input note".into(),
@@ -2522,7 +3003,12 @@ fn note_consolidation_root_fields(
     let consumed_nullifier_root = settlement_consumed_nullifier_root(&consumed_inputs)?;
     let output_note_root =
         output_note_merkle_root(&witness.output_notes, &witness.output_ciphertext_bundle_ref)?;
-    let new_note_root = settlement_state_transition_root(&prior_note_root, &output_note_root)?;
+    let new_note_root = normalize_felt_hex(&witness.new_note_root)?;
+    if new_note_root == prior_note_root {
+        return Err(ProtocolError::Crypto(
+            "note consolidation accumulator root did not advance".into(),
+        ));
+    }
     let new_nullifier_root = normalize_felt_hex(&witness.new_nullifier_root)?;
     if new_nullifier_root == "0x0" {
         return Err(ProtocolError::Crypto(
@@ -3069,6 +3555,71 @@ pub fn settlement_state_transition_root(
     Ok(felt_hex(&state))
 }
 
+fn note_accumulator_leaf(batch_root: Felt) -> Result<Felt, ProtocolError> {
+    if batch_root == Felt::ZERO {
+        return Err(ProtocolError::Crypto(
+            "note accumulator batch root cannot be zero".into(),
+        ));
+    }
+    Ok(poseidon_hash(
+        felt_from_hex_str(NOTE_ACCUMULATOR_LEAF_DOMAIN_HEX)?,
+        batch_root,
+    ))
+}
+
+fn note_accumulator_node(left: Felt, right: Felt, level: usize) -> Result<Felt, ProtocolError> {
+    if left == Felt::ZERO && right == Felt::ZERO {
+        return Ok(Felt::ZERO);
+    }
+    let mut state = poseidon_hash(
+        felt_from_hex_str(NOTE_ACCUMULATOR_NODE_DOMAIN_HEX)?,
+        Felt::from(level as u64),
+    );
+    state = poseidon_hash(state, left);
+    Ok(poseidon_hash(state, right))
+}
+
+pub fn note_accumulator_root(batch_roots: &[String]) -> Result<String, ProtocolError> {
+    Ok(NoteAccumulatorTree::from_batch_roots(batch_roots)?.root())
+}
+
+pub fn note_accumulator_roots_after_each_append(
+    batch_roots: &[String],
+) -> Result<Vec<String>, ProtocolError> {
+    Ok(NoteAccumulatorTree::from_batch_roots(batch_roots)?
+        .roots_after_each_append()
+        .to_vec())
+}
+
+pub fn note_accumulator_root_after_append(
+    batch_roots: &[String],
+    batch_root: &str,
+) -> Result<String, ProtocolError> {
+    NoteAccumulatorTree::from_batch_roots(batch_roots)?.root_after_append(batch_root)
+}
+
+pub fn note_accumulator_membership_proof(
+    batch_roots: &[String],
+    leaf_index: usize,
+) -> Result<(Vec<String>, Vec<String>), ProtocolError> {
+    note_accumulator_membership_proofs(batch_roots, &[leaf_index])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| ProtocolError::Crypto("note accumulator proof is missing".into()))
+}
+
+pub fn note_accumulator_membership_proofs(
+    batch_roots: &[String],
+    leaf_indices: &[usize],
+) -> Result<Vec<NoteAccumulatorMembershipProof>, ProtocolError> {
+    if leaf_indices.iter().any(|index| *index >= batch_roots.len()) {
+        return Err(ProtocolError::Crypto(
+            "note accumulator leaf index is out of bounds".into(),
+        ));
+    }
+    NoteAccumulatorTree::from_batch_roots(batch_roots)?.membership_proofs(leaf_indices)
+}
+
 pub fn deposit_root_from_note(note: &Note) -> Result<String, ProtocolError> {
     let note_commitment = note.commitment()?;
     let record = OutputNoteRecord {
@@ -3106,14 +3657,10 @@ pub fn encrypted_note_activation_commitment(
     )
 }
 
-pub fn settlement_note_root_after_deposit_roots(
+pub fn note_accumulator_root_after_deposits(
     deposit_roots: &[String],
 ) -> Result<String, ProtocolError> {
-    let mut root = "0x0".to_string();
-    for deposit_root in deposit_roots {
-        root = settlement_state_transition_root(&root, deposit_root)?;
-    }
-    Ok(root)
+    note_accumulator_root(deposit_roots)
 }
 
 pub fn settlement_nullifier_root_after_history(
@@ -3759,6 +4306,11 @@ pub fn deposit_note_membership_witnesses_for_chain(
     consumed_deposit_roots_by_commitment: &[(String, String)],
     consumed_note_commitments: &[String],
 ) -> Result<(String, Vec<NoteMembershipWitness>), ProtocolError> {
+    if normalize_felt_hex(initial_root)? != "0x0" {
+        return Err(ProtocolError::Crypto(
+            "note accumulator must start from the empty root".into(),
+        ));
+    }
     let consumed_note_commitments = consumed_note_commitments
         .iter()
         .map(|note_commitment| normalize_felt_hex(note_commitment))
@@ -3780,12 +4332,7 @@ pub fn deposit_note_membership_witnesses_for_chain(
             ))
         })
         .collect::<Result<BTreeMap<_, _>, ProtocolError>>()?;
-    let mut prefix_roots = Vec::with_capacity(activation_deposit_roots.len());
-    let mut root = normalize_felt_hex(initial_root)?;
-    for deposit_root in &activation_deposit_roots {
-        prefix_roots.push(root.clone());
-        root = settlement_state_transition_root(&root, deposit_root)?;
-    }
+    let root = note_accumulator_root(&activation_deposit_roots)?;
 
     let mut witnesses_by_commitment = BTreeMap::<String, NoteMembershipWitness>::new();
     for (index, batch_root) in activation_deposit_roots.iter().enumerate() {
@@ -3799,17 +4346,19 @@ pub fn deposit_note_membership_witnesses_for_chain(
         if matching_commitments.is_empty() {
             continue;
         }
+        let (accumulator_path, accumulator_directions) =
+            note_accumulator_membership_proof(&activation_deposit_roots, index)?;
         for note_commitment in matching_commitments {
             if witnesses_by_commitment
                 .insert(
                     note_commitment,
                     NoteMembershipWitness {
                         kind: NoteMembershipKind::Deposit,
-                        prefix_root: prefix_roots[index].clone(),
                         batch_root: batch_root.clone(),
                         merkle_path: Vec::new(),
                         merkle_directions: Vec::new(),
-                        suffix_batch_roots: activation_deposit_roots[index + 1..].to_vec(),
+                        accumulator_path: accumulator_path.clone(),
+                        accumulator_directions: accumulator_directions.clone(),
                     },
                 )
                 .is_some()
@@ -3878,7 +4427,7 @@ fn default_note_membership_witnesses(
         .iter()
         .map(deposit_root_from_note)
         .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let deposit_chain_root = settlement_note_root_after_deposit_roots(&deposit_roots)?;
+    let deposit_chain_root = note_accumulator_root_after_deposits(&deposit_roots)?;
     if normalize_felt_hex(&witness.prior_note_root)? == deposit_chain_root {
         return deposit_chain_membership_witnesses(&funding_notes);
     }
@@ -3903,7 +4452,7 @@ fn default_multi_pair_note_membership_witnesses(
         .iter()
         .map(deposit_root_from_note)
         .collect::<Result<Vec<_>, ProtocolError>>()?;
-    let deposit_chain_root = settlement_note_root_after_deposit_roots(&deposit_roots)?;
+    let deposit_chain_root = note_accumulator_root_after_deposits(&deposit_roots)?;
     if normalize_felt_hex(&transcript.prior_note_root)? == deposit_chain_root {
         return deposit_chain_membership_witnesses(&funding_notes);
     }
@@ -3930,6 +4479,13 @@ fn note_membership_witnesses_for_serialization(
                 "note membership merkle path/direction length mismatch".into(),
             ));
         }
+        if membership.accumulator_path.len() != NOTE_ACCUMULATOR_DEPTH
+            || membership.accumulator_directions.len() != NOTE_ACCUMULATOR_DEPTH
+        {
+            return Err(ProtocolError::Crypto(
+                "note accumulator membership path must have fixed depth".into(),
+            ));
+        }
     }
     Ok(witness.note_membership_witnesses.clone())
 }
@@ -3951,6 +4507,13 @@ fn multi_pair_note_membership_witnesses_for_serialization(
         if membership.merkle_path.len() != membership.merkle_directions.len() {
             return Err(ProtocolError::Crypto(
                 "multi-pair note membership merkle path/direction length mismatch".into(),
+            ));
+        }
+        if membership.accumulator_path.len() != NOTE_ACCUMULATOR_DEPTH
+            || membership.accumulator_directions.len() != NOTE_ACCUMULATOR_DEPTH
+        {
+            return Err(ProtocolError::Crypto(
+                "multi-pair note accumulator membership path must have fixed depth".into(),
             ));
         }
     }
@@ -4010,9 +4573,32 @@ pub fn native_settlement_message_hash(
 
 pub fn build_settlement_submission_plan(
     transcript: &SettlementTranscript,
+    reference_price_attestation: &ReferencePriceAttestation,
     verifier_address: &str,
     proof_artifact_commitment: &str,
 ) -> Result<SettlementSubmissionPlan, ProtocolError> {
+    if normalize_felt_hex(&transcript.auction_verifier_address)?
+        != normalize_felt_hex(verifier_address)?
+    {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "settlement transcript verifier does not match submission target".into(),
+        ));
+    }
+    validate_reference_price_attestation_binding(
+        reference_price_attestation,
+        ReferencePriceAttestationBinding {
+            commitment: &transcript.reference_price_attestation_commitment,
+            signer: &transcript.reference_price_signer,
+            verifier: verifier_address,
+            pair_id: &transcript.pair_id,
+            base_asset_id: &reference_price_attestation.envelope.base_asset_id,
+            quote_asset_id: &reference_price_attestation.envelope.quote_asset_id,
+            price_base_scale: transcript.price_base_scale,
+            observed_at_unix_ms: transcript.reference_price_observed_at_unix_ms,
+            valid_until_unix_ms: transcript.reference_price_valid_until_unix_ms,
+            clearing_price: transcript.clearing_price,
+        },
+    )?;
     let transcript_commitment = settlement_transcript_commitment(transcript)?;
     let roots = root_only_settlement_commitments(transcript)?;
     let normalized_proof_artifact_commitment = normalize_felt_hex(proof_artifact_commitment)?;
@@ -4024,6 +4610,22 @@ pub fn build_settlement_submission_plan(
         )?,
         encrypted_order_set_commitment: normalize_encrypted_order_set_commitment(
             &transcript.encrypted_order_set_commitment,
+        )?,
+        reference_price_attestation_commitment: normalize_felt_hex(
+            &transcript.reference_price_attestation_commitment,
+        )?,
+        reference_price_signer: normalize_felt_hex(&transcript.reference_price_signer)?,
+        reference_price_observed_at_unix_ms: encode_u64(
+            transcript.reference_price_observed_at_unix_ms,
+        ),
+        reference_price_valid_until_unix_ms: encode_u64(
+            transcript.reference_price_valid_until_unix_ms,
+        ),
+        reference_price_signature_r: normalize_felt_hex(
+            &reference_price_attestation.signature.signature_r,
+        )?,
+        reference_price_signature_s: normalize_felt_hex(
+            &reference_price_attestation.signature.signature_s,
         )?,
         transcript_commitment: normalize_felt_hex(&transcript_commitment)?,
         proof_artifact_commitment: normalized_proof_artifact_commitment.clone(),
@@ -4065,9 +4667,43 @@ pub fn build_settlement_submission_plan(
 
 pub fn build_multi_pair_settlement_submission_plan(
     transcript: &MultiPairSettlementTranscript,
+    reference_price_attestations: &[ReferencePriceAttestation],
     verifier_address: &str,
     proof_artifact_commitment: &str,
 ) -> Result<MultiPairSettlementSubmissionPlan, ProtocolError> {
+    if normalize_felt_hex(&transcript.auction_verifier_address)?
+        != normalize_felt_hex(verifier_address)?
+    {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair settlement transcript verifier does not match submission target".into(),
+        ));
+    }
+    if reference_price_attestations.len() != transcript.batch_bindings.len() {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair submission attestation count does not match batch bindings".into(),
+        ));
+    }
+    for (binding, attestation) in transcript
+        .batch_bindings
+        .iter()
+        .zip(reference_price_attestations.iter())
+    {
+        validate_reference_price_attestation_binding(
+            attestation,
+            ReferencePriceAttestationBinding {
+                commitment: &binding.reference_price_attestation_commitment,
+                signer: &binding.reference_price_signer,
+                verifier: verifier_address,
+                pair_id: &binding.pair_id,
+                base_asset_id: &binding.base_asset_id,
+                quote_asset_id: &binding.quote_asset_id,
+                price_base_scale: binding.price_base_scale,
+                observed_at_unix_ms: binding.reference_price_observed_at_unix_ms,
+                valid_until_unix_ms: binding.reference_price_valid_until_unix_ms,
+                clearing_price: attestation.envelope.midpoint_price,
+            },
+        )?;
+    }
     let transcript_commitment = multi_pair_settlement_transcript_commitment(transcript)?;
     let roots = multi_pair_root_only_settlement_commitments(transcript)?;
     let normalized_proof_artifact_commitment = normalize_felt_hex(proof_artifact_commitment)?;
@@ -4079,10 +4715,83 @@ pub fn build_multi_pair_settlement_submission_plan(
         pair_ids: encoded_bindings.pair_ids,
         order_commitment_roots: encoded_bindings.order_commitment_roots,
         encrypted_order_set_commitments: encoded_bindings.encrypted_order_set_commitments,
+        reference_price_attestation_commitments: encoded_bindings
+            .reference_price_attestation_commitments,
+        reference_price_signers: encoded_bindings.reference_price_signers,
+        reference_price_observed_at_unix_ms_values: encoded_bindings
+            .reference_price_observed_at_unix_ms_values,
+        reference_price_valid_until_unix_ms_values: encoded_bindings
+            .reference_price_valid_until_unix_ms_values,
+        reference_price_signature_rs: reference_price_attestations
+            .iter()
+            .map(|attestation| normalize_felt_hex(&attestation.signature.signature_r))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+        reference_price_signature_ss: reference_price_attestations
+            .iter()
+            .map(|attestation| normalize_felt_hex(&attestation.signature.signature_s))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
         base_asset_ids: encoded_bindings.base_asset_ids,
         quote_asset_ids: encoded_bindings.quote_asset_ids,
         price_base_scales: encoded_bindings.price_base_scales,
         taker_fee_bps_values: encoded_bindings.taker_fee_bps_values,
+        external_request_ids: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| normalize_felt_hex(&record.request.request_id))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+        external_batch_ids: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_starknet_felt("batch-id", &record.request.batch_id.0))
+            .collect(),
+        external_pair_ids: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_starknet_felt("pair-id", &record.request.pair_id.0))
+            .collect(),
+        external_base_asset_ids: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_asset_id(&record.request.base_asset_id.0))
+            .collect(),
+        external_quote_asset_ids: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_asset_id(&record.request.quote_asset_id.0))
+            .collect(),
+        external_sides: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_order_side(&record.request.side))
+            .collect(),
+        external_max_base_amounts: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_u128(record.request.max_base_amount))
+            .collect(),
+        external_midpoint_prices: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_u128(record.request.reference_midpoint_price))
+            .collect(),
+        external_price_base_scales: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_u128(record.request.price_base_scale))
+            .collect(),
+        external_valid_until_values: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_u64(record.request.valid_until_unix_ms))
+            .collect(),
+        external_consumed_base_amounts: transcript
+            .external_match_settlements
+            .iter()
+            .map(|record| encode_u128(record.consumed_base_amount))
+            .collect(),
+        external_match_root: crate::external_match_settlement_commitment(
+            &transcript.external_match_settlements,
+        )?,
         transcript_commitment: normalize_felt_hex(&transcript_commitment)?,
         proof_artifact_commitment: normalized_proof_artifact_commitment.clone(),
         protocol_fee_recipient: encode_fee_recipient(&transcript.protocol_fee_recipient),
@@ -4121,18 +4830,28 @@ pub fn build_multi_pair_settlement_submission_plan(
 pub fn build_multi_pair_settlement_witness(
     transcript: &MultiPairSettlementTranscript,
     verifier_address: &str,
-    multi_pair_problem: MultiPairOptimalityProblem,
+    multi_pair_problem: MultiPairCandidateSetProblem,
     matched_order_witnesses: Vec<MultiPairMatchedOrderWitness>,
+    admission_order_summaries: Vec<MultiPairAdmissionOrderSummary>,
+    reference_price_attestations: Vec<ReferencePriceAttestation>,
 ) -> Result<MultiPairSettlementWitness, ProtocolError> {
+    if normalize_felt_hex(&transcript.auction_verifier_address)?
+        != normalize_felt_hex(verifier_address)?
+    {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair settlement transcript verifier does not match witness target".into(),
+        ));
+    }
     let multi_pair_commitment = multi_pair_statement_commitment(&multi_pair_problem)?;
     if normalize_felt_hex(&transcript.multi_pair_commitment)? != multi_pair_commitment {
         return Err(ProtocolError::Crypto(
-            "multi-pair settlement transcript commitment does not match optimality problem".into(),
+            "multi-pair settlement transcript commitment does not match candidate-set problem"
+                .into(),
         ));
     }
     if multi_pair_problem.chosen.batch_id != transcript.group_id {
         return Err(ProtocolError::Crypto(
-            "multi-pair settlement group id does not match optimality problem".into(),
+            "multi-pair settlement group id does not match candidate-set problem".into(),
         ));
     }
     let renewal_child_uses = renewal_child_uses_from_matched_witnesses(
@@ -4151,7 +4870,45 @@ pub fn build_multi_pair_settlement_witness(
         transcript,
         &multi_pair_problem,
         &matched_order_witnesses,
+        &admission_order_summaries,
+        &transcript.external_match_settlements,
     )?;
+    if reference_price_attestations.len() != transcript.batch_bindings.len() {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair reference-price attestation count does not match batch bindings".into(),
+        ));
+    }
+    for (binding, attestation) in transcript
+        .batch_bindings
+        .iter()
+        .zip(reference_price_attestations.iter())
+    {
+        validate_reference_price_attestation_binding(
+            attestation,
+            ReferencePriceAttestationBinding {
+                commitment: &binding.reference_price_attestation_commitment,
+                signer: &binding.reference_price_signer,
+                verifier: verifier_address,
+                pair_id: &binding.pair_id,
+                base_asset_id: &binding.base_asset_id,
+                quote_asset_id: &binding.quote_asset_id,
+                price_base_scale: binding.price_base_scale,
+                observed_at_unix_ms: binding.reference_price_observed_at_unix_ms,
+                valid_until_unix_ms: binding.reference_price_valid_until_unix_ms,
+                clearing_price: attestation.envelope.midpoint_price,
+            },
+        )?;
+        if binding.reference_price_observed_at_unix_ms != attestation.envelope.observed_at_unix_ms {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair reference-price observation does not match batch binding".into(),
+            ));
+        }
+        validate_multi_pair_objective_price_binding(
+            binding,
+            &attestation.envelope,
+            &multi_pair_problem.objective_weights,
+        )?;
+    }
     let note_membership_witnesses =
         default_multi_pair_note_membership_witnesses(transcript, &matched_order_witnesses)?;
 
@@ -4159,17 +4916,21 @@ pub fn build_multi_pair_settlement_witness(
         group_id: transcript.group_id.clone(),
         batch_epoch: transcript.batch_epoch,
         batch_bindings: transcript.batch_bindings.clone(),
+        reference_price_attestations,
         transcript_commitment: multi_pair_settlement_transcript_commitment(transcript)?,
         auction_verifier_address: verifier_address.into(),
         prior_note_root: normalize_felt_hex(&transcript.prior_note_root)?,
         prior_nullifier_root: normalize_felt_hex(&transcript.prior_nullifier_root)?,
         prior_renewal_root: normalize_felt_hex(&transcript.prior_renewal_root)?,
         prior_fee_root: normalize_felt_hex(&transcript.prior_fee_root)?,
+        new_note_root: normalize_felt_hex(&transcript.new_note_root)?,
         new_nullifier_root: normalize_felt_hex(&transcript.new_nullifier_root)?,
         new_renewal_root: normalize_felt_hex(&transcript.new_renewal_root)?,
         protocol_fee_recipient: transcript.protocol_fee_recipient.clone(),
         multi_pair_problem,
         multi_pair_commitment,
+        external_match_settlements: transcript.external_match_settlements.clone(),
+        admission_order_summaries,
         matched_orders: transcript.matched_orders.clone(),
         matched_order_witnesses,
         consumed_inputs: transcript.consumed_inputs.clone(),
@@ -4196,15 +4957,18 @@ pub fn build_multi_pair_settlement_serialized_input(
     let roots = multi_pair_root_only_settlement_commitments(&MultiPairSettlementTranscript {
         group_id: witness.group_id.clone(),
         batch_epoch: witness.batch_epoch,
+        auction_verifier_address: witness.auction_verifier_address.clone(),
         batch_bindings: witness.batch_bindings.clone(),
         prior_note_root: witness.prior_note_root.clone(),
         prior_nullifier_root: witness.prior_nullifier_root.clone(),
         prior_renewal_root: witness.prior_renewal_root.clone(),
         prior_fee_root: witness.prior_fee_root.clone(),
+        new_note_root: witness.new_note_root.clone(),
         new_nullifier_root: witness.new_nullifier_root.clone(),
         new_renewal_root: witness.new_renewal_root.clone(),
         protocol_fee_recipient: witness.protocol_fee_recipient.clone(),
         multi_pair_commitment: witness.multi_pair_commitment.clone(),
+        external_match_settlements: witness.external_match_settlements.clone(),
         matched_orders: witness.matched_orders.clone(),
         consumed_inputs: witness.consumed_inputs.clone(),
         renewal_child_uses: witness.renewal_child_uses.clone(),
@@ -4413,6 +5177,8 @@ pub fn build_multi_pair_settlement_serialized_input(
         PUBLIC_MULTI_PAIR_SETTLEMENT_DOMAIN_HEX.into(),
         encode_starknet_felt("batch-id", &witness.group_id.0),
         encode_u64(witness.batch_epoch),
+        normalize_felt_hex(&witness.auction_verifier_address)?,
+        domain_felt_hex(REFERENCE_PRICE_ATTESTATION_DOMAIN_TAG),
         normalize_felt_hex(&witness.transcript_commitment)?,
         encode_fee_recipient(&witness.protocol_fee_recipient),
         encode_u64(witness.matched_order_witnesses.len() as u64),
@@ -4438,9 +5204,71 @@ pub fn build_multi_pair_settlement_serialized_input(
     push_span(&mut payload, &encoded_bindings.batch_ids);
     push_span(&mut payload, &encoded_bindings.pair_ids);
     push_span(&mut payload, &encoded_bindings.order_commitment_roots);
+    push_span(&mut payload, &encoded_bindings.admission_roots);
     push_span(
         &mut payload,
         &encoded_bindings.encrypted_order_set_commitments,
+    );
+    push_span(
+        &mut payload,
+        &encoded_bindings.reference_price_attestation_commitments,
+    );
+    push_span(&mut payload, &encoded_bindings.reference_price_signers);
+    push_span(
+        &mut payload,
+        &encoded_bindings.reference_price_observed_at_unix_ms_values,
+    );
+    push_span(
+        &mut payload,
+        &encoded_bindings.reference_price_valid_until_unix_ms_values,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .reference_price_attestations
+            .iter()
+            .map(|attestation| encode_u128(attestation.envelope.midpoint_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .reference_price_attestations
+            .iter()
+            .map(|attestation| encode_u128(attestation.envelope.lower_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .reference_price_attestations
+            .iter()
+            .map(|attestation| encode_u128(attestation.envelope.upper_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .reference_price_attestations
+            .iter()
+            .map(|attestation| encode_usize(attestation.envelope.source_count))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .reference_price_attestations
+            .iter()
+            .map(|attestation| normalize_felt_hex(&attestation.source_set_commitment))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .reference_price_attestations
+            .iter()
+            .map(|attestation| encode_u64(attestation.nonce))
+            .collect::<Vec<_>>(),
     );
     push_span(&mut payload, &encoded_bindings.base_asset_ids);
     push_span(&mut payload, &encoded_bindings.quote_asset_ids);
@@ -4989,13 +5817,6 @@ pub fn build_multi_pair_settlement_serialized_input(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .map(|membership| normalize_felt_hex(&membership.prefix_root))
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &note_membership_witnesses
-            .iter()
             .map(|membership| normalize_felt_hex(&membership.batch_root))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
@@ -5026,14 +5847,22 @@ pub fn build_multi_pair_settlement_serialized_input(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .map(|membership| encode_usize(membership.suffix_batch_roots.len()))
+            .map(|membership| encode_usize(membership.accumulator_path.len()))
             .collect::<Vec<_>>(),
     );
     push_span(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .flat_map(|membership| membership.suffix_batch_roots.iter())
+            .flat_map(|membership| membership.accumulator_path.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .flat_map(|membership| membership.accumulator_directions.iter())
             .map(|value| normalize_felt_hex(value))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
@@ -5184,6 +6013,104 @@ pub fn build_multi_pair_settlement_serialized_input(
             .map(|commitment| normalize_felt_hex(commitment))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_starknet_felt("batch-id", &summary.batch_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| normalize_felt_hex(&summary.order_commitment.0))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_order_side(&summary.side))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_order_type(&summary.order_type))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_relay_mode(&summary.relay_mode))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_u128(summary.limit_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_u128(summary.order_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_u128(summary.min_fill))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_time_in_force(&summary.time_in_force))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_execution_preference(&summary.execution_preference))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_u128(summary.funding_note_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .admission_order_summaries
+            .iter()
+            .map(|summary| encode_owner_public_key(&summary.funding_note_owner_public_key))
+            .collect::<Vec<_>>(),
+    );
+
+    push_external_match_settlement_records(&mut payload, &witness.external_match_settlements)?;
 
     let mut serialized = vec![encode_usize(payload.len())];
     serialized.extend(payload);
@@ -5196,15 +6123,18 @@ pub fn validate_multi_pair_settlement_witness(
     let transcript = MultiPairSettlementTranscript {
         group_id: witness.group_id.clone(),
         batch_epoch: witness.batch_epoch,
+        auction_verifier_address: witness.auction_verifier_address.clone(),
         batch_bindings: witness.batch_bindings.clone(),
         prior_note_root: witness.prior_note_root.clone(),
         prior_nullifier_root: witness.prior_nullifier_root.clone(),
         prior_renewal_root: witness.prior_renewal_root.clone(),
         prior_fee_root: witness.prior_fee_root.clone(),
+        new_note_root: witness.new_note_root.clone(),
         new_nullifier_root: witness.new_nullifier_root.clone(),
         new_renewal_root: witness.new_renewal_root.clone(),
         protocol_fee_recipient: witness.protocol_fee_recipient.clone(),
         multi_pair_commitment: witness.multi_pair_commitment.clone(),
+        external_match_settlements: witness.external_match_settlements.clone(),
         matched_orders: witness.matched_orders.clone(),
         consumed_inputs: witness.consumed_inputs.clone(),
         renewal_child_uses: witness.renewal_child_uses.clone(),
@@ -5225,35 +6155,385 @@ pub fn validate_multi_pair_settlement_witness(
         multi_pair_statement_commitment(&witness.multi_pair_problem)?;
     if normalize_felt_hex(&witness.multi_pair_commitment)? != computed_multi_pair_commitment {
         return Err(ProtocolError::Crypto(
-            "multi-pair settlement witness optimality commitment mismatch".into(),
+            "multi-pair settlement witness candidate-set commitment mismatch".into(),
         ));
     }
     validate_multi_pair_settlement_witness_bindings(
         &transcript,
         &witness.multi_pair_problem,
         &witness.matched_order_witnesses,
+        &witness.admission_order_summaries,
+        &witness.external_match_settlements,
     )?;
+    let executable_orders = multi_pair_executable_orders_from_admission(
+        &witness.batch_bindings,
+        &witness.admission_order_summaries,
+    )?;
+    crate::validate_external_match_settlement_records(
+        &witness.group_id,
+        &executable_orders,
+        Some(&crate::MultiPairNettingPlan {
+            problem: witness.multi_pair_problem.clone(),
+        }),
+        &witness.external_match_settlements,
+    )?;
+    crate::allocate_external_match_settlements(
+        &witness.group_id,
+        &executable_orders,
+        Some(&crate::MultiPairNettingPlan {
+            problem: witness.multi_pair_problem.clone(),
+        }),
+        &witness.external_match_settlements,
+    )?;
+    if witness.reference_price_attestations.len() != witness.batch_bindings.len() {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair reference-price attestation count does not match batch bindings".into(),
+        ));
+    }
+    for (binding, attestation) in witness
+        .batch_bindings
+        .iter()
+        .zip(witness.reference_price_attestations.iter())
+    {
+        validate_reference_price_attestation_binding(
+            attestation,
+            ReferencePriceAttestationBinding {
+                commitment: &binding.reference_price_attestation_commitment,
+                signer: &binding.reference_price_signer,
+                verifier: &witness.auction_verifier_address,
+                pair_id: &binding.pair_id,
+                base_asset_id: &binding.base_asset_id,
+                quote_asset_id: &binding.quote_asset_id,
+                price_base_scale: binding.price_base_scale,
+                observed_at_unix_ms: binding.reference_price_observed_at_unix_ms,
+                valid_until_unix_ms: binding.reference_price_valid_until_unix_ms,
+                clearing_price: attestation.envelope.midpoint_price,
+            },
+        )?;
+        validate_multi_pair_objective_price_binding(
+            binding,
+            &attestation.envelope,
+            &witness.multi_pair_problem.objective_weights,
+        )?;
+    }
+    Ok(())
+}
+
+fn push_external_match_settlement_records(
+    payload: &mut Vec<String>,
+    records: &[crate::ExternalMatchSettlementRecord],
+) -> Result<(), ProtocolError> {
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| normalize_felt_hex(&record.request.request_id))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_starknet_felt("batch-id", &record.request.batch_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_starknet_felt("pair-id", &record.request.pair_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_asset_id(&record.request.base_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_asset_id(&record.request.quote_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_order_side(&record.request.side))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_u128(record.request.max_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_u128(record.request.reference_midpoint_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_u128(record.request.price_base_scale))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_u64(record.request.valid_until_unix_ms))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &records
+            .iter()
+            .map(|record| encode_u128(record.consumed_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+fn multi_pair_executable_orders_from_admission(
+    bindings: &[MultiPairSettlementBatchBinding],
+    summaries: &[MultiPairAdmissionOrderSummary],
+) -> Result<Vec<crate::MultiPairExecutableOrder>, ProtocolError> {
+    let bindings_by_batch = bindings
+        .iter()
+        .map(|binding| (binding.batch_id.0.clone(), binding))
+        .collect::<BTreeMap<_, _>>();
+    summaries
+        .iter()
+        .filter(|summary| !matches!(summary.order_type, OrderType::HeartbeatCover))
+        .map(|summary| {
+            let binding = bindings_by_batch.get(&summary.batch_id.0).ok_or_else(|| {
+                ProtocolError::InvalidSettlementProof(
+                    "external match admission summary has no member batch binding".into(),
+                )
+            })?;
+            Ok(crate::MultiPairExecutableOrder {
+                order_commitment: summary.order_commitment.clone(),
+                pair_id: binding.pair_id.clone(),
+                base_asset_id: binding.base_asset_id.clone(),
+                quote_asset_id: binding.quote_asset_id.clone(),
+                side: summary.side,
+                submitted_base_amount: summary.order_amount,
+                min_fill_base_amount: summary.min_fill,
+                limit_price: summary.limit_price,
+                price_base_scale: binding.price_base_scale,
+                available_input_amount: summary.funding_note_amount,
+                taker_fee_bps: binding.taker_fee_bps,
+                execution_preference: summary.execution_preference,
+            })
+        })
+        .collect()
+}
+
+pub fn multi_pair_admission_order_summary(
+    batch_id: &BatchId,
+    order_witness: &AuctionOrderWitness,
+) -> Result<MultiPairAdmissionOrderSummary, ProtocolError> {
+    if order_witness.order.batch_id != *batch_id {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair admission order batch does not match member batch".into(),
+        ));
+    }
+    let funding_notes = order_witness.effective_funding_notes();
+    if funding_notes.is_empty() || funding_notes.len() > MAX_ORDER_FUNDING_INPUTS {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair admission order funding input count is invalid".into(),
+        ));
+    }
+    let owner_public_key = funding_notes[0].owner_public_key.clone();
+    let mut funding_note_amount = 0_u128;
+    for note in funding_notes {
+        if note.owner_public_key != owner_public_key {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair admission order funding inputs must share note owner".into(),
+            ));
+        }
+        funding_note_amount = funding_note_amount
+            .checked_add(note.amount)
+            .ok_or_else(|| {
+                ProtocolError::InvalidSettlementProof(
+                    "multi-pair admission order funding amount overflow".into(),
+                )
+            })?;
+    }
+    Ok(MultiPairAdmissionOrderSummary {
+        batch_id: batch_id.clone(),
+        order_commitment: order_witness.order_commitment.clone(),
+        side: order_witness.order.side,
+        order_type: order_witness.order.order_type,
+        relay_mode: order_witness.order.relay_mode.clone(),
+        limit_price: order_witness.order.limit_price,
+        order_amount: order_witness.order.amount,
+        min_fill: order_witness.order.min_fill,
+        time_in_force: order_witness.order.time_in_force,
+        execution_preference: order_witness.order.execution_preference,
+        funding_note_amount,
+        funding_note_owner_public_key: owner_public_key,
+    })
+}
+
+pub fn multi_pair_admission_root_from_summaries(
+    summaries: &[MultiPairAdmissionOrderSummary],
+) -> Result<String, ProtocolError> {
+    let mut leaves = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        let leaf_inputs = [
+            normalize_felt_hex(&summary.order_commitment.0)?,
+            encode_order_side(&summary.side),
+            encode_order_type(&summary.order_type),
+            encode_relay_mode(&summary.relay_mode),
+            encode_u128(summary.limit_price),
+            encode_u128(summary.order_amount),
+            encode_u128(summary.min_fill),
+            encode_time_in_force(&summary.time_in_force),
+            encode_execution_preference(&summary.execution_preference),
+            encode_u128(summary.funding_note_amount),
+            encode_owner_public_key(&summary.funding_note_owner_public_key),
+        ];
+        let leaf_refs = leaf_inputs.iter().map(String::as_str).collect::<Vec<_>>();
+        leaves.push(poseidon_chain_hex_from_hexes(
+            ADMISSION_LEAF_DOMAIN_HEX,
+            &leaf_refs,
+        )?);
+    }
+    let mut root_inputs = Vec::with_capacity(leaves.len() + 1);
+    root_inputs.push(encode_usize(summaries.len()));
+    root_inputs.extend(leaves);
+    let root_refs = root_inputs.iter().map(String::as_str).collect::<Vec<_>>();
+    poseidon_chain_hex_from_hexes(ADMISSION_ROOT_DOMAIN_HEX, &root_refs)
+}
+
+fn validate_multi_pair_admission_bindings(
+    bindings: &[MultiPairSettlementBatchBinding],
+    problem: &MultiPairCandidateSetProblem,
+    summaries: &[MultiPairAdmissionOrderSummary],
+) -> Result<(), ProtocolError> {
+    let known_batches = bindings
+        .iter()
+        .map(|binding| encode_starknet_felt("batch-id", &binding.batch_id.0))
+        .collect::<BTreeSet<_>>();
+    for summary in summaries {
+        let batch_id = encode_starknet_felt("batch-id", &summary.batch_id.0);
+        if !known_batches.contains(&batch_id) {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair admission summary references an unknown member batch".into(),
+            ));
+        }
+        if normalize_felt_hex(&summary.order_commitment.0)? == "0x0" {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair admission summary has zero order commitment".into(),
+            ));
+        }
+    }
+
+    let mut admitted_eligible = BTreeSet::new();
+    for binding in bindings {
+        let member_summaries = summaries
+            .iter()
+            .filter(|summary| summary.batch_id == binding.batch_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let order_commitments = member_summaries
+            .iter()
+            .map(|summary| normalize_felt_hex(&summary.order_commitment.0))
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
+        let order_root =
+            ordered_felt_list_commitment("zylith/batch-order-root", &order_commitments)?;
+        if order_root != normalize_batch_order_commitment_root(&binding.order_commitment_root)? {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair admission summaries do not reconstruct member order root".into(),
+            ));
+        }
+        let admission_root = multi_pair_admission_root_from_summaries(&member_summaries)?;
+        if admission_root != normalize_felt_hex(&binding.admission_root)? {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair admission summaries do not reconstruct member admission root".into(),
+            ));
+        }
+        for summary in member_summaries {
+            if !matches!(summary.order_type, OrderType::HeartbeatCover)
+                && !admitted_eligible.insert(normalize_felt_hex(&summary.order_commitment.0)?)
+            {
+                return Err(ProtocolError::InvalidSettlementProof(
+                    "multi-pair admitted eligible order commitment is duplicated".into(),
+                ));
+            }
+        }
+    }
+
+    let mut claimed_eligible = BTreeSet::new();
+    for commitment in &problem.eligible_order_commitments {
+        if !claimed_eligible.insert(normalize_felt_hex(&commitment.0)?) {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair claimed eligible order commitment is duplicated".into(),
+            ));
+        }
+    }
+    if claimed_eligible != admitted_eligible {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair eligible order set does not match admitted executable orders".into(),
+        ));
+    }
     Ok(())
 }
 
 fn validate_multi_pair_settlement_witness_bindings(
     transcript: &MultiPairSettlementTranscript,
-    problem: &MultiPairOptimalityProblem,
+    problem: &MultiPairCandidateSetProblem,
     matched_order_witnesses: &[MultiPairMatchedOrderWitness],
+    admission_order_summaries: &[MultiPairAdmissionOrderSummary],
+    external_match_settlements: &[crate::ExternalMatchSettlementRecord],
 ) -> Result<(), ProtocolError> {
-    crate::multipair::verify_multi_pair_optimality(problem)?;
+    validate_multi_pair_admission_bindings(
+        &transcript.batch_bindings,
+        problem,
+        admission_order_summaries,
+    )?;
+    crate::multipair::verify_multi_pair_candidate_set(problem)?;
     if problem.chosen.batch_id != transcript.group_id {
         return Err(ProtocolError::InvalidSettlementProof(
             "multi-pair settlement problem batch id must equal group id".into(),
         ));
     }
-    if problem.chosen.fills.len() != matched_order_witnesses.len()
-        || problem.chosen.fills.len() != transcript.matched_orders.len()
-    {
+    if matched_order_witnesses.len() != transcript.matched_orders.len() {
         return Err(ProtocolError::InvalidSettlementProof(
             "multi-pair settlement fill count mismatch".into(),
         ));
     }
+    let executable_orders = multi_pair_executable_orders_from_admission(
+        &transcript.batch_bindings,
+        admission_order_summaries,
+    )?;
+    let expected_final_fills = crate::final_multi_pair_fills_with_external_matches(
+        &transcript.group_id,
+        &executable_orders,
+        Some(&crate::MultiPairNettingPlan {
+            problem: problem.clone(),
+        }),
+        external_match_settlements,
+    )?;
+    if expected_final_fills.len() != matched_order_witnesses.len() {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair final fill count does not include every private or external fill".into(),
+        ));
+    }
+    let expected_by_commitment = expected_final_fills
+        .iter()
+        .map(|fill| Ok((normalize_felt_hex(&fill.order_commitment.0)?, fill)))
+        .collect::<Result<BTreeMap<_, _>, ProtocolError>>()?;
     let binding_by_pair = transcript
         .batch_bindings
         .iter()
@@ -5268,23 +6548,33 @@ fn validate_multi_pair_settlement_witness_bindings(
         })
         .collect::<Result<BTreeMap<_, _>, ProtocolError>>()?;
     let mut expected_consumed_inputs = Vec::new();
-    for ((fill, wrapper), matched_order) in problem
-        .chosen
-        .fills
+    let mut seen_final_fills = BTreeSet::new();
+    for (wrapper, matched_order) in matched_order_witnesses
         .iter()
-        .zip(matched_order_witnesses.iter())
         .zip(transcript.matched_orders.iter())
     {
-        if fill != &wrapper.fill {
+        let commitment = normalize_felt_hex(&wrapper.fill.order_commitment.0)?;
+        if !seen_final_fills.insert(commitment.clone()) {
             return Err(ProtocolError::InvalidSettlementProof(
-                "multi-pair matched witness fill does not match chosen fill".into(),
+                "multi-pair final fill commitment is duplicated".into(),
+            ));
+        }
+        let fill = expected_by_commitment.get(&commitment).ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(
+                "multi-pair final fill does not correspond to private or external execution".into(),
+            )
+        })?;
+        if *fill != &wrapper.fill {
+            return Err(ProtocolError::InvalidSettlementProof(
+                "multi-pair matched witness fill does not match combined private and external fill"
+                    .into(),
             ));
         }
         if matched_order.order_commitment != fill.order_commitment
             || matched_order.filled_amount != fill.filled_base_amount
         {
             return Err(ProtocolError::InvalidSettlementProof(
-                "multi-pair transcript matched order does not match chosen fill".into(),
+                "multi-pair transcript matched order does not match final fill".into(),
             ));
         }
         let binding_key = (
@@ -5297,6 +6587,7 @@ fn validate_multi_pair_settlement_witness_bindings(
             )
         })?;
         validate_multi_pair_fill_against_batch_binding(fill, binding)?;
+        crate::multipair::validate_fill_bounds(0, fill)?;
         validate_multi_pair_fill_against_order_witness(
             transcript.batch_epoch,
             fill,
@@ -5304,12 +6595,7 @@ fn validate_multi_pair_settlement_witness_bindings(
         )?;
         expected_consumed_inputs.extend(consumed_inputs_for_order_witness(&wrapper.order_witness)?);
     }
-    if transcript
-        .consumed_inputs
-        .iter()
-        .take(expected_consumed_inputs.len())
-        .ne(expected_consumed_inputs.iter())
-    {
+    if transcript.consumed_inputs != expected_consumed_inputs {
         return Err(ProtocolError::InvalidSettlementProof(
             "multi-pair consumed trader inputs do not match matched order witnesses".into(),
         ));
@@ -5454,7 +6740,12 @@ struct EncodedMultiPairBatchBindings {
     batch_ids: Vec<String>,
     pair_ids: Vec<String>,
     order_commitment_roots: Vec<String>,
+    admission_roots: Vec<String>,
     encrypted_order_set_commitments: Vec<String>,
+    reference_price_attestation_commitments: Vec<String>,
+    reference_price_signers: Vec<String>,
+    reference_price_observed_at_unix_ms_values: Vec<String>,
+    reference_price_valid_until_unix_ms_values: Vec<String>,
     base_asset_ids: Vec<String>,
     quote_asset_ids: Vec<String>,
     price_base_scales: Vec<String>,
@@ -5467,7 +6758,12 @@ fn encode_multi_pair_batch_bindings(
     let mut batch_ids = Vec::with_capacity(bindings.len());
     let mut pair_ids = Vec::with_capacity(bindings.len());
     let mut order_commitment_roots = Vec::with_capacity(bindings.len());
+    let mut admission_roots = Vec::with_capacity(bindings.len());
     let mut encrypted_order_set_commitments = Vec::with_capacity(bindings.len());
+    let mut reference_price_attestation_commitments = Vec::with_capacity(bindings.len());
+    let mut reference_price_signers = Vec::with_capacity(bindings.len());
+    let mut reference_price_observed_at_unix_ms_values = Vec::with_capacity(bindings.len());
+    let mut reference_price_valid_until_unix_ms_values = Vec::with_capacity(bindings.len());
     let mut base_asset_ids = Vec::with_capacity(bindings.len());
     let mut quote_asset_ids = Vec::with_capacity(bindings.len());
     let mut price_base_scales = Vec::with_capacity(bindings.len());
@@ -5479,9 +6775,18 @@ fn encode_multi_pair_batch_bindings(
         order_commitment_roots.push(normalize_batch_order_commitment_root(
             &binding.order_commitment_root,
         )?);
+        admission_roots.push(normalize_felt_hex(&binding.admission_root)?);
         encrypted_order_set_commitments.push(normalize_encrypted_order_set_commitment(
             &binding.encrypted_order_set_commitment,
         )?);
+        reference_price_attestation_commitments.push(normalize_felt_hex(
+            &binding.reference_price_attestation_commitment,
+        )?);
+        reference_price_signers.push(normalize_felt_hex(&binding.reference_price_signer)?);
+        reference_price_observed_at_unix_ms_values
+            .push(encode_u64(binding.reference_price_observed_at_unix_ms));
+        reference_price_valid_until_unix_ms_values
+            .push(encode_u64(binding.reference_price_valid_until_unix_ms));
         base_asset_ids.push(encode_asset_id(&binding.base_asset_id.0));
         quote_asset_ids.push(encode_asset_id(&binding.quote_asset_id.0));
         price_base_scales.push(encode_u128(binding.price_base_scale));
@@ -5491,7 +6796,12 @@ fn encode_multi_pair_batch_bindings(
         batch_ids,
         pair_ids,
         order_commitment_roots,
+        admission_roots,
         encrypted_order_set_commitments,
+        reference_price_attestation_commitments,
+        reference_price_signers,
+        reference_price_observed_at_unix_ms_values,
+        reference_price_valid_until_unix_ms_values,
         base_asset_ids,
         quote_asset_ids,
         price_base_scales,
@@ -5743,6 +7053,53 @@ pub fn multi_pair_proof_message_hash_from_statement(
         Felt::from(2_u64),
         felt_from_hex_str(MULTI_PAIR_PROOF_MESSAGE_DOMAIN_HEX)?,
         felt_from_hex_str(statement_message_hash)?,
+    ];
+    Ok(crate::hash::poseidon_hash_hex(&fields))
+}
+
+pub fn native_external_match_authorization_message_hash(
+    auction_verifier_address: &str,
+    batch_id: &str,
+    multi_pair_commitment: &str,
+    request_root: &str,
+    reference_price_signer: &str,
+) -> Result<String, ProtocolError> {
+    let mut state = poseidon_hash(
+        domain_felt("zylith_extauth_v1"),
+        felt_from_hex_str(&normalize_felt_hex(auction_verifier_address)?)?,
+    );
+    for value in [
+        encode_starknet_felt("batch-id", batch_id),
+        normalize_felt_hex(multi_pair_commitment)?,
+        normalize_felt_hex(request_root)?,
+        normalize_felt_hex(reference_price_signer)?,
+    ] {
+        state = poseidon_hash(state, felt_from_hex_str(&value)?);
+    }
+    Ok(felt_hex(&state))
+}
+
+pub fn external_match_authorization_proof_message_hash_for_program(
+    proof_program_address: &str,
+    auction_verifier_address: &str,
+    batch_id: &str,
+    multi_pair_commitment: &str,
+    request_root: &str,
+    reference_price_signer: &str,
+) -> Result<String, ProtocolError> {
+    let statement_message_hash = native_external_match_authorization_message_hash(
+        auction_verifier_address,
+        batch_id,
+        multi_pair_commitment,
+        request_root,
+        reference_price_signer,
+    )?;
+    let fields = [
+        felt_from_hex_str(proof_program_address)?,
+        Felt::ZERO,
+        Felt::from(2_u64),
+        domain_felt("zylith_extauth_v1"),
+        felt_from_hex_str(&statement_message_hash)?,
     ];
     Ok(crate::hash::poseidon_hash_hex(&fields))
 }
@@ -6091,7 +7448,15 @@ pub fn build_settlement_witness(
     base_asset_id: AssetId,
     quote_asset_id: AssetId,
     matched_order_witnesses: Vec<MatchedOrderWitness>,
+    reference_price_attestation: ReferencePriceAttestation,
 ) -> Result<SettlementWitness, ProtocolError> {
+    if normalize_felt_hex(&transcript.auction_verifier_address)?
+        != normalize_felt_hex(verifier_address)?
+    {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "settlement transcript verifier does not match witness target".into(),
+        ));
+    }
     if transcript.pair_id != pair_id {
         return Err(ProtocolError::Crypto(
             "settlement witness pair does not match transcript pair".into(),
@@ -6109,18 +7474,41 @@ pub fn build_settlement_witness(
             "settlement transcript price_base_scale must be non-zero".into(),
         ));
     }
+    validate_reference_price_attestation_binding(
+        &reference_price_attestation,
+        ReferencePriceAttestationBinding {
+            commitment: &transcript.reference_price_attestation_commitment,
+            signer: &transcript.reference_price_signer,
+            verifier: verifier_address,
+            pair_id: &pair_id,
+            base_asset_id: &base_asset_id,
+            quote_asset_id: &quote_asset_id,
+            price_base_scale: transcript.price_base_scale,
+            observed_at_unix_ms: transcript.reference_price_observed_at_unix_ms,
+            valid_until_unix_ms: transcript.reference_price_valid_until_unix_ms,
+            clearing_price: transcript.clearing_price,
+        },
+    )?;
     Ok(SettlementWitness {
         batch_id: transcript.batch_id.clone(),
         pair_id: pair_id.clone(),
         batch_epoch: transcript.batch_epoch,
         order_commitment_root: transcript.order_commitment_root.clone(),
         encrypted_order_set_commitment: transcript.encrypted_order_set_commitment.clone(),
+        reference_price_attestation_commitment: transcript
+            .reference_price_attestation_commitment
+            .clone(),
+        reference_price_signer: transcript.reference_price_signer.clone(),
+        reference_price_observed_at_unix_ms: transcript.reference_price_observed_at_unix_ms,
+        reference_price_valid_until_unix_ms: transcript.reference_price_valid_until_unix_ms,
+        reference_price_attestation,
         transcript_commitment: settlement_transcript_commitment(transcript)?,
         auction_verifier_address: verifier_address.into(),
         prior_note_root: normalize_felt_hex(&transcript.prior_note_root)?,
         prior_nullifier_root: normalize_felt_hex(&transcript.prior_nullifier_root)?,
         prior_renewal_root: normalize_felt_hex(&transcript.prior_renewal_root)?,
         prior_fee_root: normalize_felt_hex(&transcript.prior_fee_root)?,
+        new_note_root: normalize_felt_hex(&transcript.new_note_root)?,
         new_nullifier_root: normalize_felt_hex(&transcript.new_nullifier_root)?,
         new_renewal_root: normalize_felt_hex(&transcript.new_renewal_root)?,
         clearing_price: transcript.clearing_price,
@@ -6157,6 +7545,21 @@ pub fn build_stwo_serialized_input(
             "settlement witness batch_epoch must be non-zero".into(),
         ));
     }
+    validate_reference_price_attestation_binding(
+        &witness.reference_price_attestation,
+        ReferencePriceAttestationBinding {
+            commitment: &witness.reference_price_attestation_commitment,
+            signer: &witness.reference_price_signer,
+            verifier: &witness.auction_verifier_address,
+            pair_id: &witness.pair_id,
+            base_asset_id: &witness.base_asset_id,
+            quote_asset_id: &witness.quote_asset_id,
+            price_base_scale: witness.price_base_scale,
+            observed_at_unix_ms: witness.reference_price_observed_at_unix_ms,
+            valid_until_unix_ms: witness.reference_price_valid_until_unix_ms,
+            clearing_price: witness.clearing_price,
+        },
+    )?;
     for entry in &witness.matched_order_witnesses {
         if entry.expiry_epoch != witness.batch_epoch {
             return Err(ProtocolError::Crypto(
@@ -6397,6 +7800,23 @@ pub fn build_stwo_serialized_input(
         encode_u64(witness.batch_epoch),
         normalize_batch_order_commitment_root(&witness.order_commitment_root)?,
         normalize_encrypted_order_set_commitment(&witness.encrypted_order_set_commitment)?,
+        normalize_felt_hex(&witness.auction_verifier_address)?,
+        domain_felt_hex(REFERENCE_PRICE_ATTESTATION_DOMAIN_TAG),
+        normalize_felt_hex(&witness.reference_price_attestation_commitment)?,
+        normalize_felt_hex(&witness.reference_price_signer)?,
+        encode_u64(witness.reference_price_valid_until_unix_ms),
+        encode_u128(witness.reference_price_attestation.envelope.midpoint_price),
+        encode_u128(witness.reference_price_attestation.envelope.lower_price),
+        encode_u128(witness.reference_price_attestation.envelope.upper_price),
+        encode_usize(witness.reference_price_attestation.envelope.source_count),
+        encode_u64(
+            witness
+                .reference_price_attestation
+                .envelope
+                .observed_at_unix_ms,
+        ),
+        normalize_felt_hex(&witness.reference_price_attestation.source_set_commitment)?,
+        encode_u64(witness.reference_price_attestation.nonce),
         normalize_felt_hex(&witness.transcript_commitment)?,
         encode_asset_id(&witness.base_asset_id.0),
         encode_asset_id(&witness.quote_asset_id.0),
@@ -6411,6 +7831,7 @@ pub fn build_stwo_serialized_input(
         normalize_felt_hex(&witness.prior_nullifier_root)?,
         normalize_felt_hex(&witness.prior_renewal_root)?,
         normalize_felt_hex(&witness.prior_fee_root)?,
+        normalize_felt_hex(&witness.new_note_root)?,
         domain_felt_hex("zylith/root/consumed-notes-v1"),
         domain_felt_hex("zylith/root/consumed-nullifiers-v1"),
         domain_felt_hex("zylith/root/renewal-children-v1"),
@@ -6927,13 +8348,6 @@ pub fn build_stwo_serialized_input(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .map(|membership| normalize_felt_hex(&membership.prefix_root))
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &note_membership_witnesses
-            .iter()
             .map(|membership| normalize_felt_hex(&membership.batch_root))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
@@ -6964,14 +8378,22 @@ pub fn build_stwo_serialized_input(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .map(|membership| encode_usize(membership.suffix_batch_roots.len()))
+            .map(|membership| encode_usize(membership.accumulator_path.len()))
             .collect::<Vec<_>>(),
     );
     push_span(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .flat_map(|membership| membership.suffix_batch_roots.iter())
+            .flat_map(|membership| membership.accumulator_path.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .flat_map(|membership| membership.accumulator_directions.iter())
             .map(|value| normalize_felt_hex(value))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
@@ -7194,9 +8616,9 @@ pub fn build_stwo_serialized_input(
 }
 
 pub fn build_multi_pair_serialized_input(
-    problem: &MultiPairOptimalityProblem,
+    problem: &MultiPairCandidateSetProblem,
 ) -> Result<Vec<String>, ProtocolError> {
-    crate::multipair::verify_multi_pair_optimality(problem)?;
+    crate::multipair::verify_multi_pair_candidate_set(problem)?;
 
     let mut payload = vec![
         encode_u64(MULTI_PAIR_STATEMENT_TYPE_TAG),
@@ -7260,10 +8682,313 @@ pub fn build_multi_pair_serialized_input(
     Ok(serialized)
 }
 
+pub fn build_external_match_authorization_serialized_input(
+    witness: &crate::ExternalMatchAuthorizationWitness,
+) -> Result<Vec<String>, ProtocolError> {
+    let report = crate::validate_external_match_authorization_witness(witness)?;
+    let mut witness = witness.clone();
+    witness
+        .orders
+        .sort_by(|left, right| left.order_commitment.0.cmp(&right.order_commitment.0));
+    witness
+        .reference_price_attestations
+        .sort_by(|left, right| left.envelope.pair_id.0.cmp(&right.envelope.pair_id.0));
+    witness
+        .requests
+        .sort_by(|left, right| left.request_id.cmp(&right.request_id));
+    let mut payload = vec![
+        encode_u64(EXTERNAL_MATCH_AUTHORIZATION_STATEMENT_TYPE_TAG),
+        encode_starknet_felt("batch-id", &witness.batch_id.0),
+        normalize_felt_hex(&witness.auction_verifier_address)?,
+        normalize_felt_hex(&witness.reference_price_signer)?,
+        normalize_felt_hex(&report.multi_pair_commitment)?,
+        normalize_felt_hex(&report.request_root)?,
+    ];
+    let nested_multi_pair = witness
+        .multi_pair_problem
+        .as_ref()
+        .map(build_multi_pair_serialized_input)
+        .transpose()?
+        .unwrap_or_default();
+    push_span(&mut payload, &nested_multi_pair);
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| normalize_felt_hex(&order.order_commitment.0))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_starknet_felt("pair-id", &order.pair_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_asset_id(&order.base_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_asset_id(&order.quote_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_order_side(&order.side))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_u128(order.submitted_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_u128(order.min_fill_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_u128(order.limit_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_u128(order.price_base_scale))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_u128(order.available_input_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_u64(u64::from(order.taker_fee_bps)))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &witness
+            .orders
+            .iter()
+            .map(|order| encode_execution_preference(&order.execution_preference))
+            .collect::<Vec<_>>(),
+    );
+
+    let attestations = &witness.reference_price_attestations;
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_starknet_felt("pair-id", &item.envelope.pair_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_asset_id(&item.envelope.base_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_asset_id(&item.envelope.quote_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_u128(item.envelope.midpoint_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_u128(item.envelope.lower_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_u128(item.envelope.upper_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_u128(item.envelope.price_base_scale))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_usize(item.envelope.source_count))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_u64(item.envelope.observed_at_unix_ms))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| normalize_felt_hex(&item.source_set_commitment))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_u64(item.valid_until_unix_ms))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| encode_u64(item.nonce))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| normalize_felt_hex(&item.signer_public_key))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| normalize_felt_hex(&item.signature.signature_r))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &attestations
+            .iter()
+            .map(|item| normalize_felt_hex(&item.signature.signature_s))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+
+    let requests = &witness.requests;
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| normalize_felt_hex(&item.request_id))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_starknet_felt("pair-id", &item.pair_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_asset_id(&item.base_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_asset_id(&item.quote_asset_id.0))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_order_side(&item.side))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_u128(item.max_base_amount))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_u128(item.reference_midpoint_price))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_u128(item.price_base_scale))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        &mut payload,
+        &requests
+            .iter()
+            .map(|item| encode_u64(item.valid_until_unix_ms))
+            .collect::<Vec<_>>(),
+    );
+
+    let mut serialized = vec![encode_usize(payload.len())];
+    serialized.extend(payload);
+    Ok(serialized)
+}
+
 pub fn multi_pair_statement_commitment(
-    problem: &MultiPairOptimalityProblem,
+    problem: &MultiPairCandidateSetProblem,
 ) -> Result<String, ProtocolError> {
-    let report = crate::multipair::verify_multi_pair_optimality(problem)?;
+    let report = crate::multipair::verify_multi_pair_candidate_set(problem)?;
     let serialized = build_multi_pair_serialized_input(problem)?;
     let payload = serialized.get(1..).ok_or_else(|| {
         ProtocolError::InvalidSettlementProof("empty serialized multi-pair witness".into())
@@ -7379,6 +9104,13 @@ fn push_multi_pair_fills(
         payload,
         &fills
             .iter()
+            .map(|fill| encode_u64(u64::from(fill.taker_fee_bps)))
+            .collect::<Vec<_>>(),
+    );
+    push_span(
+        payload,
+        &fills
+            .iter()
             .map(|fill| encode_u128(fill.fee_amount))
             .collect::<Vec<_>>(),
     );
@@ -7474,8 +9206,7 @@ fn encode_multi_pair_delta_direction(direction: &MultiPairAssetDeltaDirection) -
 fn encode_multi_pair_delta_source(source: &MultiPairAssetDeltaSource) -> String {
     match source {
         MultiPairAssetDeltaSource::User => "0x0".into(),
-        MultiPairAssetDeltaSource::ExternalCompletion => "0x1".into(),
-        MultiPairAssetDeltaSource::Fee => "0x2".into(),
+        MultiPairAssetDeltaSource::Fee => "0x1".into(),
     }
 }
 
@@ -7498,7 +9229,7 @@ fn note_consolidation_membership_witnesses_for_serialization(
             })
             .cloned()
             .collect::<Vec<_>>();
-        let deposit_chain_root = settlement_note_root_after_deposit_roots(
+        let deposit_chain_root = note_accumulator_root_after_deposits(
             &input_notes
                 .iter()
                 .map(deposit_root_from_note)
@@ -7625,7 +9356,7 @@ pub fn build_note_consolidation_serialized_input(
         domain_felt_hex("zylith/root/consumed-notes-v1"),
         domain_felt_hex("zylith/root/consumed-nullifiers-v1"),
         domain_felt_hex("zylith/root/output-notes-v1"),
-        normalize_felt_hex(ROOT_ONLY_STATE_TRANSITION_DOMAIN_HEX)?,
+        normalize_felt_hex(&witness.new_note_root)?,
         normalize_felt_hex(NULLIFIER_SPARSE_LEAF_DOMAIN_HEX)?,
         normalize_felt_hex(NULLIFIER_SPARSE_NODE_DOMAIN_HEX)?,
     ];
@@ -7731,13 +9462,6 @@ pub fn build_note_consolidation_serialized_input(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .map(|membership| normalize_felt_hex(&membership.prefix_root))
-            .collect::<Result<Vec<_>, ProtocolError>>()?,
-    );
-    push_span(
-        &mut payload,
-        &note_membership_witnesses
-            .iter()
             .map(|membership| normalize_felt_hex(&membership.batch_root))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
@@ -7768,14 +9492,22 @@ pub fn build_note_consolidation_serialized_input(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .map(|membership| encode_usize(membership.suffix_batch_roots.len()))
+            .map(|membership| encode_usize(membership.accumulator_path.len()))
             .collect::<Vec<_>>(),
     );
     push_span(
         &mut payload,
         &note_membership_witnesses
             .iter()
-            .flat_map(|membership| membership.suffix_batch_roots.iter())
+            .flat_map(|membership| membership.accumulator_path.iter())
+            .map(|value| normalize_felt_hex(value))
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+    );
+    push_span(
+        &mut payload,
+        &note_membership_witnesses
+            .iter()
+            .flat_map(|membership| membership.accumulator_directions.iter())
             .map(|value| normalize_felt_hex(value))
             .collect::<Result<Vec<_>, ProtocolError>>()?,
     );
@@ -8423,6 +10155,34 @@ fn synthetic_multi_pair_member_admission_witness(
         batch_epoch: binding.batch_epoch,
         order_commitment_root: binding.order_commitment_root.clone(),
         encrypted_order_set_commitment: binding.encrypted_order_set_commitment.clone(),
+        reference_price_attestation_commitment: binding
+            .reference_price_attestation_commitment
+            .clone(),
+        reference_price_signer: binding.reference_price_signer.clone(),
+        reference_price_observed_at_unix_ms: binding.reference_price_observed_at_unix_ms,
+        reference_price_valid_until_unix_ms: binding.reference_price_valid_until_unix_ms,
+        reference_price_attestation: ReferencePriceAttestation {
+            envelope: ReferencePriceEnvelope {
+                pair_id: binding.pair_id.clone(),
+                base_asset_id: binding.base_asset_id.clone(),
+                quote_asset_id: binding.quote_asset_id.clone(),
+                midpoint_price: 1,
+                lower_price: 1,
+                upper_price: 1,
+                price_base_scale: binding.price_base_scale,
+                source_count: 3,
+                observed_at_unix_ms: binding.reference_price_observed_at_unix_ms,
+            },
+            auction_verifier_address: "0x1".into(),
+            source_set_commitment: "0x1".into(),
+            valid_until_unix_ms: binding.reference_price_valid_until_unix_ms,
+            nonce: 1,
+            signer_public_key: binding.reference_price_signer.clone(),
+            signature: crate::SpendAuthorization {
+                signature_r: "0x1".into(),
+                signature_s: "0x1".into(),
+            },
+        },
         transcript_commitment: encode_starknet_felt(
             "multi-pair-member-admission",
             &binding.batch_id.0,
@@ -8432,6 +10192,7 @@ fn synthetic_multi_pair_member_admission_witness(
         prior_nullifier_root: "0x0".into(),
         prior_renewal_root: "0x0".into(),
         prior_fee_root: "0x0".into(),
+        new_note_root: "0x0".into(),
         new_nullifier_root: "0x0".into(),
         new_renewal_root: "0x0".into(),
         clearing_price: 0,
@@ -8941,6 +10702,12 @@ fn flatten_settlement_call_arguments(args: &SettlementCallArguments) -> Vec<Stri
         args.batch_id.clone(),
         args.order_commitment_root.clone(),
         args.encrypted_order_set_commitment.clone(),
+        args.reference_price_attestation_commitment.clone(),
+        args.reference_price_signer.clone(),
+        args.reference_price_observed_at_unix_ms.clone(),
+        args.reference_price_valid_until_unix_ms.clone(),
+        args.reference_price_signature_r.clone(),
+        args.reference_price_signature_s.clone(),
         args.transcript_commitment.clone(),
         args.proof_artifact_commitment.clone(),
     ];
@@ -8974,10 +10741,34 @@ fn flatten_multi_pair_settlement_call_arguments(
     push_span(&mut calldata, &args.pair_ids);
     push_span(&mut calldata, &args.order_commitment_roots);
     push_span(&mut calldata, &args.encrypted_order_set_commitments);
+    push_span(&mut calldata, &args.reference_price_attestation_commitments);
+    push_span(&mut calldata, &args.reference_price_signers);
+    push_span(
+        &mut calldata,
+        &args.reference_price_observed_at_unix_ms_values,
+    );
+    push_span(
+        &mut calldata,
+        &args.reference_price_valid_until_unix_ms_values,
+    );
+    push_span(&mut calldata, &args.reference_price_signature_rs);
+    push_span(&mut calldata, &args.reference_price_signature_ss);
     push_span(&mut calldata, &args.base_asset_ids);
     push_span(&mut calldata, &args.quote_asset_ids);
     push_span(&mut calldata, &args.price_base_scales);
     push_span(&mut calldata, &args.taker_fee_bps_values);
+    push_span(&mut calldata, &args.external_request_ids);
+    push_span(&mut calldata, &args.external_batch_ids);
+    push_span(&mut calldata, &args.external_pair_ids);
+    push_span(&mut calldata, &args.external_base_asset_ids);
+    push_span(&mut calldata, &args.external_quote_asset_ids);
+    push_span(&mut calldata, &args.external_sides);
+    push_span(&mut calldata, &args.external_max_base_amounts);
+    push_span(&mut calldata, &args.external_midpoint_prices);
+    push_span(&mut calldata, &args.external_price_base_scales);
+    push_span(&mut calldata, &args.external_valid_until_values);
+    push_span(&mut calldata, &args.external_consumed_base_amounts);
+    calldata.push(args.external_match_root.clone());
     calldata.push(args.transcript_commitment.clone());
     calldata.push(args.proof_artifact_commitment.clone());
     calldata.push(args.protocol_fee_recipient.clone());
@@ -9090,35 +10881,299 @@ mod tests {
         build_note_consolidation_serialized_input, build_note_consolidation_submission_plan,
         build_order_submission, build_output_note, build_renewal_parent_cancel_submission_plan,
         build_settlement_output_withdrawal_submission_plan, build_settlement_submission_plan,
-        build_settlement_witness, build_stwo_serialized_input, create_order_ingress_receipt,
-        create_recovery_artifact, decrypt_note_for_owner, decrypt_order_bundle,
-        decrypt_order_share, decrypt_output_recovery_record, decrypt_recovery_artifact_payload,
-        deposit_root_from_note, derive_account_id, derive_order_cancellation_secret,
-        derive_order_cancellation_tag, derive_user_keys, encode_asset_id, encode_output_root_id,
-        encrypt_note_for_owner, encrypt_output_recovery_record,
-        encrypted_note_activation_commitment, funding_commitment_for_deposit,
-        native_note_consolidation_message_hash, note_consolidation_commitment,
-        note_recognition_public_key_from_raw_key_hex,
+        build_settlement_witness as build_settlement_witness_raw, build_stwo_serialized_input,
+        create_order_ingress_receipt, create_recovery_artifact, decrypt_note_for_owner,
+        decrypt_order_bundle, decrypt_order_share, decrypt_output_recovery_record,
+        decrypt_recovery_artifact_payload, deposit_root_from_note, derive_account_id,
+        derive_order_cancellation_secret, derive_order_cancellation_tag, derive_user_keys,
+        encode_asset_id, encode_output_root_id, encrypt_note_for_owner,
+        encrypt_output_recovery_record, encrypted_note_activation_commitment, felt_from_hex_str,
+        felt_hex, funding_commitment_for_deposit, native_note_consolidation_message_hash,
+        note_accumulator_leaf, note_accumulator_membership_proofs, note_accumulator_node,
+        note_accumulator_root, note_accumulator_root_after_append,
+        note_accumulator_root_after_deposits, note_accumulator_roots_after_each_append,
+        note_consolidation_commitment, note_recognition_public_key_from_raw_key_hex,
         nullifier_sparse_update_witnesses_for_consumed_inputs, output_note_merkle_proof,
         output_note_merkle_root, private_execution_key_registry_fingerprint,
-        proof_artifact_commitment, reconstruct_order_from_shares, renewal_child_nullifier,
-        renewal_parent_cancel_marker, renewal_sparse_witness_for_parent_cancel_marker,
-        root_only_settlement_commitments, sanitize_order_submission_for_coordinator,
-        settlement_note_root_after_deposit_roots, settlement_nullifier_root_after_history,
+        proof_artifact_commitment, reconstruct_order_from_shares,
+        reference_price_attestation_commitment, reference_price_source_set_commitment,
+        renewal_child_nullifier, renewal_parent_cancel_marker,
+        renewal_sparse_witness_for_parent_cancel_marker, root_only_settlement_commitments,
+        sanitize_order_submission_for_coordinator, settlement_nullifier_root_after_history,
         settlement_output_withdrawal_message_hash, settlement_transcript_commitment,
         sign_note_consolidation_authorization, sign_order_authorization,
-        sign_renewal_relay_package_authorization, strk20_exit_claim_message_hash,
-        validate_order_ingress_receipt_for_manifest,
+        sign_reference_price_attestation, sign_renewal_relay_package_authorization,
+        strk20_exit_claim_message_hash, validate_order_ingress_receipt_for_manifest,
         validate_order_ingress_receipt_for_manifest_with_secrets,
         validate_output_recovery_bundle_for_outputs, validate_private_execution_key_registry_pin,
         validate_private_order_authorization, verify_order_ingress_receipt,
         verify_order_ingress_receipt_with_secrets, verify_output_note_membership,
-        verify_renewal_relay_package_authorization, withdrawal_message_hash,
+        verify_reference_price_attestation, verify_renewal_relay_package_authorization,
+        withdrawal_message_hash,
     };
     use crate::types::{output_bundle_bucket_size, output_recovery_bundle_root};
     use crate::{
-        FundingRailKind, OrderIngressReceiptAttestation, RelayMode, RenewalParentCancelPlanRequest,
+        FundingRailKind, OrderIngressReceiptAttestation, ReferencePriceAttestation,
+        ReferencePriceEnvelope, RelayMode, RenewalParentCancelPlanRequest,
     };
+
+    fn verify_note_accumulator_proof(
+        batch_root: &str,
+        path: &[String],
+        directions: &[String],
+        expected_root: &str,
+    ) -> bool {
+        if path.len() != super::NOTE_ACCUMULATOR_DEPTH || path.len() != directions.len() {
+            return false;
+        }
+        let Ok(batch_root) = felt_from_hex_str(batch_root) else {
+            return false;
+        };
+        let Ok(mut current) = note_accumulator_leaf(batch_root) else {
+            return false;
+        };
+        for (level, (sibling, direction)) in path.iter().zip(directions).enumerate() {
+            let Ok(sibling) = felt_from_hex_str(sibling) else {
+                return false;
+            };
+            current = match direction.as_str() {
+                "0x0" => note_accumulator_node(current, sibling, level),
+                "0x1" => note_accumulator_node(sibling, current, level),
+                _ => return false,
+            }
+            .expect("valid accumulator node");
+        }
+        felt_hex(&current) == expected_root
+    }
+
+    #[test]
+    fn note_accumulator_roots_and_fixed_depth_membership_proofs_agree() {
+        for leaf_count in [1_usize, 2, 3, 4, 5, 7, 8, 9, 31, 32, 33, 127, 128, 129, 257] {
+            let batch_roots = (1..=leaf_count)
+                .map(|value| format!("0x{value:x}"))
+                .collect::<Vec<_>>();
+            let roots_after_each =
+                note_accumulator_roots_after_each_append(&batch_roots).expect("append roots");
+            let root = note_accumulator_root(&batch_roots).expect("accumulator root");
+            assert_eq!(roots_after_each.last(), Some(&root));
+
+            let indices = (0..leaf_count).collect::<Vec<_>>();
+            let proofs = note_accumulator_membership_proofs(&batch_roots, &indices)
+                .expect("membership proofs");
+            assert_eq!(proofs.len(), leaf_count);
+            for (index, (path, directions)) in proofs.iter().enumerate() {
+                assert_eq!(path.len(), super::NOTE_ACCUMULATOR_DEPTH);
+                assert_eq!(directions.len(), super::NOTE_ACCUMULATOR_DEPTH);
+                assert!(verify_note_accumulator_proof(
+                    &batch_roots[index],
+                    path,
+                    directions,
+                    &root,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn note_accumulator_membership_rejects_tampered_path_and_direction() {
+        let batch_roots = (1..=5)
+            .map(|value| format!("0x{value:x}"))
+            .collect::<Vec<_>>();
+        let root = note_accumulator_root(&batch_roots).expect("accumulator root");
+        let mut proof = note_accumulator_membership_proofs(&batch_roots, &[2])
+            .expect("membership proof")
+            .pop()
+            .expect("one proof");
+
+        proof.0[0] = "0xdead".into();
+        assert!(!verify_note_accumulator_proof(
+            &batch_roots[2],
+            &proof.0,
+            &proof.1,
+            &root,
+        ));
+
+        let mut proof = note_accumulator_membership_proofs(&batch_roots, &[2])
+            .expect("membership proof")
+            .pop()
+            .expect("one proof");
+        proof.1[0] = if proof.1[0] == "0x0" {
+            "0x1".into()
+        } else {
+            "0x0".into()
+        };
+        assert!(!verify_note_accumulator_proof(
+            &batch_roots[2],
+            &proof.0,
+            &proof.1,
+            &root,
+        ));
+    }
+
+    fn bind_test_reference_price(
+        transcript: &SettlementTranscript,
+        verifier_address: &str,
+        base_asset_id: &AssetId,
+        quote_asset_id: &AssetId,
+    ) -> (SettlementTranscript, ReferencePriceAttestation) {
+        let observed_at_unix_ms = 1_000;
+        let source_set_commitment = reference_price_source_set_commitment(&[
+            ("binance", transcript.clearing_price),
+            ("coinbase", transcript.clearing_price),
+            ("kraken", transcript.clearing_price),
+        ])
+        .expect("test reference source commitment");
+        let attestation = sign_reference_price_attestation(
+            "0x12345",
+            verifier_address,
+            ReferencePriceEnvelope {
+                pair_id: transcript.pair_id.clone(),
+                base_asset_id: base_asset_id.clone(),
+                quote_asset_id: quote_asset_id.clone(),
+                midpoint_price: transcript.clearing_price,
+                lower_price: transcript.clearing_price,
+                upper_price: transcript.clearing_price,
+                price_base_scale: transcript.price_base_scale,
+                source_count: 3,
+                observed_at_unix_ms,
+            },
+            &source_set_commitment,
+            observed_at_unix_ms + 5_000,
+            1,
+        )
+        .expect("test reference attestation");
+        let mut bound = transcript.clone();
+        bound.auction_verifier_address = verifier_address.into();
+        bound.reference_price_attestation_commitment =
+            reference_price_attestation_commitment(&attestation)
+                .expect("test reference attestation commitment");
+        bound.reference_price_signer = attestation.signer_public_key.clone();
+        bound.reference_price_observed_at_unix_ms = observed_at_unix_ms;
+        bound.reference_price_valid_until_unix_ms = attestation.valid_until_unix_ms;
+        (bound, attestation)
+    }
+
+    fn build_settlement_witness(
+        transcript: &SettlementTranscript,
+        pair_id: PairId,
+        verifier_address: &str,
+        base_asset_id: AssetId,
+        quote_asset_id: AssetId,
+        matched_order_witnesses: Vec<MatchedOrderWitness>,
+    ) -> Result<SettlementWitness, ProtocolError> {
+        let (transcript, attestation) = bind_test_reference_price(
+            transcript,
+            verifier_address,
+            &base_asset_id,
+            &quote_asset_id,
+        );
+        build_settlement_witness_raw(
+            &transcript,
+            pair_id,
+            verifier_address,
+            base_asset_id,
+            quote_asset_id,
+            matched_order_witnesses,
+            attestation,
+        )
+    }
+
+    fn bind_test_multi_pair_reference_prices(
+        transcript: &MultiPairSettlementTranscript,
+        problem: &crate::MultiPairCandidateSetProblem,
+        verifier_address: &str,
+    ) -> (
+        MultiPairSettlementTranscript,
+        Vec<ReferencePriceAttestation>,
+    ) {
+        let observed_at_unix_ms = 1_000;
+        let mut bound = transcript.clone();
+        bound.auction_verifier_address = verifier_address.into();
+        let attestations = bound
+            .batch_bindings
+            .iter_mut()
+            .enumerate()
+            .map(|(index, binding)| {
+                let base = problem
+                    .objective_weights
+                    .iter()
+                    .find(|weight| weight.asset_id == binding.base_asset_id)
+                    .expect("test base objective weight");
+                let quote = problem
+                    .objective_weights
+                    .iter()
+                    .find(|weight| weight.asset_id == binding.quote_asset_id)
+                    .expect("test quote objective weight");
+                let numerator = base
+                    .numerator
+                    .checked_mul(quote.denominator)
+                    .and_then(|value| value.checked_mul(binding.price_base_scale))
+                    .expect("test reference numerator");
+                let denominator = base
+                    .denominator
+                    .checked_mul(quote.numerator)
+                    .expect("test reference denominator");
+                assert_eq!(
+                    numerator % denominator,
+                    0,
+                    "test reference ratio must be exact"
+                );
+                let midpoint_price = numerator / denominator;
+                let source_set_commitment = reference_price_source_set_commitment(&[
+                    ("binance", midpoint_price),
+                    ("coinbase", midpoint_price),
+                    ("kraken", midpoint_price),
+                ])
+                .expect("test multi-pair reference source commitment");
+                let attestation = sign_reference_price_attestation(
+                    "0x12345",
+                    verifier_address,
+                    ReferencePriceEnvelope {
+                        pair_id: binding.pair_id.clone(),
+                        base_asset_id: binding.base_asset_id.clone(),
+                        quote_asset_id: binding.quote_asset_id.clone(),
+                        midpoint_price,
+                        lower_price: midpoint_price,
+                        upper_price: midpoint_price,
+                        price_base_scale: binding.price_base_scale,
+                        source_count: 3,
+                        observed_at_unix_ms,
+                    },
+                    &source_set_commitment,
+                    observed_at_unix_ms + 5_000,
+                    index as u64 + 1,
+                )
+                .expect("test multi-pair reference attestation");
+                binding.reference_price_attestation_commitment =
+                    reference_price_attestation_commitment(&attestation)
+                        .expect("test multi-pair reference attestation commitment");
+                binding.reference_price_signer = attestation.signer_public_key.clone();
+                binding.reference_price_observed_at_unix_ms = observed_at_unix_ms;
+                binding.reference_price_valid_until_unix_ms = attestation.valid_until_unix_ms;
+                attestation
+            })
+            .collect();
+        (bound, attestations)
+    }
+
+    fn build_test_multi_pair_settlement_witness(
+        transcript: &MultiPairSettlementTranscript,
+        verifier_address: &str,
+        problem: crate::MultiPairCandidateSetProblem,
+        matched_order_witnesses: Vec<MultiPairMatchedOrderWitness>,
+        admission_order_summaries: Vec<crate::MultiPairAdmissionOrderSummary>,
+    ) -> Result<crate::MultiPairSettlementWitness, ProtocolError> {
+        let (transcript, attestations) =
+            bind_test_multi_pair_reference_prices(transcript, &problem, verifier_address);
+        crate::build_multi_pair_settlement_witness(
+            &transcript,
+            verifier_address,
+            problem,
+            matched_order_witnesses,
+            admission_order_summaries,
+            attestations,
+        )
+    }
 
     fn with_deposit_prior_note_root(
         mut transcript: SettlementTranscript,
@@ -9140,8 +11195,8 @@ mod tests {
                 .map(deposit_root_from_note)
                 .collect::<Result<Vec<_>, _>>()
                 .expect("deposit roots");
-            transcript.prior_note_root = settlement_note_root_after_deposit_roots(&deposit_roots)
-                .expect("deposit note root");
+            transcript.prior_note_root =
+                note_accumulator_root_after_deposits(&deposit_roots).expect("deposit note root");
         }
         if transcript.new_nullifier_root == "0x0" {
             if transcript.consumed_inputs.is_empty() {
@@ -9229,12 +11284,18 @@ mod tests {
                     batch_id: BatchId(batch_id.into()),
                     pair_id: PairId("STRK/USDC".into()),
                     batch_epoch: 12,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: "0x111".into(),
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
                     clearing_price: 321,
@@ -10167,12 +12228,18 @@ mod tests {
                 batch_id: crate::BatchId("batch-1".into()),
                 pair_id: PairId("STRK/USDC".into()),
                 batch_epoch: 1,
+                auction_verifier_address: "0x123".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x1".into(),
+                reference_price_signer: "0x1".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
@@ -10210,8 +12277,19 @@ mod tests {
 
         let proof_commitment =
             proof_artifact_commitment("proof-sha", "public-inputs-sha").expect("proof");
-        let plan = build_settlement_submission_plan(&transcript, "0x123", &proof_commitment)
-            .expect("plan");
+        let (transcript, reference_price_attestation) = bind_test_reference_price(
+            &transcript,
+            "0x123",
+            &AssetId("STRK".into()),
+            &AssetId("USDC".into()),
+        );
+        let plan = build_settlement_submission_plan(
+            &transcript,
+            &reference_price_attestation,
+            "0x123",
+            &proof_commitment,
+        )
+        .expect("plan");
         assert_eq!(plan.settlement_call.contract_address, "0x123");
         assert_eq!(
             plan.settlement_call.entrypoint,
@@ -10225,7 +12303,7 @@ mod tests {
         assert_eq!(plan.proof_artifact_commitment, proof_commitment);
         assert_ne!(plan.encoded_args.consumed_note_root, "0x0");
         assert_ne!(plan.encoded_args.output_note_root, "0x0");
-        assert_eq!(plan.settlement_call.calldata.len(), 24);
+        assert_eq!(plan.settlement_call.calldata.len(), 30);
     }
 
     #[test]
@@ -10235,12 +12313,18 @@ mod tests {
                 batch_id: crate::BatchId("batch-1".into()),
                 pair_id: PairId("STRK/USDC".into()),
                 batch_epoch: 1,
+                auction_verifier_address: "0x123".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x1".into(),
+                reference_price_signer: "0x1".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 145,
@@ -10263,19 +12347,30 @@ mod tests {
 
         let proof_commitment =
             proof_artifact_commitment("proof-sha", "public-inputs-sha").expect("proof");
-        let plan = build_settlement_submission_plan(&transcript, "0x123", &proof_commitment)
-            .expect("plan");
+        let (transcript, reference_price_attestation) = bind_test_reference_price(
+            &transcript,
+            "0x123",
+            &AssetId("STRK".into()),
+            &AssetId("USDC".into()),
+        );
+        let plan = build_settlement_submission_plan(
+            &transcript,
+            &reference_price_attestation,
+            "0x123",
+            &proof_commitment,
+        )
+        .expect("plan");
 
         assert_eq!(
             plan.settlement_call.entrypoint,
             "submit_settlement_with_proof_facts"
         );
         assert_eq!(
-            plan.settlement_call.calldata[5],
+            plan.settlement_call.calldata[11],
             plan.encoded_args.clearing_price
         );
         assert_eq!(
-            plan.settlement_call.calldata[6],
+            plan.settlement_call.calldata[12],
             plan.encoded_args.price_base_scale
         );
     }
@@ -10291,12 +12386,18 @@ mod tests {
                 batch_id: crate::BatchId("batch-strk-usdc-1".into()),
                 pair_id: PairId("STRK/USDC".into()),
                 batch_epoch: 1,
+                auction_verifier_address: "0x123".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x1".into(),
+                reference_price_signer: "0x1".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 300,
@@ -10365,11 +12466,23 @@ mod tests {
             &[funding_note_a, funding_note_b],
         );
 
+        let (transcript, reference_price_attestation) = bind_test_reference_price(
+            &transcript,
+            "0x123",
+            &AssetId("STRK".into()),
+            &AssetId("USDC".into()),
+        );
         let commitment =
             settlement_transcript_commitment(&transcript).expect("transcript commitment");
-        let plan = build_settlement_submission_plan(&transcript, "0x123", "0x456").expect("plan");
+        let plan = build_settlement_submission_plan(
+            &transcript,
+            &reference_price_attestation,
+            "0x123",
+            "0x456",
+        )
+        .expect("plan");
         assert_eq!(commitment, plan.encoded_args.transcript_commitment);
-        assert_eq!(plan.settlement_call.calldata.len(), 24);
+        assert_eq!(plan.settlement_call.calldata.len(), 30);
     }
 
     fn settlement_binding_transcript() -> SettlementTranscript {
@@ -10377,12 +12490,18 @@ mod tests {
             batch_id: crate::BatchId("batch-binding".into()),
             pair_id: PairId("STRK/USDC".into()),
             batch_epoch: 7,
+            auction_verifier_address: "0x123".into(),
             order_commitment_root: "0x111".into(),
             encrypted_order_set_commitment: "0x222".into(),
+            reference_price_attestation_commitment: "0x1".into(),
+            reference_price_signer: "0x2".into(),
+            reference_price_observed_at_unix_ms: 1_000,
+            reference_price_valid_until_unix_ms: 6_000,
             prior_note_root: "0x333".into(),
             prior_nullifier_root: "0x444".into(),
             prior_renewal_root: "0x555".into(),
             prior_fee_root: "0x666".into(),
+            new_note_root: "0x1".into(),
             new_nullifier_root: "0x777".into(),
             new_renewal_root: "0x888".into(),
             clearing_price: 123,
@@ -10553,12 +12672,18 @@ mod tests {
             batch_id: BatchId("batch-fee-root-rows".into()),
             pair_id: PairId("ETH/USDC".into()),
             batch_epoch: 7,
+            auction_verifier_address: "0x123".into(),
             order_commitment_root: "0x111".into(),
             encrypted_order_set_commitment: "0x222".into(),
+            reference_price_attestation_commitment: "0x1".into(),
+            reference_price_signer: "0x2".into(),
+            reference_price_observed_at_unix_ms: 1_000,
+            reference_price_valid_until_unix_ms: 6_000,
             prior_note_root: "0x0".into(),
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            new_note_root: "0x1".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 0,
@@ -10636,12 +12761,18 @@ mod tests {
                 batch_id: crate::BatchId("batch-2".into()),
                 pair_id: PairId("STRK/ETH".into()),
                 batch_epoch: 9,
+                auction_verifier_address: "0x999".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x1".into(),
+                reference_price_signer: "0x1".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 200,
@@ -10736,12 +12867,18 @@ mod tests {
                     batch_id: crate::BatchId("batch-3".into()),
                     pair_id: PairId("STRK/USDC".into()),
                     batch_epoch: 12,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: "0x111".into(),
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
                     clearing_price: 321,
@@ -10825,9 +12962,9 @@ mod tests {
 
         assert_eq!(serialized[0], format!("0x{:x}", serialized.len() - 1));
         assert_eq!(serialized[1], "0x1");
-        assert_eq!(serialized[15], "0x141");
-        assert_eq!(serialized[16], "0x1");
-        assert_eq!(serialized[17], "0x4");
+        assert_eq!(serialized[27], "0x141");
+        assert_eq!(serialized[28], "0x1");
+        assert_eq!(serialized[29], "0x4");
         assert!(!serialized.is_empty());
     }
 
@@ -10862,12 +12999,18 @@ mod tests {
                     batch_id: crate::BatchId("batch-multi-input".into()),
                     pair_id: PairId("STRK/USDC".into()),
                     batch_epoch: 12,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: "0x111".into(),
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
                     clearing_price: 145,
@@ -11021,12 +13164,18 @@ mod tests {
                 batch_id: crate::BatchId("batch-mismatched-witnesses".into()),
                 pair_id: PairId("STRK/USDC".into()),
                 batch_epoch: 1,
+                auction_verifier_address: "0x999".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x1".into(),
+                reference_price_signer: "0x1".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 321,
@@ -11079,12 +13228,18 @@ mod tests {
             batch_id: crate::BatchId("batch-missing-membership".into()),
             pair_id: PairId("STRK/USDC".into()),
             batch_epoch: 12,
+            auction_verifier_address: "0x999".into(),
             order_commitment_root: "0x111".into(),
             encrypted_order_set_commitment: "0x222".into(),
+            reference_price_attestation_commitment: "0x1".into(),
+            reference_price_signer: "0x1".into(),
+            reference_price_observed_at_unix_ms: 1_000,
+            reference_price_valid_until_unix_ms: 6_000,
             prior_note_root: "0x123".into(),
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            new_note_root: "0x1".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 321,
@@ -11341,8 +13496,8 @@ mod tests {
             deposit_root_from_note(&input_a).expect("input a deposit root"),
             deposit_root_from_note(&input_b).expect("input b deposit root"),
         ];
-        let prior_note_root = settlement_note_root_after_deposit_roots(&input_deposit_roots)
-            .expect("prior note root");
+        let prior_note_root =
+            note_accumulator_root_after_deposits(&input_deposit_roots).expect("prior note root");
         let input_nullifiers = vec![sample_nullifier(&input_a), sample_nullifier(&input_b)];
         let (prior_nullifier_root, new_nullifier_root, nullifier_sparse_witnesses) =
             super::nullifier_sparse_update_witnesses_for_nullifiers(&[], &input_nullifiers)
@@ -11387,6 +13542,12 @@ mod tests {
         recovery_commitments.extend(recovery_dummy_commitments.iter().cloned());
         let output_ciphertext_bundle_ref =
             output_recovery_bundle_root(&recovery_commitments).expect("output bundle ref");
+        let output_note_root =
+            output_note_merkle_root(&output_notes, &output_ciphertext_bundle_ref)
+                .expect("output note root");
+        let new_note_root =
+            note_accumulator_root_after_append(&input_deposit_roots, &output_note_root)
+                .expect("new note root");
 
         let mut witness = NoteConsolidationWitness {
             consolidation_id,
@@ -11403,6 +13564,7 @@ mod tests {
             output_recovery_records: vec![recovery_record],
             output_recovery_dummy_commitments: recovery_dummy_commitments,
             output_ciphertext_bundle_ref,
+            new_note_root,
             new_nullifier_root,
         };
         let consolidation_commitment =
@@ -11438,6 +13600,10 @@ mod tests {
             "submit_note_consolidation_with_proof_facts"
         );
         assert_eq!(plan.consolidation_call.calldata.len(), 10);
+        assert_eq!(
+            plan.encoded_args.consolidation_id,
+            encode_starknet_felt("note-consolidation-id", &witness.consolidation_id.0)
+        );
         assert_eq!(
             plan.encoded_args.proof_artifact_commitment,
             statement_message
@@ -11480,6 +13646,19 @@ mod tests {
 
         assert!(
             matches!(error, ProtocolError::Crypto(message) if message.contains("nonce must be non-zero"))
+        );
+    }
+
+    #[test]
+    fn note_consolidation_rejects_ids_outside_consolidation_namespace() {
+        let mut witness = sample_note_consolidation_witness();
+        witness.consolidation_id = BatchId("arbitrary-id".into());
+
+        let error = note_consolidation_commitment(&witness)
+            .expect_err("ambiguous output-root id domain must be rejected");
+
+        assert!(
+            matches!(error, ProtocolError::Crypto(message) if message.contains("consolidation- namespace"))
         );
     }
 
@@ -11533,12 +13712,18 @@ mod tests {
                     batch_id: crate::BatchId("batch-asset-owner".into()),
                     pair_id: PairId("STRK/USDC".into()),
                     batch_epoch: 22,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: "0x111".into(),
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
                     clearing_price: 321,
@@ -11699,13 +13884,14 @@ mod tests {
         let _nullifier_sparse_path_values = read_serialized_span(&serialized, &mut index);
         let _nullifier_sparse_path_directions = read_serialized_span(&serialized, &mut index);
         let note_membership_kinds = read_serialized_span(&serialized, &mut index);
-        let _note_membership_prefix_roots = read_serialized_span(&serialized, &mut index);
         let note_membership_batch_roots = read_serialized_span(&serialized, &mut index);
         let note_membership_path_counts = read_serialized_span(&serialized, &mut index);
         let note_membership_path_values = read_serialized_span(&serialized, &mut index);
         let note_membership_path_directions = read_serialized_span(&serialized, &mut index);
-        let note_membership_suffix_counts = read_serialized_span(&serialized, &mut index);
-        let _note_membership_suffix_roots = read_serialized_span(&serialized, &mut index);
+        let note_membership_accumulator_path_counts = read_serialized_span(&serialized, &mut index);
+        let note_membership_accumulator_path_values = read_serialized_span(&serialized, &mut index);
+        let note_membership_accumulator_path_directions =
+            read_serialized_span(&serialized, &mut index);
         let renewal_parent_order_commitments = read_serialized_span(&serialized, &mut index);
         let renewal_child_nullifiers = read_serialized_span(&serialized, &mut index);
         let _renewal_child_sparse_key_lows = read_serialized_span(&serialized, &mut index);
@@ -11723,8 +13909,8 @@ mod tests {
         let _output_note_amounts = read_serialized_span(&serialized, &mut index);
         let _output_note_withdraw_authorities = read_serialized_span(&serialized, &mut index);
 
-        assert_eq!(serialized[13], base_asset);
-        assert_eq!(serialized[14], quote_asset);
+        assert_eq!(serialized[25], base_asset);
+        assert_eq!(serialized[26], quote_asset);
         assert_eq!(matched_order_types, vec!["0x0".to_string()]);
         assert_eq!(matched_relay_modes, vec!["0x0".to_string()]);
         assert_eq!(matched_time_in_force, vec!["0x0".to_string()]);
@@ -11747,7 +13933,12 @@ mod tests {
         assert_eq!(note_membership_path_counts, vec!["0x0".to_string()]);
         assert!(note_membership_path_values.is_empty());
         assert!(note_membership_path_directions.is_empty());
-        assert_eq!(note_membership_suffix_counts, vec!["0x0".to_string()]);
+        assert_eq!(
+            note_membership_accumulator_path_counts,
+            vec!["0x20".to_string()]
+        );
+        assert_eq!(note_membership_accumulator_path_values.len(), 32);
+        assert_eq!(note_membership_accumulator_path_directions.len(), 32);
         assert_eq!(matched_funding_note_asset_ids, vec![quote_asset.clone()]);
         assert_eq!(matched_output_note_asset_ids, vec![base_asset.clone()]);
         assert_eq!(output_note_asset_ids, vec![base_asset.clone()]);
@@ -11815,12 +14006,18 @@ mod tests {
                     batch_id: crate::BatchId("batch-auction-bind".into()),
                     pair_id: private_order.order.pair_id.clone(),
                     batch_epoch: private_order.order.expiry_epoch,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: order_root,
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
                     clearing_price: 145,
@@ -12046,12 +14243,18 @@ mod tests {
                     batch_id: crate::BatchId("batch-auction-bind".into()),
                     pair_id: private_order.order.pair_id.clone(),
                     batch_epoch: private_order.order.expiry_epoch,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: order_root,
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
                     clearing_price: 145,
@@ -12177,15 +14380,21 @@ mod tests {
                     batch_id: BatchId("batch-strk-usdc-empty".into()),
                     pair_id: PairId("STRK/USDC".into()),
                     batch_epoch: 42,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: order_root,
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
-                    clearing_price: 0,
+                    clearing_price: 1,
                     price_base_scale: 1,
                     taker_fee_bps: 4,
                     protocol_fee_recipient: "zylith-protocol-treasury".into(),
@@ -12222,13 +14431,13 @@ mod tests {
         index += 1;
         let settlement_payload = read_serialized_span(&serialized, &mut index);
         assert_eq!(settlement_payload[0], "0x1");
-        assert_eq!(settlement_payload[14], "0x0");
-        assert_eq!(settlement_payload[15], "0x1");
-        assert_eq!(settlement_payload[16], "0x4");
-        assert_eq!(settlement_payload[18], "0x0");
-        assert_ne!(settlement_payload[19], "0x0");
-        assert_eq!(settlement_payload[20], "0x0");
-        assert_eq!(settlement_payload[23], "0x0");
+        assert_eq!(settlement_payload[26], "0x1");
+        assert_eq!(settlement_payload[27], "0x1");
+        assert_eq!(settlement_payload[28], "0x4");
+        assert_eq!(settlement_payload[30], "0x0");
+        assert_ne!(settlement_payload[31], "0x0");
+        assert_eq!(settlement_payload[32], "0x0");
+        assert_eq!(settlement_payload[35], "0x0");
 
         let mut admission_vector_count = 0;
         while index < serialized.len() {
@@ -12245,12 +14454,18 @@ mod tests {
             batch_id: BatchId("batch-empty-root".into()),
             pair_id: PairId("STRK/USDC".into()),
             batch_epoch: 42,
+            auction_verifier_address: "0x123".into(),
             order_commitment_root: "0x111".into(),
             encrypted_order_set_commitment: "0x222".into(),
+            reference_price_attestation_commitment: "0x1".into(),
+            reference_price_signer: "0x2".into(),
+            reference_price_observed_at_unix_ms: 1_000,
+            reference_price_valid_until_unix_ms: 6_000,
             prior_note_root: "0x0".into(),
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            new_note_root: "0x1".into(),
             new_nullifier_root: "0x0".into(),
             new_renewal_root: "0x0".into(),
             clearing_price: 0,
@@ -12286,12 +14501,18 @@ mod tests {
                 batch_id: BatchId("batch-output-bundle-mismatch".into()),
                 pair_id: PairId("ETH/USDC".into()),
                 batch_epoch: 43,
+                auction_verifier_address: "0x123".into(),
                 order_commitment_root: "0x111".into(),
                 encrypted_order_set_commitment: "0x222".into(),
+                reference_price_attestation_commitment: "0x1".into(),
+                reference_price_signer: "0x2".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 prior_note_root: "0x0".into(),
                 prior_nullifier_root: "0x0".into(),
                 prior_renewal_root: "0x0".into(),
                 prior_fee_root: "0x0".into(),
+                new_note_root: "0x1".into(),
                 new_nullifier_root: "0x0".into(),
                 new_renewal_root: "0x0".into(),
                 clearing_price: 0,
@@ -12439,12 +14660,18 @@ mod tests {
                     batch_id: crate::BatchId("batch-auction-bind".into()),
                     pair_id: private_order.order.pair_id.clone(),
                     batch_epoch: private_order.order.expiry_epoch,
+                    auction_verifier_address: "0x999".into(),
                     order_commitment_root: order_root,
                     encrypted_order_set_commitment: "0x222".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     prior_note_root: "0x0".into(),
                     prior_nullifier_root: "0x0".into(),
                     prior_renewal_root: "0x0".into(),
                     prior_fee_root: "0x0".into(),
+                    new_note_root: "0x1".into(),
                     new_nullifier_root: "0x0".into(),
                     new_renewal_root: "0x0".into(),
                     clearing_price: 145,
@@ -12872,15 +15099,42 @@ mod tests {
     }
 
     #[test]
+    fn external_match_authorization_proof_message_binds_request_root() {
+        let proof_program = "0x0123";
+        let verifier = "0x030f8072f3c6a9261704b056875cc0983335f7e95540026bfd359c9ee5c1041d";
+        let signer = "0x0456";
+        let first = crate::external_match_authorization_proof_message_hash_for_program(
+            proof_program,
+            verifier,
+            "batch-alpha",
+            "0x789",
+            "0xabc",
+            signer,
+        )
+        .expect("external authorization proof message");
+        let second = crate::external_match_authorization_proof_message_hash_for_program(
+            proof_program,
+            verifier,
+            "batch-alpha",
+            "0x789",
+            "0xabd",
+            signer,
+        )
+        .expect("different external authorization proof message");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn multi_pair_settlement_commitment_binds_member_batch_metadata() {
-        let (base, problem, witnesses) = sample_multi_pair_settlement();
+        let (base, problem, witnesses, summaries) = sample_multi_pair_settlement();
         let base_commitment =
             crate::multi_pair_settlement_transcript_commitment(&base).expect("base commitment");
         let base_roots =
             crate::multi_pair_root_only_settlement_commitments(&base).expect("base roots");
 
         let settlement_witness =
-            crate::build_multi_pair_settlement_witness(&base, "0x123", problem, witnesses)
+            build_test_multi_pair_settlement_witness(&base, "0x123", problem, witnesses, summaries)
                 .expect("multi-pair settlement witness");
         assert_eq!(settlement_witness.transcript_commitment, base_commitment);
         assert_eq!(
@@ -12915,7 +15169,12 @@ mod tests {
                 pair_id: PairId("ETH/USDC".into()),
                 batch_epoch: 99,
                 order_commitment_root: "0x3111".into(),
+                admission_root: "0x4111".into(),
                 encrypted_order_set_commitment: "0x3211".into(),
+                reference_price_attestation_commitment: "0x5111".into(),
+                reference_price_signer: "0x6111".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 base_asset_id: AssetId("ETH".into()),
                 quote_asset_id: AssetId("USDC".into()),
                 price_base_scale: 1,
@@ -12926,7 +15185,12 @@ mod tests {
                 pair_id: PairId("ETH/STRK".into()),
                 batch_epoch: 99,
                 order_commitment_root: "0x3112".into(),
+                admission_root: "0x4112".into(),
                 encrypted_order_set_commitment: "0x3212".into(),
+                reference_price_attestation_commitment: "0x5112".into(),
+                reference_price_signer: "0x6111".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 base_asset_id: AssetId("ETH".into()),
                 quote_asset_id: AssetId("STRK".into()),
                 price_base_scale: 1,
@@ -12937,7 +15201,12 @@ mod tests {
                 pair_id: PairId("STRK/USDC".into()),
                 batch_epoch: 99,
                 order_commitment_root: "0x3113".into(),
+                admission_root: "0x4113".into(),
                 encrypted_order_set_commitment: "0x3213".into(),
+                reference_price_attestation_commitment: "0x5113".into(),
+                reference_price_signer: "0x6111".into(),
+                reference_price_observed_at_unix_ms: 1_000,
+                reference_price_valid_until_unix_ms: 6_000,
                 base_asset_id: AssetId("STRK".into()),
                 quote_asset_id: AssetId("USDC".into()),
                 price_base_scale: 1,
@@ -12947,18 +15216,19 @@ mod tests {
 
         assert_eq!(
             crate::multi_pair_batch_binding_root(&bindings).expect("batch binding root"),
-            "0x636e338984425c86cc7e95afef3d34d1884224f13ed82a78fffab30df0351b9"
+            "0x7c78b6cfd03a22fade7d7a6de9e346e1df160669fbfb92ac2c2544fd0ca3072"
         );
     }
 
     #[test]
-    fn multi_pair_settlement_serialization_carries_group_and_nested_optimality_witness() {
-        let (transcript, problem, witnesses) = sample_multi_pair_settlement();
-        let witness = crate::build_multi_pair_settlement_witness(
+    fn multi_pair_settlement_serialization_carries_group_and_nested_candidate_set_witness() {
+        let (transcript, problem, witnesses, summaries) = sample_multi_pair_settlement();
+        let witness = build_test_multi_pair_settlement_witness(
             &transcript,
             "0x123",
             problem.clone(),
             witnesses,
+            summaries,
         )
         .expect("multi-pair settlement witness");
 
@@ -12968,7 +15238,18 @@ mod tests {
         let batch_ids = read_serialized_span(&serialized, &mut index);
         let pair_ids = read_serialized_span(&serialized, &mut index);
         let _order_roots = read_serialized_span(&serialized, &mut index);
+        let _admission_roots = read_serialized_span(&serialized, &mut index);
         let _encrypted_roots = read_serialized_span(&serialized, &mut index);
+        let _reference_commitments = read_serialized_span(&serialized, &mut index);
+        let _reference_signers = read_serialized_span(&serialized, &mut index);
+        let _reference_observed_at = read_serialized_span(&serialized, &mut index);
+        let _reference_valid_until = read_serialized_span(&serialized, &mut index);
+        let _reference_midpoints = read_serialized_span(&serialized, &mut index);
+        let _reference_lowers = read_serialized_span(&serialized, &mut index);
+        let _reference_uppers = read_serialized_span(&serialized, &mut index);
+        let _reference_source_counts = read_serialized_span(&serialized, &mut index);
+        let _reference_source_sets = read_serialized_span(&serialized, &mut index);
+        let _reference_nonces = read_serialized_span(&serialized, &mut index);
         let _base_assets = read_serialized_span(&serialized, &mut index);
         let _quote_assets = read_serialized_span(&serialized, &mut index);
         let _price_scales = read_serialized_span(&serialized, &mut index);
@@ -12987,11 +15268,20 @@ mod tests {
 
     #[test]
     fn multi_pair_settlement_submission_plan_targets_group_entrypoint() {
-        let (transcript, _problem, _witnesses) = sample_multi_pair_settlement();
+        let (transcript, problem, witnesses, summaries) = sample_multi_pair_settlement();
+        let witness = build_test_multi_pair_settlement_witness(
+            &transcript,
+            "0x123",
+            problem,
+            witnesses,
+            summaries,
+        )
+        .expect("multi-pair settlement witness");
 
         let plan = crate::build_multi_pair_settlement_submission_plan(
             &transcript,
-            "0x030f8072f3c6a9261704b056875cc0983335f7e95540026bfd359c9ee5c1041d",
+            &witness.reference_price_attestations,
+            "0x123",
             "0x456",
         )
         .expect("submission plan");
@@ -13007,12 +15297,17 @@ mod tests {
 
     #[test]
     fn multi_pair_settlement_rejects_fill_order_witness_mismatch() {
-        let (transcript, problem, mut witnesses) = sample_multi_pair_settlement();
+        let (transcript, problem, mut witnesses, summaries) = sample_multi_pair_settlement();
         witnesses[0].order_witness.filled_amount += 1;
 
-        let error =
-            crate::build_multi_pair_settlement_witness(&transcript, "0x123", problem, witnesses)
-                .expect_err("mismatched fill rejected");
+        let error = build_test_multi_pair_settlement_witness(
+            &transcript,
+            "0x123",
+            problem,
+            witnesses,
+            summaries,
+        )
+        .expect_err("mismatched fill rejected");
 
         assert!(
             matches!(error, ProtocolError::InvalidSettlementProof(message) if
@@ -13020,10 +15315,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multi_pair_settlement_rejects_eligible_set_that_omits_an_admitted_order() {
+        let (mut transcript, problem, witnesses, mut summaries) = sample_multi_pair_settlement();
+        let mut omitted_summary = summaries[0].clone();
+        omitted_summary.order_commitment = OrderCommitment("0x1004".into());
+        summaries.push(omitted_summary);
+        let affected_batch_id = summaries.last().expect("omitted summary").batch_id.clone();
+        let member_summaries = summaries
+            .iter()
+            .filter(|summary| summary.batch_id == affected_batch_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let binding = transcript
+            .batch_bindings
+            .iter_mut()
+            .find(|binding| binding.batch_id == affected_batch_id)
+            .expect("affected binding");
+        binding.order_commitment_root = ordered_felt_list_commitment(
+            "zylith/batch-order-root",
+            &member_summaries
+                .iter()
+                .map(|summary| summary.order_commitment.0.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("member order root");
+        binding.admission_root = crate::multi_pair_admission_root_from_summaries(&member_summaries)
+            .expect("member admission root");
+
+        let error = build_test_multi_pair_settlement_witness(
+            &transcript,
+            "0x123",
+            problem,
+            witnesses,
+            summaries,
+        )
+        .expect_err("omitted admitted order rejected");
+
+        assert!(
+            matches!(error, ProtocolError::InvalidSettlementProof(message) if
+            message.contains("eligible order set does not match admitted executable orders"))
+        );
+    }
+
     fn sample_multi_pair_settlement() -> (
         MultiPairSettlementTranscript,
-        crate::MultiPairOptimalityProblem,
+        crate::MultiPairCandidateSetProblem,
         Vec<MultiPairMatchedOrderWitness>,
+        Vec<crate::MultiPairAdmissionOrderSummary>,
     ) {
         let order_a = MultiPairExecutableOrder {
             order_commitment: OrderCommitment("0x1001".into()),
@@ -13114,7 +15453,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("deposit roots");
         let prior_note_root =
-            settlement_note_root_after_deposit_roots(&deposit_roots).expect("prior note root");
+            note_accumulator_root_after_deposits(&deposit_roots).expect("prior note root");
         let new_nullifier_root =
             super::nullifier_sparse_update_witnesses_for_consumed_inputs(&[], &consumed_inputs)
                 .expect("nullifier sparse")
@@ -13183,16 +15522,27 @@ mod tests {
         recovery_commitments.extend(output_recovery_dummy_commitments.iter().cloned());
         let output_ciphertext_bundle_ref =
             output_recovery_bundle_root(&recovery_commitments).expect("output recovery bundle");
-        let transcript = MultiPairSettlementTranscript {
+        let output_note_root =
+            output_note_merkle_root(&output_notes, &output_ciphertext_bundle_ref)
+                .expect("output note root");
+        let new_note_root = note_accumulator_root_after_append(&deposit_roots, &output_note_root)
+            .expect("new note root");
+        let mut transcript = MultiPairSettlementTranscript {
             group_id,
             batch_epoch: 99,
+            auction_verifier_address: "0x123".into(),
             batch_bindings: vec![
                 MultiPairSettlementBatchBinding {
                     batch_id: BatchId("batch-eth-usdc-99".into()),
                     pair_id: PairId("ETH/USDC".into()),
                     batch_epoch: 99,
                     order_commitment_root: "0x111".into(),
+                    admission_root: "0x1".into(),
                     encrypted_order_set_commitment: "0x211".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     base_asset_id: AssetId("ETH".into()),
                     quote_asset_id: AssetId("USDC".into()),
                     price_base_scale: 1,
@@ -13203,7 +15553,12 @@ mod tests {
                     pair_id: PairId("ETH/STRK".into()),
                     batch_epoch: 99,
                     order_commitment_root: "0x112".into(),
+                    admission_root: "0x1".into(),
                     encrypted_order_set_commitment: "0x212".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     base_asset_id: AssetId("ETH".into()),
                     quote_asset_id: AssetId("STRK".into()),
                     price_base_scale: 1,
@@ -13214,7 +15569,12 @@ mod tests {
                     pair_id: PairId("STRK/USDC".into()),
                     batch_epoch: 99,
                     order_commitment_root: "0x113".into(),
+                    admission_root: "0x1".into(),
                     encrypted_order_set_commitment: "0x213".into(),
+                    reference_price_attestation_commitment: "0x1".into(),
+                    reference_price_signer: "0x1".into(),
+                    reference_price_observed_at_unix_ms: 1_000,
+                    reference_price_valid_until_unix_ms: 6_000,
                     base_asset_id: AssetId("STRK".into()),
                     quote_asset_id: AssetId("USDC".into()),
                     price_base_scale: 1,
@@ -13225,10 +15585,12 @@ mod tests {
             prior_nullifier_root: "0x0".into(),
             prior_renewal_root: "0x0".into(),
             prior_fee_root: "0x0".into(),
+            new_note_root,
             new_nullifier_root,
             new_renewal_root: "0x0".into(),
             protocol_fee_recipient: "zylith-protocol-treasury".into(),
             multi_pair_commitment,
+            external_match_settlements: vec![],
             matched_orders: problem
                 .chosen
                 .fills
@@ -13315,7 +15677,52 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        (transcript, problem, witnesses)
+        let admission_order_summaries = witnesses
+            .iter()
+            .map(|entry| crate::MultiPairAdmissionOrderSummary {
+                batch_id: entry.batch_id.clone(),
+                order_commitment: entry.order_witness.order_commitment.clone(),
+                side: entry.order_witness.side,
+                order_type: entry.order_witness.order_type,
+                relay_mode: entry.order_witness.relay_mode.clone(),
+                limit_price: entry.order_witness.limit_price,
+                order_amount: entry.order_witness.order_amount,
+                min_fill: entry.order_witness.min_fill,
+                time_in_force: entry.order_witness.time_in_force,
+                execution_preference: entry.order_witness.execution_preference,
+                funding_note_amount: entry
+                    .order_witness
+                    .effective_funding_notes()
+                    .iter()
+                    .map(|note| note.amount)
+                    .sum(),
+                funding_note_owner_public_key: entry
+                    .order_witness
+                    .funding_note
+                    .owner_public_key
+                    .clone(),
+            })
+            .collect::<Vec<_>>();
+        for binding in &mut transcript.batch_bindings {
+            let member_summaries = admission_order_summaries
+                .iter()
+                .filter(|summary| summary.batch_id == binding.batch_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            binding.order_commitment_root = ordered_felt_list_commitment(
+                "zylith/batch-order-root",
+                &member_summaries
+                    .iter()
+                    .map(|summary| summary.order_commitment.0.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("member order root");
+            binding.admission_root =
+                crate::multi_pair_admission_root_from_summaries(&member_summaries)
+                    .expect("member admission root");
+        }
+        transcript = bind_test_multi_pair_reference_prices(&transcript, &problem, "0x123").0;
+        (transcript, problem, witnesses, admission_order_summaries)
     }
 
     #[test]
@@ -13388,6 +15795,96 @@ mod tests {
 
         assert_eq!(direct, composed);
         assert_ne!(direct, settlement);
+    }
+
+    #[test]
+    fn reference_price_attestation_binds_scope_prices_sources_and_expiry() {
+        let private_key = "0x123456789";
+        let verifier = "0x456";
+        let observed_at = 1_000_000;
+        let source_set_commitment = reference_price_source_set_commitment(&serde_json::json!({
+            "binance": [3999, 4001],
+            "coinbase": [3998, 4002],
+            "kraken": [3999, 4002],
+        }))
+        .expect("source set commitment");
+        let attestation = sign_reference_price_attestation(
+            private_key,
+            verifier,
+            ReferencePriceEnvelope {
+                pair_id: PairId("ETH/USDC".into()),
+                base_asset_id: AssetId("ETH".into()),
+                quote_asset_id: AssetId("USDC".into()),
+                midpoint_price: 4_000,
+                lower_price: 3_994,
+                upper_price: 4_006,
+                price_base_scale: 1,
+                source_count: 3,
+                observed_at_unix_ms: observed_at,
+            },
+            &source_set_commitment,
+            observed_at + 5_000,
+            7,
+        )
+        .expect("signed reference price attestation");
+
+        assert!(
+            verify_reference_price_attestation(
+                &attestation,
+                &attestation.signer_public_key,
+                verifier,
+                observed_at + 1_000,
+            )
+            .expect("reference price attestation verification")
+        );
+        assert!(
+            !verify_reference_price_attestation(
+                &attestation,
+                &attestation.signer_public_key,
+                "0x457",
+                observed_at + 1_000,
+            )
+            .expect("cross-contract replay rejection")
+        );
+        assert!(
+            !verify_reference_price_attestation(
+                &attestation,
+                &attestation.signer_public_key,
+                verifier,
+                observed_at + 5_001,
+            )
+            .expect("expired attestation rejection")
+        );
+
+        let original_commitment =
+            reference_price_attestation_commitment(&attestation).expect("attestation commitment");
+        let mut changed = attestation.clone();
+        changed.envelope.midpoint_price += 1;
+        assert_ne!(
+            reference_price_attestation_commitment(&changed).expect("changed commitment"),
+            original_commitment
+        );
+        assert!(
+            !verify_reference_price_attestation(
+                &changed,
+                &changed.signer_public_key,
+                verifier,
+                observed_at + 1_000,
+            )
+            .expect("tampered price rejection")
+        );
+
+        let mut changed = attestation.clone();
+        changed.source_set_commitment = "0x888".into();
+        assert!(
+            !verify_reference_price_attestation(
+                &changed,
+                &changed.signer_public_key,
+                verifier,
+                observed_at + 1_000,
+            )
+            .expect("tampered source set rejection")
+        );
     }
 
     fn private_execution_keys() -> Vec<PrivateExecutionKeyPrivateConfig> {

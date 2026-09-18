@@ -7,7 +7,7 @@ use crate::{
     hash::{field_from_u64, normalize_felt_hex},
     types::{
         AssetId, BatchId, ExecutionPreference, OrderCommitment, OrderSide, PairId,
-        base_amount_affordable_for_quote, quote_amount_for_base_amount,
+        quote_amount_for_base_amount,
     },
 };
 
@@ -19,6 +19,7 @@ pub const DEFAULT_MULTI_PAIR_MAX_CYCLE_LEN: usize = 4;
 const MAX_MULTI_PAIR_ROUNDING_SEARCH_STEPS: usize = 4096;
 const MAX_MULTI_PAIR_PACKAGE_SEARCH_NODES: usize = 4096;
 const MAX_MULTI_PAIR_PACKAGE_CYCLES: usize = 8;
+const MAX_MULTI_PAIR_REFERENCE_COMPONENT: u128 = u64::MAX as u128;
 
 type AssetTotals = BTreeMap<String, u128>;
 
@@ -31,7 +32,6 @@ pub enum MultiPairAssetDeltaDirection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MultiPairAssetDeltaSource {
     User,
-    ExternalCompletion,
     Fee,
 }
 
@@ -67,7 +67,8 @@ pub struct MultiPairFill {
     pub filled_base_amount: u128,
     #[serde(with = "crate::types::serde_u128_decimal")]
     pub quote_amount: u128,
-    #[serde(default, with = "crate::types::serde_u128_decimal")]
+    pub taker_fee_bps: u16,
+    #[serde(with = "crate::types::serde_u128_decimal")]
     pub fee_amount: u128,
 }
 
@@ -111,7 +112,7 @@ pub struct MultiPairCandidateSolution {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MultiPairOptimalityProblem {
+pub struct MultiPairCandidateSetProblem {
     pub chosen: MultiPairFeasibilityProblem,
     pub eligible_order_commitments: Vec<OrderCommitment>,
     pub objective_weights: Vec<MultiPairObjectiveWeight>,
@@ -120,7 +121,7 @@ pub struct MultiPairOptimalityProblem {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MultiPairOptimalityReport {
+pub struct MultiPairCandidateSetReport {
     pub feasibility: MultiPairFeasibilityReport,
     #[serde(with = "crate::types::serde_u128_decimal")]
     pub chosen_objective: u128,
@@ -169,12 +170,12 @@ impl Default for MultiPairNettingConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MultiPairNettingPlan {
-    pub problem: MultiPairOptimalityProblem,
+    pub problem: MultiPairCandidateSetProblem,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MultiPairExternalCompletionObligation {
+pub struct MultiPairExternalMatchObligation {
     pub pair_id: PairId,
     pub base_asset_id: AssetId,
     pub quote_asset_id: AssetId,
@@ -201,15 +202,22 @@ pub fn plan_multi_pair_netting(
     validate_multi_pair_netting_config(&config)?;
     validate_executable_orders(orders)?;
     let objective_weight_map = validate_objective_weights(&objective_weights)?;
-    let graph_candidates = enumerate_multi_pair_graph_candidates(&batch_id, orders, &config)?;
+    let graph_candidates =
+        enumerate_multi_pair_graph_candidates(&batch_id, orders, &objective_weight_map, &config)?;
     let graph_candidates = deduplicate_multi_pair_graph_candidates(graph_candidates)?;
-    let graph_candidates = compose_multi_pair_graph_candidate_packages(
+    let mut graph_candidates = compose_multi_pair_graph_candidate_packages(
         &batch_id,
         graph_candidates,
         &objective_weight_map,
     )?;
     if graph_candidates.is_empty() {
-        return Ok(None);
+        graph_candidates.push(MultiPairGraphCandidate {
+            solution: MultiPairCandidateSolution {
+                solution_id: "external-only".into(),
+                fills: Vec::new(),
+                asset_deltas: Vec::new(),
+            },
+        });
     }
     if graph_candidates.len() > MAX_MULTI_PAIR_CANDIDATE_SOLUTIONS {
         return Err(ProtocolError::InvalidSettlementProof(format!(
@@ -244,7 +252,7 @@ pub fn plan_multi_pair_netting(
         fills: chosen_candidate.fills,
         asset_deltas: chosen_candidate.asset_deltas,
     };
-    let problem = MultiPairOptimalityProblem {
+    let problem = MultiPairCandidateSetProblem {
         chosen,
         eligible_order_commitments: orders
             .iter()
@@ -253,14 +261,14 @@ pub fn plan_multi_pair_netting(
         objective_weights,
         candidate_solutions: candidates,
     };
-    verify_multi_pair_optimality(&problem)?;
+    verify_multi_pair_candidate_set(&problem)?;
     Ok(Some(MultiPairNettingPlan { problem }))
 }
 
-pub fn derive_multi_pair_external_completion_obligations(
+pub fn derive_multi_pair_external_match_obligations(
     orders: &[MultiPairExecutableOrder],
     private_plan: Option<&MultiPairNettingPlan>,
-) -> Result<Vec<MultiPairExternalCompletionObligation>, ProtocolError> {
+) -> Result<Vec<MultiPairExternalMatchObligation>, ProtocolError> {
     validate_executable_orders(orders)?;
     let mut order_inputs = BTreeMap::<String, &MultiPairExecutableOrder>::new();
     for order in orders {
@@ -318,9 +326,9 @@ pub fn derive_multi_pair_external_completion_obligations(
     }
 
     let mut grouped =
-        BTreeMap::<MultiPairExternalCompletionKey, MultiPairExternalCompletionObligation>::new();
+        BTreeMap::<MultiPairExternalMatchKey, MultiPairExternalMatchObligation>::new();
     for order in orders {
-        if !order.execution_preference.allows_external_completion() {
+        if !order.execution_preference.allows_external_match() {
             continue;
         }
         let commitment = normalize_felt_hex(&order.order_commitment.0)?;
@@ -358,17 +366,11 @@ pub fn derive_multi_pair_external_completion_obligations(
                     order.price_base_scale,
                 )?;
                 let input_amount = remaining_input_capacity.min(limit_quote);
-                let gross_output_amount = base_amount_affordable_for_quote(
-                    input_amount,
-                    order.limit_price,
-                    order.price_base_scale,
-                )?
-                .min(remaining_base);
                 (
                     order.quote_asset_id.clone(),
                     order.base_asset_id.clone(),
                     input_amount,
-                    gross_output_amount,
+                    remaining_base,
                 )
             }
             OrderSide::Sell => {
@@ -390,7 +392,7 @@ pub fn derive_multi_pair_external_completion_obligations(
             continue;
         }
 
-        let key = MultiPairExternalCompletionKey {
+        let key = MultiPairExternalMatchKey {
             pair_id: order.pair_id.0.clone(),
             base_asset_id: order.base_asset_id.0.clone(),
             quote_asset_id: order.quote_asset_id.0.clone(),
@@ -406,7 +408,7 @@ pub fn derive_multi_pair_external_completion_obligations(
                     .checked_add(input_amount)
                     .ok_or_else(|| {
                         ProtocolError::InvalidSettlementProof(
-                            "multi-pair external completion input overflows".into(),
+                            "multi-pair external match input overflows".into(),
                         )
                     })?;
                 obligation.gross_output_amount = obligation
@@ -414,7 +416,7 @@ pub fn derive_multi_pair_external_completion_obligations(
                     .checked_add(gross_output_amount)
                     .ok_or_else(|| {
                         ProtocolError::InvalidSettlementProof(
-                            "multi-pair external completion output overflows".into(),
+                            "multi-pair external match output overflows".into(),
                         )
                     })?;
                 obligation
@@ -422,7 +424,7 @@ pub fn derive_multi_pair_external_completion_obligations(
                     .push(OrderCommitment(commitment));
             }
             Entry::Vacant(entry) => {
-                entry.insert(MultiPairExternalCompletionObligation {
+                entry.insert(MultiPairExternalMatchObligation {
                     pair_id: order.pair_id.clone(),
                     base_asset_id: order.base_asset_id.clone(),
                     quote_asset_id: order.quote_asset_id.clone(),
@@ -442,7 +444,7 @@ pub fn derive_multi_pair_external_completion_obligations(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct MultiPairExternalCompletionKey {
+struct MultiPairExternalMatchKey {
     pair_id: String,
     base_asset_id: String,
     quote_asset_id: String,
@@ -477,14 +479,15 @@ fn verify_multi_pair_feasibility_parts(
     })
 }
 
-pub fn verify_multi_pair_optimality(
-    problem: &MultiPairOptimalityProblem,
-) -> Result<MultiPairOptimalityReport, ProtocolError> {
+pub fn verify_multi_pair_candidate_set(
+    problem: &MultiPairCandidateSetProblem,
+) -> Result<MultiPairCandidateSetReport, ProtocolError> {
     let feasibility = verify_multi_pair_feasibility(&problem.chosen)?;
     validate_candidate_shape(problem)?;
     let eligible = normalized_commitment_set(&problem.eligible_order_commitments)?;
     assert_fills_are_eligible(&problem.chosen.fills, &eligible, "chosen multi-pair fill")?;
     let objective_weights = validate_objective_weights(&problem.objective_weights)?;
+    validate_reference_priced_fills(&problem.chosen.fills, &objective_weights)?;
     let chosen_objective = score_multi_pair_solution(&problem.chosen.fills, &objective_weights)?;
     let mut best_candidate_objective = chosen_objective;
 
@@ -495,6 +498,7 @@ pub fn verify_multi_pair_optimality(
             )));
         }
         assert_fills_are_eligible(&candidate.fills, &eligible, "candidate multi-pair fill")?;
+        validate_reference_priced_fills(&candidate.fills, &objective_weights)?;
         verify_multi_pair_feasibility_parts(
             &problem.chosen.batch_id,
             &candidate.fills,
@@ -512,7 +516,7 @@ pub fn verify_multi_pair_optimality(
         }
     }
 
-    Ok(MultiPairOptimalityReport {
+    Ok(MultiPairCandidateSetReport {
         feasibility,
         chosen_objective,
         best_candidate_objective,
@@ -662,12 +666,14 @@ struct MultiPairGraphSearch<'a> {
     batch_id: &'a BatchId,
     edges: &'a [MultiPairGraphEdge<'a>],
     next_indices_by_input_asset: &'a BTreeMap<&'a str, Vec<usize>>,
+    reference_asset_values: &'a BTreeMap<String, (u128, u128)>,
     config: &'a MultiPairNettingConfig,
 }
 
 fn enumerate_multi_pair_graph_candidates(
     batch_id: &BatchId,
     orders: &[MultiPairExecutableOrder],
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
     config: &MultiPairNettingConfig,
 ) -> Result<Vec<MultiPairGraphCandidate>, ProtocolError> {
     let mut edges = Vec::with_capacity(orders.len());
@@ -691,6 +697,7 @@ fn enumerate_multi_pair_graph_candidates(
         batch_id,
         edges: &edges,
         next_indices_by_input_asset: &next_indices_by_input_asset,
+        reference_asset_values,
         config,
     };
     for start_index in 0..edges.len() {
@@ -719,7 +726,12 @@ fn extend_graph_candidate_path(
     let current_output_asset = graph_edge_output_asset(&search.edges[current_index]);
     if path.len() >= 2
         && current_output_asset == graph_edge_input_asset(&search.edges[start_index])
-        && let Some(candidate) = build_graph_cycle_candidate(search.batch_id, search.edges, path)?
+        && let Some(candidate) = build_graph_cycle_candidate(
+            search.batch_id,
+            search.edges,
+            path,
+            search.reference_asset_values,
+        )?
     {
         candidates.push(candidate);
     }
@@ -749,8 +761,11 @@ fn build_graph_cycle_candidate(
     batch_id: &BatchId,
     edges: &[MultiPairGraphEdge<'_>],
     path: &[usize],
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
 ) -> Result<Option<MultiPairGraphCandidate>, ProtocolError> {
-    let Some(edge_fill_plans) = graph_fill_plans_for_largest_feasible_fill(edges, path)? else {
+    let Some(edge_fill_plans) =
+        graph_fill_plans_for_largest_feasible_fill(edges, path, reference_asset_values)?
+    else {
         return Ok(None);
     };
 
@@ -810,13 +825,15 @@ fn build_graph_cycle_candidate(
 fn graph_fill_plans_for_largest_feasible_fill(
     edges: &[MultiPairGraphEdge<'_>],
     path: &[usize],
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
 ) -> Result<Option<Vec<MultiPairGraphEdgeFillPlan>>, ProtocolError> {
     let mut prefixes = Vec::with_capacity(path.len());
     let mut prefix_num = 1_u128;
     let mut prefix_den = 1_u128;
     for edge_index in path.iter().copied() {
         prefixes.push((prefix_num, prefix_den));
-        let (rate_num, rate_den) = graph_edge_limit_rate(&edges[edge_index])?;
+        let (rate_num, rate_den) =
+            graph_edge_reference_rate(&edges[edge_index], reference_asset_values)?;
         multiply_ratio_checked(&mut prefix_num, &mut prefix_den, rate_num, rate_den)?;
     }
     if prefix_num > prefix_den {
@@ -825,7 +842,10 @@ fn graph_fill_plans_for_largest_feasible_fill(
 
     let mut edge_max_inputs = Vec::with_capacity(path.len());
     for edge_index in path.iter().copied() {
-        edge_max_inputs.push(max_cycle_input_for_graph_edge(&edges[edge_index])?);
+        edge_max_inputs.push(max_cycle_input_for_graph_edge(
+            &edges[edge_index],
+            reference_asset_values,
+        )?);
     }
     let mut max_start_input = None::<u128>;
     for ((prefix_num, prefix_den), max_input) in prefixes
@@ -839,14 +859,6 @@ fn graph_fill_plans_for_largest_feasible_fill(
             None => candidate_start,
         });
     }
-    if let Some(last_index) = path.last().copied()
-        && let Some(max_output) = max_cycle_output_for_graph_edge(&edges[last_index])
-    {
-        max_start_input = Some(match max_start_input {
-            Some(current) => current.min(max_output),
-            None => max_output,
-        });
-    }
     let start_input_ceiling = max_start_input.unwrap_or_default();
     for offset in 0..MAX_MULTI_PAIR_ROUNDING_SEARCH_STEPS {
         let Some(start_input) = start_input_ceiling.checked_sub(offset as u128) else {
@@ -855,9 +867,13 @@ fn graph_fill_plans_for_largest_feasible_fill(
         if start_input == 0 {
             break;
         }
-        if let Some(plans) =
-            graph_fill_plans_for_start_input(edges, path, &edge_max_inputs, start_input)?
-        {
+        if let Some(plans) = graph_fill_plans_for_start_input(
+            edges,
+            path,
+            &edge_max_inputs,
+            start_input,
+            reference_asset_values,
+        )? {
             return Ok(Some(plans));
         }
     }
@@ -869,6 +885,7 @@ fn graph_fill_plans_for_start_input(
     path: &[usize],
     edge_max_inputs: &[u128],
     start_input: u128,
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
 ) -> Result<Option<Vec<MultiPairGraphEdgeFillPlan>>, ProtocolError> {
     if path.is_empty() || start_input == 0 {
         return Ok(None);
@@ -885,17 +902,8 @@ fn graph_fill_plans_for_start_input(
         if input_amount > edge_max_inputs[path_index] {
             return Ok(None);
         }
-        let is_last = path_index + 1 == path.len();
-        let (filled_base_amount, quote_amount) = if is_last {
-            let Some(amounts) =
-                cycle_graph_edge_amounts_from_input_and_output(edge, input_amount, start_input)?
-            else {
-                return Ok(None);
-            };
-            amounts
-        } else {
-            cycle_graph_edge_amounts_from_input(edge, input_amount)?
-        };
+        let (filled_base_amount, quote_amount) =
+            cycle_graph_edge_amounts_from_input(edge, input_amount, reference_asset_values)?;
         let gross_output_amount = match graph_edge_side(edge) {
             OrderSide::Buy => filled_base_amount,
             OrderSide::Sell => quote_amount,
@@ -948,6 +956,7 @@ fn graph_edge_fill_plan(
                 price_base_scale: order.price_base_scale,
                 filled_base_amount,
                 quote_amount,
+                taker_fee_bps: order.taker_fee_bps,
                 fee_amount,
             };
             if validate_fill_bounds(path_index, &fill).is_err() {
@@ -967,64 +976,51 @@ fn graph_edge_fill_plan(
 fn cycle_graph_edge_amounts_from_input(
     edge: &MultiPairGraphEdge<'_>,
     input_amount: u128,
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
 ) -> Result<(u128, u128), ProtocolError> {
-    match graph_edge_side(edge) {
-        OrderSide::Buy => {
-            let filled_base_amount = min_base_amount_for_quote_at_limit(
-                input_amount,
-                graph_edge_limit_price(edge),
-                graph_edge_price_base_scale(edge),
-            )?;
-            Ok((filled_base_amount, input_amount))
-        }
-        OrderSide::Sell => {
-            let quote_amount = quote_amount_for_base_amount(
-                input_amount,
-                graph_edge_limit_price(edge),
-                graph_edge_price_base_scale(edge),
-            )?;
-            Ok((input_amount, quote_amount))
-        }
-    }
-}
-
-fn cycle_graph_edge_amounts_from_input_and_output(
-    edge: &MultiPairGraphEdge<'_>,
-    input_amount: u128,
-    gross_output_amount: u128,
-) -> Result<Option<(u128, u128)>, ProtocolError> {
-    if input_amount == 0 || gross_output_amount == 0 {
-        return Ok(None);
-    }
-    Ok(Some(match graph_edge_side(edge) {
+    let gross_output_amount = reference_output_amount(
+        input_amount,
+        graph_edge_input_asset(edge),
+        graph_edge_output_asset(edge),
+        reference_asset_values,
+    )?;
+    Ok(match graph_edge_side(edge) {
         OrderSide::Buy => (gross_output_amount, input_amount),
         OrderSide::Sell => (input_amount, gross_output_amount),
-    }))
-}
-
-fn graph_edge_limit_rate(edge: &MultiPairGraphEdge<'_>) -> Result<(u128, u128), ProtocolError> {
-    let limit_price = graph_edge_limit_price(edge);
-    let price_base_scale = graph_edge_price_base_scale(edge);
-    if limit_price == 0 || price_base_scale == 0 {
-        return Err(ProtocolError::InvalidSettlementProof(
-            "multi-pair cycle rate requires nonzero price fields".into(),
-        ));
-    }
-    Ok(match graph_edge_side(edge) {
-        OrderSide::Buy => reduce_ratio(price_base_scale, limit_price),
-        OrderSide::Sell => reduce_ratio(limit_price, price_base_scale),
     })
 }
 
-fn max_cycle_input_for_graph_edge(edge: &MultiPairGraphEdge<'_>) -> Result<u128, ProtocolError> {
-    match edge {
-        MultiPairGraphEdge::User(order) => max_cycle_input_for_order(order),
-    }
+fn graph_edge_reference_rate(
+    edge: &MultiPairGraphEdge<'_>,
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
+) -> Result<(u128, u128), ProtocolError> {
+    reference_conversion_rate(
+        graph_edge_input_asset(edge),
+        graph_edge_output_asset(edge),
+        reference_asset_values,
+    )
 }
 
-fn max_cycle_output_for_graph_edge(edge: &MultiPairGraphEdge<'_>) -> Option<u128> {
+fn max_cycle_input_for_graph_edge(
+    edge: &MultiPairGraphEdge<'_>,
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
+) -> Result<u128, ProtocolError> {
     match edge {
-        MultiPairGraphEdge::User(order) => max_cycle_output_for_order(order),
+        MultiPairGraphEdge::User(order) => match order.side {
+            OrderSide::Buy => {
+                let (numerator, denominator) = reference_conversion_rate(
+                    &order.base_asset_id,
+                    &order.quote_asset_id,
+                    reference_asset_values,
+                )?;
+                let reference_quote_cap =
+                    mul_div_ceil_checked(order.submitted_base_amount, numerator, denominator)?;
+                Ok(order.available_input_amount.min(reference_quote_cap))
+            }
+            OrderSide::Sell => Ok(order
+                .submitted_base_amount
+                .min(order.available_input_amount)),
+        },
     }
 }
 
@@ -1043,18 +1039,6 @@ fn graph_edge_output_asset<'a>(edge: &MultiPairGraphEdge<'a>) -> &'a AssetId {
 fn graph_edge_side(edge: &MultiPairGraphEdge<'_>) -> OrderSide {
     match edge {
         MultiPairGraphEdge::User(order) => order.side,
-    }
-}
-
-fn graph_edge_limit_price(edge: &MultiPairGraphEdge<'_>) -> u128 {
-    match edge {
-        MultiPairGraphEdge::User(order) => order.limit_price,
-    }
-}
-
-fn graph_edge_price_base_scale(edge: &MultiPairGraphEdge<'_>) -> u128 {
-    match edge {
-        MultiPairGraphEdge::User(order) => order.price_base_scale,
     }
 }
 
@@ -1316,40 +1300,6 @@ fn insert_multi_pair_graph_candidate(
     Ok(())
 }
 
-fn max_cycle_input_for_order(order: &MultiPairExecutableOrder) -> Result<u128, ProtocolError> {
-    let max_order_input = match order.side {
-        OrderSide::Buy => quote_amount_for_base_amount(
-            order.submitted_base_amount,
-            order.limit_price,
-            order.price_base_scale,
-        )?,
-        OrderSide::Sell => order.submitted_base_amount,
-    };
-    Ok(max_order_input.min(order.available_input_amount))
-}
-
-fn max_cycle_output_for_order(order: &MultiPairExecutableOrder) -> Option<u128> {
-    match order.side {
-        OrderSide::Buy => Some(order.submitted_base_amount),
-        OrderSide::Sell => None,
-    }
-}
-
-fn min_base_amount_for_quote_at_limit(
-    quote_amount: u128,
-    price: u128,
-    price_base_scale: u128,
-) -> Result<u128, ProtocolError> {
-    if price == 0 || price_base_scale == 0 {
-        return Ok(0);
-    }
-    quote_amount
-        .checked_mul(price_base_scale)
-        .and_then(|value| value.checked_add(price.saturating_sub(1)))
-        .and_then(|value| value.checked_div(price))
-        .ok_or_else(|| ProtocolError::InvalidOrder("base amount overflows u128".into()))
-}
-
 fn multiply_ratio_checked(
     numerator: &mut u128,
     denominator: &mut u128,
@@ -1402,6 +1352,42 @@ fn mul_div_floor_checked(
                 "multi-pair ratio multiplication overflows".into(),
             )
         })
+}
+
+fn mul_div_ceil_checked(
+    amount: u128,
+    numerator: u128,
+    denominator: u128,
+) -> Result<u128, ProtocolError> {
+    if denominator == 0 {
+        return Err(ProtocolError::InvalidSettlementProof(
+            "multi-pair ratio denominator is zero".into(),
+        ));
+    }
+    if amount == 0 || numerator == 0 {
+        return Ok(0);
+    }
+    let cross_a = gcd(amount, denominator);
+    let reduced_amount = amount / cross_a;
+    let reduced_denominator = denominator / cross_a;
+    let cross_b = gcd(numerator, reduced_denominator);
+    let reduced_numerator = numerator / cross_b;
+    let reduced_denominator = reduced_denominator / cross_b;
+    let product = reduced_amount
+        .checked_mul(reduced_numerator)
+        .ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(
+                "multi-pair ratio multiplication overflows".into(),
+            )
+        })?;
+    let quotient = product / reduced_denominator;
+    if product % reduced_denominator == 0 {
+        Ok(quotient)
+    } else {
+        quotient.checked_add(1).ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof("multi-pair ratio result overflows".into())
+        })
+    }
 }
 
 fn reduce_ratio(numerator: u128, denominator: u128) -> (u128, u128) {
@@ -1495,12 +1481,11 @@ fn asset_delta_direction_key(direction: &MultiPairAssetDeltaDirection) -> u8 {
 fn asset_delta_source_key(source: &MultiPairAssetDeltaSource) -> u8 {
     match source {
         MultiPairAssetDeltaSource::User => 0,
-        MultiPairAssetDeltaSource::ExternalCompletion => 1,
-        MultiPairAssetDeltaSource::Fee => 2,
+        MultiPairAssetDeltaSource::Fee => 1,
     }
 }
 
-fn ceil_bps_amount(amount: u128, bps: u128) -> Result<u128, ProtocolError> {
+pub(crate) fn ceil_bps_amount(amount: u128, bps: u128) -> Result<u128, ProtocolError> {
     if amount == 0 || bps == 0 {
         return Ok(0);
     }
@@ -1531,15 +1516,15 @@ fn push_cycle_delta(
     });
 }
 
-fn validate_candidate_shape(problem: &MultiPairOptimalityProblem) -> Result<(), ProtocolError> {
+fn validate_candidate_shape(problem: &MultiPairCandidateSetProblem) -> Result<(), ProtocolError> {
     if problem.eligible_order_commitments.is_empty() {
         return Err(ProtocolError::InvalidSettlementProof(
-            "multi-pair optimality requires eligible order commitments".into(),
+            "multi-pair candidate-set verification requires eligible order commitments".into(),
         ));
     }
     if problem.candidate_solutions.is_empty() {
         return Err(ProtocolError::InvalidSettlementProof(
-            "multi-pair optimality requires candidate solutions".into(),
+            "multi-pair candidate-set verification requires candidate solutions".into(),
         ));
     }
     if problem.candidate_solutions.len() > MAX_MULTI_PAIR_CANDIDATE_SOLUTIONS {
@@ -1609,6 +1594,13 @@ fn validate_objective_weights(
                 "multi-pair objective weight {index} must be positive"
             )));
         }
+        if weight.numerator > MAX_MULTI_PAIR_REFERENCE_COMPONENT
+            || weight.denominator > MAX_MULTI_PAIR_REFERENCE_COMPONENT
+        {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "multi-pair objective weight {index} exceeds the reference component bound"
+            )));
+        }
         if normalized
             .insert(
                 weight.asset_id.0.clone(),
@@ -1622,6 +1614,91 @@ fn validate_objective_weights(
         }
     }
     Ok(normalized)
+}
+
+fn validate_reference_priced_fills(
+    fills: &[MultiPairFill],
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
+) -> Result<(), ProtocolError> {
+    for (index, fill) in fills.iter().enumerate() {
+        let (input_asset, input_amount, output_asset, actual_output_amount) = match fill.side {
+            OrderSide::Buy => (
+                &fill.quote_asset_id,
+                fill.quote_amount,
+                &fill.base_asset_id,
+                fill.filled_base_amount,
+            ),
+            OrderSide::Sell => (
+                &fill.base_asset_id,
+                fill.filled_base_amount,
+                &fill.quote_asset_id,
+                fill.quote_amount,
+            ),
+        };
+        let expected_output_amount = reference_output_amount(
+            input_amount,
+            input_asset,
+            output_asset,
+            reference_asset_values,
+        )?;
+        if actual_output_amount != expected_output_amount {
+            return Err(ProtocolError::InvalidSettlementProof(format!(
+                "multi-pair fill {index} is not priced at the committed reference value"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reference_conversion_rate(
+    input_asset: &AssetId,
+    output_asset: &AssetId,
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
+) -> Result<(u128, u128), ProtocolError> {
+    let (input_numerator, input_denominator) = reference_asset_values
+        .get(&input_asset.0)
+        .copied()
+        .ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(format!(
+                "multi-pair input asset {} has no reference value",
+                input_asset.0
+            ))
+        })?;
+    let (output_numerator, output_denominator) = reference_asset_values
+        .get(&output_asset.0)
+        .copied()
+        .ok_or_else(|| {
+            ProtocolError::InvalidSettlementProof(format!(
+                "multi-pair output asset {} has no reference value",
+                output_asset.0
+            ))
+        })?;
+    let mut numerator = 1_u128;
+    let mut denominator = 1_u128;
+    multiply_ratio_checked(
+        &mut numerator,
+        &mut denominator,
+        input_numerator,
+        input_denominator,
+    )?;
+    multiply_ratio_checked(
+        &mut numerator,
+        &mut denominator,
+        output_denominator,
+        output_numerator,
+    )?;
+    Ok((numerator, denominator))
+}
+
+fn reference_output_amount(
+    input_amount: u128,
+    input_asset: &AssetId,
+    output_asset: &AssetId,
+    reference_asset_values: &BTreeMap<String, (u128, u128)>,
+) -> Result<u128, ProtocolError> {
+    let (numerator, denominator) =
+        reference_conversion_rate(input_asset, output_asset, reference_asset_values)?;
+    mul_div_floor_checked(input_amount, numerator, denominator)
 }
 
 fn score_multi_pair_solution(
@@ -1669,9 +1746,9 @@ fn validate_problem_shape(
             "multi-pair feasibility requires a batch id".into(),
         ));
     }
-    if fills.is_empty() {
+    if fills.is_empty() != asset_deltas.is_empty() {
         return Err(ProtocolError::InvalidSettlementProof(
-            "multi-pair feasibility requires at least one fill".into(),
+            "multi-pair feasibility requires fills and deltas to both be empty or non-empty".into(),
         ));
     }
     if fills.len() > MAX_MULTI_PAIR_FILLS {
@@ -1680,11 +1757,6 @@ fn validate_problem_shape(
             fills.len(),
             MAX_MULTI_PAIR_FILLS
         )));
-    }
-    if asset_deltas.is_empty() {
-        return Err(ProtocolError::InvalidSettlementProof(
-            "multi-pair feasibility requires asset deltas".into(),
-        ));
     }
     if asset_deltas.len() > MAX_MULTI_PAIR_ASSET_DELTAS {
         return Err(ProtocolError::InvalidSettlementProof(format!(
@@ -1716,7 +1788,10 @@ fn validate_fills(fills: &[MultiPairFill]) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn validate_fill_bounds(index: usize, fill: &MultiPairFill) -> Result<(), ProtocolError> {
+pub(crate) fn validate_fill_bounds(
+    index: usize,
+    fill: &MultiPairFill,
+) -> Result<(), ProtocolError> {
     if fill.pair_id.0.trim().is_empty()
         || fill.base_asset_id.0.trim().is_empty()
         || fill.quote_asset_id.0.trim().is_empty()
@@ -1759,6 +1834,17 @@ fn validate_fill_bounds(index: usize, fill: &MultiPairFill) -> Result<(), Protoc
         OrderSide::Buy => fill.filled_base_amount,
         OrderSide::Sell => fill.quote_amount,
     };
+    if u128::from(fill.taker_fee_bps) > 10_000 {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair fill {index} fee rate exceeds 10000 bps"
+        )));
+    }
+    let expected_fee = ceil_bps_amount(gross_output_amount, u128::from(fill.taker_fee_bps))?;
+    if fill.fee_amount != expected_fee {
+        return Err(ProtocolError::InvalidSettlementProof(format!(
+            "multi-pair fill {index} fee does not match configured rate"
+        )));
+    }
     if fill.fee_amount >= gross_output_amount {
         return Err(ProtocolError::InvalidSettlementProof(format!(
             "multi-pair fill {index} fee consumes its output"
@@ -1876,7 +1962,6 @@ fn validate_bound_asset_deltas(
                 delta.direction,
                 delta.amount,
             )?,
-            MultiPairAssetDeltaSource::ExternalCompletion => {}
         }
     }
 
@@ -2010,15 +2095,19 @@ pub(crate) mod serde_btreemap_u128_decimal {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::{
         MAX_MULTI_PAIR_CANDIDATE_SOLUTIONS, MultiPairAssetDelta, MultiPairAssetDeltaDirection,
-        MultiPairAssetDeltaSource, MultiPairCandidateSolution, MultiPairExecutableOrder,
-        MultiPairFeasibilityProblem, MultiPairFill, MultiPairNettingConfig,
-        MultiPairObjectiveWeight, MultiPairOptimalityProblem,
-        derive_multi_pair_external_completion_obligations, plan_multi_pair_netting,
-        verify_multi_pair_feasibility, verify_multi_pair_optimality,
+        MultiPairAssetDeltaSource, MultiPairCandidateSetProblem, MultiPairCandidateSolution,
+        MultiPairExecutableOrder, MultiPairFeasibilityProblem, MultiPairFill,
+        MultiPairNettingConfig, MultiPairObjectiveWeight, ceil_bps_amount,
+        derive_multi_pair_external_match_obligations, plan_multi_pair_netting,
+        verify_multi_pair_candidate_set, verify_multi_pair_feasibility,
     };
-    use crate::{AssetId, BatchId, OrderCommitment, OrderSide, PairId};
+    use crate::{
+        AssetId, BatchId, OrderCommitment, OrderSide, PairId, quote_amount_for_base_amount,
+    };
 
     #[test]
     fn accepts_feasible_three_asset_cycle() {
@@ -2049,7 +2138,9 @@ mod tests {
 
     #[test]
     fn rejects_non_conserved_asset() {
-        let mut problem = simple_buy_problem();
+        let mut problem = simple_cross_problem();
+        problem.fills[1].submitted_base_amount = 9;
+        problem.fills[1].filled_base_amount = 9;
         problem.asset_deltas[2].amount = 9;
 
         let error = verify_multi_pair_feasibility(&problem).expect_err("must reject");
@@ -2059,7 +2150,7 @@ mod tests {
 
     #[test]
     fn rejects_buy_above_limit_price() {
-        let mut problem = simple_buy_problem();
+        let mut problem = simple_cross_problem();
         problem.fills[0].quote_amount = 25_001;
         problem.asset_deltas[0].amount = 25_001;
         problem.asset_deltas[1].amount = 10;
@@ -2073,12 +2164,15 @@ mod tests {
     fn rejects_sell_below_limit_price() {
         let problem = MultiPairFeasibilityProblem {
             batch_id: BatchId("epoch-42".into()),
-            fills: vec![sell("0x1", "ETH/USDC", "ETH", "USDC", 10, 24_000, 2_500)],
+            fills: vec![
+                buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 24_000, 2_500),
+                sell("0x2", "ETH/USDC", "ETH", "USDC", 10, 24_000, 2_500),
+            ],
             asset_deltas: vec![
-                user_delta("0x1", "ETH", 10, MultiPairAssetDeltaDirection::In),
-                user_delta("0x1", "USDC", 24_000, MultiPairAssetDeltaDirection::Out),
-                external_completion_delta("0x99", "USDC", 24_000, MultiPairAssetDeltaDirection::In),
-                external_completion_delta("0x99", "ETH", 10, MultiPairAssetDeltaDirection::Out),
+                user_delta("0x1", "USDC", 24_000, MultiPairAssetDeltaDirection::In),
+                user_delta("0x1", "ETH", 10, MultiPairAssetDeltaDirection::Out),
+                user_delta("0x2", "ETH", 10, MultiPairAssetDeltaDirection::In),
+                user_delta("0x2", "USDC", 24_000, MultiPairAssetDeltaDirection::Out),
             ],
         };
 
@@ -2089,7 +2183,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_order_commitments_after_normalization() {
-        let mut problem = simple_buy_problem();
+        let mut problem = simple_cross_problem();
         problem
             .fills
             .push(buy("0x01", "ETH/USDC", "ETH", "USDC", 1, 2_500, 2_500));
@@ -2101,7 +2195,7 @@ mod tests {
 
     #[test]
     fn rejects_balanced_user_deltas_that_are_not_bound_to_the_fill() {
-        let mut problem = simple_buy_problem();
+        let mut problem = simple_cross_problem();
         problem.asset_deltas[0].source_commitment = Some("0x2".into());
 
         let error = verify_multi_pair_feasibility(&problem).expect_err("must reject");
@@ -2114,8 +2208,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_output_fees_bound_to_the_originating_fill() {
-        let mut problem = simple_buy_problem();
+    fn rejects_output_fee_without_a_configured_fill_rate() {
+        let mut problem = simple_cross_problem();
         problem.fills[0].fee_amount = 1;
         problem.asset_deltas[1].amount = 9;
         problem.asset_deltas.insert(
@@ -2129,42 +2223,58 @@ mod tests {
             ),
         );
 
-        let report = verify_multi_pair_feasibility(&problem).expect("fee-bound fill");
+        let error = verify_multi_pair_feasibility(&problem).expect_err("fee rate is required");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fee does not match configured rate")
+        );
+    }
+
+    #[test]
+    fn accepts_exact_output_fee_for_the_configured_fill_rate() {
+        let mut problem = simple_cross_problem();
+        problem.fills[0].taker_fee_bps = 1_000;
+        problem.fills[0].fee_amount = 1;
+        problem.asset_deltas[1].amount = 9;
+        problem.asset_deltas.insert(
+            2,
+            delta(
+                "0x1",
+                "ETH",
+                1,
+                MultiPairAssetDeltaDirection::Out,
+                MultiPairAssetDeltaSource::Fee,
+            ),
+        );
+
+        let report = verify_multi_pair_feasibility(&problem).expect("exact fee-bound fill");
 
         assert_eq!(report.asset_inputs.get("ETH"), Some(&10));
         assert_eq!(report.asset_outputs.get("ETH"), Some(&10));
     }
 
     #[test]
-    fn accepts_solution_that_beats_declared_multi_pair_candidates() {
-        let chosen = MultiPairFeasibilityProblem {
-            batch_id: BatchId("epoch-42".into()),
-            fills: vec![
-                buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 2_500),
-                sell("0x2", "STRK/USDC", "STRK", "USDC", 10_000, 10_000, 1),
-            ],
-            asset_deltas: vec![
-                user_delta("0x1", "USDC", 25_000, MultiPairAssetDeltaDirection::In),
-                user_delta("0x1", "ETH", 10, MultiPairAssetDeltaDirection::Out),
-                user_delta("0x2", "STRK", 10_000, MultiPairAssetDeltaDirection::In),
-                user_delta("0x2", "USDC", 10_000, MultiPairAssetDeltaDirection::Out),
-                external_completion_delta("0x99", "ETH", 10, MultiPairAssetDeltaDirection::In),
-                external_completion_delta(
-                    "0x99",
-                    "USDC",
-                    25_000,
-                    MultiPairAssetDeltaDirection::Out,
-                ),
-                external_completion_delta("0x9a", "USDC", 10_000, MultiPairAssetDeltaDirection::In),
-                external_completion_delta(
-                    "0x9a",
-                    "STRK",
-                    10_000,
-                    MultiPairAssetDeltaDirection::Out,
-                ),
-            ],
-        };
-        let problem = MultiPairOptimalityProblem {
+    fn asset_delta_schema_rejects_external_match_source() {
+        let encoded = r#"{
+            "asset_id":"ETH",
+            "amount":"10",
+            "direction":"In",
+            "source":"ExternalMatch",
+            "source_commitment":"0x1"
+        }"#;
+
+        let error = serde_json::from_str::<MultiPairAssetDelta>(encoded)
+            .expect_err("external match is not a private settlement source");
+
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn accepts_solution_that_matches_every_declared_candidate() {
+        let chosen = simple_cross_problem();
+        let problem = MultiPairCandidateSetProblem {
             chosen: chosen.clone(),
             eligible_order_commitments: vec![
                 OrderCommitment("0x1".into()),
@@ -2178,73 +2288,62 @@ mod tests {
                     asset_deltas: chosen.asset_deltas.clone(),
                 },
                 MultiPairCandidateSolution {
-                    solution_id: "eth-only".into(),
-                    fills: vec![chosen.fills[0].clone()],
-                    asset_deltas: vec![
-                        user_delta("0x1", "USDC", 25_000, MultiPairAssetDeltaDirection::In),
-                        user_delta("0x1", "ETH", 10, MultiPairAssetDeltaDirection::Out),
-                        external_completion_delta(
-                            "0x99",
-                            "ETH",
-                            10,
-                            MultiPairAssetDeltaDirection::In,
-                        ),
-                        external_completion_delta(
-                            "0x99",
-                            "USDC",
-                            25_000,
-                            MultiPairAssetDeltaDirection::Out,
-                        ),
-                    ],
+                    solution_id: "equivalent".into(),
+                    fills: chosen.fills.clone(),
+                    asset_deltas: chosen.asset_deltas.clone(),
                 },
             ],
         };
 
-        let report = verify_multi_pair_optimality(&problem).expect("optimal solution");
+        let report = verify_multi_pair_candidate_set(&problem).expect("candidate set verifies");
 
-        assert_eq!(report.chosen_objective, 35_000);
-        assert_eq!(report.best_candidate_objective, 35_000);
+        assert_eq!(report.chosen_objective, 50_000);
+        assert_eq!(report.best_candidate_objective, 50_000);
         assert_eq!(report.candidate_count, 2);
     }
 
     #[test]
     fn rejects_feasible_candidate_with_better_objective() {
-        let chosen = simple_buy_problem();
+        let chosen = simple_cross_problem();
         let better = MultiPairCandidateSolution {
             solution_id: "double-size".into(),
-            fills: vec![buy("0x2", "ETH/USDC", "ETH", "USDC", 20, 50_000, 2_500)],
+            fills: vec![
+                buy("0x3", "ETH/USDC", "ETH", "USDC", 20, 50_000, 2_500),
+                sell("0x4", "ETH/USDC", "ETH", "USDC", 20, 50_000, 2_500),
+            ],
             asset_deltas: vec![
-                user_delta("0x2", "USDC", 50_000, MultiPairAssetDeltaDirection::In),
-                user_delta("0x2", "ETH", 20, MultiPairAssetDeltaDirection::Out),
-                external_completion_delta("0x99", "ETH", 20, MultiPairAssetDeltaDirection::In),
-                external_completion_delta(
-                    "0x99",
-                    "USDC",
-                    50_000,
-                    MultiPairAssetDeltaDirection::Out,
-                ),
+                user_delta("0x3", "USDC", 50_000, MultiPairAssetDeltaDirection::In),
+                user_delta("0x3", "ETH", 20, MultiPairAssetDeltaDirection::Out),
+                user_delta("0x4", "ETH", 20, MultiPairAssetDeltaDirection::In),
+                user_delta("0x4", "USDC", 50_000, MultiPairAssetDeltaDirection::Out),
             ],
         };
-        let problem = MultiPairOptimalityProblem {
+        let problem = MultiPairCandidateSetProblem {
             chosen,
             eligible_order_commitments: vec![
                 OrderCommitment("0x1".into()),
                 OrderCommitment("0x2".into()),
+                OrderCommitment("0x3".into()),
+                OrderCommitment("0x4".into()),
             ],
             objective_weights: objective_weights(),
             candidate_solutions: vec![better],
         };
 
-        let error = verify_multi_pair_optimality(&problem).expect_err("better candidate rejected");
+        let error =
+            verify_multi_pair_candidate_set(&problem).expect_err("better candidate rejected");
 
         assert!(error.to_string().contains("beats chosen objective"));
     }
 
     #[test]
-    fn rejects_optimality_without_weight_for_output_asset() {
-        let problem = MultiPairOptimalityProblem {
-            chosen: simple_buy_problem(),
-            eligible_order_commitments: vec![OrderCommitment("0x1".into())],
+    fn rejects_candidate_set_without_weight_for_output_asset() {
+        let problem = MultiPairCandidateSetProblem {
+            chosen: simple_cross_problem(),
+            eligible_order_commitments: vec![
+                OrderCommitment("0x1".into()),
+                OrderCommitment("0x2".into()),
+            ],
             objective_weights: vec![MultiPairObjectiveWeight {
                 asset_id: AssetId("USDC".into()),
                 numerator: 1,
@@ -2252,70 +2351,65 @@ mod tests {
             }],
             candidate_solutions: vec![MultiPairCandidateSolution {
                 solution_id: "chosen".into(),
-                fills: simple_buy_problem().fills,
-                asset_deltas: simple_buy_problem().asset_deltas,
+                fills: simple_cross_problem().fills,
+                asset_deltas: simple_cross_problem().asset_deltas,
             }],
         };
 
-        let error = verify_multi_pair_optimality(&problem).expect_err("missing weight rejected");
+        let error = verify_multi_pair_candidate_set(&problem).expect_err("missing weight rejected");
 
-        assert!(error.to_string().contains("has no objective weight"));
+        assert!(error.to_string().contains("has no reference value"));
     }
 
     #[test]
-    fn planner_discovers_full_size_three_asset_user_cycle() {
+    fn rejects_fill_priced_away_from_committed_reference_values() {
+        let chosen = MultiPairFeasibilityProblem {
+            batch_id: BatchId("epoch-42".into()),
+            fills: vec![
+                buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 24_000, 3_000),
+                sell("0x2", "ETH/USDC", "ETH", "USDC", 10, 24_000, 2_000),
+            ],
+            asset_deltas: vec![
+                user_delta("0x1", "USDC", 24_000, MultiPairAssetDeltaDirection::In),
+                user_delta("0x1", "ETH", 10, MultiPairAssetDeltaDirection::Out),
+                user_delta("0x2", "ETH", 10, MultiPairAssetDeltaDirection::In),
+                user_delta("0x2", "USDC", 24_000, MultiPairAssetDeltaDirection::Out),
+            ],
+        };
+        let problem = MultiPairCandidateSetProblem {
+            chosen: chosen.clone(),
+            eligible_order_commitments: vec![
+                OrderCommitment("0x1".into()),
+                OrderCommitment("0x2".into()),
+            ],
+            objective_weights: objective_weights(),
+            candidate_solutions: vec![MultiPairCandidateSolution {
+                solution_id: "off-reference".into(),
+                fills: chosen.fills.clone(),
+                asset_deltas: chosen.asset_deltas.clone(),
+            }],
+        };
+
+        let error = verify_multi_pair_candidate_set(&problem)
+            .expect_err("off-reference execution must be rejected");
+
+        assert!(error.to_string().contains("reference value"));
+    }
+
+    #[test]
+    fn planner_prices_every_cycle_leg_from_reference_values_not_user_limits() {
         let plan = plan_multi_pair_netting(
             BatchId("epoch-42".into()),
             &[
-                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 5_000),
-                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 50_000, 5_000),
-                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 50_000, 50_000, 1),
+                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 6_000),
+                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 10, 2_000),
+                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 25_000, 25_000, 1),
             ],
             objective_weights(),
             MultiPairNettingConfig::default(),
         )
         .expect("planner succeeds")
-        .expect("cycle is feasible");
-
-        let report = verify_multi_pair_optimality(&plan.problem).expect("plan verifies");
-
-        assert_eq!(report.feasibility.fill_count, 3);
-        assert_eq!(report.chosen_objective, 125_000);
-        assert_eq!(report.candidate_count, 1);
-        assert_eq!(plan.problem.chosen.asset_deltas.len(), 6);
-    }
-
-    #[test]
-    fn planner_rejects_cycle_when_buy_leg_exceeds_limit_price() {
-        let plan = plan_multi_pair_netting(
-            BatchId("epoch-42".into()),
-            &[
-                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 4_999),
-                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 50_000, 5_000),
-                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 50_000, 50_000, 1),
-            ],
-            objective_weights(),
-            MultiPairNettingConfig::default(),
-        )
-        .expect("planner succeeds");
-
-        assert!(plan.is_none());
-    }
-
-    #[test]
-    fn planner_accepts_cycle_when_final_leg_receives_price_improvement() {
-        let plan = plan_multi_pair_netting(
-            BatchId("epoch-42".into()),
-            &[
-                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 6_000),
-                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 50_000, 5_000),
-                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 50_000, 50_000, 1),
-            ],
-            objective_weights(),
-            MultiPairNettingConfig::default(),
-        )
-        .expect("planner succeeds")
-        .expect("price-improved cycle is feasible");
+        .expect("reference-priced cycle is feasible");
 
         let fills = plan
             .problem
@@ -2330,16 +2424,97 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let report = verify_multi_pair_optimality(&plan.problem).expect("plan verifies");
 
-        assert_eq!(report.feasibility.fill_count, 3);
-        assert_eq!(report.candidate_count, 3);
         assert_eq!(
             fills,
             vec![
-                ("0x2", 10, 50_000),
-                ("0x3", 50_000, 50_000),
-                ("0x1", 10, 50_000),
+                ("0x1", 10, 25_000),
+                ("0x2", 10, 25_000),
+                ("0x3", 25_000, 25_000)
+            ]
+        );
+    }
+
+    #[test]
+    fn planner_discovers_full_size_three_asset_user_cycle() {
+        let plan = plan_multi_pair_netting(
+            BatchId("epoch-42".into()),
+            &[
+                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 5_000),
+                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 10, 2_500),
+                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 25_000, 25_000, 1),
+            ],
+            objective_weights(),
+            MultiPairNettingConfig::default(),
+        )
+        .expect("planner succeeds")
+        .expect("cycle is feasible");
+
+        let report = verify_multi_pair_candidate_set(&plan.problem).expect("plan verifies");
+
+        assert_eq!(report.feasibility.fill_count, 3);
+        assert_eq!(report.chosen_objective, 75_000);
+        assert_eq!(report.candidate_count, 1);
+        assert_eq!(plan.problem.chosen.asset_deltas.len(), 6);
+    }
+
+    #[test]
+    fn planner_falls_back_to_external_only_when_buy_leg_exceeds_limit_price() {
+        let plan = plan_multi_pair_netting(
+            BatchId("epoch-42".into()),
+            &[
+                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 2_499),
+                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 10, 2_500),
+                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 25_000, 25_000, 1),
+            ],
+            objective_weights(),
+            MultiPairNettingConfig::default(),
+        )
+        .expect("planner succeeds");
+
+        let plan = plan.expect("external-only solution");
+        assert!(plan.problem.chosen.fills.is_empty());
+        assert!(plan.problem.chosen.asset_deltas.is_empty());
+    }
+
+    #[test]
+    fn planner_accepts_cycle_when_user_limits_are_looser_than_reference_values() {
+        let plan = plan_multi_pair_netting(
+            BatchId("epoch-42".into()),
+            &[
+                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 6_000),
+                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 10, 2_000),
+                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 25_000, 25_000, 1),
+            ],
+            objective_weights(),
+            MultiPairNettingConfig::default(),
+        )
+        .expect("planner succeeds")
+        .expect("reference-priced cycle is feasible");
+
+        let fills = plan
+            .problem
+            .chosen
+            .fills
+            .iter()
+            .map(|fill| {
+                (
+                    fill.order_commitment.0.as_str(),
+                    fill.filled_base_amount,
+                    fill.quote_amount,
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = verify_multi_pair_candidate_set(&plan.problem).expect("plan verifies");
+
+        assert_eq!(report.feasibility.fill_count, 3);
+        assert!(report.candidate_count >= 1);
+        assert_eq!(
+            fills,
+            vec![
+                ("0x1", 10, 25_000),
+                ("0x2", 10, 25_000),
+                ("0x3", 25_000, 25_000),
             ]
         );
     }
@@ -2350,8 +2525,8 @@ mod tests {
             BatchId("epoch-42".into()),
             &[
                 executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 5_000),
-                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 4, 4, 5_000),
-                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 20_000, 20_000, 1),
+                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 4, 4, 2_500),
+                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 10_000, 10_000, 1),
             ],
             objective_weights(),
             MultiPairNettingConfig::default(),
@@ -2359,7 +2534,7 @@ mod tests {
         .expect("planner succeeds")
         .expect("partial cycle is feasible");
 
-        let report = verify_multi_pair_optimality(&plan.problem).expect("plan verifies");
+        let report = verify_multi_pair_candidate_set(&plan.problem).expect("plan verifies");
         let fills = plan
             .problem
             .chosen
@@ -2369,9 +2544,30 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(report.feasibility.fill_count, 3);
-        assert_eq!(fills, vec![("0x1", 4), ("0x2", 4), ("0x3", 20_000)]);
-        assert_eq!(report.feasibility.asset_inputs.get("USDC"), Some(&20_000));
-        assert_eq!(report.feasibility.asset_outputs.get("USDC"), Some(&20_000));
+        assert_eq!(fills, vec![("0x1", 4), ("0x2", 4), ("0x3", 10_000)]);
+        assert_eq!(report.feasibility.asset_inputs.get("USDC"), Some(&10_000));
+        assert_eq!(report.feasibility.asset_outputs.get("USDC"), Some(&10_000));
+    }
+
+    #[test]
+    fn planner_emits_provable_empty_private_solution_for_one_sided_flow() {
+        let plan = plan_multi_pair_netting(
+            BatchId("epoch-one-sided".into()),
+            &[
+                executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 5_000),
+                executable_buy("0x2", "ETH/USDC", "ETH", "USDC", 5, 25_000, 5_000),
+            ],
+            objective_weights(),
+            MultiPairNettingConfig::default(),
+        )
+        .expect("planner succeeds")
+        .expect("external-only solution is represented");
+
+        let report = verify_multi_pair_candidate_set(&plan.problem).expect("empty plan verifies");
+        assert!(plan.problem.chosen.fills.is_empty());
+        assert!(plan.problem.chosen.asset_deltas.is_empty());
+        assert_eq!(plan.problem.candidate_solutions.len(), 1);
+        assert_eq!(report.chosen_objective, 0);
     }
 
     #[test]
@@ -2380,11 +2576,11 @@ mod tests {
             BatchId("epoch-42".into()),
             &[
                 executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 5_000),
-                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 50_000, 5_000),
-                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 50_000, 50_000, 1),
+                executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 10, 2_500),
+                executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 25_000, 25_000, 1),
                 executable_buy("0x4", "ETH/USDC", "ETH", "USDC", 20, 100_000, 5_000),
-                executable_sell("0x5", "ETH/STRK", "ETH", "STRK", 20, 100_000, 5_000),
-                executable_sell("0x6", "STRK/USDC", "STRK", "USDC", 100_000, 100_000, 1),
+                executable_sell("0x5", "ETH/STRK", "ETH", "STRK", 20, 20, 2_500),
+                executable_sell("0x6", "STRK/USDC", "STRK", "USDC", 50_000, 50_000, 1),
             ],
             objective_weights(),
             MultiPairNettingConfig::default(),
@@ -2412,8 +2608,8 @@ mod tests {
     }
 
     #[test]
-    fn external_completion_obligation_covers_order_when_no_private_plan_exists() {
-        let obligations = derive_multi_pair_external_completion_obligations(
+    fn external_match_obligation_covers_order_when_no_private_plan_exists() {
+        let obligations = derive_multi_pair_external_match_obligations(
             &[executable_buy(
                 "0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 2_500,
             )],
@@ -2435,25 +2631,25 @@ mod tests {
     }
 
     #[test]
-    fn external_completion_obligation_skips_private_only_residual() {
+    fn external_match_obligation_skips_private_only_residual() {
         let mut order = executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 2_500);
         order.execution_preference = crate::ExecutionPreference::PrivateOnly;
 
         let obligations =
-            derive_multi_pair_external_completion_obligations(&[order], None).expect("obligations");
+            derive_multi_pair_external_match_obligations(&[order], None).expect("obligations");
 
         assert!(
             obligations.is_empty(),
-            "private-only residuals must not become external completion obligations"
+            "private-only residuals must not become external match obligations"
         );
     }
 
     #[test]
-    fn external_completion_obligation_excludes_private_cycle_fills() {
+    fn external_match_obligation_excludes_private_cycle_fills() {
         let orders = vec![
             executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 5_000),
-            executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 50_000, 5_000),
-            executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 50_000, 50_000, 1),
+            executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 10, 10, 2_500),
+            executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 25_000, 25_000, 1),
         ];
         let plan = plan_multi_pair_netting(
             BatchId("epoch-42".into()),
@@ -2464,18 +2660,18 @@ mod tests {
         .expect("planner succeeds")
         .expect("cycle is feasible");
 
-        let obligations = derive_multi_pair_external_completion_obligations(&orders, Some(&plan))
+        let obligations = derive_multi_pair_external_match_obligations(&orders, Some(&plan))
             .expect("obligations");
 
         assert!(obligations.is_empty());
     }
 
     #[test]
-    fn external_completion_obligation_covers_only_private_remainder() {
+    fn external_match_obligation_covers_only_private_remainder() {
         let orders = vec![
             executable_buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 50_000, 5_000),
-            executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 4, 4, 5_000),
-            executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 20_000, 20_000, 1),
+            executable_sell("0x2", "ETH/STRK", "ETH", "STRK", 4, 4, 2_500),
+            executable_sell("0x3", "STRK/USDC", "STRK", "USDC", 10_000, 10_000, 1),
         ];
         let plan = plan_multi_pair_netting(
             BatchId("epoch-42".into()),
@@ -2486,7 +2682,7 @@ mod tests {
         .expect("planner succeeds")
         .expect("partial cycle is feasible");
 
-        let obligations = derive_multi_pair_external_completion_obligations(&orders, Some(&plan))
+        let obligations = derive_multi_pair_external_match_obligations(&orders, Some(&plan))
             .expect("obligations");
 
         assert_eq!(obligations.len(), 1);
@@ -2502,8 +2698,8 @@ mod tests {
     }
 
     #[test]
-    fn external_completion_obligation_is_capped_by_remaining_buy_input() {
-        let obligations = derive_multi_pair_external_completion_obligations(
+    fn external_match_obligation_is_capped_by_remaining_buy_input() {
+        let obligations = derive_multi_pair_external_match_obligations(
             &[executable_buy(
                 "0x1", "ETH/USDC", "ETH", "USDC", 10, 20_000, 2_500,
             )],
@@ -2513,23 +2709,21 @@ mod tests {
 
         assert_eq!(obligations.len(), 1);
         assert_eq!(obligations[0].input_amount, 20_000);
-        assert_eq!(obligations[0].gross_output_amount, 8);
+        assert_eq!(obligations[0].gross_output_amount, 10);
     }
 
-    fn simple_buy_problem() -> MultiPairFeasibilityProblem {
+    fn simple_cross_problem() -> MultiPairFeasibilityProblem {
         MultiPairFeasibilityProblem {
             batch_id: BatchId("epoch-42".into()),
-            fills: vec![buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 2_500)],
+            fills: vec![
+                buy("0x1", "ETH/USDC", "ETH", "USDC", 10, 25_000, 2_500),
+                sell("0x2", "ETH/USDC", "ETH", "USDC", 10, 25_000, 2_500),
+            ],
             asset_deltas: vec![
                 user_delta("0x1", "USDC", 25_000, MultiPairAssetDeltaDirection::In),
                 user_delta("0x1", "ETH", 10, MultiPairAssetDeltaDirection::Out),
-                external_completion_delta("0x99", "ETH", 10, MultiPairAssetDeltaDirection::In),
-                external_completion_delta(
-                    "0x99",
-                    "USDC",
-                    25_000,
-                    MultiPairAssetDeltaDirection::Out,
-                ),
+                user_delta("0x2", "ETH", 10, MultiPairAssetDeltaDirection::In),
+                user_delta("0x2", "USDC", 25_000, MultiPairAssetDeltaDirection::Out),
             ],
         }
     }
@@ -2660,6 +2854,7 @@ mod tests {
             price_base_scale: 1,
             filled_base_amount: base_amount,
             quote_amount,
+            taker_fee_bps: 0,
             fee_amount: 0,
         }
     }
@@ -2676,21 +2871,6 @@ mod tests {
             amount,
             direction,
             MultiPairAssetDeltaSource::User,
-        )
-    }
-
-    fn external_completion_delta(
-        commitment: &str,
-        asset: &str,
-        amount: u128,
-        direction: MultiPairAssetDeltaDirection,
-    ) -> MultiPairAssetDelta {
-        delta(
-            commitment,
-            asset,
-            amount,
-            direction,
-            MultiPairAssetDeltaSource::ExternalCompletion,
         )
     }
 
@@ -2728,5 +2908,195 @@ mod tests {
                 denominator: 1,
             },
         ]
+    }
+
+    fn generated_cross_problem(
+        whole_base_units: u128,
+        price: u128,
+        price_base_scale: u128,
+        buy_fee_bps: u16,
+        sell_fee_bps: u16,
+    ) -> MultiPairFeasibilityProblem {
+        let base_amount = whole_base_units * price_base_scale;
+        let quote_amount = quote_amount_for_base_amount(base_amount, price, price_base_scale)
+            .expect("bounded generated quote");
+        let mut buy_fill = buy(
+            "0x1",
+            "BASE/QUOTE",
+            "BASE",
+            "QUOTE",
+            base_amount,
+            quote_amount,
+            price,
+        );
+        buy_fill.price_base_scale = price_base_scale;
+        buy_fill.taker_fee_bps = buy_fee_bps;
+        let buy_fee = ceil_bps_amount(base_amount, u128::from(buy_fee_bps))
+            .expect("bounded generated buy fee");
+        buy_fill.fee_amount = buy_fee;
+        let mut sell_fill = sell(
+            "0x2",
+            "BASE/QUOTE",
+            "BASE",
+            "QUOTE",
+            base_amount,
+            quote_amount,
+            price,
+        );
+        sell_fill.price_base_scale = price_base_scale;
+        sell_fill.taker_fee_bps = sell_fee_bps;
+        let sell_fee = ceil_bps_amount(quote_amount, u128::from(sell_fee_bps))
+            .expect("bounded generated sell fee");
+        sell_fill.fee_amount = sell_fee;
+
+        let mut asset_deltas = vec![
+            user_delta(
+                "0x1",
+                "QUOTE",
+                quote_amount,
+                MultiPairAssetDeltaDirection::In,
+            ),
+            user_delta(
+                "0x1",
+                "BASE",
+                base_amount - buy_fee,
+                MultiPairAssetDeltaDirection::Out,
+            ),
+            user_delta("0x2", "BASE", base_amount, MultiPairAssetDeltaDirection::In),
+            user_delta(
+                "0x2",
+                "QUOTE",
+                quote_amount - sell_fee,
+                MultiPairAssetDeltaDirection::Out,
+            ),
+        ];
+        if buy_fee > 0 {
+            asset_deltas.push(delta(
+                "0x1",
+                "BASE",
+                buy_fee,
+                MultiPairAssetDeltaDirection::Out,
+                MultiPairAssetDeltaSource::Fee,
+            ));
+        }
+        if sell_fee > 0 {
+            asset_deltas.push(delta(
+                "0x2",
+                "QUOTE",
+                sell_fee,
+                MultiPairAssetDeltaDirection::Out,
+                MultiPairAssetDeltaSource::Fee,
+            ));
+        }
+
+        MultiPairFeasibilityProblem {
+            batch_id: BatchId("generated-epoch".into()),
+            fills: vec![buy_fill, sell_fill],
+            asset_deltas,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn generated_crosses_conserve_assets_and_partition_fees(
+            whole_base_units in 1u128..1_000_000_000u128,
+            price in 1u128..1_000_000_000_000u128,
+            price_base_scale in 1u128..1_000_000_000u128,
+            buy_fee_seed in any::<u64>(),
+            sell_fee_seed in any::<u64>(),
+        ) {
+            let base_amount = whole_base_units * price_base_scale;
+            let quote_amount = whole_base_units * price;
+            let buy_fee_bps = (buy_fee_seed % 10_001) as u16;
+            let sell_fee_bps = (sell_fee_seed % 10_001) as u16;
+            let buy_fee = ceil_bps_amount(base_amount, u128::from(buy_fee_bps))
+                .expect("bounded generated buy fee");
+            let sell_fee = ceil_bps_amount(quote_amount, u128::from(sell_fee_bps))
+                .expect("bounded generated sell fee");
+            // A fee that consumes the entire output is not a valid fill. The
+            // production validator rejects it; keep this property focused on
+            // valid settlement fixtures and cover the rejection separately.
+            prop_assume!(buy_fee < base_amount && sell_fee < quote_amount);
+            let problem = generated_cross_problem(
+                whole_base_units,
+                price,
+                price_base_scale,
+                buy_fee_bps,
+                sell_fee_bps,
+            );
+
+            let report = verify_multi_pair_feasibility(&problem)
+                .expect("generated cross must verify");
+
+            prop_assert_eq!(&report.asset_inputs, &report.asset_outputs);
+            prop_assert_eq!(report.asset_inputs.get("BASE"), Some(&base_amount));
+            prop_assert_eq!(report.asset_inputs.get("QUOTE"), Some(&quote_amount));
+        }
+
+        #[test]
+        fn any_unbound_delta_mutation_is_rejected(
+            whole_base_units in 1u128..1_000_000_000u128,
+            price in 1u128..1_000_000_000_000u128,
+            price_base_scale in 1u128..1_000_000_000u128,
+            delta_index_seed in any::<usize>(),
+        ) {
+            let mut problem = generated_cross_problem(
+                whole_base_units,
+                price,
+                price_base_scale,
+                0,
+                0,
+            );
+            let delta_index = delta_index_seed % problem.asset_deltas.len();
+            problem.asset_deltas[delta_index].amount += 1;
+
+            let error = verify_multi_pair_feasibility(&problem)
+                .expect_err("a delta not justified by its fill must fail");
+
+            prop_assert!(error.to_string().contains("do not match the declared fills"));
+        }
+
+        #[test]
+        fn feasibility_problem_json_round_trip_is_exact(
+            whole_base_units in 1u128..1_000_000_000u128,
+            price in 1u128..1_000_000_000_000u128,
+            price_base_scale in 1u128..1_000_000_000u128,
+            buy_fee_seed in any::<u64>(),
+            sell_fee_seed in any::<u64>(),
+        ) {
+            let base_amount = whole_base_units * price_base_scale;
+            let quote_amount = whole_base_units * price;
+            let buy_fee_bps = (buy_fee_seed % 10_001) as u16;
+            let sell_fee_bps = (sell_fee_seed % 10_001) as u16;
+            let buy_fee = ceil_bps_amount(base_amount, u128::from(buy_fee_bps))
+                .expect("bounded generated buy fee");
+            let sell_fee = ceil_bps_amount(quote_amount, u128::from(sell_fee_bps))
+                .expect("bounded generated sell fee");
+            prop_assume!(buy_fee < base_amount && sell_fee < quote_amount);
+            let problem = generated_cross_problem(
+                whole_base_units,
+                price,
+                price_base_scale,
+                buy_fee_bps,
+                sell_fee_bps,
+            );
+
+            let encoded = serde_json::to_vec(&problem).expect("serialize generated problem");
+            let decoded: MultiPairFeasibilityProblem =
+                serde_json::from_slice(&encoded).expect("deserialize generated problem");
+
+            prop_assert_eq!(&decoded, &problem);
+            prop_assert!(verify_multi_pair_feasibility(&decoded).is_ok());
+        }
+    }
+
+    #[test]
+    fn dust_fills_reject_fees_that_consume_the_output() {
+        let problem = generated_cross_problem(1, 1, 1, 10_000, 10_000);
+        let error = verify_multi_pair_feasibility(&problem)
+            .expect_err("a fee that consumes the output must be rejected");
+        assert!(error.to_string().contains("fee consumes its output"));
     }
 }
