@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "network": "mainnet",
+  "description": "Production reference-price policy. Zylith uses Binance spot book midpoint as the private-crossing benchmark, validates it against independent CEX books, and forbids prior Zylith clearing prices as a fallback.",
+  "reference_engine": {
+    "primary": "binance-book-midpoint",
+    "primary_cex_source": "binance",
+    "allowed_cex_sources": [
+      "binance",
+      "coinbase",
+      "kraken",
+      "okx"
+    ],
+    "min_cex_sources": 3
+  },
+  "external_matcher": {
+    "request_type": "ExternalMatchRequest",
+    "mode": "searcher-midpoint-fill",
+    "purpose": "Aggregate residual obligations are exposed as bounded matcher requests. User execution remains at the Binance-primary midpoint; searchers may fill only when their own hedge is profitable. External hedge venues are not reference-price inputs."
+  },
+  "global_policy": {
+    "max_staleness_ms": 5000,
+    "min_sources": 3,
+    "max_source_spread_bps": 20,
+    "max_divergence_bps": 30,
+    "reference_envelope_bps": 15,
+    "large_move_policy": "require-confirmation-widen-size-reduce-or-halt",
+    "forbidden_fallbacks": [
+      "last-cleared-price",
+      "single-exchange-only",
+      "fixed-price"
+    ]
+  },
+  "pairs": {
+    "STRK/USDC": {
+      "primary": "binance-midpoint:STRKUSDC:bookTicker",
+      "confirmations": [
+        "coinbase:STRK-USD through coinbase:USDT-USD and coinbase:USDT-USDC",
+        "okx:STRK-USDT divided by okx:USDC-USDT",
+        "kraken:STRKUSD divided by kraken:USDCUSD"
+      ],
+      "min_independent_sources": 3
+    },
+    "ETH/USDC": {
+      "primary": "binance-midpoint:ETHUSDC:bookTicker",
+      "confirmations": [
+        "coinbase:ETH-USD through coinbase:USDT-USD and coinbase:USDT-USDC",
+        "okx:ETH-USDT divided by okx:USDC-USDT",
+        "kraken:XETHZUSD divided by kraken:USDCUSD"
+      ],
+      "min_independent_sources": 3
+    }
+  },
+  "unsupported": {
+    "strkBTC": "strkBTC is its own asset with its own market; no btc midpoint prices it, so its pairs are not traded."
+  }
+}

@@ -1,0 +1,10 @@
+/target
+/paymaster/node_modules
+/paymaster/dist
+/paymaster/state
+/paymaster/*.tsbuildinfo
+/coordinator/batches.dev.json
+/client/public/deployment.json
+/.DS_Store
+.env*
+!**/.env.example

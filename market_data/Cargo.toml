@@ -1,0 +1,18 @@
+[package]
+name = "zylith-market-data"
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+authors = ["Tanya"]
+
+[dependencies]
+axum = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

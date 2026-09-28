@@ -1,0 +1,22 @@
+[package]
+name = "zylith-indexer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[dependencies]
+axum = "0.8"
+ipnet = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+starknet-crypto = "0.8.1"
+starknet-rust-core = "0.19"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tower-http = { version = "0.6", features = ["cors"] }
+zylith-core = { path = "../core" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

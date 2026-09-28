@@ -1,0 +1,43 @@
+name: services ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: service compile and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: setup rust
+        uses: dtolnay/rust-toolchain@ebb3d1676050bfd0971c36c1e215b5751473994d # 1.96.0
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: paymaster/package-lock.json
+      - name: install paymaster dependencies
+        working-directory: paymaster
+        run: npm ci
+      - name: rust checks
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: paymaster checks
+        working-directory: paymaster
+        run: |
+          npm test -- --run
+          npm run build
+      - name: operations checks
+        run: |
+          node --check ops/live-monitoring-drill.mjs
+          node --test ops/production-readiness-check.test.mjs
