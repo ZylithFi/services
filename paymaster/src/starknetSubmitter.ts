@@ -5,7 +5,8 @@ import {
   ETransactionVersion3,
   RpcProvider,
   hash,
-  outsideExecution
+  outsideExecution,
+  typedData
 } from "starknet";
 import type {
   Call,
@@ -37,6 +38,15 @@ type AccountInstance = {
     contract_address?: string | string[];
     contractAddress?: string | string[];
   }>;
+  estimateDeployFee(
+    payload: {
+      classHash: string;
+      salt: string;
+      unique: boolean;
+      constructorCalldata: string[];
+    },
+    details?: Record<string, unknown>
+  ): Promise<unknown>;
   buildInvocation(calls: Call[], details: Record<string, unknown>): Promise<{
     contractAddress: unknown;
     calldata: unknown[];
@@ -53,6 +63,11 @@ type AccountInstance = {
 
 type RpcProviderInstance = {
   getClassHashAt(contractAddress: string, blockIdentifier?: string): Promise<string>;
+  verifyMessageInStarknet(
+    message: unknown,
+    signature: string[],
+    accountAddress: string
+  ): Promise<boolean>;
 };
 
 type ResourceBoundsLike = {
@@ -92,6 +107,7 @@ const DEFAULT_PAYMASTER_L1_GAS_FLOOR = 0n;
 const DEFAULT_PAYMASTER_L1_DATA_GAS_FLOOR = 8_000n;
 const DEFAULT_PAYMASTER_L2_GAS_FLOOR = 180_000_000n;
 const PAYMASTER_GAS_PRICE_MULTIPLIER = 2n;
+const DEFAULT_MAX_SPONSORED_FEE_FRI = 1_000_000_000_000_000_000n;
 const STARKNET_STRK_TOKEN_ADDRESS =
   "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
 
@@ -99,7 +115,7 @@ type ProofSubmissionConfig = Pick<
   PaymasterConfig,
   "rpcUrl" | "chainId" | "accountAddress" | "privateKey"
 > &
-  Partial<Pick<PaymasterConfig, "gatewayUrl">>;
+  Partial<Pick<PaymasterConfig, "gatewayUrl" | "maxSponsoredFeeFri">>;
 
 export type SubmitterDeps = {
   runtime?: StarknetRuntime;
@@ -108,7 +124,8 @@ export type SubmitterDeps = {
 
 export async function ensurePrivacyProofSignerContract(
   request: EnsurePrivacySignerRequest,
-  config: Pick<PaymasterConfig, "rpcUrl" | "accountAddress" | "privateKey">,
+  config: Pick<PaymasterConfig, "rpcUrl" | "accountAddress" | "privateKey"> &
+    Partial<Pick<PaymasterConfig, "maxSponsoredFeeFri">>,
   deps: SubmitterDeps = {}
 ): Promise<EnsurePrivacySignerResponse> {
   const runtime = deps.runtime ?? defaultRuntime;
@@ -129,6 +146,9 @@ export async function ensurePrivacyProofSignerContract(
 
   const existingClassHash = await deployedClassHash(provider, contractAddress);
   if (existingClassHash) {
+    if (toRpcFelt(existingClassHash) !== classHash) {
+      throw new Error("privacy proof signer address has an unexpected class");
+    }
     return { contract_address: contractAddress, deployed: false };
   }
 
@@ -138,18 +158,129 @@ export async function ensurePrivacyProofSignerContract(
     signer: config.privateKey,
     transactionVersion: runtime.ETransactionVersion3.V3
   });
-  const result = await deployWithNonceRetry(account, provider, contractAddress, {
-    classHash,
-    salt,
-    unique: false,
-    constructorCalldata: [signerPublicKey]
-  });
+  const result = await deployWithNonceRetry(
+    account,
+    provider,
+    contractAddress,
+    {
+      classHash,
+      salt,
+      unique: false,
+      constructorCalldata: [signerPublicKey]
+    },
+    config.maxSponsoredFeeFri ?? DEFAULT_MAX_SPONSORED_FEE_FRI
+  );
   const transactionHash = result.transaction_hash ?? result.transactionHash;
   return {
     contract_address: contractAddress,
     deployed: true,
     ...(transactionHash ? { transaction_hash: transactionHash } : {})
   };
+}
+
+export async function inspectPrivacyProofSignerContract(
+  request: EnsurePrivacySignerRequest,
+  config: Pick<PaymasterConfig, "rpcUrl">,
+  deps: SubmitterDeps = {}
+): Promise<{ contract_address: string; deployed: boolean }> {
+  const runtime = deps.runtime ?? defaultRuntime;
+  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
+  const classHash = toRpcFelt(request.class_hash, "class_hash");
+  const constructorCalldata = runtime.CallData.toHex([
+    toRpcFelt(request.signer_public_key, "signer_public_key")
+  ]);
+  const contractAddress = toRpcFelt(
+    runtime.hash.calculateContractAddressFromHash(
+      toRpcFelt(request.salt, "salt"),
+      classHash,
+      constructorCalldata,
+      0
+    ),
+    "contract_address"
+  );
+  const existingClassHash = await deployedClassHash(provider, contractAddress);
+  if (existingClassHash && toRpcFelt(existingClassHash) !== classHash) {
+    throw new Error("privacy proof signer address has an unexpected class");
+  }
+  return { contract_address: contractAddress, deployed: Boolean(existingClassHash) };
+}
+
+export async function verifyPrivacySignerDeploymentSponsorship(
+  request: EnsurePrivacySignerRequest,
+  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress">,
+  deps: SubmitterDeps = {}
+): Promise<void> {
+  if (
+    !request.sponsor_address ||
+    !request.sponsor_signature ||
+    !request.sponsor_nonce ||
+    !request.sponsor_expires_at
+  ) {
+    throw new Error("signer deployment authorization required");
+  }
+  const runtime = deps.runtime ?? defaultRuntime;
+  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
+  const message = privacySignerDeploymentTypedData(request, config);
+  const valid = await provider
+    .verifyMessageInStarknet(
+      message,
+      request.sponsor_signature,
+      request.sponsor_address
+    )
+    .catch(() => false);
+  if (!valid) {
+    throw new Error("signer deployment authorization failed");
+  }
+}
+
+export function privacySignerDeploymentTypedData(
+  request: EnsurePrivacySignerRequest,
+  config: Pick<PaymasterConfig, "chainId" | "accountAddress">
+) {
+  if (
+    !request.sponsor_address ||
+    !request.sponsor_nonce ||
+    !request.sponsor_expires_at
+  ) {
+    throw new Error("signer deployment authorization required");
+  }
+  const message = {
+    types: {
+      StarknetDomain: [
+        { name: "name", type: "shortstring" },
+        { name: "version", type: "shortstring" },
+        { name: "chainId", type: "shortstring" },
+        { name: "revision", type: "shortstring" },
+      ],
+      ZylithSignerSponsorship: [
+        { name: "action", type: "shortstring" },
+        { name: "paymaster", type: "ContractAddress" },
+        { name: "signerPublicKey", type: "felt" },
+        { name: "salt", type: "felt" },
+        { name: "classHash", type: "felt" },
+        { name: "nonce", type: "felt" },
+        { name: "expiresAt", type: "u64" },
+      ],
+    },
+    primaryType: "ZylithSignerSponsorship",
+    domain: {
+      name: "Zylith",
+      version: "1",
+      chainId: config.chainId,
+      revision: "1",
+    },
+    message: {
+      action: "DeploySigner",
+      paymaster: config.accountAddress,
+      signerPublicKey: request.signer_public_key,
+      salt: request.salt,
+      classHash: request.class_hash,
+      nonce: request.sponsor_nonce,
+      expiresAt: request.sponsor_expires_at,
+    },
+  };
+  typedData.validateTypedData(message);
+  return message;
 }
 
 async function deployWithNonceRetry(
@@ -161,7 +292,8 @@ async function deployWithNonceRetry(
     salt: string;
     unique: boolean;
     constructorCalldata: string[];
-  }
+  },
+  maxSponsoredFeeFri: bigint
 ): ReturnType<AccountInstance["deploy"]> {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < PAYMASTER_DEPLOY_RETRY_ATTEMPTS; attempt += 1) {
@@ -172,7 +304,14 @@ async function deployWithNonceRetry(
     try {
       const nonce = await account.getNonce("pre_confirmed")
         .catch(() => account.getNonce());
-      return await account.deploy(payload, { nonce });
+      const estimate = await account.estimateDeployFee(payload, { nonce });
+      const rawBounds =
+        (estimate as { resourceBounds?: unknown; resource_bounds?: unknown }).resourceBounds ??
+        (estimate as { resourceBounds?: unknown; resource_bounds?: unknown }).resource_bounds ??
+        estimate;
+      const resourceBounds = resourceBoundsFromRpc(rawBounds);
+      assertSponsoredFeeWithinLimit(resourceBounds, maxSponsoredFeeFri);
+      return await account.deploy(payload, { nonce, resourceBounds });
     } catch (error) {
       lastError = error;
       if (
@@ -320,6 +459,10 @@ async function submitPaymasterCallsOnce(
         }
       : {})
   });
+  assertSponsoredFeeWithinLimit(
+    feeResourceBounds,
+    config.maxSponsoredFeeFri ?? DEFAULT_MAX_SPONSORED_FEE_FRI
+  );
   const details = {
     resourceBounds: feeResourceBounds,
     walletAddress: config.accountAddress,
@@ -1081,6 +1224,23 @@ function resourceBoundsFromRpc(resourceBounds: unknown): ResourceBoundsLike {
     l2_gas: resourceBoundFromRpc(raw.l2_gas ?? raw.l2Gas),
     l1_data_gas: resourceBoundFromRpc(raw.l1_data_gas ?? raw.l1DataGas)
   };
+}
+
+export function assertSponsoredFeeWithinLimit(
+  resourceBounds: ResourceBoundsLike,
+  maxSponsoredFeeFri: bigint
+): void {
+  const maximumFee = [
+    resourceBounds.l1_gas,
+    resourceBounds.l2_gas,
+    resourceBounds.l1_data_gas,
+  ].reduce(
+    (total, bound) => total + bound.max_amount * bound.max_price_per_unit,
+    0n
+  );
+  if (maximumFee > maxSponsoredFeeFri) {
+    throw new Error("sponsored fee limit exceeded");
+  }
 }
 
 function resourceBoundFromRpc(value: unknown): ResourceBoundsLike["l1_gas"] {

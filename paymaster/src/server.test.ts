@@ -9,6 +9,7 @@ import type { PaymasterConfig } from "./config.js";
 import {
   FixedWindowRateLimiter,
   SignerDeploymentBudget,
+  SignerRelayBudget,
   SubmissionQueues,
   createPaymasterServer
 } from "./server.js";
@@ -363,7 +364,7 @@ describe("paymaster server", () => {
       calls: [{
         contract_address: "0x123",
         entrypoint: "approve",
-        calldata: ["0x123", "0x1", "0x0"]
+        calldata: ["0x123", "0xffffffffffffffffffffffffffffffff", "0x0"]
       }],
       nonce: "0x55",
       signature_r: "0xaa",
@@ -406,12 +407,81 @@ describe("paymaster server", () => {
       },
       body: JSON.stringify(relayBody)
     });
-    expect(relayAfterEnsure.status).toBe(200);
-    await expect(relayAfterEnsure.json()).resolves.toEqual({ transaction_hash: "0xtx" });
+    expect(relayAfterEnsure.status).toBe(409);
+  });
+
+  it("requires a valid wallet sponsorship before paying for a new signer deployment", async () => {
+    let deployments = 0;
+    const server = createPaymasterServer(config(), {
+      fetchImpl: fakeRpcFetch(),
+      runtime: fakeRuntime({
+        deployed: false,
+        validSponsor: true,
+        onDeploy: () => { deployments += 1; },
+      })
+    });
+    servers.push(server);
+    const url = await listen(server);
+    const base = {
+      signer_public_key: "0x777",
+      salt: "0x88",
+      class_hash: "0xabc",
+    };
+
+    const unauthorized = await fetch(`${url}/privacy-signer/ensure`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://app.example"
+      },
+      body: JSON.stringify(base)
+    });
+    expect(unauthorized.status).toBe(401);
+    expect(deployments).toBe(0);
+
+    const authorized = await fetch(`${url}/privacy-signer/ensure`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: "https://app.example"
+      },
+      body: JSON.stringify({
+        ...base,
+        sponsor_address: "0x999",
+        sponsor_signature: ["0x1", "0x2"],
+        sponsor_nonce: "0x3",
+        sponsor_expires_at: String(Math.floor(Date.now() / 1000) + 300),
+      })
+    });
+    expect(authorized.status).toBe(200);
+    expect(deployments).toBe(1);
   });
 });
 
 describe("paymaster in-memory bounds", () => {
+  it("allows only one successful approval sponsorship per signer token and spender", async () => {
+    const budget = new SignerRelayBudget(2, null);
+    await budget.reserve("signer:token:spender");
+    await expect(budget.reserve("signer:token:spender")).rejects.toThrow(
+      "approval was already sponsored"
+    );
+    await expect(budget.reserve("other:token:spender")).resolves.toBeTypeOf("function");
+  });
+
+  it("releases failed approval sponsorship reservations", async () => {
+    const budget = new SignerRelayBudget(1, null);
+    const release = await budget.reserve("signer:token:spender");
+    await release();
+    await expect(budget.reserve("signer:token:spender")).resolves.toBeTypeOf("function");
+  });
+
+  it("enforces per-sponsor signer deployment budgets", async () => {
+    const budget = new SignerDeploymentBudget(3, null, 1);
+    await budget.reserve("0xaaa");
+    await expect(budget.reserve("0xaaa")).rejects.toThrow(/budget exhausted for sponsor/);
+    await expect(budget.reserve("0xbbb")).resolves.toBeTypeOf("function");
+  });
+
   it("enforces the signer deployment budget and releases reservations", async () => {
     const budget = new SignerDeploymentBudget(1, null);
     const release = await budget.reserve();
@@ -530,11 +600,15 @@ function config(): PaymasterConfig {
     allowedOrigins: new Set(["https://app.example"]),
     signerLimitPerMinute: 20,
     signerDeploymentLimitPerDay: 100,
+    signerDeploymentLimitPerPrincipalPerDay: 1,
+    signerRelayLimitPerDay: 500,
+    maxSponsoredFeeFri: 1_000_000_000_000_000_000n,
     trustProxyHeaders: false,
     trustedProxyCidrs: [],
     internalApiToken: "test-paymaster-token",
     submissionLogPath: null,
-    signerDeploymentLogPath: null
+    signerDeploymentLogPath: null,
+    signerRelayLogPath: null
   };
 }
 
@@ -638,13 +712,22 @@ function requestWithSigner(index: number): ExecuteOutsideRequest {
   };
 }
 
-function fakeRuntime(options: { buildInvocationError?: Error } = {}): StarknetRuntime {
+function fakeRuntime(options: {
+  buildInvocationError?: Error;
+  deployed?: boolean;
+  validSponsor?: boolean;
+  onDeploy?: () => void;
+} = {}): StarknetRuntime {
   return {
     RpcProvider: class {
       constructor(_options: { nodeUrl: string }) {}
 
       async getClassHashAt() {
-        return "0xabc";
+        return options.deployed === false ? null : "0xabc";
+      }
+
+      async verifyMessageInStarknet() {
+        return options.validSponsor ?? true;
       }
     },
     Account: class {
@@ -659,7 +742,18 @@ function fakeRuntime(options: { buildInvocationError?: Error } = {}): StarknetRu
       }
 
       async deploy() {
+        options.onDeploy?.();
         return { transaction_hash: "0xdeploy", contract_address: "0x1234" };
+      }
+
+      async estimateDeployFee() {
+        return {
+          resourceBounds: {
+            l1_gas: { max_amount: 1n, max_price_per_unit: 2n },
+            l2_gas: { max_amount: 3n, max_price_per_unit: 4n },
+            l1_data_gas: { max_amount: 5n, max_price_per_unit: 6n }
+          }
+        };
       }
 
       async estimateInvokeFee() {

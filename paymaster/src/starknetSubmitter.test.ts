@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { StarknetRuntime } from "./starknetSubmitter.js";
 import {
   ensurePrivacyProofSignerContract,
+  privacySignerDeploymentTypedData,
   relayPrivacyProofSignerCall,
   submitProofBearingOutsideExecution
 } from "./starknetSubmitter.js";
@@ -13,6 +14,108 @@ import type {
 } from "./types.js";
 
 describe("submitProofBearingOutsideExecution", () => {
+  it("binds every signer deployment sponsorship field", () => {
+    expect(privacySignerDeploymentTypedData(
+      {
+        signer_public_key: "0x111",
+        salt: "0x222",
+        class_hash: "0x333",
+        sponsor_address: "0x999",
+        sponsor_signature: ["0x1", "0x2"],
+        sponsor_nonce: "0x444",
+        sponsor_expires_at: "1700000300",
+      },
+      {
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+      }
+    )).toEqual({
+      types: {
+        StarknetDomain: [
+          { name: "name", type: "shortstring" },
+          { name: "version", type: "shortstring" },
+          { name: "chainId", type: "shortstring" },
+          { name: "revision", type: "shortstring" },
+        ],
+        ZylithSignerSponsorship: [
+          { name: "action", type: "shortstring" },
+          { name: "paymaster", type: "ContractAddress" },
+          { name: "signerPublicKey", type: "felt" },
+          { name: "salt", type: "felt" },
+          { name: "classHash", type: "felt" },
+          { name: "nonce", type: "felt" },
+          { name: "expiresAt", type: "u64" },
+        ],
+      },
+      primaryType: "ZylithSignerSponsorship",
+      domain: {
+        name: "Zylith",
+        version: "1",
+        chainId: "0x534e5f5345504f4c4941",
+        revision: "1",
+      },
+      message: {
+        action: "DeploySigner",
+        paymaster: "0xabc",
+        signerPublicKey: "0x111",
+        salt: "0x222",
+        classHash: "0x333",
+        nonce: "0x444",
+        expiresAt: "1700000300",
+      },
+    });
+  });
+
+  it("rejects a transaction whose resource bounds exceed the sponsorship cap", async () => {
+    let submissions = 0;
+    await expect(
+      relayPrivacyProofSignerCall(
+        relayRequest,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey",
+          privacySignerClassHash: "0xabc",
+          maxSponsoredFeeFri: 1n,
+        },
+        {
+          runtime: {
+            ...fakeRuntime,
+            RpcProvider: class {
+              constructor(_options: { nodeUrl: string }) {}
+              async getClassHashAt() { return "0xabc"; }
+            },
+          },
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(String(init?.body));
+            if (body.method === "starknet_estimateFee") {
+              return new Response(JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: [{
+                  l1_gas_consumed: "0x2",
+                  l1_gas_price: "0x4",
+                  l2_gas_consumed: "0x6",
+                  l2_gas_price: "0x8",
+                  l1_data_gas_consumed: "0xa",
+                  l1_data_gas_price: "0xc"
+                }]
+              }), { status: 200 });
+            }
+            submissions += 1;
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: { transaction_hash: "0xtx" }
+            }), { status: 200 });
+          }
+        }
+      )
+    ).rejects.toThrow("sponsored fee limit exceeded");
+    expect(submissions).toBe(0);
+  });
+
   it("submits a proof-bearing invoke through the configured Starknet gateway", async () => {
     const seen: { body?: unknown; estimateBody?: unknown; submissionUrl?: string } = {};
     const result = await submitProofBearingOutsideExecution(
@@ -1127,6 +1230,43 @@ describe("submitProofBearingOutsideExecution", () => {
     expect(deployNonces).toEqual(["0x7", "0x8"]);
   });
 
+  it("rejects signer deployment when its resource bounds exceed the sponsorship cap", async () => {
+    let deployments = 0;
+    const runtime = {
+      ...fakeRuntime,
+      Account: class extends fakeRuntime.Account {
+        async estimateDeployFee() {
+          return {
+            resourceBounds: {
+              l1_gas: { max_amount: 2n, max_price_per_unit: 2n },
+              l2_gas: { max_amount: 0n, max_price_per_unit: 0n },
+              l1_data_gas: { max_amount: 0n, max_price_per_unit: 0n }
+            }
+          };
+        }
+
+        async deploy() {
+          deployments += 1;
+          return { transaction_hash: "0xdeploy" };
+        }
+      }
+    } satisfies StarknetRuntime;
+
+    await expect(
+      ensurePrivacyProofSignerContract(
+        ensureRequest,
+        {
+          rpcUrl: "https://rpc.example",
+          accountAddress: "0xabc",
+          privateKey: "0xkey",
+          maxSponsoredFeeFri: 1n,
+        },
+        { runtime }
+      )
+    ).rejects.toThrow("sponsored fee limit exceeded");
+    expect(deployments).toBe(0);
+  });
+
   it("only relays privacy signer calls for the configured signer class hash", async () => {
     const seen: { body?: unknown } = {};
     const runtime = {
@@ -1292,6 +1432,16 @@ const fakeRuntime = {
         accountDeploymentData: [],
         nonceDataAvailabilityMode: "L1",
         feeDataAvailabilityMode: "L1"
+      };
+    }
+
+    async estimateDeployFee() {
+      return {
+        resourceBounds: {
+          l1_gas: { max_amount: 1n, max_price_per_unit: 2n },
+          l2_gas: { max_amount: 3n, max_price_per_unit: 4n },
+          l1_data_gas: { max_amount: 5n, max_price_per_unit: 6n }
+        }
       };
     }
 

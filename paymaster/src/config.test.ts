@@ -16,9 +16,32 @@ const BASE_ENV = {
   ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH: "0x987",
   ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH: "/var/lib/zylith/submissions.json",
   ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LOG_PATH: "/var/lib/zylith/signer-deployments.json",
+  ZYLITH_PAYMASTER_SIGNER_RELAY_LOG_PATH: "/var/lib/zylith/signer-relays.json",
 } satisfies NodeJS.ProcessEnv;
 
 describe("paymaster config", () => {
+  it("loads bounded sponsorship controls", () => {
+    const config = loadConfig({
+      ...BASE_ENV,
+      ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI: "900000000000000000",
+      ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY: "250",
+      ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY: "1",
+    });
+
+    expect(config.maxSponsoredFeeFri).toBe(900_000_000_000_000_000n);
+    expect(config.signerRelayLimitPerDay).toBe(250);
+    expect(config.signerDeploymentLimitPerPrincipalPerDay).toBe(1);
+  });
+
+  it("rejects non-positive sponsored fee limits", () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI: "0",
+      })
+    ).toThrow(/positive integer/);
+  });
+
   it("loads the production allowlist snapshot exactly", () => {
     const config = loadConfig({
       ...BASE_ENV,

@@ -9,8 +9,10 @@ import type { PaymasterConfig } from "./config.js";
 import type { SubmitterDeps } from "./starknetSubmitter.js";
 import {
   ensurePrivacyProofSignerContract,
+  inspectPrivacyProofSignerContract,
   relayPrivacyProofSignerCall,
-  submitProofBearingOutsideExecution
+  submitProofBearingOutsideExecution,
+  verifyPrivacySignerDeploymentSponsorship
 } from "./starknetSubmitter.js";
 import { SubmissionStore } from "./submissionStore.js";
 import {
@@ -33,7 +35,12 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
   const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
   const signerDeploymentBudget = new SignerDeploymentBudget(
     config.signerDeploymentLimitPerDay,
-    config.signerDeploymentLogPath
+    config.signerDeploymentLogPath,
+    config.signerDeploymentLimitPerPrincipalPerDay
+  );
+  const signerRelayBudget = new SignerRelayBudget(
+    config.signerRelayLimitPerDay,
+    config.signerRelayLogPath
   );
   const metrics = new PaymasterMetrics();
 
@@ -71,7 +78,10 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
           const validated = validateEnsurePrivacySignerRequest(body, config);
           enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
           return submissionQueues.enqueue(config.accountAddress, async () => {
-            const release = await signerDeploymentBudget.reserve();
+            const status = await inspectPrivacyProofSignerContract(validated, config, deps);
+            if (status.deployed) return status;
+            await verifyPrivacySignerDeploymentSponsorship(validated, config, deps);
+            const release = await signerDeploymentBudget.reserve(validated.sponsor_address!);
             try {
               const result = await ensurePrivacyProofSignerContract(validated, config, deps);
               if (!result.deployed) await release();
@@ -97,9 +107,15 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
           const body = JSON.parse(rawBody) as unknown;
           const validated = validateRelayPrivacySignerRequest(body, config);
           enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.account_address);
-          return submissionQueues.enqueue(config.accountAddress, () =>
-            relayPrivacyProofSignerCall(validated, config, deps)
-          );
+          return submissionQueues.enqueue(config.accountAddress, async () => {
+            const release = await signerRelayBudget.reserve(relaySponsorshipKey(validated));
+            try {
+              return await relayPrivacyProofSignerCall(validated, config, deps);
+            } catch (error) {
+              await release();
+              throw error;
+            }
+          });
         });
         sendJson(request, response, 200, result);
         return;
@@ -402,7 +418,10 @@ function statusForError(message: string): number {
   if (message.includes("submission queue is full")) {
     return 503;
   }
-  if (message.includes("authorization failed")) {
+  if (
+    message.includes("authorization failed") ||
+    message.includes("authorization required")
+  ) {
     return 401;
   }
   if (message.includes("metrics token is not configured")) {
@@ -420,6 +439,15 @@ function statusForError(message: string): number {
   }
   if (message.includes("deployment budget exhausted")) {
     return 429;
+  }
+  if (message.includes("relay budget exhausted")) {
+    return 429;
+  }
+  if (message.includes("sponsored fee limit exceeded")) {
+    return 429;
+  }
+  if (message.includes("approval was already sponsored")) {
+    return 409;
   }
   return 400;
 }
@@ -548,34 +576,52 @@ export class FixedWindowRateLimiter {
 type SignerDeploymentBudgetRecord = {
   utc_day: string;
   reserved: number;
+  principals: Record<string, number>;
 };
 
 /**
- * Deployment is the only paymaster route without a user-owned nonce. Keep a
- * durable daily budget so rotating keys/IPs cannot turn the paymaster into an
- * unbounded deployment faucet. Reservations are released when no deployment
- * was needed or submission failed.
+ * deployment sponsorship is globally and per-principal bounded. reservations
+ * are released when no deployment was needed or submission failed.
  */
 export class SignerDeploymentBudget {
   private loaded = false;
   private loadPromise: Promise<void> | null = null;
-  private record: SignerDeploymentBudgetRecord = { utc_day: utcDay(), reserved: 0 };
+  private record: SignerDeploymentBudgetRecord = {
+    utc_day: utcDay(),
+    reserved: 0,
+    principals: {},
+  };
   private persistTail: Promise<void> = Promise.resolve();
 
-  constructor(private readonly limitPerDay: number, private readonly path: string | null) {
+  constructor(
+    private readonly limitPerDay: number,
+    private readonly path: string | null,
+    private readonly limitPerPrincipalPerDay = 1
+  ) {
     if (!Number.isSafeInteger(limitPerDay) || limitPerDay <= 0) {
       throw new Error("signer deployment limit must be a positive integer");
     }
+    if (
+      !Number.isSafeInteger(limitPerPrincipalPerDay) ||
+      limitPerPrincipalPerDay <= 0
+    ) {
+      throw new Error("per-principal signer deployment limit must be a positive integer");
+    }
   }
 
-  async reserve(): Promise<() => Promise<void>> {
+  async reserve(principal = "legacy"): Promise<() => Promise<void>> {
     await this.load();
     this.rotateIfNeeded();
     if (this.record.reserved >= this.limitPerDay) {
       throw new Error("privacy signer deployment budget exhausted");
     }
+    const principalCount = this.record.principals[principal] ?? 0;
+    if (principalCount >= this.limitPerPrincipalPerDay) {
+      throw new Error("privacy signer deployment budget exhausted for sponsor");
+    }
     const reservationDay = this.record.utc_day;
     this.record.reserved += 1;
+    this.record.principals[principal] = principalCount + 1;
     await this.persist();
     let released = false;
     return async () => {
@@ -584,6 +630,9 @@ export class SignerDeploymentBudget {
       this.rotateIfNeeded();
       if (this.record.utc_day !== reservationDay) return;
       this.record.reserved = Math.max(0, this.record.reserved - 1);
+      const current = this.record.principals[principal] ?? 0;
+      if (current <= 1) delete this.record.principals[principal];
+      else this.record.principals[principal] = current - 1;
       await this.persist();
     };
   }
@@ -622,13 +671,30 @@ export class SignerDeploymentBudget {
     ) {
       throw new Error("signer deployment budget file is invalid");
     }
-    this.record = { utc_day: parsed.utc_day, reserved: parsed.reserved as number };
+    const principals = parsed.principals ?? {};
+    if (
+      !principals ||
+      typeof principals !== "object" ||
+      Array.isArray(principals) ||
+      Object.values(principals).some(
+        (count) => !Number.isSafeInteger(count) || count < 0
+      )
+    ) {
+      throw new Error("signer deployment budget file is invalid");
+    }
+    this.record = {
+      utc_day: parsed.utc_day,
+      reserved: parsed.reserved as number,
+      principals: principals as Record<string, number>,
+    };
     this.rotateIfNeeded();
   }
 
   private rotateIfNeeded(): void {
     const today = utcDay();
-    if (this.record.utc_day !== today) this.record = { utc_day: today, reserved: 0 };
+    if (this.record.utc_day !== today) {
+      this.record = { utc_day: today, reserved: 0, principals: {} };
+    }
   }
 
   private async persist(): Promise<void> {
@@ -653,6 +719,138 @@ export class SignerDeploymentBudget {
     });
     return this.persistTail;
   }
+}
+
+type SignerRelayBudgetRecord = {
+  utc_day: string;
+  reserved: number;
+  sponsorships: string[];
+};
+
+export class SignerRelayBudget {
+  private loaded = false;
+  private record: SignerRelayBudgetRecord = {
+    utc_day: utcDay(),
+    reserved: 0,
+    sponsorships: [],
+  };
+  private persistTail: Promise<void> = Promise.resolve();
+
+  constructor(private readonly limitPerDay: number, private readonly path: string | null) {
+    if (!Number.isSafeInteger(limitPerDay) || limitPerDay <= 0) {
+      throw new Error("signer relay limit must be a positive integer");
+    }
+  }
+
+  async reserve(key: string): Promise<() => Promise<void>> {
+    await this.load();
+    this.rotateIfNeeded();
+    if (this.record.sponsorships.includes(key)) {
+      throw new Error("privacy signer approval was already sponsored");
+    }
+    if (this.record.reserved >= this.limitPerDay) {
+      throw new Error("privacy signer relay budget exhausted");
+    }
+    const reservationDay = this.record.utc_day;
+    this.record.reserved += 1;
+    this.record.sponsorships.push(key);
+    await this.persist();
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      this.record.sponsorships = this.record.sponsorships.filter(
+        (sponsorship) => sponsorship !== key
+      );
+      this.rotateIfNeeded();
+      if (this.record.utc_day === reservationDay) {
+        this.record.reserved = Math.max(0, this.record.reserved - 1);
+      }
+      await this.persist();
+    };
+  }
+
+  private async load(): Promise<void> {
+    if (this.loaded) return;
+    if (!this.path) {
+      this.loaded = true;
+      return;
+    }
+    let body: string;
+    try {
+      const metadata = await stat(this.path);
+      if (metadata.size > 64 * 1024 * 1024) {
+        throw new Error("signer relay budget file is too large");
+      }
+      body = await readFile(this.path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.loaded = true;
+        return;
+      }
+      throw error;
+    }
+    if (body.trim()) {
+      const parsed = JSON.parse(body) as Partial<SignerRelayBudgetRecord>;
+      if (
+        typeof parsed.utc_day !== "string" ||
+        !/^\d{4}-\d{2}-\d{2}$/.test(parsed.utc_day) ||
+        !Number.isSafeInteger(parsed.reserved) ||
+        (parsed.reserved ?? 0) < 0 ||
+        !Array.isArray(parsed.sponsorships) ||
+        parsed.sponsorships.some((key) => typeof key !== "string")
+      ) {
+        throw new Error("signer relay budget file is invalid");
+      }
+      this.record = {
+        utc_day: parsed.utc_day,
+        reserved: parsed.reserved as number,
+        sponsorships: [...new Set(parsed.sponsorships)],
+      };
+      this.rotateIfNeeded();
+    }
+    this.loaded = true;
+  }
+
+  private rotateIfNeeded(): void {
+    const today = utcDay();
+    if (this.record.utc_day !== today) {
+      this.record.utc_day = today;
+      this.record.reserved = 0;
+    }
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.path) return;
+    const snapshot = JSON.stringify(this.record) + "\n";
+    this.persistTail = this.persistTail.then(async () => {
+      await mkdir(dirname(this.path!), { recursive: true });
+      const tempPath = `${this.path}.${process.pid}.relay.tmp`;
+      const handle = await open(tempPath, "w");
+      try {
+        await handle.writeFile(snapshot, "utf8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await rename(tempPath, this.path!);
+      } catch (error) {
+        await unlink(tempPath).catch(() => undefined);
+        throw error;
+      }
+    });
+    return this.persistTail;
+  }
+}
+
+function relaySponsorshipKey(request: {
+  account_address: string;
+  calls: Array<{ contract_address: string; calldata: string[] }>;
+}): string {
+  const call = request.calls[0];
+  if (!call) throw new Error("privacy signer relay requires exactly one call");
+  return `${request.account_address}:${call.contract_address}:${call.calldata[0]}`;
 }
 
 function utcDay(now = new Date()): string {

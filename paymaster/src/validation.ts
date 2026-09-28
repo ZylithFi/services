@@ -10,6 +10,8 @@ import type {
 } from "./types.js";
 
 const MAX_OUTSIDE_EXECUTION_WINDOW_SECONDS = 3_900;
+const MAX_SIGNER_DEPLOYMENT_SPONSORSHIP_WINDOW_SECONDS = 600;
+const CANONICAL_PRIVACY_SIGNER_APPROVAL_LOW = "0xffffffffffffffffffffffffffffffff";
 const SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS = new Set(["apply_actions"]);
 const EXECUTE_OUTSIDE_REQUEST_KEYS = new Set([
   "chain_id",
@@ -25,6 +27,10 @@ const ENSURE_PRIVACY_SIGNER_REQUEST_KEYS = new Set([
   "signer_public_key",
   "salt",
   "class_hash",
+  "sponsor_address",
+  "sponsor_signature",
+  "sponsor_nonce",
+  "sponsor_expires_at",
 ]);
 const RELAY_PRIVACY_SIGNER_REQUEST_KEYS = new Set([
   "account_address",
@@ -197,7 +203,8 @@ function validateOutsideTransaction(
 
 export function validateEnsurePrivacySignerRequest(
   value: unknown,
-  config: Pick<PaymasterConfig, "privacySignerClassHash">
+  config: Pick<PaymasterConfig, "privacySignerClassHash">,
+  nowUnixSeconds = Math.floor(Date.now() / 1000)
 ): EnsurePrivacySignerRequest {
   const request = expectRecord(value, "request") as Partial<EnsurePrivacySignerRequest>;
   assertAllowedKeys(request, ENSURE_PRIVACY_SIGNER_REQUEST_KEYS, "request");
@@ -212,11 +219,56 @@ export function validateEnsurePrivacySignerRequest(
   if (signerPublicKey === "0x0") {
     throw new Error("signer_public_key cannot be zero");
   }
-  return {
+  const sponsorshipValues = [
+    request.sponsor_address,
+    request.sponsor_signature,
+    request.sponsor_nonce,
+    request.sponsor_expires_at,
+  ];
+  const sponsorshipCount = sponsorshipValues.filter((entry) => entry !== undefined).length;
+  if (sponsorshipCount !== 0 && sponsorshipCount !== sponsorshipValues.length) {
+    throw new Error("deployment sponsorship fields must be provided together");
+  }
+  const validated: EnsurePrivacySignerRequest = {
     signer_public_key: signerPublicKey,
     salt,
     class_hash: classHash,
   };
+  if (sponsorshipCount === sponsorshipValues.length) {
+    const sponsorAddress = normalizeFelt(
+      expectString(request.sponsor_address, "sponsor_address")
+    );
+    if (sponsorAddress === "0x0") {
+      throw new Error("sponsor_address cannot be zero");
+    }
+    const sponsorSignature = expectStringArray(
+      request.sponsor_signature,
+      "sponsor_signature"
+    ).map(normalizeFelt);
+    if (sponsorSignature.length === 0 || sponsorSignature.length > 8) {
+      throw new Error("sponsor_signature must contain between one and eight felts");
+    }
+    const sponsorExpiresAt = parseSafeUnsignedInteger(
+      expectString(request.sponsor_expires_at, "sponsor_expires_at"),
+      "sponsor_expires_at"
+    );
+    if (sponsorExpiresAt <= nowUnixSeconds) {
+      throw new Error("deployment sponsorship is expired");
+    }
+    if (
+      sponsorExpiresAt - nowUnixSeconds >
+      MAX_SIGNER_DEPLOYMENT_SPONSORSHIP_WINDOW_SECONDS
+    ) {
+      throw new Error("deployment sponsorship window is too long");
+    }
+    validated.sponsor_address = sponsorAddress;
+    validated.sponsor_signature = sponsorSignature;
+    validated.sponsor_nonce = normalizeFelt(
+      expectString(request.sponsor_nonce, "sponsor_nonce")
+    );
+    validated.sponsor_expires_at = String(sponsorExpiresAt);
+  }
+  return validated;
 }
 
 export function validateRelayPrivacySignerRequest(
@@ -251,6 +303,12 @@ export function validateRelayPrivacySignerRequest(
   if (!config.approvalSpenders.has(spender)) {
     throw new Error("token approve spender is not allowlisted");
   }
+  if (
+    call.calldata[1] !== CANONICAL_PRIVACY_SIGNER_APPROVAL_LOW ||
+    call.calldata[2] !== "0x0"
+  ) {
+    throw new Error("token approve amount is not canonical");
+  }
   return {
     account_address: accountAddress,
     calls,
@@ -258,6 +316,17 @@ export function validateRelayPrivacySignerRequest(
     signature_r: normalizeFelt(expectString(request.signature_r, "signature_r")),
     signature_s: normalizeFelt(expectString(request.signature_s, "signature_s")),
   };
+}
+
+function parseSafeUnsignedInteger(value: string, label: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${label} must be an unsigned decimal integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a safe unsigned integer`);
+  }
+  return parsed;
 }
 
 function validateDirectRelayedCall(

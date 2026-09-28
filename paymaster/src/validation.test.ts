@@ -191,6 +191,56 @@ describe("validateExecuteOutsideRequest", () => {
 });
 
 describe("validateEnsurePrivacySignerRequest", () => {
+  it("accepts a complete, short-lived deployment sponsorship", () => {
+    const validated = validateEnsurePrivacySignerRequest(
+      {
+        signer_public_key: "0x1",
+        salt: "0x2",
+        class_hash: "0x123",
+        sponsor_address: "0xabc",
+        sponsor_signature: ["0x4", "0x5"],
+        sponsor_nonce: "0x6",
+        sponsor_expires_at: "1700000300",
+      },
+      { privacySignerClassHash: "0x123" },
+      1_700_000_000
+    );
+
+    expect(validated.sponsor_address).toBe("0xabc");
+    expect(validated.sponsor_signature).toEqual(["0x4", "0x5"]);
+  });
+
+  it("rejects partial and long-lived deployment sponsorships", () => {
+    expect(() =>
+      validateEnsurePrivacySignerRequest(
+        {
+          signer_public_key: "0x1",
+          salt: "0x2",
+          class_hash: "0x123",
+          sponsor_address: "0xabc",
+        },
+        { privacySignerClassHash: "0x123" },
+        1_700_000_000
+      )
+    ).toThrow("deployment sponsorship fields must be provided together");
+
+    expect(() =>
+      validateEnsurePrivacySignerRequest(
+        {
+          signer_public_key: "0x1",
+          salt: "0x2",
+          class_hash: "0x123",
+          sponsor_address: "0xabc",
+          sponsor_signature: ["0x4", "0x5"],
+          sponsor_nonce: "0x6",
+          sponsor_expires_at: "1700003600",
+        },
+        { privacySignerClassHash: "0x123" },
+        1_700_000_000
+      )
+    ).toThrow("deployment sponsorship window is too long");
+  });
+
   it("rejects unknown signer deployment fields", () => {
     expect(() =>
       validateEnsurePrivacySignerRequest(
@@ -214,7 +264,7 @@ describe("validateRelayPrivacySignerRequest", () => {
         calls: [{
           contract_address: "0x456",
           entrypoint: "approve",
-          calldata: ["0x123", "0x64", "0x0"]
+          calldata: ["0x123", "0xffffffffffffffffffffffffffffffff", "0x0"]
         }],
         nonce: "0x999",
         signature_r: "0xa",
@@ -225,6 +275,25 @@ describe("validateRelayPrivacySignerRequest", () => {
 
     expect(validated.account_address).toBe("0x777");
     expect(validated.calls[0]?.entrypoint).toBe("approve");
+  });
+
+  it("rejects approvals that are not the canonical reusable amount", () => {
+    expect(() =>
+      validateRelayPrivacySignerRequest(
+        {
+          account_address: "0x777",
+          calls: [{
+            contract_address: "0x456",
+            entrypoint: "approve",
+            calldata: ["0x123", "0x64", "0x0"]
+          }],
+          nonce: "0x999",
+          signature_r: "0xa",
+          signature_s: "0xb"
+        },
+        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
+      )
+    ).toThrow("token approve amount is not canonical");
   });
 
   it("rejects unknown signer relay request fields", () => {

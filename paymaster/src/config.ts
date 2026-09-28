@@ -15,17 +15,24 @@ export type PaymasterConfig = {
   allowedOrigins: Set<string>;
   signerLimitPerMinute: number;
   signerDeploymentLimitPerDay: number;
+  signerDeploymentLimitPerPrincipalPerDay: number;
+  signerRelayLimitPerDay: number;
+  maxSponsoredFeeFri: bigint;
   trustProxyHeaders: boolean;
   trustedProxyCidrs: string[];
   internalApiToken: string;
   submissionLogPath: string | null;
   signerDeploymentLogPath: string | null;
+  signerRelayLogPath: string | null;
 };
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
 const DEFAULT_SIGNER_LIMIT_PER_MINUTE = 20;
 const DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_DAY = 100;
+const DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY = 1;
+const DEFAULT_SIGNER_RELAY_LIMIT_PER_DAY = 500;
+const DEFAULT_MAX_SPONSORED_FEE_FRI = 1_000_000_000_000_000_000n;
 const STARKNET_FIELD_PRIME =
   3618502788666131213697322783095070105623107215331596699973092056135872020481n;
 
@@ -101,11 +108,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_DAY,
       "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY"
     ),
+    signerDeploymentLimitPerPrincipalPerDay: parsePositiveInt(
+      env.ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY,
+      DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY,
+      "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY"
+    ),
+    signerRelayLimitPerDay: parsePositiveInt(
+      env.ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY,
+      DEFAULT_SIGNER_RELAY_LIMIT_PER_DAY,
+      "ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY"
+    ),
+    maxSponsoredFeeFri: parsePositiveBigInt(
+      env.ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI,
+      DEFAULT_MAX_SPONSORED_FEE_FRI,
+      "ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI"
+    ),
     trustProxyHeaders,
     trustedProxyCidrs,
     internalApiToken,
     submissionLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH"),
-    signerDeploymentLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LOG_PATH")
+    signerDeploymentLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LOG_PATH"),
+    signerRelayLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SIGNER_RELAY_LOG_PATH")
   };
 }
 
@@ -228,6 +251,22 @@ function parsePositiveInt(value: string | undefined, defaultValue: number, key: 
   }
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${key} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parsePositiveBigInt(
+  value: string | undefined,
+  defaultValue: bigint,
+  key: string
+): bigint {
+  if (!value) return defaultValue;
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error(`${key} must be a positive integer`);
+  }
+  const parsed = BigInt(value);
+  if (parsed <= 0n) {
     throw new Error(`${key} must be a positive integer`);
   }
   return parsed;

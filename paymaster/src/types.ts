@@ -25,6 +25,10 @@ export type EnsurePrivacySignerRequest = {
   signer_public_key: string;
   salt: string;
   class_hash?: string;
+  sponsor_address?: string;
+  sponsor_signature?: string[];
+  sponsor_nonce?: string;
+  sponsor_expires_at?: string;
 };
 
 export type EnsurePrivacySignerResponse = {

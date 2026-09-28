@@ -11,10 +11,10 @@ use std::{
     convert::Infallible,
     future::Future,
     hash::Hash,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -22,8 +22,8 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{HeaderName, HeaderValue, StatusCode, header},
+    extract::{ConnectInfo, Path, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -39,9 +39,13 @@ use tokio_tungstenite::tungstenite::Message;
 const BIND_ADDR_ENV: &str = "ZYLITH_MARKET_DATA_BIND_ADDR";
 const PAIRS_ENV: &str = "ZYLITH_MARKET_DATA_PAIRS";
 const MAX_STREAMS_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAMS";
+const MAX_STREAMS_PER_CLIENT_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAMS_PER_CLIENT";
+const MAX_STREAM_LIFETIME_SECONDS_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAM_LIFETIME_SECONDS";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3500";
 const DEFAULT_PAIRS: &str = "STRK/USDC,ETH/USDC";
 const DEFAULT_MAX_STREAMS: usize = 4_096;
+const DEFAULT_MAX_STREAMS_PER_CLIENT: usize = 64;
+const DEFAULT_MAX_STREAM_LIFETIME: Duration = Duration::from_secs(300);
 
 const BINANCE_REST_ORIGINS: [&str; 2] =
     ["https://api.binance.com", "https://data-api.binance.vision"];
@@ -468,7 +472,10 @@ struct Inner {
     candles: Cache<(Pair, &'static str), CandleHistory>,
     binance: Arc<BinanceStreamHub>,
     active_streams: AtomicUsize,
+    active_streams_by_client: Mutex<HashMap<IpAddr, usize>>,
     max_streams: usize,
+    max_streams_per_client: usize,
+    max_stream_lifetime: Duration,
 }
 
 #[derive(Clone)]
@@ -479,6 +486,8 @@ impl AppState {
         fetch: Fetcher,
         pairs: BTreeSet<Pair>,
         max_streams: usize,
+        max_streams_per_client: usize,
+        max_stream_lifetime: Duration,
         binance: Arc<BinanceStreamHub>,
     ) -> Self {
         Self(Arc::new(Inner {
@@ -488,7 +497,10 @@ impl AppState {
             candles: Cache::new(CANDLES_TTL),
             binance,
             active_streams: AtomicUsize::new(0),
+            active_streams_by_client: Mutex::new(HashMap::new()),
             max_streams,
+            max_streams_per_client,
+            max_stream_lifetime,
         }))
     }
 
@@ -755,37 +767,70 @@ async fn candle_history(
         .into_response())
 }
 
-/// releases a stream slot when the client's fan-out task ends.
-struct StreamSlot(AppState);
+/// releases global and per-client stream capacity when fan-out ends.
+struct StreamSlot {
+    state: AppState,
+    client_ip: IpAddr,
+}
 
 impl Drop for StreamSlot {
     fn drop(&mut self) {
-        self.0.0.active_streams.fetch_sub(1, Ordering::Relaxed);
+        let inner = &self.state.0;
+        inner.active_streams.fetch_sub(1, Ordering::Relaxed);
+        let mut clients = inner
+            .active_streams_by_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(active) = clients.get_mut(&self.client_ip) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                clients.remove(&self.client_ip);
+            }
+        }
     }
 }
 
 impl AppState {
-    fn acquire_stream_slot(&self) -> Result<StreamSlot, StatusCode> {
+    fn acquire_stream_slot(&self, client_ip: IpAddr) -> Result<StreamSlot, StatusCode> {
         let inner = &self.0;
+        let mut clients = inner
+            .active_streams_by_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active_for_client = clients.entry(client_ip).or_default();
+        if *active_for_client >= inner.max_streams_per_client {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
         if inner.active_streams.fetch_add(1, Ordering::Relaxed) >= inner.max_streams {
             inner.active_streams.fetch_sub(1, Ordering::Relaxed);
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        Ok(StreamSlot(self.clone()))
+        *active_for_client += 1;
+        Ok(StreamSlot {
+            state: self.clone(),
+            client_ip,
+        })
     }
 }
 
 async fn market_stream(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path((base, quote, interval)): Path<(String, String, String)>,
 ) -> Result<Response, StatusCode> {
     let pair = state.pair(&base, &quote)?;
     let interval = chart_interval(&interval)?;
-    let slot = state.acquire_stream_slot()?;
+    let client_ip = trusted_proxy_client_ip(peer.ip(), &headers);
+    let slot = state.acquire_stream_slot(client_ip)?;
+    let max_stream_lifetime = state.0.max_stream_lifetime;
     let (events, receiver) = mpsc::channel::<Event>(32);
     tokio::spawn(async move {
         let _slot = slot;
-        fan_out_market_stream(state, pair, interval, events).await;
+        tokio::select! {
+            _ = fan_out_market_stream(state, pair, interval, events) => {}
+            _ = tokio::time::sleep(max_stream_lifetime) => {}
+        }
     });
     let stream = stream::unfold(receiver, |mut receiver| async move {
         receiver
@@ -805,6 +850,17 @@ async fn market_stream(
         Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))),
     )
         .into_response())
+}
+
+fn trusted_proxy_client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(peer)
 }
 
 async fn recv_optional(
@@ -978,16 +1034,51 @@ async fn main() -> Result<(), String> {
             .ok_or_else(|| format!("{MAX_STREAMS_ENV} must be a positive integer"))?,
         Err(_) => DEFAULT_MAX_STREAMS,
     };
+    let max_streams_per_client = match std::env::var(MAX_STREAMS_PER_CLIENT_ENV) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0 && *value <= max_streams)
+            .ok_or_else(|| {
+                format!(
+                    "{MAX_STREAMS_PER_CLIENT_ENV} must be a positive integer no larger than {MAX_STREAMS_ENV}"
+                )
+            })?,
+        Err(_) => DEFAULT_MAX_STREAMS_PER_CLIENT.min(max_streams),
+    };
+    let max_stream_lifetime = match std::env::var(MAX_STREAM_LIFETIME_SECONDS_ENV) {
+        Ok(raw) => Duration::from_secs(
+            raw.trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    format!("{MAX_STREAM_LIFETIME_SECONDS_ENV} must be a positive integer")
+                })?,
+        ),
+        Err(_) => DEFAULT_MAX_STREAM_LIFETIME,
+    };
     let (hub, subscribe_requests) = BinanceStreamHub::new();
     tokio::spawn(run_binance_stream(hub.clone(), subscribe_requests));
-    let state = AppState::new(http_fetcher(), pairs, max_streams, hub);
+    let state = AppState::new(
+        http_fetcher(),
+        pairs,
+        max_streams,
+        max_streams_per_client,
+        max_stream_lifetime,
+        hub,
+    );
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|error| format!("bind {bind_addr}: {error}"))?;
     println!("zylith market data listening on http://{bind_addr}");
-    axum::serve(listener, app(state))
-        .await
-        .map_err(|error| format!("serve: {error}"))
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|error| format!("serve: {error}"))
 }
 
 #[cfg(test)]
@@ -1027,6 +1118,8 @@ mod tests {
             fake_fetcher(responses, calls.clone()),
             configured_pairs(pairs).expect("pairs"),
             2,
+            1,
+            DEFAULT_MAX_STREAM_LIFETIME,
             hub,
         );
         (state, calls)
@@ -1054,6 +1147,25 @@ mod tests {
         assert_eq!(chart_interval("1M"), Ok("1M"));
         assert_eq!(chart_interval("2m"), Err(StatusCode::NOT_FOUND));
         assert!(configured_pairs("STRK/USDC,STRK/??").is_err());
+    }
+
+    #[test]
+    fn client_identity_only_accepts_headers_from_the_loopback_proxy() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.10"));
+        assert_eq!(
+            trusted_proxy_client_ip("127.0.0.1".parse().expect("ip"), &headers),
+            "192.0.2.10".parse::<IpAddr>().expect("ip")
+        );
+        assert_eq!(
+            trusted_proxy_client_ip("198.51.100.8".parse().expect("ip"), &headers),
+            "198.51.100.8".parse::<IpAddr>().expect("ip")
+        );
+        headers.insert("x-real-ip", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(
+            trusted_proxy_client_ip("127.0.0.1".parse().expect("ip"), &headers),
+            "127.0.0.1".parse::<IpAddr>().expect("ip")
+        );
     }
 
     #[test]
@@ -1266,6 +1378,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .uri(uri)
+                        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
                         .body(Body::empty())
                         .expect("request"),
                 )
@@ -1278,10 +1391,40 @@ mod tests {
             0,
             "rejected requests never reach upstream"
         );
-        let _first = state.acquire_stream_slot().expect("slot");
-        let _second = state.acquire_stream_slot().expect("slot");
-        assert!(state.acquire_stream_slot().is_err());
+        let first_client = "192.0.2.1".parse().expect("ip");
+        let second_client = "192.0.2.2".parse().expect("ip");
+        let _first = state.acquire_stream_slot(first_client).expect("slot");
+        assert!(state.acquire_stream_slot(first_client).is_err());
+        let _second = state.acquire_stream_slot(second_client).expect("slot");
+        assert!(state.acquire_stream_slot(second_client).is_err());
         drop(_first);
-        assert!(state.acquire_stream_slot().is_ok());
+        assert!(state.acquire_stream_slot(first_client).is_ok());
+    }
+
+    #[tokio::test]
+    async fn stream_capacity_is_reclaimed_after_the_maximum_lifetime() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (hub, _requests) = BinanceStreamHub::new();
+        let state = AppState::new(
+            fake_fetcher(vec![], calls),
+            configured_pairs(DEFAULT_PAIRS).expect("pairs"),
+            2,
+            1,
+            Duration::from_millis(1),
+            hub,
+        );
+        let client = SocketAddr::from(([192, 0, 2, 1], 12345));
+        let response = market_stream(
+            State(state.clone()),
+            ConnectInfo(client),
+            HeaderMap::new(),
+            Path(("STRK".into(), "USDC".into(), "15m".into())),
+        )
+        .await
+        .expect("stream");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.acquire_stream_slot(client.ip()).is_err());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(state.acquire_stream_slot(client.ip()).is_ok());
     }
 }
