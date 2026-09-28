@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use starknet_rust_core::types::Felt;
 use tokio::sync::Mutex;
 
 use crate::config::{Account, Config, felt};
@@ -48,6 +49,8 @@ async fn main() -> Result<(), String> {
                 .map_err(|error| format!("execution keys {path}: {error}"))?;
             let keys: Vec<zylith_core::PrivateExecutionKeyPrivateConfig> =
                 serde_json::from_str(&raw).map_err(|error| format!("execution keys: {error}"))?;
+            zylith_core::validate_private_execution_keys(&keys)
+                .map_err(|error| format!("execution keys: {error}"))?;
             let registry = zylith_core::PrivateExecutionKeyRegistry {
                 keys: keys
                     .iter()
@@ -108,6 +111,31 @@ async fn check_token_decimals(config: &Config, snip36: &Snip36) -> Result<(), St
     Ok(())
 }
 
+async fn check_exchange_configuration(config: &Config, snip36: &Snip36) -> Result<(), String> {
+    let signer = snip36
+        .view(config.exchange, "reference_signer", Vec::new())
+        .await?
+        .first()
+        .copied()
+        .ok_or("exchange returned no reference signer")?;
+    if signer != config.reference_price_signer {
+        return Err(format!(
+            "exchange reference signer {signer:#x} differs from the manifest's {:#x}",
+            config.reference_price_signer
+        ));
+    }
+    let locked = snip36
+        .view(config.exchange, "config_is_locked", Vec::new())
+        .await?
+        .first()
+        .copied()
+        .ok_or("exchange returned no configuration lock state")?;
+    if locked != Felt::ONE {
+        return Err("exchange configuration is not locked".into());
+    }
+    Ok(())
+}
+
 async fn serve() -> Result<(), String> {
     let config = Config::from_env()?;
     let store = Store::open(
@@ -116,6 +144,7 @@ async fn serve() -> Result<(), String> {
         &config.data_key,
     )?;
     let snip36 = Snip36::new(&config);
+    check_exchange_configuration(&config, &snip36).await?;
     check_token_decimals(&config, &snip36).await?;
     let state = match store.load()? {
         Some(state) => state,

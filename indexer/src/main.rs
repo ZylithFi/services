@@ -71,6 +71,7 @@ pub struct TransitionOutputsList {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IndexerStatus {
     pub service: String,
+    pub ready: bool,
     pub deposits_bucket: String,
     pub latest_seq: u32,
     pub last_successful_sync_unix_ms: u64,
@@ -739,21 +740,16 @@ impl AppState {
 
     fn allow(&self, peer: SocketAddr, headers: &HeaderMap) -> Result<(), StatusCode> {
         let peer_ip = peer.ip();
-        let client = if self
-            .config
-            .trusted_proxies
-            .iter()
-            .any(|network| network.contains(&peer_ip))
-        {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.rsplit(',').next())
-                .and_then(|value| value.trim().parse().ok())
-                .unwrap_or(peer_ip)
-        } else {
-            peer_ip
-        };
+        let forwarded = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim);
+        let client = zylith_core::forwarded_client_ip(peer_ip, forwarded, |address| {
+            self.config
+                .trusted_proxies
+                .iter()
+                .any(|network| network.contains(&address))
+        });
         let minute = now_ms() / 60_000;
         let mut limiter = self
             .limiter
@@ -777,11 +773,12 @@ impl AppState {
         let index = self.index.read().await;
         IndexerStatus {
             service: "zylith-indexer".into(),
+            ready: index.last_sync_ms != 0,
             deposits_bucket: count_bucket_label(index.deposits.len() as u64),
             latest_seq: index.transitions.keys().next_back().copied().unwrap_or(0),
             last_successful_sync_unix_ms: index.last_sync_ms,
             sync_lag_ms: if index.last_sync_ms == 0 {
-                0
+                u64::MAX
             } else {
                 now_ms().saturating_sub(index.last_sync_ms)
             },
@@ -835,8 +832,14 @@ fn transition_outputs(
     })
 }
 
-async fn health(State(state): State<AppState>) -> Json<IndexerStatus> {
-    Json(state.status().await)
+async fn health(State(state): State<AppState>) -> (StatusCode, Json<IndexerStatus>) {
+    let status = state.status().await;
+    let code = if status.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(status))
 }
 
 async fn sync_now(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<IndexerStatus> {
@@ -1135,6 +1138,24 @@ mod tests {
                 .0,
             StatusCode::OK
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn health_is_unavailable_until_one_sync_completes() {
+        let path = temporary("health");
+        let _ = std::fs::remove_file(&path);
+        let state = state(path.clone(), 100);
+        let app = router(state.clone());
+        let (status, body) = get(&app, "/health", "1.2.3.4:5", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["last_successful_sync_unix_ms"], 0);
+
+        state.index.write().await.last_sync_ms = now_ms();
+        let (status, body) = get(&app, "/health", "1.2.3.4:5", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ready"], true);
         let _ = std::fs::remove_file(&path);
     }
 

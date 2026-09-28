@@ -10,7 +10,7 @@ mod types;
 
 pub use auth::{
     CONTROL_PLANE_TOKEN_ENV, RECOVERY_AUTH_HEADER, constant_time_eq, derive_recovery_auth_tag,
-    extract_bearer_token,
+    extract_bearer_token, forwarded_client_ip,
 };
 pub use crypto::{
     ReferencePriceBatchEntry, Strk20ExitClaimMessage, build_deposit_submission_plan,
@@ -35,5 +35,6 @@ pub use types::{
     PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry, ProductAssetConfig,
     ProductConfig, ProductPairConfig, RecoveryArtifact, RecoveryArtifactKind, RecoveryArtifactList,
     RecoveryArtifactUpload, SpendAuthorization, StarknetPrivacyFundingRail, count_bucket_label,
-    spend_authority_from_raw_key_hex, withdraw_authority_from_raw_key_hex,
+    spend_authority_from_raw_key_hex, validate_private_execution_keys,
+    withdraw_authority_from_raw_key_hex,
 };

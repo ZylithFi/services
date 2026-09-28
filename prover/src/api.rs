@@ -138,24 +138,20 @@ async fn allow(api: &Api, peer: IpAddr) -> bool {
     entry.1 <= limit
 }
 
-/// the client's address: the peer, or behind a trusted proxy the last forwarded hop.
+/// the client's address, resolved right-to-left through only configured proxy hops.
 fn client_ip(api: &Api, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     let peer_ip = peer.ip();
-    if !api
-        .operator
-        .config
-        .trusted_proxies
-        .iter()
-        .any(|network| network.contains(&peer_ip))
-    {
-        return peer_ip;
-    }
-    headers
+    let forwarded = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.rsplit(',').next())
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(peer_ip)
+        .map(str::trim);
+    zylith_core::forwarded_client_ip(peer_ip, forwarded, |address| {
+        api.operator
+            .config
+            .trusted_proxies
+            .iter()
+            .any(|network| network.contains(&address))
+    })
 }
 
 async fn private_request(

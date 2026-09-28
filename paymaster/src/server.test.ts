@@ -284,7 +284,7 @@ describe("paymaster server", () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
   });
 
-  it("uses valid forwarded client IPs only from trusted proxies", async () => {
+  it("uses the nearest untrusted forwarded client instead of a spoofable leftmost value", async () => {
     const server = createPaymasterServer(
       {
         ...config(),
@@ -308,14 +308,14 @@ describe("paymaster server", () => {
           headers: {
             "content-type": "application/json",
             origin: "https://app.example",
-            "x-forwarded-for": `203.0.113.${index + 1}`
+            "x-forwarded-for": `198.51.100.${index + 1}, 203.0.113.50`
           },
           body: JSON.stringify(requestWithSigner(index))
         })
       );
     }
 
-    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200]);
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
   });
 
   it("ignores malformed forwarded IP headers even from trusted proxies", async () => {

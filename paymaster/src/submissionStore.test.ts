@@ -180,6 +180,52 @@ describe("SubmissionStore", () => {
     expect(first.transaction_hash).toBe("0xfirst");
     expect(second.transaction_hash).toBe("0xsecond");
   });
+
+  it("persists the intent before broadcasting", async () => {
+    const store = new SubmissionStore("/dev/null/zylith-submissions.json");
+    let submits = 0;
+    await expect(
+      store.runOnce(request, async () => {
+        submits += 1;
+        return { transaction_hash: "0xnever" };
+      })
+    ).rejects.toThrow();
+    expect(submits).toBe(0);
+  });
+
+  it("fails closed on an indeterminate persisted submission", async () => {
+    const path = await tempPath();
+    await writeFile(path, JSON.stringify([{ ...submissionRecord(null) }]));
+    const store = new SubmissionStore(path);
+    let submits = 0;
+    await expect(
+      store.runOnce(request, async () => {
+        submits += 1;
+        return { transaction_hash: "0xduplicate" };
+      })
+    ).rejects.toThrow("pending reconciliation");
+    expect(submits).toBe(0);
+  });
+
+  it("retains the pending intent when submission fails ambiguously", async () => {
+    const path = await tempPath();
+    const store = new SubmissionStore(path);
+    await expect(
+      store.runOnce(request, async () => {
+        throw new Error("rpc disconnected after send");
+      })
+    ).rejects.toThrow("rpc disconnected after send");
+
+    const restarted = new SubmissionStore(path);
+    let retries = 0;
+    await expect(
+      restarted.runOnce(request, async () => {
+        retries += 1;
+        return { transaction_hash: "0xduplicate" };
+      })
+    ).rejects.toThrow("pending reconciliation");
+    expect(retries).toBe(0);
+  });
 });
 
 async function tempPath(): Promise<string> {
@@ -226,7 +272,7 @@ function requestWithNonce(nonce: string): ExecuteOutsideRequest {
   };
 }
 
-function submissionRecord(transactionHash: string, submittedAtUnixMs = Date.now()) {
+function submissionRecord(transactionHash: string | null, submittedAtUnixMs = Date.now()) {
   return {
     key: "0x777:0x9",
     signer_address: "0x777",

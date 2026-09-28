@@ -9,7 +9,7 @@ export type SubmissionRecord = {
   key: string;
   signer_address: string;
   outside_nonce: string;
-  transaction_hash: string;
+  transaction_hash: string | null;
   submitted_at_unix_ms: number;
 };
 
@@ -43,14 +43,16 @@ export class SubmissionStore {
     await this.load();
 
     const key = submissionKey(request);
-    const existing = this.records.get(key);
-    if (existing) {
-      return { transaction_hash: existing.transaction_hash };
-    }
-
     const inFlight = this.inFlight.get(key);
     if (inFlight) {
       return inFlight;
+    }
+    const existing = this.records.get(key);
+    if (existing) {
+      if (existing.transaction_hash === null) {
+        throw new Error("submission outcome is pending reconciliation");
+      }
+      return { transaction_hash: existing.transaction_hash };
     }
 
     const promise = this.submitAndRecord(key, request, submit);
@@ -72,17 +74,27 @@ export class SubmissionStore {
     request: ExecuteOutsideRequest,
     submit: () => Promise<ExecuteOutsideResponse>
   ): Promise<ExecuteOutsideResponse> {
-    const result = await submit();
-    const record: SubmissionRecord = {
+    const pending: SubmissionRecord = {
       key,
       signer_address: request.signer_address,
       outside_nonce: submissionNonce(request),
-      transaction_hash: result.transaction_hash,
+      transaction_hash: null,
       submitted_at_unix_ms: Date.now()
     };
-    this.records.set(key, record);
-    this.pruneRecords(record.submitted_at_unix_ms);
-    await this.persistBestEffort();
+    this.records.set(key, pending);
+    this.pruneRecords(pending.submitted_at_unix_ms);
+    await this.persist();
+
+    const result = await submit();
+
+    const submitted = { ...pending, transaction_hash: result.transaction_hash };
+    this.records.set(key, submitted);
+    try {
+      await this.persist();
+    } catch (error) {
+      this.records.set(key, pending);
+      throw error;
+    }
     return result;
   }
 
@@ -141,43 +153,43 @@ export class SubmissionStore {
     this.pruneRecords(Date.now(), true);
   }
 
-  private async persistBestEffort(): Promise<void> {
+  private async persist(): Promise<void> {
     const run = this.persistTail
       .catch(() => undefined)
-      .then(() => this.persistSnapshotBestEffort());
+      .then(() => this.persistSnapshot());
     this.persistTail = run;
-    return run;
+    try {
+      await run;
+    } catch (error) {
+      throw new Error("submission journal is unavailable", { cause: error });
+    }
   }
 
-  private async persistSnapshotBestEffort(): Promise<void> {
+  private async persistSnapshot(): Promise<void> {
     if (!this.path) {
       return;
     }
 
+    await mkdir(dirname(this.path), { recursive: true });
+    const tempPath = `${this.path}.${process.pid}.${tempFileCounter++}.tmp`;
+    const handle = await open(tempPath, "wx");
     try {
-      await mkdir(dirname(this.path), { recursive: true });
-      const tempPath = `${this.path}.${process.pid}.${tempFileCounter++}.tmp`;
-      const handle = await open(tempPath, "wx");
-      try {
-        await handle.writeFile(`${JSON.stringify([...this.records.values()], null, 2)}\n`);
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      try {
-        await rename(tempPath, this.path);
-      } catch (error) {
-        await unlink(tempPath).catch(() => undefined);
-        throw error;
-      }
-      const directory = await open(dirname(this.path), "r");
-      try {
-        await directory.sync();
-      } finally {
-        await directory.close();
-      }
+      await handle.writeFile(`${JSON.stringify([...this.records.values()], null, 2)}\n`);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await rename(tempPath, this.path);
     } catch (error) {
-      console.error("failed to persist paymaster submission log", error);
+      await unlink(tempPath).catch(() => undefined);
+      throw error;
+    }
+    const directory = await open(dirname(this.path), "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
     }
   }
 
@@ -191,14 +203,15 @@ export class SubmissionStore {
     }
     const oldestAllowed = Math.max(0, nowUnixMs - SUBMISSION_RECORD_RETENTION_MS);
     for (const [key, record] of this.records) {
-      if (record.submitted_at_unix_ms < oldestAllowed) {
+      if (record.transaction_hash !== null && record.submitted_at_unix_ms < oldestAllowed) {
         this.records.delete(key);
       }
     }
     if (this.records.size > MAX_SUBMISSION_RECORDS) {
       const oldest = [...this.records.values()]
+        .filter((record) => record.transaction_hash !== null)
         .sort((left, right) => left.submitted_at_unix_ms - right.submitted_at_unix_ms)
-        .slice(0, this.records.size - MAX_SUBMISSION_RECORDS);
+        .slice(0, Math.max(0, this.records.size - MAX_SUBMISSION_RECORDS));
       for (const record of oldest) {
         this.records.delete(record.key);
       }
@@ -222,8 +235,8 @@ function validateSubmissionRecord(value: unknown): asserts value is SubmissionRe
     !record.key ||
     typeof record.signer_address !== "string" ||
     typeof record.outside_nonce !== "string" ||
-    typeof record.transaction_hash !== "string" ||
-    !record.transaction_hash ||
+    (record.transaction_hash !== null &&
+      (typeof record.transaction_hash !== "string" || !record.transaction_hash)) ||
     typeof record.submitted_at_unix_ms !== "number" ||
     !Number.isSafeInteger(record.submitted_at_unix_ms) ||
     record.submitted_at_unix_ms < 0

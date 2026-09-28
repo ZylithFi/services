@@ -35,6 +35,19 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
       if (!/^https:\/\//i.test(url)) fail(`${name} must use https: ${url}`);
     }
   };
+  const healthUrls = (name) => {
+    const raw = required(name);
+    for (const url of raw.split(",").map((entry) => entry.trim()).filter(Boolean)) {
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        fail(`${name} contains an invalid url: ${url}`);
+        continue;
+      }
+      if (parsed.protocol !== "https:" && !isOperatorHost(url)) fail(`${name} must use https or an operator-local address: ${url}`);
+    }
+  };
   const origins = (name) => {
     const raw = required(name);
     for (const origin of raw.split(",").map((entry) => entry.trim()).filter(Boolean)) {
@@ -56,13 +69,21 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
   secret("ZYLITH_CONTROL_PLANE_TOKEN", 32);
   secret("ZYLITH_REFERENCE_PRICE_ATTESTOR_TOKEN", 32);
   httpsUrls("ZYLITH_REFERENCE_PRICE_ATTESTOR_URL");
+  if (value("ZYLITH_TX_PROVER_REMOTE_TRUSTED")) fail("ZYLITH_TX_PROVER_REMOTE_TRUSTED is retired; use ZYLITH_TX_PROVER_TRUSTED_HOSTS");
+  const trustedProverHosts = new Set(value("ZYLITH_TX_PROVER_TRUSTED_HOSTS").split(",").map((host) => host.trim().toLowerCase()).filter(Boolean));
   // the transaction prover sees every witness: it runs on the operator's own hosts.
   for (const prover of required("ZYLITH_TX_PROVER_URLS").split(",").map((entry) => entry.trim()).filter(Boolean)) {
-    if (!isOperatorHost(prover) && value("ZYLITH_TX_PROVER_REMOTE_TRUSTED") !== "1") {
-      fail(`transaction prover ${prover} is not operator-run; it sees every witness`);
+    let host = "";
+    try { host = new URL(prover).hostname.toLowerCase(); } catch {}
+    if (!isOperatorHost(prover) && !trustedProverHosts.has(host)) {
+      fail(`transaction prover ${prover} is not local or explicitly listed in ZYLITH_TX_PROVER_TRUSTED_HOSTS`);
     }
   }
   httpsUrls("ZYLITH_ROUTE_SERVICE_URL", { optional: true });
+  healthUrls("ZYLITH_PAYMASTER_HEALTH_URL");
+  healthUrls("ZYLITH_PRIVACY_DISCOVERY_HEALTH_URL");
+  healthUrls("ZYLITH_PRIVACY_PROVER_HEALTH_URL");
+  healthUrls("ZYLITH_TX_PROVER_HEALTH_URLS");
   origins("ZYLITH_PROVER_ALLOWED_ORIGINS");
   const executionKeys = required("ZYLITH_EXECUTION_KEYS_PATH");
   if (executionKeys && !fileExists(executionKeys)) fail(`ZYLITH_EXECUTION_KEYS_PATH does not exist: ${executionKeys}`);
@@ -79,6 +100,7 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
 
   // the attestor signs only for the exchange.
   felt("ZYLITH_REFERENCE_PRICE_SIGNER_PRIVATE_KEY");
+  felt("ZYLITH_REFERENCE_PRICE_SIGNER_PUBLIC_KEY");
   felt("ZYLITH_EXCHANGE_ADDRESS");
 
   // the indexer and the backup service.
@@ -115,6 +137,10 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     if (value("ZYLITH_EXCHANGE_ADDRESS") && !sameFelt(value("ZYLITH_EXCHANGE_ADDRESS"), manifest.contracts?.exchange)) {
       fail("ZYLITH_EXCHANGE_ADDRESS does not match the manifest's exchange");
     }
+    if (!isNonZeroFelt(manifest.roles?.reference_price_signer)) fail("manifest roles.reference_price_signer must be set");
+    if (value("ZYLITH_REFERENCE_PRICE_SIGNER_PUBLIC_KEY") && !sameFelt(value("ZYLITH_REFERENCE_PRICE_SIGNER_PUBLIC_KEY"), manifest.roles?.reference_price_signer)) {
+      fail("ZYLITH_REFERENCE_PRICE_SIGNER_PUBLIC_KEY does not match the manifest's roles.reference_price_signer");
+    }
     for (const [account, field] of [["ZYLITH_STARKNET_ACCOUNT_ADDRESS", "settlement_account_address"], ["ZYLITH_PROOF_ACCOUNT_ADDRESS", "proof_account_address"]]) {
       if (value(account) && !sameFelt(value(account), manifest.proof?.[field])) fail(`${account} does not match the manifest's proof.${field}`);
     }
@@ -139,6 +165,7 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     } else {
       if (value("ZYLITH_EXTERNAL_MATCHING_DISABLED") === "1") fail(`ZYLITH_EXTERNAL_MATCHING_DISABLED is set but ${external.map((pair) => pair.pair_id).join(", ")} match externally`);
       if (!value("ZYLITH_ROUTE_SERVICE_URL")) fail("external matching needs ZYLITH_ROUTE_SERVICE_URL");
+      healthUrls("ZYLITH_ROUTE_SERVICE_HEALTH_URL");
       // margins are per quote asset: raw atoms of different assets are never compared.
       let margins = {};
       try {
@@ -164,7 +191,7 @@ function isOperatorHost(url) {
   } catch {
     return false;
   }
-  if (host === "localhost" || host.endsWith(".internal") || host.endsWith(".local") || host === "::1") return true;
+  if (host === "localhost" || host === "::1") return true;
   const octets = host.split(".").map(Number);
   if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet))) return /^f[cd]/i.test(host);
   return octets[0] === 127 || octets[0] === 10 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) || (octets[0] === 192 && octets[1] === 168);

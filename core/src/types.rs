@@ -1,5 +1,9 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use serde::{Deserialize, Serialize};
 use starknet_crypto::get_public_key;
 use zeroize::Zeroize;
@@ -324,6 +328,56 @@ impl Drop for PrivateExecutionKeyPrivateConfig {
     }
 }
 
+impl PrivateExecutionKeyPrivateConfig {
+    /// validates the secret/public point pair and returns the canonical uncompressed point.
+    pub fn canonical_public_key(&self) -> Result<Vec<u8>, ProtocolError> {
+        let private = hex::decode(self.private_key.trim_start_matches("0x"))?;
+        let secret = p256::SecretKey::from_slice(&private)
+            .map_err(|_| ProtocolError::Crypto("execution private key is invalid".into()))?;
+        let public = hex::decode(self.public_key.trim_start_matches("0x"))?;
+        let supplied = p256::PublicKey::from_sec1_bytes(&public)
+            .map_err(|_| ProtocolError::Crypto("execution public key is invalid".into()))?;
+        let canonical = supplied.to_encoded_point(false);
+        if public.as_slice() != canonical.as_bytes() {
+            return Err(ProtocolError::Crypto(
+                "execution public key is not canonical uncompressed sec1".into(),
+            ));
+        }
+        let derived = secret.public_key().to_encoded_point(false);
+        if derived.as_bytes() != canonical.as_bytes() {
+            return Err(ProtocolError::Crypto(
+                "execution private and public keys do not match".into(),
+            ));
+        }
+        Ok(canonical.as_bytes().to_vec())
+    }
+}
+
+pub fn validate_private_execution_keys(
+    keys: &[PrivateExecutionKeyPrivateConfig],
+) -> Result<(), ProtocolError> {
+    if keys.is_empty() {
+        return Err(ProtocolError::Crypto(
+            "at least one private execution key is required".into(),
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut points = BTreeSet::new();
+    for key in keys {
+        if key.key_id.trim().is_empty() || !ids.insert(key.key_id.clone()) {
+            return Err(ProtocolError::Crypto(
+                "execution key ids must be nonempty and unique".into(),
+            ));
+        }
+        if !points.insert(key.canonical_public_key()?) {
+            return Err(ProtocolError::Crypto(
+                "execution public keys must be unique".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateExecutionKeyRegistry {
     pub keys: Vec<PrivateExecutionKeyPublicConfig>,
@@ -535,7 +589,6 @@ pub struct ProductAssetConfig {
     pub enabled: bool,
     pub token_address: String,
     pub erc20_behavior: String,
-    pub audit_status: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +651,7 @@ pub struct DeploymentMetadata {
 pub struct DeploymentRoles {
     pub protocol_fee_recipient: String,
     pub pause_guardian_address: String,
+    pub reference_price_signer: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,7 +687,11 @@ pub struct DeploymentManifest {
 
 #[cfg(test)]
 mod tests {
-    use super::DeploymentManifest;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    use super::{
+        DeploymentManifest, PrivateExecutionKeyPrivateConfig, validate_private_execution_keys,
+    };
 
     /// the manifest example the client ships must parse as the services read it.
     #[test]
@@ -643,5 +701,40 @@ mod tests {
                 .unwrap();
         assert!(manifest.runtime.epoch_ms > 0);
         assert!(!manifest.product.pairs.is_empty());
+    }
+
+    fn execution_key(id: &str, scalar: u8) -> PrivateExecutionKeyPrivateConfig {
+        let mut bytes = [0_u8; 32];
+        bytes[31] = scalar;
+        let secret = p256::SecretKey::from_slice(&bytes).unwrap();
+        PrivateExecutionKeyPrivateConfig {
+            key_id: id.into(),
+            private_key: hex::encode(bytes),
+            public_key: hex::encode(secret.public_key().to_encoded_point(false).as_bytes()),
+        }
+    }
+
+    #[test]
+    fn private_execution_keys_bind_each_secret_to_one_unique_public_point() {
+        let first = execution_key("first", 1);
+        let second = execution_key("second", 2);
+        validate_private_execution_keys(&[first.clone(), second.clone()]).unwrap();
+
+        let mut mismatched = first.clone();
+        mismatched.public_key = second.public_key.clone();
+        assert!(
+            validate_private_execution_keys(&[mismatched])
+                .unwrap_err()
+                .to_string()
+                .contains("do not match")
+        );
+
+        let mut duplicate_id = second.clone();
+        duplicate_id.key_id = first.key_id.clone();
+        assert!(validate_private_execution_keys(&[first.clone(), duplicate_id]).is_err());
+
+        let mut duplicate_point = first.clone();
+        duplicate_point.key_id = "other".into();
+        assert!(validate_private_execution_keys(&[first, duplicate_point]).is_err());
     }
 }

@@ -72,8 +72,7 @@
         "decimals": 18,
         "enabled": true,
         "token_address": "0x0",
-        "erc20_behavior": "vanilla-exact-delta",
-        "audit_status": "pending"
+        "erc20_behavior": "vanilla-exact-delta"
       },
       "ETH": {
         "asset_id": "ETH",
@@ -81,8 +80,7 @@
         "decimals": 18,
         "enabled": true,
         "token_address": "0x0",
-        "erc20_behavior": "vanilla-exact-delta",
-        "audit_status": "pending"
+        "erc20_behavior": "vanilla-exact-delta"
       },
       "USDC": {
         "asset_id": "USDC",
@@ -90,8 +88,7 @@
         "decimals": 6,
         "enabled": true,
         "token_address": "0x0",
-        "erc20_behavior": "vanilla-exact-delta",
-        "audit_status": "pending"
+        "erc20_behavior": "vanilla-exact-delta"
       }
     },
     "pairs": {
@@ -132,7 +129,8 @@
   },
   "roles": {
     "protocol_fee_recipient": "0x0",
-    "pause_guardian_address": "0x0"
+    "pause_guardian_address": "0x0",
+    "reference_price_signer": "0x0"
   },
   "runtime": {
     "epoch_ms": 6000,

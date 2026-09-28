@@ -140,6 +140,7 @@ pub struct Market {
     leg_gas: LegGas,
     /// the price move, in basis points of the escrow's side, a chosen leg must survive.
     headroom_bps: u128,
+    reference_signer: Felt,
     /// the latest attestation of each pair, which serves the public reference price until it
     /// lapses.
     latest: tokio::sync::Mutex<std::collections::HashMap<Felt, MarketAttestation>>,
@@ -171,6 +172,7 @@ impl Market {
             min_profit: config.searcher_min_profit.clone(),
             leg_gas: config.leg_gas,
             headroom_bps: config.searcher_headroom_bps,
+            reference_signer: config.reference_price_signer,
             latest: Default::default(),
         })
     }
@@ -207,7 +209,11 @@ impl Market {
             .map_err(|error| format!("attestor {}: {error}", pair.name))?;
         let attestation = MarketAttestation::from_reference(&response.attestation)
             .map_err(|error| error.to_string())?;
-        if from_core(attestation.pair_id) != pair.pair_id || attestation.scale != pair.scale {
+        if from_core(attestation.pair_id) != pair.pair_id
+            || attestation.scale != pair.scale
+            || from_core(attestation.signer) != self.reference_signer
+            || !attestation.verify(to_core(self.exchange))
+        {
             return Err(format!(
                 "attestor returned a different market for {}",
                 pair.name
@@ -268,6 +274,7 @@ impl Market {
         for (attestation, pair) in attestations.iter().zip(pairs) {
             if from_core(attestation.pair_id) != pair.pair_id
                 || attestation.scale != pair.scale
+                || from_core(attestation.signer) != self.reference_signer
                 || !attestation.verify(to_core(self.exchange))
             {
                 return Err(format!("price batch mismatches {}", pair.name));
@@ -958,8 +965,24 @@ mod tests {
                 per_hop: 0,
             },
             headroom_bps: 0,
+            reference_signer: from_core(starknet_crypto::get_public_key(
+                &zylith_core::hash::felt_from_hex_str("0x5167").unwrap(),
+            )),
             latest: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn the_operator_rejects_an_attestation_from_an_unpinned_signer() {
+        let mut market = market().await;
+        market.reference_signer = Felt::ONE;
+        assert!(
+            market
+                .attest(&pair())
+                .await
+                .unwrap_err()
+                .contains("different market")
+        );
     }
 
     fn profit(size: u128) -> i128 {

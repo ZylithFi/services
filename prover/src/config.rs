@@ -11,7 +11,7 @@ use url::Url;
 use zylith_core::hash::felt_from_hex_str;
 use zylith_core::{
     DeploymentManifest, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
-    PrivateExecutionKeyRegistry,
+    PrivateExecutionKeyRegistry, validate_private_execution_keys,
 };
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3200";
@@ -113,6 +113,7 @@ pub struct Config {
     pub fee_rate_haircut_bps: u128,
     pub execution_keys: Vec<PrivateExecutionKeyPrivateConfig>,
     pub fee_recipient: Felt,
+    pub reference_price_signer: Felt,
     pub pairs: Vec<PairRuntime>,
     pub policy: Policy,
     pub control_token: String,
@@ -161,7 +162,7 @@ pub fn is_operator_host(url: &str) -> bool {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
         Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
-        Err(_) => host == "localhost" || host.ends_with(".internal") || host.ends_with(".local"),
+        Err(_) => host == "localhost",
     }
 }
 
@@ -239,9 +240,7 @@ fn load_execution_keys(path: &str) -> Result<Vec<PrivateExecutionKeyPrivateConfi
         fs::read_to_string(path).map_err(|error| format!("execution keys {path}: {error}"))?;
     let keys: Vec<PrivateExecutionKeyPrivateConfig> =
         serde_json::from_str(&raw).map_err(|error| format!("execution keys: {error}"))?;
-    if keys.is_empty() {
-        return Err("at least one private execution key is required".into());
-    }
+    validate_private_execution_keys(&keys).map_err(|error| format!("execution keys: {error}"))?;
     Ok(keys)
 }
 
@@ -259,6 +258,28 @@ impl Config {
         let manifest_path = optional("ZYLITH_DEPLOYMENT_MANIFEST")
             .unwrap_or_else(|| "client/public/deployment.json".into());
         let manifest = load_manifest(&manifest_path)?;
+        if !manifest.deployment.finalized {
+            return Err("the deployment manifest is not finalized".into());
+        }
+        if !manifest.proof.config_locked_after_deploy {
+            return Err(
+                "the deployment manifest does not attest locked proof configuration".into(),
+            );
+        }
+        if manifest.deployment.release_commit.len() != 40
+            || !manifest
+                .deployment
+                .release_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || manifest
+                .deployment
+                .release_commit
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return Err("the deployment manifest has no released commit".into());
+        }
         let rpc_url = Url::parse(
             &optional("ZYLITH_STARKNET_RPC_URL").unwrap_or_else(|| manifest.rpc_url.clone()),
         )
@@ -303,15 +324,27 @@ impl Config {
         if tx_provers.is_empty() {
             return Err("at least one transaction prover is required".into());
         }
-        // the transaction prover executes the whole witness, every order and note in the clear,
-        // so it must run under the operator's own control; ohttp would hide only who is asking.
-        if optional("ZYLITH_TX_PROVER_REMOTE_TRUSTED").as_deref() != Some("1") {
-            for prover in &tx_provers {
-                if !is_operator_host(prover) {
-                    return Err(format!(
-                        "transaction prover {prover} is not on a loopback or private address; it sees every witness, so run it yourself or set ZYLITH_TX_PROVER_REMOTE_TRUSTED=1 for one you control"
-                    ));
-                }
+        if optional("ZYLITH_TX_PROVER_REMOTE_TRUSTED").is_some() {
+            return Err("ZYLITH_TX_PROVER_REMOTE_TRUSTED is retired; list exact operator-controlled names in ZYLITH_TX_PROVER_TRUSTED_HOSTS".into());
+        }
+        let trusted_prover_hosts = optional("ZYLITH_TX_PROVER_TRUSTED_HOSTS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect::<BTreeSet<_>>();
+        // the transaction prover executes the whole witness in the clear. numeric private
+        // addresses are accepted directly; dns names require an exact operator allowlist.
+        for prover in &tx_provers {
+            let host = Url::parse(prover)
+                .ok()
+                .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()));
+            if !is_operator_host(prover)
+                && host.is_none_or(|host| !trusted_prover_hosts.contains(&host))
+            {
+                return Err(format!(
+                    "transaction prover {prover} is not local or explicitly listed in ZYLITH_TX_PROVER_TRUSTED_HOSTS"
+                ));
             }
         }
         let tx_prover_ohttp_key_config = if manifest.proof.tx_prover_ohttp_enabled {
@@ -379,18 +412,24 @@ impl Config {
             return Err("runtime.max_internal_deferral_epochs must be positive".into());
         }
         let epoch_ms = parsed("ZYLITH_EPOCH_MS", runtime.epoch_ms)?;
+        let pipeline_depth = parsed("ZYLITH_PIPELINE_DEPTH", 2_usize)?;
+        if !(1..=4).contains(&pipeline_depth) {
+            return Err("ZYLITH_PIPELINE_DEPTH must be in [1, 4]".into());
+        }
+        let proof_book_limit = zylith_core::exchange::StepShape::max_book_orders(step_budget);
+        if runtime.max_book_orders as usize > proof_book_limit {
+            return Err(format!(
+                "runtime.max_book_orders exceeds the step budget limit of {proof_book_limit}"
+            ));
+        }
         let policy = Policy {
             epoch_ms,
-            pipeline_depth: parsed("ZYLITH_PIPELINE_DEPTH", 2_usize)?.clamp(1, 4),
+            pipeline_depth,
             max_admissions: parsed(
                 "ZYLITH_MAX_ADMISSIONS",
                 runtime.max_admissions_per_transition as usize,
             )?,
-            // the manifest's book size, never beyond what the step budget proves when every
-            // order crosses at once.
-            max_book_orders: (runtime.max_book_orders as usize).min(
-                zylith_core::exchange::StepShape::max_book_orders(step_budget),
-            ),
+            max_book_orders: runtime.max_book_orders as usize,
             step_budget,
             force_after_ms: parsed("ZYLITH_FORCE_AFTER_MS", 60_000_u64)?,
             uneconomic_max_wait_ms: epoch_ms
@@ -444,6 +483,10 @@ impl Config {
             fee_recipient: nonzero(
                 &manifest.roles.protocol_fee_recipient,
                 "protocol fee recipient",
+            )?,
+            reference_price_signer: nonzero(
+                &manifest.roles.reference_price_signer,
+                "reference price signer",
             )?,
             pairs,
             policy,
@@ -624,12 +667,12 @@ mod tests {
             "http://10.0.3.7:3000",
             "http://192.168.1.2",
             "http://[::1]:3000",
-            "http://prover.internal:3000",
         ] {
             assert!(is_operator_host(local), "{local}");
         }
         for remote in [
             "https://prover.example.com",
+            "http://prover.internal:3000",
             "http://35.192.48.142:3000",
             "not a url",
         ] {

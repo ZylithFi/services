@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use crate::hash::tagged_sha256_hex;
 
 pub const CONTROL_PLANE_TOKEN_ENV: &str = "ZYLITH_CONTROL_PLANE_TOKEN";
@@ -33,10 +35,36 @@ pub fn derive_recovery_auth_tag(account_id: &str, recovery_key_hex: &str) -> Str
     )
 }
 
+/// returns the nearest untrusted address in a proxy-appended forwarding chain.
+pub fn forwarded_client_ip(
+    peer: IpAddr,
+    forwarded_for: Option<&str>,
+    is_trusted_proxy: impl Fn(IpAddr) -> bool,
+) -> IpAddr {
+    if !is_trusted_proxy(peer) {
+        return peer;
+    }
+    let Some(forwarded_for) = forwarded_for else {
+        return peer;
+    };
+    for raw in forwarded_for.rsplit(',') {
+        let Ok(candidate) = raw.trim().parse::<IpAddr>() else {
+            return peer;
+        };
+        if !is_trusted_proxy(candidate) {
+            return candidate;
+        }
+    }
+    peer
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::{
         constant_time_eq, derive_recovery_auth_tag, extract_bearer_token, format_bearer_token,
+        forwarded_client_ip,
     };
 
     #[test]
@@ -71,6 +99,35 @@ mod tests {
                 "91e7fb7e163abc840faedd0c354d4e048ead61efab9bd14f7966c19f1ef44624"
             ),
             "8907823a9cfe812c9cca507d8f3d52b7b872b2f105c383c172baa3239c456395"
+        );
+    }
+
+    #[test]
+    fn forwarding_uses_the_nearest_untrusted_hop() {
+        let trusted = |ip: IpAddr| ip.is_loopback() || ip.to_string().starts_with("10.");
+        assert_eq!(
+            forwarded_client_ip(
+                "127.0.0.1".parse().unwrap(),
+                Some("198.51.100.4, 10.0.0.2"),
+                trusted,
+            ),
+            "198.51.100.4".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            forwarded_client_ip(
+                "203.0.113.9".parse().unwrap(),
+                Some("198.51.100.4"),
+                trusted,
+            ),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            forwarded_client_ip(
+                "127.0.0.1".parse().unwrap(),
+                Some("198.51.100.4, malformed"),
+                trusted,
+            ),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
         );
     }
 }

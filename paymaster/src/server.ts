@@ -229,10 +229,11 @@ function clientIp(request: IncomingMessage, config: PaymasterConfig): string {
   const socketIp = normalizeRemoteAddress(request.socket.remoteAddress ?? "unknown");
   if (config.trustProxyHeaders && isTrustedProxy(socketIp, config.trustedProxyCidrs)) {
     const forwarded = request.headers["x-forwarded-for"];
-    const forwardedIp = forwardedClientIp(forwarded);
-    if (forwardedIp) return forwardedIp;
+    if (forwarded !== undefined) {
+      return forwardedClientIp(forwarded, config.trustedProxyCidrs) ?? socketIp;
+    }
     const realIp = request.headers["x-real-ip"];
-    const realClientIp = forwardedClientIp(realIp);
+    const realClientIp = forwardedClientIp(realIp, config.trustedProxyCidrs);
     if (realClientIp) return realClientIp;
   }
   return socketIp;
@@ -242,10 +243,18 @@ function normalizeRemoteAddress(address: string): string {
   return address.startsWith("::ffff:") ? address.slice("::ffff:".length) : address;
 }
 
-function forwardedClientIp(value: string | string[] | undefined): string | null {
+function forwardedClientIp(
+  value: string | string[] | undefined,
+  trustedProxyCidrs: string[]
+): string | null {
   const raw = Array.isArray(value) ? value[0] : value;
-  const candidate = normalizeRemoteAddress((raw ?? "").split(",")[0]?.trim() ?? "");
-  return candidate && isIP(candidate) !== 0 ? candidate : null;
+  const chain = (raw ?? "").split(",");
+  for (let index = chain.length - 1; index >= 0; index -= 1) {
+    const candidate = normalizeRemoteAddress(chain[index]?.trim() ?? "");
+    if (!candidate || isIP(candidate) === 0) return null;
+    if (!isTrustedProxy(candidate, trustedProxyCidrs)) return candidate;
+  }
+  return null;
 }
 
 function isTrustedProxy(peerIp: string, cidrs: string[]): boolean {
@@ -416,6 +425,12 @@ function statusForError(message: string): number {
     return 408;
   }
   if (message.includes("submission queue is full")) {
+    return 503;
+  }
+  if (
+    message.includes("submission journal is unavailable") ||
+    message.includes("submission outcome is pending reconciliation")
+  ) {
     return 503;
   }
   if (

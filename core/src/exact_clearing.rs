@@ -1,7 +1,8 @@
 //! global clearing with a dual optimality certificate. the solver is exact over the rational
 //! relaxation; the executed allocation is integral, so the certificate proves it optimal within a
-//! protocol-fixed rounding tolerance. residual maximality separately rejects every skipped direct
-//! cross and prevents a zero-fill allocation from hiding a consistent multi-market circulation.
+//! protocol-fixed rounding tolerance. the residual check rejects a wholly skipped direct cross
+//! and prevents a zero-fill allocation from hiding a consistent multi-market circulation. small
+//! two-sided residuals may remain only within the certificate's exact integer tolerance.
 //!
 //! model: markets price their base asset in their quote asset at a committed midpoint
 //! `midpoint / scale`. every eligible order `i` may fill `x_i` base units, `0 <= x_i <= u_i`
@@ -35,6 +36,7 @@ use crate::ProtocolError;
 
 pub const MAX_CLEARING_ASSETS: usize = 8;
 pub const MAX_CLEARING_ORDERS: usize = 1_024;
+const MAX_SIMPLEX_PIVOTS: usize = 100_000;
 /// grid denominator of certified asset prices.
 pub const CLEARING_PRICE_DENOMINATOR: u128 = 1 << 64;
 
@@ -426,8 +428,8 @@ pub fn usdc_clearing_weights(
     })
 }
 
-/// the numeric tolerance covers only certificate-grid and quote-rounding error. it cannot hide a
-/// crossing because residual maximality is checked independently below.
+/// the numeric tolerance covers only certificate-grid and quote-rounding error. the independent
+/// residual check prevents a wholly skipped direct cross and a hidden zero-fill circulation.
 pub fn clearing_tolerance(instance: &ClearingInstance) -> BigUint {
     let mut units = BigUint::zero();
     let mut market_capacity = vec![BigUint::zero(); instance.markets.len()];
@@ -635,6 +637,22 @@ struct Simplex {
     at_upper: Vec<bool>,
 }
 
+struct SolveBudget {
+    pivots_left: usize,
+}
+
+impl SolveBudget {
+    fn spend(&mut self) -> Result<(), ProtocolError> {
+        if self.pivots_left == 0 {
+            return Err(invalid(
+                "clearing simplex exceeds its deterministic pivot budget",
+            ));
+        }
+        self.pivots_left -= 1;
+        Ok(())
+    }
+}
+
 impl Simplex {
     fn new(instance: &ClearingInstance, rhs: Vec<Q>) -> Self {
         let rows = instance.asset_weights.len();
@@ -738,7 +756,7 @@ impl Simplex {
         }
     }
 
-    fn solve(&mut self) {
+    fn solve(&mut self, budget: &mut SolveBudget) -> Result<(), ProtocolError> {
         let total = self.n() + self.rows;
         loop {
             let duals = self.duals();
@@ -759,7 +777,10 @@ impl Simplex {
                     reduced.is_positive() && self.upper(*var).is_none_or(|upper| !upper.is_zero())
                 }
             });
-            let Some(entering) = entering else { return };
+            let Some(entering) = entering else {
+                return Ok(());
+            };
+            budget.spend()?;
             let increasing = !self.at_upper[entering];
             let direction = self.column(entering);
             // step t along the entering variable; basic values move by -sign * direction * t.
@@ -1066,23 +1087,27 @@ fn repair_deficits(instance: &ClearingInstance, mut fills: Vec<u128>) -> Option<
 /// fractional fill at its floor and re-solves. each dive tightens one bound, so it ends; an
 /// integral vertex of the balanced relaxation is feasible as it stands, because base legs are
 /// exact and every rounded quote leg favours the pool.
-fn dive_to_integral(instance: &ClearingInstance, mut relaxed: Vec<Q>) -> Vec<u128> {
+fn dive_to_integral(
+    instance: &ClearingInstance,
+    mut relaxed: Vec<Q>,
+    budget: &mut SolveBudget,
+) -> Result<Vec<u128>, ProtocolError> {
     let mut capped = instance.clone();
     let rows = vec![Q::zero(); instance.asset_weights.len()];
     loop {
         if let Some(fills) = round_to_feasible(&capped, &relaxed) {
-            return fills;
+            return Ok(fills);
         }
         let fractional = relaxed
             .iter()
             .position(|value| Q::from_u128(value.floor().to_u128().unwrap_or(0)) != *value);
         let Some(index) = fractional else {
             // unreachable for a balanced vertex; the empty allocation is always feasible.
-            return vec![0; instance.orders.len()];
+            return Ok(vec![0; instance.orders.len()]);
         };
         capped.orders[index].capacity = relaxed[index].floor().to_u128().unwrap_or(0);
         let mut lp = Simplex::new(&capped, rows.clone());
-        lp.solve();
+        lp.solve(budget)?;
         relaxed = lp.solution();
     }
 }
@@ -1125,17 +1150,23 @@ pub fn solve_exact_clearing(instance: &ClearingInstance) -> Result<ExactClearing
         .map(|count| Q::int(BigInt::from(count)))
         .collect::<Vec<_>>();
     let mut priced = Simplex::new(instance, slack);
-    priced.solve();
+    let mut budget = SolveBudget {
+        pivots_left: MAX_SIMPLEX_PIVOTS,
+    };
+    priced.solve(&mut budget)?;
     let mut balanced = Simplex::new(instance, vec![Q::zero(); instance.asset_weights.len()]);
-    balanced.solve();
+    balanced.solve(&mut budget)?;
     let certificate = ClearingCertificate {
         asset_prices: grid_prices(&priced.duals()),
     };
     // if the balanced relaxation's rounding cannot be repaired, retry from the slack relaxation's
     // allocation, then dive: the dive always ends at a feasible integral allocation.
-    let fills = round_to_feasible(instance, &balanced.solution())
+    let fills = match round_to_feasible(instance, &balanced.solution())
         .or_else(|| round_to_feasible(instance, &priced.solution()))
-        .unwrap_or_else(|| dive_to_integral(instance, balanced.solution()));
+    {
+        Some(fills) => fills,
+        None => dive_to_integral(instance, balanced.solution(), &mut budget)?,
+    };
     let report = verify_clearing_certificate(instance, &fills, &certificate)?;
     let quote_amounts = instance
         .orders
@@ -1325,6 +1356,18 @@ mod tests {
             midpoint,
             scale,
         }
+    }
+
+    #[test]
+    fn simplex_work_is_bounded_before_an_adversarial_instance_can_run_forever() {
+        let instance = ClearingInstance {
+            asset_weights: vec![1, 1],
+            markets: vec![market(0, 1, 1, 1)],
+            orders: vec![order(0, true, 10), order(0, false, 10)],
+        };
+        let mut simplex = Simplex::new(&instance, vec![Q::zero(), Q::zero()]);
+        let mut budget = SolveBudget { pivots_left: 0 };
+        assert!(simplex.solve(&mut budget).is_err());
     }
 
     #[test]

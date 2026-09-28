@@ -50,6 +50,7 @@ struct AppState {
     /// each asset's token decimals, from the deployment manifest: the same asset name can be a
     /// different token, with other decimals, on another network.
     decimals: Arc<HashMap<String, u8>>,
+    markets: Arc<HashMap<String, PairMarket>>,
     nonce: Arc<AtomicU64>,
 }
 
@@ -84,31 +85,25 @@ struct UnsignedEntry {
     source_set_commitment: String,
 }
 
-/// the exact binance book that supplies the market's settlement midpoint.
-#[derive(Clone, Copy)]
-struct BinanceSource {
-    symbol: &'static str,
-}
-
-#[derive(Clone, Copy)]
-enum ReferenceMarket {
-    Direct {
-        binance: BinanceSource,
-        coinbase_base: &'static str,
-        coinbase_usdt_usd: &'static str,
-        coinbase_usdt_usdc: &'static str,
-        okx_base: Option<&'static str>,
-        okx_quote: Option<&'static str>,
-        kraken_base: &'static str,
-        kraken_quote: &'static str,
-    },
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct PairMarket {
-    base_asset_id: &'static str,
-    quote_asset_id: &'static str,
-    market: ReferenceMarket,
+    base_asset_id: String,
+    quote_asset_id: String,
+    binance_symbol: String,
+    coinbase_base: String,
+    coinbase_quote: String,
+    okx_base: Option<String>,
+    okx_quote: Option<String>,
+    kraken_base: String,
+    kraken_quote: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceSourceConfig {
+    version: u32,
+    pairs: HashMap<String, PairMarket>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,16 +149,28 @@ async fn main() -> Result<(), String> {
         .timeout(std::time::Duration::from_millis(source_request_timeout_ms))
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))?;
+    let manifest_raw = std::fs::read_to_string(required_env("ZYLITH_DEPLOYMENT_MANIFEST")?)
+        .map_err(|error| format!("deployment manifest: {error}"))?;
+    let expected_signer = manifest_reference_signer(&manifest_raw)?;
+    let signer_secret = parse_felt(&signer_private_key)
+        .ok_or("ZYLITH_REFERENCE_PRICE_SIGNER_PRIVATE_KEY must be a nonzero Starknet felt")?;
+    if starknet_crypto::get_public_key(&signer_secret) != expected_signer {
+        return Err("reference price private key does not match the deployment manifest".into());
+    }
+    let source_path = required_env("ZYLITH_REFERENCE_PRICE_SOURCES_PATH")?;
+    let markets = reference_markets(
+        &std::fs::read_to_string(&source_path)
+            .map_err(|error| format!("reference price sources {source_path}: {error}"))?,
+        &manifest_raw,
+    )?;
     let state = AppState {
         client,
         exchange_address,
         signer_private_key: Arc::new(Zeroizing::new(signer_private_key)),
         auth_token_digest: sha256(auth_token.as_bytes()),
         attestation_ttl_ms,
-        decimals: Arc::new(manifest_decimals(
-            &std::fs::read_to_string(required_env("ZYLITH_DEPLOYMENT_MANIFEST")?)
-                .map_err(|error| format!("deployment manifest: {error}"))?,
-        )?),
+        decimals: Arc::new(manifest_decimals(&manifest_raw)?),
+        markets: Arc::new(markets),
         nonce: Arc::new(AtomicU64::new(now_unix_ms()?)),
     };
     let app = Router::new()
@@ -290,7 +297,10 @@ async fn build_unsigned_entry(
     if parse_felt(&request.exchange_address) != Some(state.exchange_address) {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    let pair = pair_market(&request.pair_id.0).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let pair = state
+        .markets
+        .get(&request.pair_id.0)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
     if request.base_asset_id.0 != pair.base_asset_id
         || request.quote_asset_id.0 != pair.quote_asset_id
         || request.price_base_scale == 0
@@ -298,8 +308,8 @@ async fn build_unsigned_entry(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
     let (Some(&base_decimals), Some(&quote_decimals)) = (
-        state.decimals.get(pair.base_asset_id),
-        state.decimals.get(pair.quote_asset_id),
+        state.decimals.get(&pair.base_asset_id),
+        state.decimals.get(&pair.quote_asset_id),
     ) else {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     };
@@ -309,7 +319,7 @@ async fn build_unsigned_entry(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
     let samples = fetch_samples(
         &state.client,
-        pair.market,
+        pair,
         quote_decimals,
         base_asset_scale,
         request.price_base_scale,
@@ -398,144 +408,186 @@ fn manifest_decimals(raw: &str) -> Result<HashMap<String, u8>, String> {
         .collect()
 }
 
-fn pair_market(pair_id: &str) -> Option<PairMarket> {
-    match pair_id {
-        "STRK/USDC" => Some(PairMarket {
-            base_asset_id: "STRK",
-            quote_asset_id: "USDC",
-            market: ReferenceMarket::Direct {
-                binance: BinanceSource { symbol: "STRKUSDC" },
-                coinbase_base: "STRK-USD",
-                coinbase_usdt_usd: "USDT-USD",
-                coinbase_usdt_usdc: "USDT-USDC",
-                okx_base: Some("STRK-USDT"),
-                okx_quote: Some("USDC-USDT"),
-                kraken_base: "STRKUSD",
-                kraken_quote: "USDCUSD",
-            },
-        }),
-        "ETH/USDC" => Some(PairMarket {
-            base_asset_id: "ETH",
-            quote_asset_id: "USDC",
-            market: ReferenceMarket::Direct {
-                binance: BinanceSource { symbol: "ETHUSDC" },
-                coinbase_base: "ETH-USD",
-                coinbase_usdt_usd: "USDT-USD",
-                coinbase_usdt_usdc: "USDT-USDC",
-                okx_base: Some("ETH-USDT"),
-                okx_quote: Some("USDC-USDT"),
-                kraken_base: "XETHZUSD",
-                kraken_quote: "USDCUSD",
-            },
-        }),
-        _ => None,
+fn manifest_reference_signer(raw: &str) -> Result<Felt, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("deployment manifest: {error}"))?;
+    let manifest = value.get("manifest").unwrap_or(&value);
+    if manifest
+        .pointer("/deployment/finalized")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+        || manifest
+            .pointer("/proof/config_locked_after_deploy")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err("reference price attestor requires a finalized, locked deployment".into());
     }
+    manifest
+        .pointer("/roles/reference_price_signer")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_felt)
+        .ok_or_else(|| "deployment manifest has no reference price signer".into())
+}
+
+fn reference_markets(
+    sources_raw: &str,
+    manifest_raw: &str,
+) -> Result<HashMap<String, PairMarket>, String> {
+    let sources: ReferenceSourceConfig = serde_json::from_str(sources_raw)
+        .map_err(|error| format!("reference price sources: {error}"))?;
+    if sources.version != 1 {
+        return Err("reference price sources use an unsupported version".into());
+    }
+    let markets = sources
+        .pairs
+        .into_iter()
+        .map(|(name, market)| {
+            let symbols = [
+                Some(market.binance_symbol.as_str()),
+                Some(market.coinbase_base.as_str()),
+                Some(market.coinbase_quote.as_str()),
+                market.okx_base.as_deref(),
+                market.okx_quote.as_deref(),
+                Some(market.kraken_base.as_str()),
+                Some(market.kraken_quote.as_str()),
+            ];
+            if symbols.into_iter().flatten().any(|symbol| {
+                symbol.is_empty()
+                    || !symbol
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            }) {
+                return Err(format!(
+                    "reference price source {name} has an invalid venue symbol"
+                ));
+            }
+            Ok((name, market))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+
+    let manifest: serde_json::Value = serde_json::from_str(manifest_raw)
+        .map_err(|error| format!("deployment manifest: {error}"))?;
+    let manifest = manifest.get("manifest").unwrap_or(&manifest);
+    let enabled = manifest
+        .pointer("/product/pairs")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("deployment manifest has no product pairs")?
+        .iter()
+        .filter(|(_, pair)| pair.get("enabled").and_then(serde_json::Value::as_bool) == Some(true))
+        .map(|(name, pair)| {
+            let base = pair
+                .get("base_asset_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("manifest pair {name} has no base asset"))?;
+            let quote = pair
+                .get("quote_asset_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("manifest pair {name} has no quote asset"))?;
+            Ok((name.clone(), (base.to_owned(), quote.to_owned())))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    if markets.len() != enabled.len() || enabled.keys().any(|name| !markets.contains_key(name)) {
+        return Err("reference price source pairs differ from the enabled deployment pairs".into());
+    }
+    for (name, (base, quote)) in enabled {
+        let market = markets.get(&name).expect("enabled source checked");
+        if market.base_asset_id != base || market.quote_asset_id != quote {
+            return Err(format!(
+                "reference price source {name} has different assets than the manifest"
+            ));
+        }
+    }
+    Ok(markets)
 }
 
 async fn fetch_samples(
     client: &Client,
-    market: ReferenceMarket,
+    market: &PairMarket,
     quote_decimals: u8,
     base_asset_scale: u128,
     price_base_scale: u128,
     observed_at_unix_ms: u64,
 ) -> Result<Vec<ReferencePriceSample>, String> {
-    let samples = match market {
-        ReferenceMarket::Direct {
-            binance,
-            coinbase_base,
-            coinbase_usdt_usd,
-            coinbase_usdt_usdc,
-            okx_base,
-            okx_quote,
-            kraken_base,
-            kraken_quote,
-        } => {
-            let (
-                binance_sample,
-                coinbase_base,
-                coinbase_usdt_usd,
-                coinbase_usdt_usdc,
-                okx_base_result,
-                okx_quote_result,
-                kraken_base,
-                kraken_quote,
-            ) = tokio::join!(
-                fetch_binance_sample(
-                    client,
-                    binance,
-                    quote_decimals,
-                    base_asset_scale,
-                    price_base_scale,
-                    observed_at_unix_ms,
-                ),
-                fetch_coinbase_book(client, coinbase_base),
-                fetch_coinbase_book(client, coinbase_usdt_usd),
-                fetch_coinbase_book(client, coinbase_usdt_usdc),
-                fetch_optional_okx_book(client, okx_base),
-                fetch_optional_okx_book(client, okx_quote),
-                fetch_kraken_book(client, kraken_base),
-                fetch_kraken_book(client, kraken_quote),
-            );
-            let mut samples = Vec::new();
-            samples.push(binance_sample?);
-            if let (Ok(base), Ok(usdt_usd), Ok(usdt_usdc)) =
-                (coinbase_base, coinbase_usdt_usd, coinbase_usdt_usdc)
-                && let Ok(sample) = sample_from_coinbase_usdc_proxy_books(
-                    "coinbase",
-                    [base, usdt_usd, usdt_usdc],
-                    quote_decimals,
-                    base_asset_scale,
-                    price_base_scale,
-                    observed_at_unix_ms,
-                )
-            {
-                samples.push(sample);
-            }
-            if let (Ok(Some(base)), Ok(Some(quote))) = (okx_base_result, okx_quote_result)
-                && let Ok(sample) = sample_from_ratio_books(
-                    "okx",
-                    base,
-                    quote,
-                    quote_decimals,
-                    base_asset_scale,
-                    price_base_scale,
-                    observed_at_unix_ms,
-                )
-            {
-                samples.push(sample);
-            }
-            if let (Ok(base), Ok(quote)) = (kraken_base, kraken_quote)
-                && let Ok(sample) = sample_from_ratio_books(
-                    "kraken",
-                    base,
-                    quote,
-                    quote_decimals,
-                    base_asset_scale,
-                    price_base_scale,
-                    observed_at_unix_ms,
-                )
-            {
-                samples.push(sample);
-            }
-            samples
-        }
-    };
+    let (
+        binance_sample,
+        coinbase_base,
+        coinbase_quote,
+        okx_base,
+        okx_quote,
+        kraken_base,
+        kraken_quote,
+    ) = tokio::join!(
+        fetch_binance_sample(
+            client,
+            &market.binance_symbol,
+            quote_decimals,
+            base_asset_scale,
+            price_base_scale,
+            observed_at_unix_ms,
+        ),
+        fetch_coinbase_book(client, &market.coinbase_base),
+        fetch_coinbase_book(client, &market.coinbase_quote),
+        fetch_optional_okx_book(client, market.okx_base.as_deref()),
+        fetch_optional_okx_book(client, market.okx_quote.as_deref()),
+        fetch_kraken_book(client, &market.kraken_base),
+        fetch_kraken_book(client, &market.kraken_quote),
+    );
+    let mut samples = vec![binance_sample?];
+    if let (Ok(base), Ok(quote)) = (coinbase_base, coinbase_quote)
+        && let Ok(sample) = sample_from_ratio_books(
+            "coinbase",
+            base,
+            quote,
+            quote_decimals,
+            base_asset_scale,
+            price_base_scale,
+            observed_at_unix_ms,
+        )
+    {
+        samples.push(sample);
+    }
+    if let (Ok(Some(base)), Ok(Some(quote))) = (okx_base, okx_quote)
+        && let Ok(sample) = sample_from_ratio_books(
+            "okx",
+            base,
+            quote,
+            quote_decimals,
+            base_asset_scale,
+            price_base_scale,
+            observed_at_unix_ms,
+        )
+    {
+        samples.push(sample);
+    }
+    if let (Ok(base), Ok(quote)) = (kraken_base, kraken_quote)
+        && let Ok(sample) = sample_from_ratio_books(
+            "kraken",
+            base,
+            quote,
+            quote_decimals,
+            base_asset_scale,
+            price_base_scale,
+            observed_at_unix_ms,
+        )
+    {
+        samples.push(sample);
+    }
     Ok(samples)
 }
 
 /// the exact direct binance book sample for the market.
 async fn fetch_binance_sample(
     client: &Client,
-    source: BinanceSource,
+    symbol: &str,
     quote_decimals: u8,
     base_asset_scale: u128,
     price_base_scale: u128,
     observed_at_unix_ms: u64,
 ) -> Result<ReferencePriceSample, String> {
-    let book = fetch_binance_book(client, source.symbol).await?;
+    let book = fetch_binance_book(client, symbol).await?;
     sample_from_book(
-        &format!("binance:{}", source.symbol),
+        &format!("binance:{symbol}"),
         book,
         quote_decimals,
         base_asset_scale,
@@ -703,32 +755,6 @@ fn sample_from_ratio_books(
     )
 }
 
-fn sample_from_coinbase_usdc_proxy_books(
-    source: &str,
-    books: [Book; 3],
-    quote_decimals: u8,
-    base_asset_scale: u128,
-    price_base_scale: u128,
-    observed_at_unix_ms: u64,
-) -> Result<ReferencePriceSample, String> {
-    let [base_usd, usdt_usd, usdt_usdc] = books;
-    let base_bid = parse_decimal_ratio(&base_usd.bid)?;
-    let base_ask = parse_decimal_ratio(&base_usd.ask)?;
-    let usdt_usd_bid = parse_decimal_ratio(&usdt_usd.bid)?;
-    let usdt_usd_ask = parse_decimal_ratio(&usdt_usd.ask)?;
-    let usdt_usdc_bid = parse_decimal_ratio(&usdt_usdc.bid)?;
-    let usdt_usdc_ask = parse_decimal_ratio(&usdt_usdc.ask)?;
-    sample_from_ratios(
-        source,
-        divide_ratio(multiply_ratio(base_bid, usdt_usdc_bid)?, usdt_usd_ask)?,
-        divide_ratio(multiply_ratio(base_ask, usdt_usdc_ask)?, usdt_usd_bid)?,
-        quote_decimals,
-        base_asset_scale,
-        price_base_scale,
-        observed_at_unix_ms,
-    )
-}
-
 fn sample_from_ratios(
     source: &str,
     bid: DecimalRatio,
@@ -824,19 +850,6 @@ fn divide_ratio(left: DecimalRatio, right: DecimalRatio) -> Result<DecimalRatio,
         denominator: left
             .denominator
             .checked_mul(right.numerator)
-            .ok_or_else(|| "ratio overflows".to_string())?,
-    })
-}
-
-fn multiply_ratio(left: DecimalRatio, right: DecimalRatio) -> Result<DecimalRatio, String> {
-    Ok(DecimalRatio {
-        numerator: left
-            .numerator
-            .checked_mul(right.numerator)
-            .ok_or_else(|| "ratio overflows".to_string())?,
-        denominator: left
-            .denominator
-            .checked_mul(right.denominator)
             .ok_or_else(|| "ratio overflows".to_string())?,
     })
 }
@@ -966,37 +979,36 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use starknet_rust_core::types::Felt;
+
     use super::{
-        BinanceSource, Book, ReferenceMarket, constant_time_eq, manifest_decimals, pair_market,
-        parse_decimal_ratio, parse_okx_book, ratio_to_units, sample_from_coinbase_usdc_proxy_books,
+        Book, constant_time_eq, manifest_decimals, manifest_reference_signer, parse_decimal_ratio,
+        parse_okx_book, ratio_to_units, reference_markets, sample_from_ratio_books,
     };
 
     #[test]
-    fn supported_pair_metadata_is_pinned() {
-        let strk_usdc = pair_market("STRK/USDC").expect("supported pair");
-        assert!(matches!(
-            strk_usdc.market,
-            ReferenceMarket::Direct {
-                binance: BinanceSource { symbol: "STRKUSDC" },
-                ..
-            }
-        ));
+    fn reference_markets_are_data_driven_and_match_the_manifest() {
+        let markets = reference_markets(
+            include_str!("../../../ops/config/reference-price-sources.mainnet.json"),
+            include_str!("../../../client/public/deployment.example.json"),
+        )
+        .unwrap();
+        assert_eq!(markets["STRK/USDC"].binance_symbol, "STRKUSDC");
+        assert_eq!(markets["ETH/USDC"].kraken_base, "XETHZUSD");
 
-        let eth_usdc = pair_market("ETH/USDC").expect("supported pair");
-        assert!(matches!(
-            eth_usdc.market,
-            ReferenceMarket::Direct {
-                binance: BinanceSource { symbol: "ETHUSDC" },
-                kraken_base: "XETHZUSD",
-                ..
+        let source = serde_json::json!({ "version": 1, "pairs": {
+            "ETH/STRK": {
+                "base_asset_id": "ETH", "quote_asset_id": "STRK",
+                "binance_symbol": "ETHSTRK", "coinbase_base": "ETH-USD",
+                "coinbase_quote": "STRK-USD", "okx_base": "ETH-USDT",
+                "okx_quote": "STRK-USDT", "kraken_base": "ETHUSD",
+                "kraken_quote": "STRKUSD"
             }
-        ));
-
-        // the derivative token is its own asset, so no underlying midpoint prices it.
-        for unsupported in ["STRK/ETH", "strkBTC/USDC", "strkBTC/ETH", "STRK/strkBTC"] {
-            assert!(pair_market(unsupported).is_none());
-        }
-        assert!(pair_market("USDC/USDT").is_none());
+        }});
+        let manifest = serde_json::json!({ "product": { "pairs": {
+            "ETH/STRK": { "base_asset_id": "ETH", "quote_asset_id": "STRK", "enabled": true }
+        }}});
+        assert!(reference_markets(&source.to_string(), &manifest.to_string()).is_ok());
     }
 
     #[test]
@@ -1011,6 +1023,17 @@ mod tests {
         assert_eq!(decimals["USDC"], 6);
         assert!(manifest_decimals(r#"{"product":{"assets":{"USDC":{}}}}"#).is_err());
         assert!(manifest_decimals(r#"{"product":{}}"#).is_err());
+    }
+
+    #[test]
+    fn signer_pin_requires_a_finalized_locked_manifest() {
+        let valid = r#"{"deployment":{"finalized":true},"proof":{"config_locked_after_deploy":true},"roles":{"reference_price_signer":"0x123"}}"#;
+        assert_eq!(
+            manifest_reference_signer(valid).unwrap(),
+            Felt::from(0x123_u16)
+        );
+        assert!(manifest_reference_signer(&valid.replace("true", "false")).is_err());
+        assert!(manifest_reference_signer(&valid.replace("0x123", "0x0")).is_err());
     }
 
     #[test]
@@ -1036,29 +1059,23 @@ mod tests {
     }
 
     #[test]
-    fn coinbase_usdc_proxy_uses_executable_three_book_bounds() {
-        let sample = sample_from_coinbase_usdc_proxy_books(
+    fn corroborating_ratio_books_use_executable_bounds() {
+        let sample = sample_from_ratio_books(
             "coinbase",
-            [
-                Book {
-                    bid: "4000".into(),
-                    ask: "4001".into(),
-                },
-                Book {
-                    bid: "0.999".into(),
-                    ask: "1.001".into(),
-                },
-                Book {
-                    bid: "0.998".into(),
-                    ask: "1.002".into(),
-                },
-            ],
+            Book {
+                bid: "4000".into(),
+                ask: "4001".into(),
+            },
+            Book {
+                bid: "0.999".into(),
+                ask: "1.001".into(),
+            },
             6,
             10_u128.pow(18),
             10_u128.pow(18),
             42,
         )
-        .expect("three-book sample");
+        .expect("ratio sample");
 
         assert_eq!(sample.source, "coinbase");
         assert!(sample.bid_price < 4_000_000_000);

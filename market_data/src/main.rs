@@ -38,10 +38,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 const BIND_ADDR_ENV: &str = "ZYLITH_MARKET_DATA_BIND_ADDR";
 const PAIRS_ENV: &str = "ZYLITH_MARKET_DATA_PAIRS";
+const MANIFEST_ENV: &str = "ZYLITH_DEPLOYMENT_MANIFEST";
 const MAX_STREAMS_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAMS";
 const MAX_STREAMS_PER_CLIENT_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAMS_PER_CLIENT";
 const MAX_STREAM_LIFETIME_SECONDS_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAM_LIFETIME_SECONDS";
+const TRUSTED_PROXY_CIDRS_ENV: &str = "ZYLITH_TRUSTED_PROXY_CIDRS";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3500";
+#[cfg(test)]
 const DEFAULT_PAIRS: &str = "STRK/USDC,ETH/USDC";
 const DEFAULT_MAX_STREAMS: usize = 4_096;
 const DEFAULT_MAX_STREAMS_PER_CLIENT: usize = 64;
@@ -476,6 +479,7 @@ struct Inner {
     max_streams: usize,
     max_streams_per_client: usize,
     max_stream_lifetime: Duration,
+    trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 #[derive(Clone)]
@@ -488,6 +492,7 @@ impl AppState {
         max_streams: usize,
         max_streams_per_client: usize,
         max_stream_lifetime: Duration,
+        trusted_proxies: Vec<ipnet::IpNet>,
         binance: Arc<BinanceStreamHub>,
     ) -> Self {
         Self(Arc::new(Inner {
@@ -501,6 +506,7 @@ impl AppState {
             max_streams,
             max_streams_per_client,
             max_stream_lifetime,
+            trusted_proxies,
         }))
     }
 
@@ -821,7 +827,7 @@ async fn market_stream(
 ) -> Result<Response, StatusCode> {
     let pair = state.pair(&base, &quote)?;
     let interval = chart_interval(&interval)?;
-    let client_ip = trusted_proxy_client_ip(peer.ip(), &headers);
+    let client_ip = trusted_proxy_client_ip(&state, peer.ip(), &headers);
     let slot = state.acquire_stream_slot(client_ip)?;
     let max_stream_lifetime = state.0.max_stream_lifetime;
     let (events, receiver) = mpsc::channel::<Event>(32);
@@ -852,15 +858,18 @@ async fn market_stream(
         .into_response())
 }
 
-fn trusted_proxy_client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
-    if !peer.is_loopback() {
-        return peer;
-    }
-    headers
-        .get("x-real-ip")
+fn trusted_proxy_client_ip(state: &AppState, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    let forwarded = headers
+        .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(peer)
+        .map(str::trim);
+    zylith_core::forwarded_client_ip(peer, forwarded, |address| {
+        state
+            .0
+            .trusted_proxies
+            .iter()
+            .any(|network| network.contains(&address))
+    })
 }
 
 async fn recv_optional(
@@ -1017,14 +1026,51 @@ fn configured_pairs(raw: &str) -> Result<BTreeSet<Pair>, String> {
     Ok(pairs)
 }
 
+fn manifest_pairs(raw: &str) -> Result<BTreeSet<Pair>, String> {
+    let value: Value =
+        serde_json::from_str(raw).map_err(|error| format!("deployment manifest: {error}"))?;
+    let manifest = value.get("manifest").unwrap_or(&value);
+    let pairs = manifest
+        .pointer("/product/pairs")
+        .and_then(Value::as_object)
+        .ok_or("deployment manifest has no product pairs")?;
+    let names = pairs
+        .values()
+        .filter(|pair| pair.get("enabled").and_then(Value::as_bool) == Some(true))
+        .map(|pair| {
+            let base = pair
+                .get("base_asset_id")
+                .and_then(Value::as_str)
+                .ok_or("enabled manifest pair has no base asset")?;
+            let quote = pair
+                .get("quote_asset_id")
+                .and_then(Value::as_str)
+                .ok_or("enabled manifest pair has no quote asset")?;
+            Ok(format!("{base}/{quote}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    configured_pairs(&names.join(","))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let bind_addr = std::env::var(BIND_ADDR_ENV)
         .unwrap_or_else(|_| DEFAULT_BIND_ADDR.into())
         .parse::<SocketAddr>()
         .map_err(|error| format!("{BIND_ADDR_ENV} is invalid: {error}"))?;
-    let pairs =
-        configured_pairs(&std::env::var(PAIRS_ENV).unwrap_or_else(|_| DEFAULT_PAIRS.into()))?;
+    let manifest_path =
+        std::env::var(MANIFEST_ENV).map_err(|_| format!("{MANIFEST_ENV} is required"))?;
+    let pairs = manifest_pairs(
+        &std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("deployment manifest {manifest_path}: {error}"))?,
+    )?;
+    if let Ok(configured) = std::env::var(PAIRS_ENV)
+        && configured_pairs(&configured)? != pairs
+    {
+        return Err(format!(
+            "{PAIRS_ENV} differs from the enabled deployment manifest pairs"
+        ));
+    }
     let max_streams = match std::env::var(MAX_STREAMS_ENV) {
         Ok(raw) => raw
             .trim()
@@ -1059,6 +1105,17 @@ async fn main() -> Result<(), String> {
         ),
         Err(_) => DEFAULT_MAX_STREAM_LIFETIME,
     };
+    let trusted_proxies = std::env::var(TRUSTED_PROXY_CIDRS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<ipnet::IpNet>().map_err(|error| {
+                format!("invalid {TRUSTED_PROXY_CIDRS_ENV} entry {value}: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let (hub, subscribe_requests) = BinanceStreamHub::new();
     tokio::spawn(run_binance_stream(hub.clone(), subscribe_requests));
     let state = AppState::new(
@@ -1067,6 +1124,7 @@ async fn main() -> Result<(), String> {
         max_streams,
         max_streams_per_client,
         max_stream_lifetime,
+        trusted_proxies,
         hub,
     );
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -1120,6 +1178,7 @@ mod tests {
             2,
             1,
             DEFAULT_MAX_STREAM_LIFETIME,
+            vec!["127.0.0.1/32".parse().unwrap()],
             hub,
         );
         (state, calls)
@@ -1150,20 +1209,31 @@ mod tests {
     }
 
     #[test]
-    fn client_identity_only_accepts_headers_from_the_loopback_proxy() {
+    fn enabled_market_data_pairs_come_from_the_deployment_manifest() {
+        let pairs = manifest_pairs(
+            r#"{"product":{"pairs":{"a":{"base_asset_id":"STRK","quote_asset_id":"USDC","enabled":true},"b":{"base_asset_id":"ETH","quote_asset_id":"USDC","enabled":false}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(pairs, configured_pairs("STRK/USDC").unwrap());
+        assert!(manifest_pairs(r#"{"product":{"pairs":{}}}"#).is_err());
+    }
+
+    #[test]
+    fn client_identity_only_accepts_headers_from_configured_proxies() {
+        let (state, _) = state_with(vec![]);
         let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.10"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.10"));
         assert_eq!(
-            trusted_proxy_client_ip("127.0.0.1".parse().expect("ip"), &headers),
+            trusted_proxy_client_ip(&state, "127.0.0.1".parse().expect("ip"), &headers),
             "192.0.2.10".parse::<IpAddr>().expect("ip")
         );
         assert_eq!(
-            trusted_proxy_client_ip("198.51.100.8".parse().expect("ip"), &headers),
+            trusted_proxy_client_ip(&state, "198.51.100.8".parse().expect("ip"), &headers,),
             "198.51.100.8".parse::<IpAddr>().expect("ip")
         );
-        headers.insert("x-real-ip", HeaderValue::from_static("not-an-ip"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
         assert_eq!(
-            trusted_proxy_client_ip("127.0.0.1".parse().expect("ip"), &headers),
+            trusted_proxy_client_ip(&state, "127.0.0.1".parse().expect("ip"), &headers),
             "127.0.0.1".parse::<IpAddr>().expect("ip")
         );
     }
@@ -1411,6 +1481,7 @@ mod tests {
             2,
             1,
             Duration::from_millis(1),
+            Vec::new(),
             hub,
         );
         let client = SocketAddr::from(([192, 0, 2, 1], 12345));

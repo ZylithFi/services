@@ -16,6 +16,7 @@ const manifest = {
     settlement_account_address: felt(11),
     config_locked_after_deploy: true,
   },
+  roles: { reference_price_signer: felt(14) },
   product: { assets: { STRK: { decimals: 18 }, USDC: { decimals: 6 } }, pairs: { "STRK/USDC": { pair_id: "STRK/USDC", base_asset_id: "STRK", quote_asset_id: "USDC", taker_fee_bps: 4, min_order_amount: "1000", enabled: true } } },
   runtime: { epoch_ms: 6000 },
 };
@@ -32,9 +33,14 @@ const env = {
   ZYLITH_REFERENCE_PRICE_ATTESTOR_TOKEN: "a".repeat(32),
   ZYLITH_REFERENCE_PRICE_ATTESTOR_URL: "https://attestor.example",
   ZYLITH_TX_PROVER_URLS: "http://10.0.0.5:3000,http://127.0.0.1:3001",
+  ZYLITH_TX_PROVER_HEALTH_URLS: "http://10.0.0.5:3000/health,http://127.0.0.1:3001/health",
+  ZYLITH_PAYMASTER_HEALTH_URL: "http://127.0.0.1:8787/health",
+  ZYLITH_PRIVACY_DISCOVERY_HEALTH_URL: "https://api.example/discovery/health",
+  ZYLITH_PRIVACY_PROVER_HEALTH_URL: "https://api.example/prover/health",
   ZYLITH_PROVER_ALLOWED_ORIGINS: "https://app.zylith.fi",
   ZYLITH_EXECUTION_KEYS_PATH: "/secrets/keys.json",
   ZYLITH_REFERENCE_PRICE_SIGNER_PRIVATE_KEY: felt(14),
+  ZYLITH_REFERENCE_PRICE_SIGNER_PUBLIC_KEY: felt(14),
   ZYLITH_EXCHANGE_ADDRESS: felt(4),
   ZYLITH_INDEXER_ALLOWED_ORIGINS: "https://app.zylith.fi",
   ZYLITH_COORDINATOR_ALLOWED_ORIGINS: "https://app.zylith.fi",
@@ -51,11 +57,11 @@ test("a complete production environment passes", () => {
   assert.deepEqual(run(), []);
 });
 
-test("missing secrets, cleartext urls and wildcard origins fail", () => {
+test("missing secrets, untrusted prover names and wildcard origins fail", () => {
   const failures = run({ ZYLITH_PROVER_DATA_KEY_HEX: "", ZYLITH_TX_PROVER_URLS: "https://prover.example", ZYLITH_PROVER_ALLOWED_ORIGINS: "*" });
   assert.ok(failures.some((failure) => failure.includes("ZYLITH_PROVER_DATA_KEY_HEX is required")));
-  assert.ok(failures.some((failure) => failure.includes("is not operator-run")));
-  assert.deepEqual(run({ ZYLITH_TX_PROVER_URLS: "https://prover.example", ZYLITH_TX_PROVER_REMOTE_TRUSTED: "1" }), []);
+  assert.ok(failures.some((failure) => failure.includes("is not local or explicitly listed")));
+  assert.deepEqual(run({ ZYLITH_TX_PROVER_URLS: "https://prover.example", ZYLITH_TX_PROVER_HEALTH_URLS: "https://prover.example/health", ZYLITH_TX_PROVER_TRUSTED_HOSTS: "prover.example" }), []);
   assert.ok(failures.some((failure) => failure.includes("ZYLITH_PROVER_ALLOWED_ORIGINS must list exact https origins")));
 });
 
@@ -104,6 +110,6 @@ test("external matching is either fully configured or explicitly disabled", () =
   assert.ok(incomplete.some((failure) => failure.includes("ZYLITH_SEARCHER_MIN_PROFIT.USDC")));
   assert.ok(incomplete.some((failure) => failure.includes("external_window_seconds")));
   assert.ok(run({}, external(12)).some((failure) => failure.includes("match externally")));
-  const configured = { ZYLITH_EXTERNAL_MATCHING_DISABLED: "", ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example", ZYLITH_SEARCHER_MIN_PROFIT: '{"USDC":"1000"}' };
+  const configured = { ZYLITH_EXTERNAL_MATCHING_DISABLED: "", ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example", ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/health", ZYLITH_SEARCHER_MIN_PROFIT: '{"USDC":"1000"}' };
   assert.deepEqual(run(configured, external(12)), []);
 });
