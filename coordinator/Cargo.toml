@@ -6,14 +6,21 @@ version.workspace = true
 authors.workspace = true
 
 [dependencies]
+aes-gcm = "0.10"
 axum = { version = "0.8", features = ["macros"] }
+hex = "0.4"
+hmac = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ipnet = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net"] }
+sha2 = "0.10"
+starknet-crypto = "0.8.1"
 tower-http = { version = "0.6", features = ["cors", "set-header"] }
 zylith-core = { path = "../core" }
+zylith-proof-job = { path = "../proof_job" }
 
 [dev-dependencies]
 http-body-util = "0.1"

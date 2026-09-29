@@ -15,7 +15,7 @@ use zylith_core::{
 };
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3200";
-pub const DEFAULT_DATA_DIR: &str = "data/prover";
+pub const DEFAULT_DATA_DIR: &str = "data/operator";
 const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 
 #[derive(Clone)]
@@ -46,6 +46,8 @@ pub struct PairRuntime {
     pub scale: u128,
     pub fee_bps: u128,
     pub external_enabled: bool,
+    /// quote atoms every permissionless fill pays onchain for settlement and a possible freeze.
+    pub external_settlement_support_quote: u128,
     /// the smallest order the operator admits, in base atoms.
     pub min_order_amount: u128,
 }
@@ -53,6 +55,8 @@ pub struct PairRuntime {
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub epoch_ms: u64,
+    /// how long before the boundary cutoff establishment and price sampling begin.
+    pub epoch_prepare_ms: u64,
     /// how many transitions may be in flight (proving or submitted) ahead of the chain.
     pub pipeline_depth: usize,
     pub max_admissions: usize,
@@ -85,9 +89,10 @@ pub struct Config {
     pub router: Felt,
     pub settlement: Account,
     pub proof_account: Account,
-    pub tx_provers: Vec<String>,
-    pub tx_prover_ohttp_key_config: Option<Vec<u8>>,
-    pub tx_prover_timeout_seconds: u64,
+    pub proof_queue_url: String,
+    pub proof_queue_control_token: String,
+    pub prover_build_id: String,
+    pub proof_job_timeout_seconds: u64,
     pub proving_blocks_back: u64,
     pub attestor_url: String,
     pub attestor_token: String,
@@ -97,10 +102,10 @@ pub struct Config {
     pub searcher_headroom_bps: u128,
     /// the secret that blinds fee notes; the fee recipient needs it to recover and spend them.
     pub fee_key: Felt,
-    /// the strk asset id, the unit gas is paid and valued in.
-    pub strk_asset: Felt,
+    /// the registry-selected gas asset id, the unit gas is paid and valued in.
+    pub gas_fee_asset: Felt,
     /// the fixed objective numeraire; every enabled asset needs a direct observation against it.
-    pub usdc_asset: Felt,
+    pub objective_numeraire_asset: Felt,
     /// the l2 gas a transition costs until landed transitions teach a better estimate.
     pub transition_gas_estimate: u64,
     /// the l2 gas a searcher leg adds, by its route's shape.
@@ -149,23 +154,6 @@ pub fn felt(value: &str, label: &str) -> Result<Felt, String> {
     Felt::from_hex(value.trim()).map_err(|error| format!("{label} is not a felt: {error}"))
 }
 
-/// whether a service url names this machine or a private network, where the operator runs its
-/// own transaction provers.
-pub fn is_operator_host(url: &str) -> bool {
-    let Some(host) = Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-    else {
-        return false;
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
-        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00,
-        Err(_) => host == "localhost",
-    }
-}
-
 /// a starknet chain id as manifests write it: the hex felt (`0x534e5f5345504f4c4941`) or the short
 /// string it encodes (sn_sepolia in capitals).
 pub fn chain_id(value: &str) -> Result<Felt, String> {
@@ -194,25 +182,6 @@ pub fn pair_felt(name: &str) -> Felt {
     from_core(zylith_core::exchange::pair_id(name))
 }
 
-/// a json object of asset name to decimal atoms, keyed by asset id.
-fn asset_amounts(name: &str) -> Result<BTreeMap<Felt, u128>, String> {
-    let Some(raw) = optional(name) else {
-        return Ok(BTreeMap::new());
-    };
-    let amounts: BTreeMap<String, String> =
-        serde_json::from_str(&raw).map_err(|error| format!("{name}: {error}"))?;
-    amounts
-        .into_iter()
-        .map(|(asset, amount)| {
-            let amount = amount
-                .trim()
-                .parse::<u128>()
-                .map_err(|_| format!("{name}: {asset} is not an integer amount"))?;
-            Ok((asset_felt(&asset), amount))
-        })
-        .collect()
-}
-
 pub fn asset_felt(name: &str) -> Felt {
     from_core(zylith_core::exchange::asset_id(name))
 }
@@ -232,7 +201,10 @@ pub fn load_manifest(path: &str) -> Result<DeploymentManifest, String> {
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| format!("deployment manifest: {error}"))?;
     let manifest = value.get("manifest").cloned().unwrap_or(value);
-    serde_json::from_value(manifest).map_err(|error| format!("deployment manifest schema: {error}"))
+    let manifest: DeploymentManifest = serde_json::from_value(manifest)
+        .map_err(|error| format!("deployment manifest schema: {error}"))?;
+    manifest.validate_market_registry()?;
+    Ok(manifest)
 }
 
 fn load_execution_keys(path: &str) -> Result<Vec<PrivateExecutionKeyPrivateConfig>, String> {
@@ -245,12 +217,12 @@ fn load_execution_keys(path: &str) -> Result<Vec<PrivateExecutionKeyPrivateConfi
 }
 
 fn data_key() -> Result<[u8; 32], String> {
-    let hex = required("ZYLITH_PROVER_DATA_KEY_HEX")?;
-    let bytes =
-        hex::decode(hex.trim()).map_err(|_| "ZYLITH_PROVER_DATA_KEY_HEX is not hex".to_string())?;
+    let hex = required("ZYLITH_OPERATOR_DATA_KEY_HEX")?;
+    let bytes = hex::decode(hex.trim())
+        .map_err(|_| "ZYLITH_OPERATOR_DATA_KEY_HEX is not hex".to_string())?;
     bytes
         .try_into()
-        .map_err(|_| "ZYLITH_PROVER_DATA_KEY_HEX must be 32 bytes".to_string())
+        .map_err(|_| "ZYLITH_OPERATOR_DATA_KEY_HEX must be 32 bytes".to_string())
 }
 
 impl Config {
@@ -258,13 +230,10 @@ impl Config {
         let manifest_path = optional("ZYLITH_DEPLOYMENT_MANIFEST")
             .unwrap_or_else(|| "client/public/deployment.json".into());
         let manifest = load_manifest(&manifest_path)?;
-        if !manifest.deployment.finalized {
-            return Err("the deployment manifest is not finalized".into());
-        }
-        if !manifest.proof.config_locked_after_deploy {
-            return Err(
-                "the deployment manifest does not attest locked proof configuration".into(),
-            );
+        manifest.validate_production()?;
+        if manifest.proof.proof_validity_blocks <= zylith_proof_job::PROOF_VALIDITY_HEADROOM_BLOCKS
+        {
+            return Err("proof validity must leave submission headroom after proving".into());
         }
         if manifest.deployment.release_commit.len() != 40
             || !manifest
@@ -312,76 +281,77 @@ impl Config {
                 "proof account key",
             )?,
         };
-        let tx_provers = optional("ZYLITH_TX_PROVER_URLS")
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(|url| url.trim().to_owned())
-                    .filter(|url| !url.is_empty())
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![manifest.proof.tx_prover_url.clone()]);
-        if tx_provers.is_empty() {
-            return Err("at least one transaction prover is required".into());
+        let proof_queue_url = required("ZYLITH_PROOF_QUEUE_URL")?;
+        Url::parse(&proof_queue_url).map_err(|error| format!("proof queue url: {error}"))?;
+        let prover_build_id = optional("ZYLITH_PROVER_BUILD_ID")
+            .unwrap_or_else(|| manifest.proof.prover_build_id.clone());
+        if prover_build_id != manifest.proof.prover_build_id
+            || prover_build_id.trim().is_empty()
+            || prover_build_id.len() > 256
+        {
+            return Err("the prover build id does not match the deployment manifest".into());
         }
-        if optional("ZYLITH_TX_PROVER_REMOTE_TRUSTED").is_some() {
-            return Err("ZYLITH_TX_PROVER_REMOTE_TRUSTED is retired; list exact operator-controlled names in ZYLITH_TX_PROVER_TRUSTED_HOSTS".into());
-        }
-        let trusted_prover_hosts = optional("ZYLITH_TX_PROVER_TRUSTED_HOSTS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|host| host.trim().to_ascii_lowercase())
-            .filter(|host| !host.is_empty())
-            .collect::<BTreeSet<_>>();
-        // the transaction prover executes the whole witness in the clear. numeric private
-        // addresses are accepted directly; dns names require an exact operator allowlist.
-        for prover in &tx_provers {
-            let host = Url::parse(prover)
-                .ok()
-                .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()));
-            if !is_operator_host(prover)
-                && host.is_none_or(|host| !trusted_prover_hosts.contains(&host))
-            {
+
+        for retired in [
+            "ZYLITH_MIN_SETTLEMENT_FEES",
+            "ZYLITH_SEARCHER_MIN_PROFIT_QUOTE",
+            "ZYLITH_SEARCHER_MIN_PROFIT",
+            "ZYLITH_MARKET_DATA_PAIRS",
+            "ZYLITH_REFERENCE_PRICE_SOURCES_PATH",
+            "ZYLITH_REFERENCE_PRICE_ATTESTATION_TTL_MS",
+            "ZYLITH_PAIRS",
+            "ZYLITH_TOKENS",
+            "ZYLITH_EXTERNAL_PAIRS",
+            "ZYLITH_PAIR_FEE_BPS",
+            "ZYLITH_EXTERNAL_SETTLEMENT_SUPPORT_QUOTE",
+            "ZYLITH_MAX_ADMISSIONS",
+        ] {
+            if optional(retired).is_some() {
                 return Err(format!(
-                    "transaction prover {prover} is not local or explicitly listed in ZYLITH_TX_PROVER_TRUSTED_HOSTS"
+                    "{retired} is retired; use the canonical market registry"
                 ));
             }
         }
-        let tx_prover_ohttp_key_config = if manifest.proof.tx_prover_ohttp_enabled {
-            match optional("ZYLITH_TX_PROVER_OHTTP_KEY_CONFIG_HEX") {
-                Some(hex) => Some(
-                    hex::decode(hex.trim())
-                        .map_err(|_| "ohttp key config is not hex".to_string())?,
-                ),
-                None => Some(Vec::new()),
-            }
-        } else {
-            None
-        };
-
-        if optional("ZYLITH_MIN_SETTLEMENT_FEES").is_some()
-            || optional("ZYLITH_SEARCHER_MIN_PROFIT_QUOTE").is_some()
-        {
-            return Err("ZYLITH_MIN_SETTLEMENT_FEES and ZYLITH_SEARCHER_MIN_PROFIT_QUOTE are replaced by ZYLITH_MIN_TRANSITION_FEE_STRK and ZYLITH_SEARCHER_MIN_PROFIT".into());
-        }
         let mut pairs = Vec::new();
-        for pair in manifest.product.pairs.values().filter(|pair| pair.enabled) {
+        let mut searcher_min_profit = BTreeMap::new();
+        for pair in manifest.market_registry.enabled_markets() {
+            let quote_asset_id = asset_felt(&pair.quote_asset_id.0);
+            if pair.capabilities.external_matching
+                && let Some(existing) = searcher_min_profit
+                    .insert(quote_asset_id, pair.external_min_profit_quote)
+                    .filter(|existing| *existing != pair.external_min_profit_quote)
+            {
+                return Err(format!(
+                    "external markets sharing quote asset {} disagree on their minimum profit: {existing} and {}",
+                    pair.quote_asset_id.0, pair.external_min_profit_quote
+                ));
+            }
             pairs.push(PairRuntime {
-                name: pair.pair_id.0.clone(),
+                name: pair.market_id.0.clone(),
                 base_name: pair.base_asset_id.0.clone(),
                 quote_name: pair.quote_asset_id.0.clone(),
-                pair_id: pair_felt(&pair.pair_id.0),
+                pair_id: pair_felt(&pair.market_id.0),
                 base_asset_id: asset_felt(&pair.base_asset_id.0),
-                quote_asset_id: asset_felt(&pair.quote_asset_id.0),
+                quote_asset_id,
                 scale: pair.price_base_scale,
                 fee_bps: u128::from(pair.taker_fee_bps),
-                external_enabled: pair.external_match_enabled,
+                external_enabled: pair.capabilities.external_matching,
+                external_settlement_support_quote: pair.external_settlement_support_quote,
                 min_order_amount: pair.min_order_amount,
             });
         }
         // tiny funded orders would crowd the book and the proofs: every pair needs a minimum.
         if let Some(pair) = pairs.iter().find(|pair| pair.min_order_amount == 0) {
             return Err(format!("pair {} has no minimum order amount", pair.name));
+        }
+        if let Some(pair) = pairs
+            .iter()
+            .find(|pair| pair.external_enabled != (pair.external_settlement_support_quote != 0))
+        {
+            return Err(format!(
+                "pair {} must configure nonzero external settlement support exactly when external matching is enabled",
+                pair.name
+            ));
         }
         if pairs.len() > zylith_core::exchange::MAX_MARKETS {
             return Err(format!(
@@ -391,19 +361,22 @@ impl Config {
             ));
         }
         pairs.sort_by_key(|pair| pair.pair_id.to_bytes_be());
-        let usdc_asset = asset_felt("USDC");
+        let objective_numeraire_asset =
+            asset_felt(&manifest.market_registry.objective_numeraire_asset_id.0);
         let enabled_assets = pairs
             .iter()
             .flat_map(|pair| [pair.base_asset_id, pair.quote_asset_id])
             .collect::<BTreeSet<_>>();
         for asset in enabled_assets {
-            if asset != usdc_asset
+            if asset != objective_numeraire_asset
                 && !pairs.iter().any(|pair| {
-                    (pair.base_asset_id == asset && pair.quote_asset_id == usdc_asset)
-                        || (pair.quote_asset_id == asset && pair.base_asset_id == usdc_asset)
+                    (pair.base_asset_id == asset
+                        && pair.quote_asset_id == objective_numeraire_asset)
+                        || (pair.quote_asset_id == asset
+                            && pair.base_asset_id == objective_numeraire_asset)
                 })
             {
-                return Err("every enabled asset needs a direct USDC observation pair".into());
+                return Err("every enabled asset needs a direct objective-numeraire market".into());
             }
         }
 
@@ -412,6 +385,9 @@ impl Config {
             return Err("runtime.max_internal_deferral_epochs must be positive".into());
         }
         let epoch_ms = parsed("ZYLITH_EPOCH_MS", runtime.epoch_ms)?;
+        if epoch_ms != runtime.epoch_ms {
+            return Err("ZYLITH_EPOCH_MS differs from the deployment manifest".into());
+        }
         let pipeline_depth = parsed("ZYLITH_PIPELINE_DEPTH", 2_usize)?;
         if !(1..=4).contains(&pipeline_depth) {
             return Err("ZYLITH_PIPELINE_DEPTH must be in [1, 4]".into());
@@ -422,13 +398,20 @@ impl Config {
                 "runtime.max_book_orders exceeds the step budget limit of {proof_book_limit}"
             ));
         }
+        let proof_admission_limit = zylith_core::exchange::StepShape::max_admissions(step_budget);
+        if runtime.max_admissions_per_transition as usize > proof_admission_limit {
+            return Err(format!(
+                "runtime.max_admissions_per_transition exceeds the worst-case step budget limit of {proof_admission_limit}"
+            ));
+        }
         let policy = Policy {
             epoch_ms,
-            pipeline_depth,
-            max_admissions: parsed(
-                "ZYLITH_MAX_ADMISSIONS",
-                runtime.max_admissions_per_transition as usize,
+            epoch_prepare_ms: parsed(
+                "ZYLITH_EPOCH_PREPARE_MS",
+                3_000_u64.min(epoch_ms.saturating_sub(1)),
             )?,
+            pipeline_depth,
+            max_admissions: runtime.max_admissions_per_transition as usize,
             max_book_orders: runtime.max_book_orders as usize,
             step_budget,
             force_after_ms: parsed("ZYLITH_FORCE_AFTER_MS", 60_000_u64)?,
@@ -441,14 +424,26 @@ impl Config {
         if policy.epoch_ms < 1_000 {
             return Err("the epoch must be at least one second".into());
         }
+        if policy.epoch_prepare_ms == 0 || policy.epoch_prepare_ms >= policy.epoch_ms {
+            return Err(
+                "ZYLITH_EPOCH_PREPARE_MS must be positive and shorter than the epoch".into(),
+            );
+        }
+        let proving_blocks_back = parsed("ZYLITH_PROVING_BLOCKS_BACK", 1_u64)?;
+        if proving_blocks_back == 0
+            || proving_blocks_back.saturating_add(zylith_proof_job::PROOF_VALIDITY_HEADROOM_BLOCKS)
+                >= manifest.proof.proof_validity_blocks
+        {
+            return Err("the proof base leaves no validity window for submission".into());
+        }
 
         let config = Self {
-            bind_addr: optional("ZYLITH_PROVER_BIND_ADDR")
+            bind_addr: optional("ZYLITH_OPERATOR_BIND_ADDR")
                 .unwrap_or_else(|| DEFAULT_BIND_ADDR.into()),
             data_dir: PathBuf::from(
-                optional("ZYLITH_PROVER_DATA_DIR").unwrap_or_else(|| DEFAULT_DATA_DIR.into()),
+                optional("ZYLITH_OPERATOR_DATA_DIR").unwrap_or_else(|| DEFAULT_DATA_DIR.into()),
             ),
-            replica_dir: optional("ZYLITH_PROVER_REPLICA_DIR").map(PathBuf::from),
+            replica_dir: optional("ZYLITH_OPERATOR_REPLICA_DIR").map(PathBuf::from),
             confirmation_blocks: parsed("ZYLITH_CONFIRMATION_BLOCKS", 2_u64)?,
             data_key: data_key()?,
             rpc_url,
@@ -458,18 +453,19 @@ impl Config {
             router: felt(&manifest.contracts.ekubo_external_match_router, "router")?,
             settlement,
             proof_account,
-            tx_provers,
-            tx_prover_ohttp_key_config,
-            tx_prover_timeout_seconds: parsed("ZYLITH_TX_PROVER_TIMEOUT_SECONDS", 120_u64)?,
-            proving_blocks_back: parsed("ZYLITH_PROVING_BLOCKS_BACK", 1_u64)?,
+            proof_queue_url,
+            proof_queue_control_token: required("ZYLITH_PROOF_QUEUE_CONTROL_TOKEN")?,
+            prover_build_id,
+            proof_job_timeout_seconds: parsed("ZYLITH_PROOF_JOB_TIMEOUT_SECONDS", 120_u64)?,
+            proving_blocks_back,
             attestor_url: required("ZYLITH_REFERENCE_PRICE_ATTESTOR_URL")?,
             attestor_token: required("ZYLITH_REFERENCE_PRICE_ATTESTOR_TOKEN")?,
             route_service_url: optional("ZYLITH_ROUTE_SERVICE_URL"),
-            searcher_min_profit: asset_amounts("ZYLITH_SEARCHER_MIN_PROFIT")?,
+            searcher_min_profit,
             searcher_headroom_bps: parsed("ZYLITH_SEARCHER_HEADROOM_BPS", 5_u128)?,
             fee_key: nonzero(&required("ZYLITH_FEE_NOTE_KEY")?, "fee note key")?,
-            strk_asset: asset_felt("STRK"),
-            usdc_asset,
+            gas_fee_asset: asset_felt(&manifest.market_registry.gas_fee_asset_id.0),
+            objective_numeraire_asset,
             transition_gas_estimate: parsed("ZYLITH_TRANSITION_GAS_ESTIMATE", 250_000_000_u64)?,
             leg_gas: crate::market::LegGas {
                 base: parsed("ZYLITH_EXTERNAL_LEG_GAS", 25_000_000_u64)?,
@@ -491,7 +487,7 @@ impl Config {
             pairs,
             policy,
             control_token: required("ZYLITH_CONTROL_PLANE_TOKEN")?,
-            allowed_origins: optional("ZYLITH_PROVER_ALLOWED_ORIGINS")
+            allowed_origins: optional("ZYLITH_OPERATOR_ALLOWED_ORIGINS")
                 .map(|value| {
                     value
                         .split(',')
@@ -510,7 +506,7 @@ impl Config {
                         .map_err(|_| format!("invalid proxy cidr {cidr}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            max_body_bytes: parsed("ZYLITH_PROVER_MAX_BODY_BYTES", 256 * 1024_usize)?,
+            max_body_bytes: parsed("ZYLITH_OPERATOR_MAX_BODY_BYTES", 256 * 1024_usize)?,
             sync_from_block: parsed("ZYLITH_SYNC_FROM_BLOCK", 0_u64)?,
             manifest,
         };
@@ -527,7 +523,7 @@ impl Config {
         }
         if config.max_body_bytes < zylith_core::exchange::MAX_SEALED_REQUEST_BYTES {
             return Err(format!(
-                "ZYLITH_PROVER_MAX_BODY_BYTES must be at least {}",
+                "ZYLITH_OPERATOR_MAX_BODY_BYTES must be at least {}",
                 zylith_core::exchange::MAX_SEALED_REQUEST_BYTES
             ));
         }
@@ -556,10 +552,10 @@ impl Config {
                 (pair.base_asset_id, &pair.base_name),
                 (pair.quote_asset_id, &pair.quote_name),
             ] {
-                let priced = asset == self.strk_asset
+                let priced = asset == self.gas_fee_asset
                     || neighbours(asset).any(|middle| {
-                        middle == self.strk_asset
-                            || neighbours(middle).any(|end| end == self.strk_asset)
+                        middle == self.gas_fee_asset
+                            || neighbours(middle).any(|end| end == self.gas_fee_asset)
                     });
                 if !priced {
                     return Err(format!(
@@ -595,6 +591,14 @@ impl Config {
     /// positive margin and an on-chain window for the fill.
     fn check_external_matching(&self) -> Result<(), String> {
         let Some(pair) = self.pairs.iter().find(|pair| pair.external_enabled) else {
+            if self.route_service_url.is_some()
+                || self.router != Felt::ZERO
+                || self.policy.external_window_seconds != 0
+            {
+                return Err(
+                    "external routing is configured while every registry market disables it".into(),
+                );
+            }
             return Ok(());
         };
         let missing = if self.route_service_url.is_none() {
@@ -611,7 +615,7 @@ impl Config {
                     .is_none_or(|margin| *margin == 0)
             })
         {
-            "positive ZYLITH_SEARCHER_MIN_PROFIT margin for its quote asset"
+            "a positive external_min_profit_quote in the market registry"
         } else if self.policy.external_window_seconds == 0 {
             "a nonzero runtime.external_window_seconds"
         } else {
@@ -658,27 +662,6 @@ pub fn from_core(value: starknet_crypto::Felt) -> Felt {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_local_or_private_hosts_count_as_operator_run_provers() {
-        for local in [
-            "http://127.0.0.1:3000",
-            "http://localhost:8080/prove",
-            "http://10.0.3.7:3000",
-            "http://192.168.1.2",
-            "http://[::1]:3000",
-        ] {
-            assert!(is_operator_host(local), "{local}");
-        }
-        for remote in [
-            "https://prover.example.com",
-            "http://prover.internal:3000",
-            "http://35.192.48.142:3000",
-            "not a url",
-        ] {
-            assert!(!is_operator_host(remote), "{remote}");
-        }
-    }
 
     #[test]
     fn chain_ids_parse_from_hex_or_short_string() {

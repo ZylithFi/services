@@ -188,6 +188,8 @@ pub struct TransitionInput {
     pub book: Vec<BookEntry>,
     pub new_orders: Vec<NewOrder>,
     pub cancellations: Vec<Cancellation>,
+    #[serde(default, with = "felt_vec_hex_serde")]
+    pub recovered_order_ids: Vec<Felt>,
     pub outcomes: Vec<Outcome>,
     #[serde(with = "felt_hex_serde")]
     pub padding_seed: Felt,
@@ -210,6 +212,12 @@ pub struct OutputRecord {
     pub leaf: Felt,
     #[serde(with = "felt_hex_serde")]
     pub enc: Felt,
+    #[serde(with = "felt_hex_serde")]
+    pub enc_remaining: Felt,
+    #[serde(with = "felt_hex_serde")]
+    pub enc_reserved: Felt,
+    #[serde(with = "felt_hex_serde")]
+    pub enc_reserved_offset: Felt,
 }
 
 /// a note this transition created, with where it sits in the padded output list.
@@ -223,11 +231,21 @@ pub struct OutputNote {
     pub note: NoteFields,
 }
 
+/// a shielded residual-order authority created by this transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidualOutput {
+    #[serde(with = "felt_hex_serde")]
+    pub order_id: Felt,
+    pub index: usize,
+    pub note: ResidualNote,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Removal {
     Completed,
     Cancelled,
     Expired,
+    Recovered,
 }
 
 /// what happened to one order, for the operator and the order's owner.
@@ -281,6 +299,10 @@ pub struct TransitionPublic {
     pub nullifiers: Vec<Felt>,
     #[serde(with = "felt_hex_serde")]
     pub nullifiers_commitment: Felt,
+    #[serde(with = "felt_vec_hex_serde")]
+    pub retired_nullifiers: Vec<Felt>,
+    #[serde(with = "felt_hex_serde")]
+    pub retired_nullifiers_commitment: Felt,
     pub output_records: Vec<OutputRecord>,
     #[serde(with = "felt_hex_serde")]
     pub outputs_commitment: Felt,
@@ -322,6 +344,7 @@ pub struct TransitionResult {
     pub public: TransitionPublic,
     pub new_book: Vec<BookEntry>,
     pub outputs: Vec<OutputNote>,
+    pub residual_outputs: Vec<ResidualOutput>,
     pub reports: Vec<OrderReport>,
     /// cancellations that could not apply yet (reserved order or no market this transition).
     #[serde(with = "felt_vec_hex_serde")]
@@ -385,11 +408,23 @@ pub fn nullifiers_commitment(chain_context: Felt, nullifiers: &[Felt]) -> Felt {
     starknet_crypto::poseidon_hash(state, felt_u64(nullifiers.len() as u64))
 }
 
+pub fn retired_nullifiers_commitment(chain_context: Felt, nullifiers: &[Felt]) -> Felt {
+    let mut state =
+        starknet_crypto::poseidon_hash(short_string(RETIRED_NULLIFIERS_DOMAIN), chain_context);
+    for nullifier in nullifiers {
+        state = starknet_crypto::poseidon_hash(state, *nullifier);
+    }
+    starknet_crypto::poseidon_hash(state, felt_u64(nullifiers.len() as u64))
+}
+
 pub fn outputs_commitment(chain_context: Felt, records: &[OutputRecord]) -> Felt {
     let mut values = vec![short_string(OUTPUTS_DOMAIN), chain_context];
     for record in records {
         values.push(record.leaf);
         values.push(record.enc);
+        values.push(record.enc_remaining);
+        values.push(record.enc_reserved);
+        values.push(record.enc_reserved_offset);
     }
     values.push(felt_u64(records.len() as u64));
     sponge(&values)
@@ -409,6 +444,7 @@ impl TransitionPublic {
             self.outcomes_commitment,
             self.capacity_commitment,
             self.nullifiers_commitment,
+            self.retired_nullifiers_commitment,
             self.outputs_commitment,
             self.output_root,
             self.fee_recipient,
@@ -433,6 +469,14 @@ pub fn output_blinding(key: Felt, seq: u32, kind: u64, asset_id: Felt) -> Felt {
             felt_u64(kind),
         ])
     }
+}
+
+fn output_aux_blinding(blinding: Felt, lane: u64) -> Felt {
+    sponge(&[
+        short_string(OUTPUT_AUX_BLINDING_DOMAIN),
+        blinding,
+        felt_u64(lane),
+    ])
 }
 
 /// an order output as its owner can rebuild it from the order and the transition: its blinding
@@ -619,10 +663,11 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
     if input.chain_context == Felt::ZERO
         || input.fee_recipient == Felt::ZERO
         || input.fee_key == Felt::ZERO
+        || input.padding_seed == Felt::ZERO
         || input.objective_numeraire_asset_id == Felt::ZERO
     {
         return Err(invalid(
-            "transition context, fee recipient, fee key and numeraire must be nonzero",
+            "transition context, fee recipient, private seeds and numeraire must be nonzero",
         ));
     }
     validate_markets(input)?;
@@ -754,6 +799,14 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
         .iter()
         .map(|cancellation| (cancellation.order_id, cancellation.signature))
         .collect::<BTreeMap<_, _>>();
+    let recovered = input
+        .recovered_order_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if recovered.len() != input.recovered_order_ids.len() {
+        return Err(invalid("duplicate recovered order"));
+    }
     let mut deferred_cancellations = Vec::new();
 
     // the stream: book groups with this transition's new orders appended to their group.
@@ -853,6 +906,7 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
             }
             outcome_user_quote[index] += quote;
             stream.order.reserved = 0;
+            stream.order.reserved_offset = 0;
             stream.order.reserved_seq = 0;
         }
     }
@@ -869,7 +923,12 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 continue;
             }
             let removable = group.market.is_some() && stream.order.reserved == 0;
-            if let Some(signature) = cancellations.get(&stream.order.order_id) {
+            if recovered.contains(&stream.order.order_id) {
+                if !removable {
+                    return Err(invalid("a recovered order is not ready to retire"));
+                }
+                stream.removal = Some(Removal::Recovered);
+            } else if let Some(signature) = cancellations.get(&stream.order.order_id) {
                 if !removable {
                     deferred_cancellations.push(stream.order.order_id);
                     continue;
@@ -897,6 +956,12 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
         .any(|order_id| !known_ids.contains(order_id))
     {
         return Err(invalid("a cancellation names no book order"));
+    }
+    if recovered
+        .iter()
+        .any(|order_id| !known_ids.contains(order_id))
+    {
+        return Err(invalid("a recovered order names no book order"));
     }
 
     // 3-4. the global clearing over participating orders, certified within tolerance.
@@ -1064,6 +1129,7 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                     mul_div_floor(stream.order.funding, market_data.scale, bound)
                 };
                 stream.external_amount = available.min(stream.order.remaining);
+                stream.order.reserved_offset = total;
                 total = total
                     .checked_add(stream.external_amount)
                     .ok_or_else(|| invalid("external capacity aggregate overflows"))?;
@@ -1088,8 +1154,10 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 stream.external_base
             };
             stream.fee = fee_amount(internal, market_data.fee_bps);
-            stream.external_fee = fee_amount(external, market_data.fee_bps);
-            let gross = internal + external;
+            let recovered = stream.removal == Some(Removal::Recovered);
+            let unsettled_external = if recovered { 0 } else { external };
+            stream.external_fee = fee_amount(unsettled_external, market_data.fee_bps);
+            let gross = internal + unsettled_external;
             let fee = stream.fee + stream.external_fee;
             fee_totals[output_asset] = fee_totals[output_asset]
                 .checked_add(fee)
@@ -1099,7 +1167,9 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 stream.order.reserved = stream.external_amount;
                 stream.order.reserved_seq = input.seq;
             }
-            if stream.order.reserved == 0 && stream.removal.is_none() && stream.order.remaining == 0
+            if stream.order.reserved == 0
+                && stream.removal.is_none()
+                && (stream.order.remaining == 0 || stream.order.funding == 0)
             {
                 stream.removal = Some(Removal::Completed);
             }
@@ -1134,12 +1204,14 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
 
     // 6. outputs, the new book and the public lists.
     let mut outputs = Vec::new();
+    let mut residual_outputs = Vec::new();
     let mut records = Vec::new();
     let mut new_book = Vec::new();
     let mut reports = Vec::new();
     let mut nullifiers = Vec::new();
-    for group in &groups {
-        for stream in &group.orders {
+    let mut retired_nullifiers = Vec::new();
+    for group in &mut groups {
+        for stream in &mut group.orders {
             if let Some(new_order) = &stream.new_order {
                 nullifiers.extend(
                     new_order
@@ -1160,11 +1232,36 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 ),
                 None => (Felt::ZERO, Felt::ZERO),
             };
+            let state_changed = stream
+                .prior
+                .as_ref()
+                .is_some_and(|prior| !same_persisted_state(prior, &stream.order));
+            if stream.existing && (state_changed || stream.removal.is_some()) {
+                let prior = stream
+                    .prior
+                    .as_ref()
+                    .expect("existing order has prior state");
+                let old = ResidualNote::from_order(
+                    input.chain_context,
+                    input_asset,
+                    prior,
+                    &stream.owner,
+                    prior.residual_generation,
+                );
+                if !old.matches_order(prior) {
+                    return Err(invalid("book residual authority does not match its order"));
+                }
+                if stream.removal == Some(Removal::Recovered) {
+                    retired_nullifiers.push(old.nullifier());
+                } else {
+                    nullifiers.push(old.nullifier());
+                }
+            }
             for (kind, asset_id, amount) in [
                 (OUTPUT_KIND_PROCEEDS, output_asset, stream.proceeds),
                 (OUTPUT_KIND_REFUND, input_asset, stream.refund),
             ] {
-                if amount == 0 {
+                if amount == 0 || stream.removal == Some(Removal::Recovered) {
                     continue;
                 }
                 let note = order_output_note(
@@ -1178,6 +1275,9 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 records.push(OutputRecord {
                     leaf: note.output_leaf(),
                     enc: felt_u128(amount) + note.blinding,
+                    enc_remaining: output_aux_blinding(note.blinding, 1),
+                    enc_reserved: output_aux_blinding(note.blinding, 2),
+                    enc_reserved_offset: output_aux_blinding(note.blinding, 3),
                 });
                 outputs.push(OutputNote {
                     order_id: stream.order.order_id,
@@ -1187,6 +1287,47 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 });
             }
             if stream.removal.is_none() {
+                if !stream.existing || state_changed {
+                    let note = ResidualNote::from_order(
+                        input.chain_context,
+                        input_asset,
+                        &stream.order,
+                        &stream.owner,
+                        input.seq,
+                    );
+                    stream.order.residual_commitment = note.commitment();
+                    stream.order.residual_generation = input.seq;
+                    records.push(OutputRecord {
+                        leaf: note.output_leaf(),
+                        enc: felt_u128(note.funding) + note.blinding,
+                        enc_remaining: felt_u128(note.remaining)
+                            + output_blinding(
+                                stream.owner.nonce,
+                                input.seq,
+                                OUTPUT_KIND_RESIDUAL + 1,
+                                Felt::ZERO,
+                            ),
+                        enc_reserved: felt_u128(note.reserved)
+                            + output_blinding(
+                                stream.owner.nonce,
+                                input.seq,
+                                OUTPUT_KIND_RESIDUAL + 2,
+                                Felt::ZERO,
+                            ),
+                        enc_reserved_offset: felt_u128(note.reserved_offset)
+                            + output_blinding(
+                                stream.owner.nonce,
+                                input.seq,
+                                OUTPUT_KIND_RESIDUAL + 3,
+                                Felt::ZERO,
+                            ),
+                    });
+                    residual_outputs.push(ResidualOutput {
+                        order_id: stream.order.order_id,
+                        index: records.len() - 1,
+                        note,
+                    });
+                }
                 new_book.push(BookEntry {
                     order: stream.order.clone(),
                     owner: stream.owner.clone(),
@@ -1221,6 +1362,9 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
         records.push(OutputRecord {
             leaf: note.output_leaf(),
             enc: felt_u128(*total) + note.blinding,
+            enc_remaining: output_aux_blinding(note.blinding, 1),
+            enc_reserved: output_aux_blinding(note.blinding, 2),
+            enc_reserved_offset: output_aux_blinding(note.blinding, 3),
         });
         outputs.push(OutputNote {
             order_id: Felt::ZERO,
@@ -1234,6 +1378,9 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
         records.push(OutputRecord {
             leaf: padding_value(input.padding_seed, "output_leaf", index),
             enc: padding_value(input.padding_seed, "output_enc", index),
+            enc_remaining: padding_value(input.padding_seed, "output_remaining", index),
+            enc_reserved: padding_value(input.padding_seed, "output_reserved", index),
+            enc_reserved_offset: padding_value(input.padding_seed, "output_offset", index),
         });
     }
     let real_nullifiers = nullifiers.len();
@@ -1269,6 +1416,11 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
         capacities,
         nullifiers_commitment: nullifiers_commitment(input.chain_context, &nullifiers),
         nullifiers,
+        retired_nullifiers_commitment: retired_nullifiers_commitment(
+            input.chain_context,
+            &retired_nullifiers,
+        ),
+        retired_nullifiers,
         outputs_commitment: outputs_commitment(input.chain_context, &records),
         output_root: output_tree_root(&leaves),
         output_records: records,
@@ -1277,20 +1429,12 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
     };
     public.commitment = public.transition_commitment();
 
-    let (witness, layout) = serialize_witness(
-        input,
-        &assets,
-        &weights,
-        &prices,
-        &groups,
-        &public,
-        real_outputs,
-        real_nullifiers,
-    );
+    let (witness, layout) = serialize_witness(input, &assets, &weights, &prices, &groups, &public);
     Ok(TransitionResult {
         public,
         new_book,
         outputs,
+        residual_outputs,
         reports,
         deferred_cancellations,
         witness,
@@ -1326,8 +1470,22 @@ fn stream_order(
     }
 }
 
+fn same_persisted_state(left: &BookOrder, right: &BookOrder) -> bool {
+    left.pair_id == right.pair_id
+        && left.sell == right.sell
+        && left.external == right.external
+        && left.remaining == right.remaining
+        && left.limit == right.limit
+        && left.funding == right.funding
+        && left.reserved == right.reserved
+        && left.reserved_offset == right.reserved_offset
+        && left.reserved_seq == right.reserved_seq
+        && left.expiry_ms == right.expiry_ms
+        && left.owner_digest == right.owner_digest
+        && left.order_id == right.order_id
+}
+
 /// the felt input of the cairo transition statement (`stwo_statement/src/exchange/transition.cairo`).
-#[allow(clippy::too_many_arguments)]
 fn serialize_witness(
     input: &TransitionInput,
     assets: &Assets,
@@ -1335,8 +1493,6 @@ fn serialize_witness(
     prices: &[u128],
     groups: &[Group],
     public: &TransitionPublic,
-    real_outputs: usize,
-    real_nullifiers: usize,
 ) -> (Vec<Felt>, WitnessLayout) {
     let mut layout = WitnessLayout::default();
     let mut data = vec![
@@ -1346,6 +1502,7 @@ fn serialize_witness(
         felt_u64(input.close_time_ms),
         input.fee_recipient,
         input.fee_key,
+        input.padding_seed,
         input.note_root,
         public.prior_book_root,
     ];
@@ -1426,16 +1583,11 @@ fn serialize_witness(
             layout.orders.push(order_layout);
         }
     }
-    for record in &public.output_records[real_outputs..] {
-        data.push(record.leaf);
-        data.push(record.enc);
-    }
-    data.extend_from_slice(&public.nullifiers[real_nullifiers..]);
     (data, layout)
 }
 
 fn serialize_existing(data: &mut Vec<Felt>, stream: &StreamOrder, layout: &mut OrderLayout) {
-    // a fixed 18-felt record the statement reads in one step, then the owner when needed.
+    // a fixed record the statement reads in one step, then the owner when needed.
     let order = stream
         .prior
         .as_ref()
@@ -1446,10 +1598,13 @@ fn serialize_existing(data: &mut Vec<Felt>, stream: &StreamOrder, layout: &mut O
         felt_u128(order.limit),
         felt_u128(order.funding),
         felt_u128(order.reserved),
+        felt_u128(order.reserved_offset),
         felt_u64(u64::from(order.reserved_seq)),
         felt_u64(order.expiry_ms),
         order.owner_digest,
         order.order_id,
+        order.residual_commitment,
+        felt_u64(u64::from(order.residual_generation)),
     ]);
     layout.outcome = Some(data.len());
     data.push(felt_u64(stream.outcome.map_or(0, |index| index as u64 + 1)));
@@ -1459,12 +1614,21 @@ fn serialize_existing(data: &mut Vec<Felt>, stream: &StreamOrder, layout: &mut O
             data.extend_from_slice(&[Felt::ONE, signature.r, signature.s])
         }
         (Some(Removal::Expired), _) => data.extend_from_slice(&[Felt::TWO, Felt::ZERO, Felt::ZERO]),
+        (Some(Removal::Recovered), _) => {
+            data.extend_from_slice(&[felt_u64(3), Felt::ZERO, Felt::ZERO])
+        }
         _ => data.extend_from_slice(&[Felt::ZERO, Felt::ZERO, Felt::ZERO]),
     }
     layout.allocation = data.len();
     serialize_allocation(data, stream);
-    let owner_needed =
-        stream.proceeds > 0 || stream.refund > 0 || stream.cancel_signature.is_some();
+    let owner_needed = stream.proceeds > 0
+        || stream.refund > 0
+        || stream.cancel_signature.is_some()
+        || stream.removal == Some(Removal::Recovered)
+        || stream
+            .prior
+            .as_ref()
+            .is_some_and(|prior| !same_persisted_state(prior, &stream.order));
     data.push(felt_bool(owner_needed));
     if owner_needed {
         data.extend_from_slice(&stream.owner.fields());
@@ -1542,6 +1706,7 @@ pub struct StepShape {
     pub admissions: u64,
     pub crossing: u64,
     pub nullifiers: u64,
+    pub retired_nullifiers: u64,
     pub outputs: u64,
     pub funding_notes: u64,
     pub membership_path_elements: u64,
@@ -1565,6 +1730,7 @@ impl StepShape {
                 .filter(|report| report.fill_base != 0)
                 .count() as u64,
             nullifiers: result.public.nullifiers.len() as u64,
+            retired_nullifiers: result.public.retired_nullifiers.len() as u64,
             outputs: result.public.output_records.len() as u64,
             funding_notes: result
                 .layout
@@ -1591,6 +1757,7 @@ impl StepShape {
             + STEPS_PER_ADMISSION * self.admissions
             + STEPS_PER_CROSSING * self.crossing
             + STEPS_PER_NULLIFIER * self.nullifiers
+            + STEPS_PER_NULLIFIER * self.retired_nullifiers
             + STEPS_PER_OUTPUT * self.outputs
             + STEPS_PER_FUNDING_NOTE * self.funding_notes
             + STEPS_PER_MEMBERSHIP_PATH_ELEMENT * self.membership_path_elements
@@ -1605,9 +1772,32 @@ impl StepShape {
             admissions: 0,
             crossing: orders as u64,
             nullifiers: MIN_NULLIFIER_BUCKET as u64,
+            retired_nullifiers: 0,
             outputs: padded_len(2 * orders + MAX_ASSETS, MIN_OUTPUT_BUCKET) as u64,
             funding_notes: 0,
             membership_path_elements: 0,
+        };
+        (0..=MAX_BOOK_ORDERS)
+            .rev()
+            .find(|orders| worst(*orders).estimated_steps() <= budget)
+            .unwrap_or(0)
+    }
+
+    /// the largest all-crossing admission batch that fits even when every order spends the
+    /// maximum four notes and every membership path has its full protocol depth.
+    pub fn max_admissions(budget: u64) -> usize {
+        let worst = |orders: usize| Self {
+            markets: MAX_MARKETS as u64,
+            admissions: orders as u64,
+            crossing: orders as u64,
+            nullifiers: (MAX_FUNDING_NOTES * orders).max(MIN_NULLIFIER_BUCKET) as u64,
+            outputs: padded_len(2 * orders + MAX_ASSETS, MIN_OUTPUT_BUCKET) as u64,
+            funding_notes: (MAX_FUNDING_NOTES * orders) as u64,
+            membership_path_elements: (MAX_FUNDING_NOTES
+                * orders
+                * (NOTE_ACCUMULATOR_DEPTH + MAX_OUTPUT_SUBTREE_DEPTH))
+                as u64,
+            ..Default::default()
         };
         (0..=MAX_BOOK_ORDERS)
             .rev()
@@ -1619,13 +1809,13 @@ impl StepShape {
 // fitted to the vectors with a few percent of headroom: a resting order costs about 397 steps,
 // a crossing one 260 more plus its two padded outputs, an admission about 1960 plus its
 // nullifier.
-const STEPS_FIXED: u64 = 2_000;
-const STEPS_PER_MARKET: u64 = 5_000;
-const STEPS_PER_RESTING: u64 = 405;
+const STEPS_FIXED: u64 = 3_000;
+const STEPS_PER_MARKET: u64 = 5_500;
+const STEPS_PER_RESTING: u64 = 580;
 const STEPS_PER_ADMISSION: u64 = 2_000;
-const STEPS_PER_CROSSING: u64 = 270;
+const STEPS_PER_CROSSING: u64 = 520;
 const STEPS_PER_NULLIFIER: u64 = 64;
-const STEPS_PER_OUTPUT: u64 = 72;
+const STEPS_PER_OUTPUT: u64 = 100;
 const STEPS_PER_FUNDING_NOTE: u64 = 500;
 const STEPS_PER_MEMBERSHIP_PATH_ELEMENT: u64 = 15;
 

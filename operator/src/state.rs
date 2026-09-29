@@ -17,10 +17,10 @@ use zylith_core::exchange::{
 };
 
 use crate::chain::NoteIndex;
-use crate::snip36::Proof;
+use crate::snip36::{PreparedSubmission, Proof};
 
 const STATE_FILE: &str = "operator-state.bin";
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 /// an order the operator accepted and will admit when it can participate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +93,12 @@ pub struct InFlight {
     pub applied_capacities: Vec<OpenCapacity>,
     pub stage: TransitionStage,
     pub proof: Option<Proof>,
+    /// the exact signed settlement transaction, durably stored before its first broadcast.
+    #[serde(default)]
+    pub prepared_submission: Option<PreparedSubmission>,
+    /// the external legs carried by `prepared_submission`.
+    #[serde(default)]
+    pub prepared_legged: Vec<(Felt, bool)>,
     pub built_at_ms: u64,
     /// the submitted transaction carries the searcher leg.
     #[serde(default)]
@@ -152,6 +158,25 @@ pub struct WithdrawalJob {
     pub request: WithdrawRequest,
     pub nullifier: Felt,
     pub stage: WithdrawalStage,
+    /// the exact signed request transaction, retained until chain reconciliation proves it
+    /// landed or reverted.
+    #[serde(default)]
+    pub prepared_submission: Option<PreparedSubmission>,
+    pub updated_at_ms: u64,
+}
+
+/// a permissionless recovery request the operator will finalize if its owner goes offline.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingResidualRecovery {
+    pub nullifier: Felt,
+    pub requested_at_ms: u64,
+    pub matures_at_ms: u64,
+    pub requested_block: u64,
+    #[serde(default)]
+    pub retired: bool,
+    #[serde(default)]
+    pub finalization_transaction: Option<Felt>,
+    #[serde(default)]
     pub updated_at_ms: u64,
 }
 
@@ -177,6 +202,12 @@ pub struct OperatorState {
     #[serde(default)]
     pub closed_orders: BTreeMap<String, ClosedOrder>,
     pub withdrawals: BTreeMap<String, WithdrawalJob>,
+    /// finalized permissionless residual exits, retained with their block for reorg-safe cleanup.
+    #[serde(default)]
+    pub recovered_residuals: BTreeMap<String, u64>,
+    /// accepted residual exits, finalized by the operator only as a liveness service.
+    #[serde(default)]
+    pub pending_residual_recoveries: BTreeMap<String, PendingResidualRecovery>,
     /// output leaves of our own transitions, by seq, until the chain sync folds them in.
     pub transition_leaves: BTreeMap<u32, Vec<Felt>>,
     /// the l2 gas a transition costs, learned from the fees of landed transitions.
@@ -203,6 +234,8 @@ impl OperatorState {
             orders: BTreeMap::new(),
             closed_orders: BTreeMap::new(),
             withdrawals: BTreeMap::new(),
+            recovered_residuals: BTreeMap::new(),
+            pending_residual_recoveries: BTreeMap::new(),
             transition_leaves: BTreeMap::new(),
             transition_gas: 0,
             uneconomic_since_ms: None,
@@ -324,6 +357,13 @@ fn write_durably(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use starknet_rust_core::types::{
+        BroadcastedInvokeTransaction, BroadcastedInvokeTransactionV3, DataAvailabilityMode,
+        ResourceBounds, ResourceBoundsMapping,
+    };
+    use zylith_core::exchange::fixtures::{BASE, Notes, deposit, input, new_order, user};
+    use zylith_core::exchange::{Signature, WithdrawRequest, build_transition};
+
     use super::*;
 
     fn directory(name: &str) -> PathBuf {
@@ -364,5 +404,146 @@ mod tests {
         assert_eq!(store.load().unwrap().unwrap().confirmed_seq, 10);
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&replica);
+    }
+
+    #[test]
+    fn a_restart_preserves_the_latest_residual_authority_and_recovery_events() {
+        let dir = directory("residual-restart");
+        let store = Store::open(&dir, None, &[7; 32]).unwrap();
+        let owner = user(88);
+        let funding = deposit(&owner, BASE, 10, 88);
+        let mut notes = Notes::default();
+        notes.add_deposit(&funding);
+        let transition = build_transition(&input(
+            1,
+            vec![],
+            vec![new_order(
+                &notes,
+                &owner,
+                true,
+                false,
+                10,
+                110,
+                std::slice::from_ref(&funding),
+            )],
+            notes.root(),
+            100,
+        ))
+        .unwrap();
+        let nullifier = transition.residual_outputs[0].note.nullifier();
+        let mut state = OperatorState::new(5);
+        state.book = transition.new_book.clone();
+        let prepared = PreparedSubmission {
+            expected_hash: Felt::from(90_u8),
+            request: BroadcastedInvokeTransaction {
+                broadcasted_invoke_txn_v3: BroadcastedInvokeTransactionV3 {
+                    sender_address: Felt::from(91_u8),
+                    calldata: vec![Felt::from(92_u8)],
+                    signature: vec![Felt::from(93_u8)],
+                    nonce: Felt::ONE,
+                    resource_bounds: ResourceBoundsMapping {
+                        l1_gas: ResourceBounds {
+                            max_amount: 1,
+                            max_price_per_unit: 2,
+                        },
+                        l1_data_gas: ResourceBounds {
+                            max_amount: 3,
+                            max_price_per_unit: 4,
+                        },
+                        l2_gas: ResourceBounds {
+                            max_amount: 5,
+                            max_price_per_unit: 6,
+                        },
+                    },
+                    tip: 0,
+                    paymaster_data: Vec::new(),
+                    account_deployment_data: Vec::new(),
+                    nonce_data_availability_mode: DataAvailabilityMode::L1,
+                    fee_data_availability_mode: DataAvailabilityMode::L1,
+                    proof_facts: None,
+                    is_query: false,
+                },
+                proof: None,
+            },
+        };
+        state.in_flight.push(InFlight {
+            seq: 1,
+            close_time_ms: 6_000,
+            result: transition,
+            calldata: vec![Felt::from(94_u8)],
+            admitted: Vec::new(),
+            cancelled: Vec::new(),
+            applied_capacities: Vec::new(),
+            stage: TransitionStage::Proven,
+            proof: None,
+            prepared_submission: Some(prepared.clone()),
+            prepared_legged: Vec::new(),
+            built_at_ms: 6_001,
+            with_leg: false,
+            legged: Vec::new(),
+            leg_dropped: false,
+            for_legs: false,
+        });
+        state.withdrawals.insert(
+            key(&funding.nullifier()),
+            WithdrawalJob {
+                request: WithdrawRequest {
+                    note: funding,
+                    exit_commitment: Felt::from(95_u8),
+                    exit_authority: Felt::from(96_u8),
+                    authorization: Signature {
+                        r: Felt::from(97_u8),
+                        s: Felt::from(98_u8),
+                    },
+                },
+                nullifier: Felt::from(99_u8),
+                stage: WithdrawalStage::Proving,
+                prepared_submission: Some(prepared.clone()),
+                updated_at_ms: 6_002,
+            },
+        );
+        state.recovered_residuals.insert(key(&nullifier), 19);
+        state.pending_residual_recoveries.insert(
+            key(&Felt::from(77_u8)),
+            PendingResidualRecovery {
+                nullifier: Felt::from(77_u8),
+                requested_at_ms: 1_000,
+                matures_at_ms: 2_000,
+                requested_block: 20,
+                retired: true,
+                finalization_transaction: Some(Felt::from(78_u8)),
+                updated_at_ms: 1_500,
+            },
+        );
+        store.save(&state).unwrap();
+
+        let restored = store.load().unwrap().unwrap();
+        assert_eq!(restored.book, state.book);
+        assert_eq!(
+            serde_json::to_value(restored.in_flight[0].prepared_submission.as_ref().unwrap())
+                .unwrap(),
+            serde_json::to_value(&prepared).unwrap()
+        );
+        assert_eq!(restored.recovered_residuals, state.recovered_residuals);
+        assert_eq!(restored.withdrawals.len(), 1);
+        assert_eq!(
+            serde_json::to_value(
+                restored
+                    .withdrawals
+                    .values()
+                    .next()
+                    .unwrap()
+                    .prepared_submission
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&prepared).unwrap()
+        );
+        assert_eq!(
+            restored.pending_residual_recoveries,
+            state.pending_residual_recoveries
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

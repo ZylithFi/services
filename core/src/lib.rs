@@ -5,6 +5,7 @@ pub(crate) mod exact_clearing;
 pub mod exchange;
 pub mod hash;
 pub mod keys;
+pub mod market_registry;
 pub mod reference_price;
 mod types;
 
@@ -22,18 +23,22 @@ pub use crypto::{
 };
 pub use error::ProtocolError;
 pub use keys::{RecoverySeed, UserKeys, derive_user_keys};
+pub use market_registry::{
+    MARKET_REGISTRY_SCHEMA_VERSION, MarketCapabilities, MarketReferencePrice, MarketRegistry,
+    MarketRegistryAsset, MarketRegistryMarket, OhttpPolicy, ReferenceIdentity,
+    ReferencePriceMethodology, ReferenceRelationship, VenueAdapter, VenueObservation,
+};
 pub use reference_price::{
     ReferencePriceAttestation, ReferencePriceEnvelope, ReferencePricePolicy, ReferencePriceSample,
-    build_reference_price_envelope, reference_price_policy_for_pair,
+    build_reference_price_envelope,
 };
 pub use types::{
     AssetId, DeploymentContracts, DeploymentManifest, DeploymentMetadata, DeploymentProofConfig,
     DeploymentRoles, DeploymentRuntime, DepositActivationRecord, DepositActivationRecordList,
     DepositCallArguments, DepositConfirmationList, DepositIntent, DepositSubmissionPlan,
-    EncryptedBlob, EncryptedRecoveryPayload, FundingRailAssetConfig, FundingRailConfig,
-    FundingRailKind, Note, NoteCommitment, PairId, PrivateExecutionKeyPrivateConfig,
-    PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry, ProductAssetConfig,
-    ProductConfig, ProductPairConfig, RecoveryArtifact, RecoveryArtifactKind, RecoveryArtifactList,
+    EncryptedBlob, EncryptedRecoveryPayload, FundingRailConfig, FundingRailKind, Note,
+    NoteCommitment, PairId, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
+    PrivateExecutionKeyRegistry, RecoveryArtifact, RecoveryArtifactKind, RecoveryArtifactList,
     RecoveryArtifactUpload, SpendAuthorization, StarknetPrivacyFundingRail, count_bucket_label,
     spend_authority_from_raw_key_hex, validate_private_execution_keys,
     withdraw_authority_from_raw_key_hex,

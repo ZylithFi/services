@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-};
+use std::{collections::BTreeSet, fmt};
 
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use serde::{Deserialize, Serialize};
@@ -9,7 +6,7 @@ use starknet_crypto::get_public_key;
 use zeroize::Zeroize;
 
 use crate::{
-    ProtocolError,
+    MarketRegistry, OhttpPolicy, ProtocolError,
     hash::{
         domain_felt, encode_starknet_felt, felt_from_hex_str, field_from_u64, field_from_u128,
         poseidon_chain_hex,
@@ -527,13 +524,13 @@ pub enum FundingRailKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StarknetPrivacyFundingRail {
     pub privacy_pool: String,
     pub bridge_adapter: String,
     pub discovery_url: String,
     pub proving_url: String,
-    #[serde(default)]
-    pub proving_ohttp_enabled: bool,
+    pub proving_ohttp_policy: OhttpPolicy,
     pub paymaster_address: String,
     pub paymaster_url: String,
     pub ingress_key_registry_fingerprint: String,
@@ -563,54 +560,9 @@ impl StarknetPrivacyFundingRail {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FundingRailAssetConfig {
-    pub asset_id: AssetId,
-    pub token_address: String,
-    pub rail_token_address: String,
-    #[serde(with = "serde_u128_decimal")]
-    pub min_trade_amount: u128,
-    pub enabled_pairs: Vec<PairId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FundingRailConfig {
     pub primary: FundingRailKind,
     pub starknet_privacy: StarknetPrivacyFundingRail,
-    pub assets: BTreeMap<String, FundingRailAssetConfig>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProductAssetConfig {
-    pub asset_id: AssetId,
-    #[serde(with = "serde_u128_decimal")]
-    pub min_trade_amount: u128,
-    pub decimals: u8,
-    pub enabled: bool,
-    pub token_address: String,
-    pub erc20_behavior: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProductPairConfig {
-    pub pair_id: PairId,
-    pub base_asset_id: AssetId,
-    pub quote_asset_id: AssetId,
-    #[serde(with = "serde_u128_decimal")]
-    pub min_order_amount: u128,
-    #[serde(with = "serde_u128_decimal")]
-    pub price_base_scale: u128,
-    pub taker_fee_bps: u16,
-    pub external_match_enabled: bool,
-    pub enabled: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProductConfig {
-    pub assets: BTreeMap<String, ProductAssetConfig>,
-    pub pairs: BTreeMap<String, ProductPairConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -623,6 +575,7 @@ pub struct DeploymentContracts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentProofConfig {
     /// `snip36-stwo`: every statement is a cairo program proven by the starknet transaction
     /// prover and consumed through the transaction's proof facts.
@@ -635,8 +588,7 @@ pub struct DeploymentProofConfig {
     pub settlement_account_address: String,
     pub proof_validity_blocks: u64,
     pub config_locked_after_deploy: bool,
-    pub tx_prover_url: String,
-    pub tx_prover_ohttp_enabled: bool,
+    pub prover_build_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,18 +623,73 @@ pub struct DeploymentRuntime {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentManifest {
     pub network: String,
     pub rpc_url: String,
     pub chain_id: String,
     pub contracts: DeploymentContracts,
-    pub token_addresses: BTreeMap<String, String>,
+    pub market_registry: MarketRegistry,
     pub funding: FundingRailConfig,
-    pub product: ProductConfig,
     pub proof: DeploymentProofConfig,
     pub deployment: DeploymentMetadata,
     pub roles: DeploymentRoles,
     pub runtime: DeploymentRuntime,
+}
+
+impl DeploymentManifest {
+    pub fn validate_market_registry(&self) -> Result<(), String> {
+        self.market_registry.validate()?;
+        if self.network != self.market_registry.network
+            || self.chain_id != self.market_registry.chain_id
+        {
+            return Err("deployment identity differs from the market registry".into());
+        }
+        Ok(())
+    }
+
+    pub fn validate_production(&self) -> Result<(), String> {
+        self.validate_market_registry()?;
+        if !self.deployment.finalized || !self.proof.config_locked_after_deploy {
+            return Err(
+                "deployment manifest must be finalized with locked proof configuration".into(),
+            );
+        }
+        if self.funding.starknet_privacy.proving_ohttp_policy != OhttpPolicy::BestEffort {
+            return Err("production funding must use best-effort ohttp".into());
+        }
+        let runtime = &self.runtime;
+        if !(1_000..=300_000).contains(&runtime.epoch_ms)
+            || runtime.max_close_delay_ms == 0
+            || runtime.withdrawal_delay_seconds == 0
+            || runtime.max_book_orders == 0
+            || runtime.max_book_orders as usize > crate::exchange::MAX_BOOK_ORDERS
+            || runtime.max_admissions_per_transition == 0
+            || runtime.max_admissions_per_transition > runtime.max_book_orders
+            || runtime.max_internal_deferral_epochs == 0
+        {
+            return Err("deployment runtime limits are invalid".into());
+        }
+        let external_enabled = self
+            .market_registry
+            .enabled_markets()
+            .any(|market| market.capabilities.external_matching);
+        if external_enabled != (runtime.external_window_seconds != 0)
+            || runtime.external_window_seconds > 300
+        {
+            return Err("deployment external window differs from market capabilities".into());
+        }
+        let commit = self.deployment.release_commit.as_bytes();
+        if commit.len() != 40
+            || commit.iter().all(|byte| *byte == b'0')
+            || !commit
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err("deployment manifest has an invalid release commit".into());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -700,7 +707,47 @@ mod tests {
             serde_json::from_str(include_str!("../../client/public/deployment.example.json"))
                 .unwrap();
         assert!(manifest.runtime.epoch_ms > 0);
-        assert!(!manifest.product.pairs.is_empty());
+        assert!(
+            manifest.runtime.max_book_orders as usize
+                <= crate::exchange::StepShape::max_book_orders(700_000)
+        );
+        assert!(
+            manifest.runtime.max_admissions_per_transition as usize
+                <= crate::exchange::StepShape::max_admissions(700_000)
+        );
+        manifest.validate_market_registry().unwrap();
+        assert!(manifest.market_registry.enabled_markets().next().is_some());
+    }
+
+    #[test]
+    fn deployment_and_registry_identity_must_match() {
+        let mut manifest: DeploymentManifest =
+            serde_json::from_str(include_str!("../../client/public/deployment.example.json"))
+                .unwrap();
+        manifest.chain_id = "0x1".into();
+        assert!(
+            manifest
+                .validate_market_registry()
+                .unwrap_err()
+                .contains("identity differs")
+        );
+    }
+
+    #[test]
+    fn production_runtime_limits_fail_closed() {
+        let mut manifest: DeploymentManifest =
+            serde_json::from_str(include_str!("../../client/public/deployment.example.json"))
+                .unwrap();
+        manifest.deployment.finalized = true;
+        manifest.deployment.release_commit = "1".repeat(40);
+        manifest.proof.config_locked_after_deploy = true;
+        manifest.runtime.max_admissions_per_transition = manifest.runtime.max_book_orders + 1;
+        assert!(
+            manifest
+                .validate_production()
+                .unwrap_err()
+                .contains("runtime limits")
+        );
     }
 
     fn execution_key(id: &str, scalar: u8) -> PrivateExecutionKeyPrivateConfig {

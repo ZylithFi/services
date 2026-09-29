@@ -46,7 +46,7 @@ pub const MAX_STATUS_ITEMS: usize = 8;
 pub const MAX_STATUS_EVENTS_PER_ORDER: usize = 2;
 /// an upper bound on a serialized sealed request with the most execution keys.
 pub const MAX_SEALED_REQUEST_BYTES: usize = 96 * 1_024;
-/// every private answer uses one wire size, including idle and populated status heartbeats.
+/// every private answer uses one wire size across request kinds and populated status lookups.
 pub const RESPONSE_PLAINTEXT_BYTES: usize = 16_384;
 
 /// what a sealed request asks for.
@@ -150,8 +150,7 @@ pub fn chunk_status(status: StatusRequest) -> Vec<StatusRequest> {
         .chain(status.nullifiers.into_iter().map(Err))
         .collect::<Vec<Result<OrderQuery, Felt>>>();
     if items.is_empty() {
-        // the wallet sends this indistinguishable empty lookup as its idle heartbeat.
-        return vec![StatusRequest::default()];
+        return vec![];
     }
     items
         .chunks(MAX_STATUS_ITEMS)

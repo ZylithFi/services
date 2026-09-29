@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { loadConfig } from "./config.js";
+
+const manifest = JSON.parse(readFileSync("../client/public/deployment.example.json", "utf8"));
+manifest.funding.starknet_privacy.privacy_pool = "0x123";
+manifest.funding.starknet_privacy.paymaster_address = "0xabc";
+manifest.funding.starknet_privacy.proof_signer_class_hash = "0x987";
+manifest.contracts.exchange = "0x456";
+manifest.deployment = { finalized: true, release_commit: "a".repeat(40) };
+manifest.proof.config_locked_after_deploy = true;
+const manifestPath = join(mkdtempSync(join(tmpdir(), "zylith-paymaster-test-")), "deployment.json");
+writeFileSync(manifestPath, JSON.stringify(manifest));
 
 const BASE_ENV = {
   ZYLITH_PAYMASTER_RPC_URL: "https://rpc.zylith.example",
@@ -7,8 +20,7 @@ const BASE_ENV = {
   ZYLITH_PAYMASTER_CHAIN_ID: "0x534e5f5345504f4c4941",
   ZYLITH_PAYMASTER_ACCOUNT_ADDRESS: "0xabc",
   ZYLITH_PAYMASTER_PRIVATE_KEY: "1".repeat(64),
-  ZYLITH_PAYMASTER_ALLOWED_CONTRACTS: "0x101",
-  ZYLITH_PAYMASTER_APPROVAL_SPENDERS: "0x201",
+  ZYLITH_DEPLOYMENT_MANIFEST: manifestPath,
   ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS: "apply_actions",
   ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS: "apply_actions",
   ZYLITH_PAYMASTER_INTERNAL_TOKEN: "test-paymaster-token",
@@ -46,8 +58,6 @@ describe("paymaster config", () => {
     const config = loadConfig({
       ...BASE_ENV,
       ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH: "0x987",
-      ZYLITH_PAYMASTER_ALLOWED_CONTRACTS: "0x101,0x102",
-      ZYLITH_PAYMASTER_APPROVAL_SPENDERS: "0x201",
       ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS: "apply_actions",
       ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS: "apply_actions",
       ZYLITH_PAYMASTER_ALLOWED_ORIGINS: "https://app.zylith.example,https://preview.zylith.example",
@@ -63,8 +73,11 @@ describe("paymaster config", () => {
     }).toMatchInlineSnapshot(`
       {
         "allowedContracts": [
-          "0x101",
-          "0x102",
+          "0x123",
+          "0x456",
+          "0x4718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+          "0x49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+          "0x512feac6339ff7889822cb5aa2a86c848e9d392bb0e3e237c008674feed8343",
         ],
         "allowedEntrypoints": [
           "apply_actions",
@@ -74,7 +87,7 @@ describe("paymaster config", () => {
           "https://preview.zylith.example",
         ],
         "approvalSpenders": [
-          "0x201",
+          "0x123",
         ],
         "privacySignerClassHash": "0x987",
         "proofRequiredEntrypoints": [
@@ -82,6 +95,27 @@ describe("paymaster config", () => {
         ],
       }
     `);
+  });
+
+  it("fails closed when the runtime identity differs from the deployment", () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        ZYLITH_PAYMASTER_CHAIN_ID: "0x1",
+      })
+    ).toThrow(/chain id differs/);
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        ZYLITH_PAYMASTER_ACCOUNT_ADDRESS: "0xdef",
+      })
+    ).toThrow(/account differs/);
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH: "0x654",
+      })
+    ).toThrow(/class hash differs/);
   });
 
   it("rejects trusted proxy headers without trusted proxy CIDRs", () => {
@@ -145,20 +179,20 @@ describe("paymaster config", () => {
     ).toThrow(/ZYLITH_PAYMASTER_GATEWAY_URL must be a valid http\(s\) URL/);
   });
 
-  it("requires explicit contract and entrypoint allowlists", () => {
+  it("derives contract and spender allowlists from the deployment registry", () => {
     expect(() =>
       loadConfig({
         ...BASE_ENV,
-        ZYLITH_PAYMASTER_ALLOWED_CONTRACTS: undefined,
+        ZYLITH_PAYMASTER_ALLOWED_CONTRACTS: "0x456",
       }),
-    ).toThrow(/ZYLITH_PAYMASTER_ALLOWED_CONTRACTS is required/);
+    ).toThrow(/allowlist overrides are retired/);
 
     expect(() =>
       loadConfig({
         ...BASE_ENV,
-        ZYLITH_PAYMASTER_APPROVAL_SPENDERS: undefined,
+        ZYLITH_DEPLOYMENT_MANIFEST: undefined,
       }),
-    ).toThrow(/ZYLITH_PAYMASTER_APPROVAL_SPENDERS is required/);
+    ).toThrow(/ZYLITH_DEPLOYMENT_MANIFEST is required/);
 
     expect(() =>
       loadConfig({
@@ -180,20 +214,6 @@ describe("paymaster config", () => {
       loadConfig({
         ...BASE_ENV,
         ZYLITH_PAYMASTER_ACCOUNT_ADDRESS: "0x0",
-      }),
-    ).toThrow(/felt value cannot be zero/);
-
-    expect(() =>
-      loadConfig({
-        ...BASE_ENV,
-        ZYLITH_PAYMASTER_ALLOWED_CONTRACTS: "0x0",
-      }),
-    ).toThrow(/felt value cannot be zero/);
-
-    expect(() =>
-      loadConfig({
-        ...BASE_ENV,
-        ZYLITH_PAYMASTER_APPROVAL_SPENDERS: "0x0",
       }),
     ).toThrow(/felt value cannot be zero/);
 

@@ -97,11 +97,446 @@ fn an_unfilled_order_persists_and_its_book_reopens() {
     let first = build_transition(&input(1, vec![], orders, notes.root(), 100)).unwrap();
     assert_eq!(first.new_book.len(), 1);
     assert_eq!(first.new_book[0].order.funding, 900);
-    assert!(first.outputs.is_empty());
+    assert_eq!(first.residual_outputs.len(), 1);
+    let first_residual = &first.residual_outputs[0];
+    assert_eq!(first_residual.order_id, first.new_book[0].order.order_id);
+    assert_eq!(first_residual.note.funding, 900);
+    assert_eq!(
+        first.new_book[0].order.residual_commitment,
+        first_residual.note.commitment()
+    );
     let second =
         build_transition(&input(2, first.new_book.clone(), vec![], Felt::ZERO, 100)).unwrap();
     assert_eq!(second.public.prior_book_root, first.public.new_book_root);
     assert_eq!(second.public.new_book_root, first.public.new_book_root);
+    assert!(second.residual_outputs.is_empty());
+    assert!(
+        !second
+            .public
+            .nullifiers
+            .contains(&first_residual.note.nullifier())
+    );
+}
+
+#[test]
+fn a_partial_fill_replaces_exactly_one_residual_generation() {
+    let mut notes = Notes::default();
+    let (seller, buyer) = (user(31), user(32));
+    let base = deposit(&seller, BASE, 20, 31);
+    notes.add_deposit(&base);
+    let first = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &seller, true, false, 20, 95, &[base])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let old = first.residual_outputs[0].note.clone();
+    notes.add_outputs(&first.public);
+
+    let quote = deposit(&buyer, QUOTE, 500, 32);
+    notes.add_deposit(&quote);
+    let second = build_transition(&input(
+        2,
+        first.new_book,
+        vec![new_order(&notes, &buyer, false, false, 5, 105, &[quote])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    assert!(second.public.nullifiers.contains(&old.nullifier()));
+    assert_eq!(second.residual_outputs.len(), 1);
+    let replacement = &second.residual_outputs[0].note;
+    assert_eq!(replacement.generation, 2);
+    assert_eq!(replacement.remaining, 15);
+    assert_eq!(replacement.funding, 15);
+    assert_ne!(replacement.commitment(), old.commitment());
+    assert_eq!(
+        second.new_book[0].order.residual_commitment,
+        replacement.commitment()
+    );
+}
+
+#[test]
+fn a_full_fill_consumes_the_residual_authority_without_replacing_it() {
+    let mut notes = Notes::default();
+    let (seller, buyer) = (user(37), user(38));
+    let base = deposit(&seller, BASE, 10, 37);
+    notes.add_deposit(&base);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &seller, true, false, 10, 95, &[base])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let authority = admitted.residual_outputs[0].note.clone();
+    let order_id = authority.order_id;
+    notes.add_outputs(&admitted.public);
+    let quote = deposit(&buyer, QUOTE, 1_000, 38);
+    notes.add_deposit(&quote);
+    let filled = build_transition(&input(
+        2,
+        admitted.new_book,
+        vec![new_order(&notes, &buyer, false, false, 10, 105, &[quote])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    assert!(filled.new_book.is_empty());
+    assert!(filled.residual_outputs.is_empty());
+    assert!(filled.public.nullifiers.contains(&authority.nullifier()));
+    assert_eq!(report(&filled, order_id).removal, Some(Removal::Completed));
+}
+
+#[test]
+fn repeated_partial_fills_replace_only_the_latest_residual_authority() {
+    let mut notes = Notes::default();
+    let (seller, first_buyer, second_buyer) = (user(41), user(42), user(43));
+    let base = deposit(&seller, BASE, 20, 41);
+    notes.add_deposit(&base);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &seller, true, false, 20, 95, &[base])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let first_authority = admitted.residual_outputs[0].note.clone();
+    notes.add_outputs(&admitted.public);
+
+    let first_quote = deposit(&first_buyer, QUOTE, 500, 42);
+    notes.add_deposit(&first_quote);
+    let first_fill = build_transition(&input(
+        2,
+        admitted.new_book,
+        vec![new_order(
+            &notes,
+            &first_buyer,
+            false,
+            false,
+            5,
+            105,
+            &[first_quote],
+        )],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let second_authority = first_fill.residual_outputs[0].note.clone();
+    assert!(
+        first_fill
+            .public
+            .nullifiers
+            .contains(&first_authority.nullifier())
+    );
+    notes.add_outputs(&first_fill.public);
+
+    let second_quote = deposit(&second_buyer, QUOTE, 500, 43);
+    notes.add_deposit(&second_quote);
+    let second_fill = build_transition(&input(
+        3,
+        first_fill.new_book,
+        vec![new_order(
+            &notes,
+            &second_buyer,
+            false,
+            false,
+            5,
+            105,
+            &[second_quote],
+        )],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let latest = second_fill.residual_outputs[0].note.clone();
+    assert!(
+        second_fill
+            .public
+            .nullifiers
+            .contains(&second_authority.nullifier())
+    );
+    assert!(
+        !second_fill
+            .public
+            .nullifiers
+            .contains(&first_authority.nullifier())
+    );
+    assert_eq!(
+        (latest.generation, latest.remaining, latest.funding),
+        (3, 10, 10)
+    );
+    assert_ne!(latest.nullifier(), second_authority.nullifier());
+}
+
+#[test]
+fn many_zero_fill_epochs_do_not_churn_the_residual_authority() {
+    let mut notes = Notes::default();
+    let owner = user(44);
+    let funding = deposit(&owner, BASE, 10, 44);
+    notes.add_deposit(&funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &owner, true, false, 10, 110, &[funding])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let authority = admitted.residual_outputs[0].note.clone();
+    let mut book = admitted.new_book;
+    for seq in 2..=32 {
+        let unchanged = build_transition(&input(seq, book, vec![], Felt::ZERO, 100)).unwrap();
+        assert_eq!(
+            unchanged.public.prior_book_root,
+            unchanged.public.new_book_root
+        );
+        assert!(unchanged.residual_outputs.is_empty());
+        assert!(!unchanged.public.nullifiers.contains(&authority.nullifier()));
+        assert_eq!(
+            unchanged.new_book[0].order.residual_commitment,
+            authority.commitment()
+        );
+        assert_eq!(unchanged.new_book[0].order.residual_generation, 1);
+        book = unchanged.new_book;
+    }
+}
+
+#[test]
+fn malformed_residual_recovery_preimages_fail_membership() {
+    let mut notes = Notes::default();
+    let owner = user(45);
+    let funding = deposit(&owner, BASE, 10, 45);
+    notes.add_deposit(&funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &owner, true, false, 10, 110, &[funding])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    notes.add_outputs(&admitted.public);
+    let note = admitted.residual_outputs[0].note.clone();
+    let base = ResidualRecoveryInput {
+        note_root: notes.root(),
+        membership: notes.membership_leaf(note.output_leaf()),
+        note,
+        output_asset_id: Felt::from(QUOTE),
+        fee_bps: 30,
+        capacity: RecoveryCapacity::default(),
+        input_exit: RecoveryExit {
+            commitment: Felt::from(900_u64),
+            authority: Felt::from(901_u64),
+        },
+        output_exit: RecoveryExit::default(),
+        authorization: Signature {
+            r: Felt::ZERO,
+            s: Felt::ZERO,
+        },
+    };
+    let mut wrong_owner = base.clone();
+    wrong_owner.note.owner = user(46).owner;
+    assert!(preview_residual_recovery(&wrong_owner).is_err());
+    let mut wrong_market = base;
+    wrong_market.note.pair_id = Felt::from(999_u64);
+    assert!(preview_residual_recovery(&wrong_market).is_err());
+}
+
+#[test]
+fn permissionless_recovery_matches_the_external_average_allocation() {
+    let mut notes = Notes::default();
+    let owner = user(77);
+    let funding = deposit(&owner, BASE, 10, 77);
+    notes.add_deposit(&funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &owner, true, true, 10, 95, &[funding])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    notes.add_outputs(&admitted.public);
+    let residual = admitted.residual_outputs[0].note.clone();
+    let capacity = RecoveryCapacity {
+        generation: 2,
+        status: CAPACITY_STATUS_FROZEN,
+        total: 10,
+        consumed_base: 6,
+        pool_quote: 606,
+        scale: 1,
+    };
+    assert_eq!(
+        residual_recovery_amounts(&residual, capacity, 30).unwrap(),
+        (4, 604, 2)
+    );
+    let mut recovery = ResidualRecoveryInput {
+        note_root: notes.root(),
+        note: residual.clone(),
+        membership: notes.membership_leaf(residual.output_leaf()),
+        output_asset_id: Felt::from(QUOTE),
+        fee_bps: 30,
+        capacity,
+        input_exit: RecoveryExit {
+            commitment: Felt::from(701_u64),
+            authority: public_key(&Felt::from(702_u64)),
+        },
+        output_exit: RecoveryExit {
+            commitment: Felt::from(703_u64),
+            authority: public_key(&Felt::from(704_u64)),
+        },
+        authorization: Signature {
+            r: Felt::ZERO,
+            s: Felt::ZERO,
+        },
+    };
+    let preview = preview_residual_recovery(&recovery).unwrap();
+    recovery.authorization = sign_message(
+        &owner.withdraw_key,
+        &residual_recovery_authorization_message(preview.commitment),
+    )
+    .unwrap();
+    let (public, _) = build_residual_recovery(&recovery).unwrap();
+    assert_eq!(
+        (public.input_amount, public.output_amount, public.fee_amount),
+        (4, 604, 2)
+    );
+
+    let mut next = input(2, admitted.new_book, vec![], Felt::ZERO, 100);
+    next.outcomes = vec![Outcome::from_capacity(
+        1,
+        Felt::from(PAIR),
+        true,
+        6,
+        606,
+        95,
+        1,
+    )];
+    let applied = build_transition(&next).unwrap();
+    assert_eq!(applied.reports[0].external_base, 6);
+    assert_eq!(applied.reports[0].proceeds, 604);
+}
+
+#[test]
+fn retiring_an_externally_recovered_order_does_not_issue_its_value_or_fee_twice() {
+    let mut notes = Notes::default();
+    let owner = user(81);
+    let funding = deposit(&owner, BASE, 10, 81);
+    notes.add_deposit(&funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &owner, true, true, 10, 95, &[funding])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let residual = admitted.residual_outputs[0].note.clone();
+    let mut retire = input(2, admitted.new_book, vec![], Felt::ZERO, 100);
+    retire.outcomes = vec![Outcome::from_capacity(
+        1,
+        Felt::from(PAIR),
+        true,
+        10,
+        1_010,
+        95,
+        1,
+    )];
+    retire.recovered_order_ids = vec![residual.order_id];
+    let retired = build_transition(&retire).unwrap();
+
+    assert!(retired.new_book.is_empty());
+    assert_eq!(
+        retired.public.retired_nullifiers,
+        vec![residual.nullifier()]
+    );
+    assert!(retired.outputs.is_empty());
+    assert_eq!(retired.reports[0].external_base, 10);
+    assert_eq!(retired.reports[0].proceeds, 0);
+    assert_eq!(retired.reports[0].fee, 0);
+}
+
+#[test]
+fn residual_recovery_uses_the_capacitys_canonical_multi_order_offset() {
+    let mut notes = Notes::default();
+    let (first, second) = (user(79), user(80));
+    let first_funding = deposit(&first, BASE, 10, 79);
+    let second_funding = deposit(&second, BASE, 10, 80);
+    notes.add_deposit(&first_funding);
+    notes.add_deposit(&second_funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![
+            new_order(&notes, &first, true, true, 10, 95, &[first_funding]),
+            new_order(&notes, &second, true, true, 10, 95, &[second_funding]),
+        ],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let mut residuals = admitted
+        .residual_outputs
+        .iter()
+        .map(|output| output.note.clone())
+        .collect::<Vec<_>>();
+    residuals.sort_by_key(|note| note.reserved_offset);
+    assert_eq!(residuals[0].reserved_offset, 0);
+    assert_eq!(residuals[1].reserved_offset, 10);
+    let capacity = RecoveryCapacity {
+        generation: 2,
+        status: CAPACITY_STATUS_FROZEN,
+        total: 20,
+        consumed_base: 15,
+        pool_quote: 1515,
+        scale: 1,
+    };
+    assert_eq!(
+        residual_recovery_amounts(&residuals[0], capacity, 30).unwrap(),
+        (0, 1006, 4)
+    );
+    assert_eq!(
+        residual_recovery_amounts(&residuals[1], capacity, 30).unwrap(),
+        (5, 503, 2)
+    );
+}
+
+#[test]
+fn a_finalized_recovery_retires_only_the_authenticated_residual() {
+    let mut notes = Notes::default();
+    let owner = user(78);
+    let funding = deposit(&owner, BASE, 10, 78);
+    notes.add_deposit(&funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &owner, true, false, 10, 110, &[funding])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let old = admitted.residual_outputs[0].note.clone();
+    let mut retire = input(2, admitted.new_book, vec![], Felt::ZERO, 100);
+    retire.recovered_order_ids = vec![old.order_id];
+    let retired = build_transition(&retire).unwrap();
+    assert!(retired.new_book.is_empty());
+    assert_eq!(retired.public.retired_nullifiers, vec![old.nullifier()]);
+    assert!(!retired.public.nullifiers.contains(&old.nullifier()));
+    assert!(
+        retired
+            .outputs
+            .iter()
+            .all(|output| output.order_id != old.order_id)
+    );
+
+    let mut unknown = input(2, retired.new_book, vec![], Felt::ZERO, 100);
+    unknown.recovered_order_ids = vec![old.order_id];
+    assert!(build_transition(&unknown).is_err());
 }
 
 #[test]
@@ -416,8 +851,14 @@ fn mainnet_scale_prices_cross_and_reserve() {
 }
 
 #[test]
-fn fee_notes_publish_only_blinded_amounts_the_fee_key_recovers() {
+fn every_value_output_blinds_unused_residual_lanes_and_fee_amounts() {
     let result = crossed();
+    for output in &result.outputs {
+        let record = result.public.output_records[output.index];
+        assert_ne!(record.enc_remaining, Felt::ZERO);
+        assert_ne!(record.enc_reserved, Felt::ZERO);
+        assert_ne!(record.enc_reserved_offset, Felt::ZERO);
+    }
     let fees = result
         .outputs
         .iter()
@@ -444,7 +885,7 @@ fn fee_notes_publish_only_blinded_amounts_the_fee_key_recovers() {
 #[test]
 fn the_step_budget_caps_the_book_so_a_full_cross_still_proves() {
     let cap = StepShape::max_book_orders(700_000);
-    assert!((600..MAX_BOOK_ORDERS).contains(&cap), "cap {cap}");
+    assert!((400..MAX_BOOK_ORDERS).contains(&cap), "cap {cap}");
     let full = |orders: usize| StepShape {
         markets: MAX_MARKETS as u64,
         resting: orders as u64,
@@ -473,6 +914,9 @@ fn the_step_estimate_accounts_for_multi_note_membership_paths() {
     };
     assert!(four_note_admissions(64).estimated_steps() >= 398_290);
     assert!(four_note_admissions(128).estimated_steps() >= 790_340);
+    let cap = StepShape::max_admissions(700_000);
+    assert!((80..128).contains(&cap), "admission cap {cap}");
+    assert!(four_note_admissions(cap as u64).estimated_steps() <= 700_000);
 }
 
 /// the widest json a value of this shape can take: every felt at full width, every amount and
@@ -597,10 +1041,7 @@ fn status_lookups_chunk_in_order_within_the_limit() {
     assert_eq!(rejoined_orders.collect::<Vec<_>>(), orders);
     let rejoined_nullifiers = chunks.iter().flat_map(|chunk| chunk.nullifiers.clone());
     assert_eq!(rejoined_nullifiers.collect::<Vec<_>>(), nullifiers);
-    assert_eq!(
-        chunk_status(StatusRequest::default()),
-        vec![StatusRequest::default()]
-    );
+    assert!(chunk_status(StatusRequest::default()).is_empty());
 }
 
 #[test]

@@ -154,6 +154,13 @@ pub enum ChainEvent {
     WithdrawalFinalized {
         nullifier: Felt,
     },
+    ResidualRecoveryRequested {
+        nullifier: Felt,
+        matures_at: u64,
+    },
+    ResidualRecoveryFinalized {
+        nullifier: Felt,
+    },
 }
 
 fn u128_of(value: Felt) -> Result<u128, String> {
@@ -290,6 +297,10 @@ impl Chain<'_> {
         let deposit = get_selector_from_name("DepositActivated").expect("event name");
         let transition = get_selector_from_name("TransitionSettled").expect("event name");
         let finalized = get_selector_from_name("WithdrawalFinalized").expect("event name");
+        let residual_requested =
+            get_selector_from_name("ResidualRecoveryRequested").expect("event name");
+        let residual_finalized =
+            get_selector_from_name("ResidualRecoveryFinalized").expect("event name");
         let mut events = Vec::new();
         let mut continuation = None;
         loop {
@@ -343,6 +354,21 @@ impl Chain<'_> {
                     events.push((
                         block,
                         ChainEvent::WithdrawalFinalized {
+                            nullifier: *event.keys.get(1).ok_or("event is truncated")?,
+                        },
+                    ));
+                } else if selector == residual_requested {
+                    events.push((
+                        block,
+                        ChainEvent::ResidualRecoveryRequested {
+                            nullifier: *event.keys.get(1).ok_or("event is truncated")?,
+                            matures_at: u64_of(field(0)?)?,
+                        },
+                    ));
+                } else if selector == residual_finalized {
+                    events.push((
+                        block,
+                        ChainEvent::ResidualRecoveryFinalized {
                             nullifier: *event.keys.get(1).ok_or("event is truncated")?,
                         },
                     ));

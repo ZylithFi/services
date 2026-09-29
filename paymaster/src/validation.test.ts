@@ -125,6 +125,23 @@ describe("validateExecuteOutsideRequest", () => {
     expect(validated.outside_transaction).toBeUndefined();
   });
 
+  it("accepts a direct proof-bearing residual recovery request", () => {
+    const request = baseRequest();
+    request.call.entrypoint = "request_residual_recovery";
+    request.call.calldata = ["0x1", "0x2", "0x3"];
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+    const recoveryConfig = {
+      ...config,
+      allowedEntrypoints: new Set(["request_residual_recovery"]),
+      proofRequiredEntrypoints: new Set(["request_residual_recovery"]),
+    };
+
+    const validated = validateExecuteOutsideRequest(request, recoveryConfig, 1_700_000_000);
+
+    expect(validated.call.entrypoint).toBe("request_residual_recovery");
+    expect(validated.outside_transaction).toBeUndefined();
+  });
+
   it("rejects direct settlement relays even when settlement is allowlisted", () => {
     const request = baseRequest();
     request.call.entrypoint = "submit_settlement_with_proof_facts";

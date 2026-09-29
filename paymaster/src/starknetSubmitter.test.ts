@@ -734,7 +734,8 @@ describe("submitProofBearingOutsideExecution", () => {
           rpcUrl: "https://rpc.example",
           chainId: "0x534e5f5345504f4c4941",
           accountAddress: "0xabc",
-          privateKey: "0xkey"
+          privateKey: "0xkey",
+          feeTokenAddress: "0xfee"
         },
         {
           runtime: fakeRuntime,

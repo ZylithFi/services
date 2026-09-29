@@ -15,6 +15,8 @@ use starknet_crypto::Felt;
 use zylith_core::exchange::fixtures::*;
 use zylith_core::exchange::*;
 
+const RESIDUAL_RECOVERY_FUNDING_INDEX: usize = 21;
+
 struct Vectors {
     dir: String,
     expectations: BTreeMap<String, Value>,
@@ -263,6 +265,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))?;
     vectors.accept("admit_resting", &first)?;
     vectors.accept("persist_cross", &persist)?;
+    let mut retire_input = input(2, first.new_book.clone(), vec![], Felt::ZERO, 110);
+    retire_input.recovered_order_ids = vec![first.new_book[0].order.order_id];
+    let retire = build_transition(&retire_input)?;
+    vectors.accept("retire_recovered", &retire)?;
     vectors.tamper("reject_book_forged", &persist, |witness, layout| {
         witness[order_layout(layout, true, 0).start + 1] += Felt::ONE;
     })?;
@@ -585,6 +591,112 @@ fn main() -> Result<(), Box<dyn Error>> {
         &wrong_root,
         None,
     )?;
+
+    // permissionless recovery of a resting residual authority.
+    let mut residual_notes = Notes::default();
+    let residual_user = user(30);
+    let residual_funding = deposit(&residual_user, BASE, 10, 30);
+    residual_notes.add_deposit(&residual_funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(
+            &residual_notes,
+            &residual_user,
+            true,
+            false,
+            10,
+            110,
+            &[residual_funding],
+        )],
+        residual_notes.root(),
+        100,
+    ))?;
+    residual_notes.add_outputs(&admitted.public);
+    let residual = &admitted.residual_outputs[0].note;
+    let mut recovery = ResidualRecoveryInput {
+        note_root: residual_notes.root(),
+        note: residual.clone(),
+        membership: residual_notes.membership_leaf(residual.output_leaf()),
+        output_asset_id: Felt::from(QUOTE),
+        fee_bps: 30,
+        capacity: RecoveryCapacity::default(),
+        input_exit: RecoveryExit {
+            commitment: Felt::from(0x301_u64),
+            authority: public_key(&Felt::from(0x302_u64)),
+        },
+        output_exit: RecoveryExit::default(),
+        authorization: Signature {
+            r: Felt::ZERO,
+            s: Felt::ZERO,
+        },
+    };
+    let preview = preview_residual_recovery(&recovery)?;
+    recovery.authorization = sign_message(
+        &residual_user.withdraw_key,
+        &residual_recovery_authorization_message(preview.commitment),
+    )?;
+    let (recovery_public, recovery_witness) = build_residual_recovery(&recovery)?;
+    vectors.write_for(
+        "residual_recovery",
+        "recover_residual",
+        &recovery_witness,
+        Some(recovery_public.commitment),
+    )?;
+    let mut wrong_recovery_signature = recovery_witness.clone();
+    let last = wrong_recovery_signature.len() - 1;
+    wrong_recovery_signature[last] += Felt::ONE;
+    vectors.write_for(
+        "residual_recovery",
+        "reject_recovery_signature",
+        &wrong_recovery_signature,
+        None,
+    )?;
+    let mut inflated_residual_funding = recovery_witness.clone();
+    inflated_residual_funding[RESIDUAL_RECOVERY_FUNDING_INDEX] += Felt::ONE;
+    vectors.write_for(
+        "residual_recovery",
+        "reject_residual_funding_inflated",
+        &inflated_residual_funding,
+        None,
+    )?;
+
+    // a finalized recovery owns the external proceeds and fee, so retirement authenticates the
+    // capacity outcome without emitting those economic outputs a second time.
+    let mut external_notes = Notes::default();
+    let external_user = user(31);
+    let external_funding = deposit(&external_user, BASE, 10, 31);
+    external_notes.add_deposit(&external_funding);
+    let reserved = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(
+            &external_notes,
+            &external_user,
+            true,
+            true,
+            10,
+            95,
+            &[external_funding],
+        )],
+        external_notes.root(),
+        100,
+    ))?;
+    let recovered = reserved.residual_outputs[0].note.clone();
+    let mut retire = input(2, reserved.new_book, vec![], Felt::ZERO, 100);
+    retire.outcomes = vec![Outcome::from_capacity(
+        1,
+        Felt::from(PAIR),
+        true,
+        10,
+        1_010,
+        95,
+        1,
+    )];
+    retire.recovered_order_ids = vec![recovered.order_id];
+    let retired = build_transition(&retire)?;
+    assert!(retired.outputs.is_empty());
+    vectors.accept("retire_recovered_external", &retired)?;
 
     fs::write(
         Path::new(&vectors.dir).join("expectations.json"),

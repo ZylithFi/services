@@ -34,10 +34,6 @@ impl Default for ReferencePricePolicy {
     }
 }
 
-pub fn reference_price_policy_for_pair(_pair_id: &PairId) -> ReferencePricePolicy {
-    ReferencePricePolicy::default()
-}
-
 fn default_reference_primary_source() -> String {
     "binance".into()
 }
@@ -135,8 +131,7 @@ pub fn build_reference_price_envelope(
     }
     let mut fresh_midpoints = Vec::<(String, u128)>::new();
     let mut fresh_venues = BTreeSet::<String>::new();
-    let mut primary_midpoint = None::<u128>;
-    let mut newest_observed_at = 0_u64;
+    let mut primary = None::<(u128, u64)>;
     for sample in samples {
         validate_reference_source_name(&sample.source)?;
         if !is_allowed_reference_source(&sample.source) {
@@ -179,7 +174,6 @@ pub fn build_reference_price_envelope(
         if spread_bps > policy.max_source_spread_bps as u128 {
             continue;
         }
-        newest_observed_at = newest_observed_at.max(sample.observed_at_unix_ms);
         let source = sample.source.trim().to_lowercase();
         let venue = canonical_reference_venue(&source);
         if !fresh_venues.insert(venue.clone()) {
@@ -188,13 +182,13 @@ pub fn build_reference_price_envelope(
             )));
         }
         if venue == primary_source {
-            if primary_midpoint.is_some() {
+            if primary.is_some() {
                 return Err(ProtocolError::InvalidSettlementProof(format!(
                     "reference price includes multiple fresh primary {} samples",
                     policy.primary_source
                 )));
             }
-            primary_midpoint = Some(mid);
+            primary = Some((mid, sample.observed_at_unix_ms));
         }
         fresh_midpoints.push((source, mid));
     }
@@ -207,7 +201,7 @@ pub fn build_reference_price_envelope(
         )));
     }
 
-    let midpoint = primary_midpoint.ok_or_else(|| {
+    let (midpoint, primary_observed_at) = primary.ok_or_else(|| {
         ProtocolError::InvalidSettlementProof(format!(
             "reference price requires fresh primary {} source",
             policy.primary_source
@@ -262,7 +256,7 @@ pub fn build_reference_price_envelope(
         upper_price,
         price_base_scale,
         source_count: corroborating_source_count,
-        observed_at_unix_ms: newest_observed_at,
+        observed_at_unix_ms: primary_observed_at,
     })
 }
 
@@ -339,13 +333,6 @@ mod tests {
     const SCALE: u128 = 1_000_000;
 
     #[test]
-    fn current_pairs_use_the_default_reference_policy() {
-        let policy = reference_price_policy_for_pair(&PairId("STRK/USDC".into()));
-
-        assert_eq!(policy, ReferencePricePolicy::default());
-    }
-
-    #[test]
     fn reference_envelope_uses_fresh_primary_midpoint_source() {
         let envelope = build_reference_price_envelope(
             PairId("ETH/USDC".into()),
@@ -373,6 +360,32 @@ mod tests {
         assert_eq!(envelope.lower_price, 3_998_000_000);
         assert_eq!(envelope.upper_price, 4_002_000_000);
         assert_eq!(envelope.source_count, 2);
+    }
+
+    #[test]
+    fn reference_envelope_uses_the_primary_observation_time() {
+        let envelope = build_reference_price_envelope(
+            PairId("ETH/USDC".into()),
+            AssetId("ETH".into()),
+            AssetId("USDC".into()),
+            SCALE,
+            10_000,
+            &[
+                sample("binance", 3_999_000_000, 4_001_000_000, 9_950),
+                sample("coinbase", 3_999_500_000, 4_000_500_000, 9_999),
+            ],
+            &ReferencePricePolicy {
+                primary_source: "binance".into(),
+                min_sources: 2,
+                max_age_ms: 100,
+                max_source_spread_bps: 10,
+                max_cross_source_deviation_bps: 10,
+                envelope_bps: 5,
+            },
+        )
+        .expect("reference envelope");
+
+        assert_eq!(envelope.observed_at_unix_ms, 9_950);
     }
 
     #[test]

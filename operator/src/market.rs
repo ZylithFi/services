@@ -144,16 +144,23 @@ pub struct Market {
     /// the latest attestation of each pair, which serves the public reference price until it
     /// lapses.
     latest: tokio::sync::Mutex<std::collections::HashMap<Felt, MarketAttestation>>,
+    /// serializes complete batch refreshes so public clients cannot stampede the venues.
+    batch_refresh: tokio::sync::Mutex<()>,
 }
 
 impl Market {
     pub fn new(config: &Config) -> Result<Self, String> {
         let tokens = config
             .manifest
-            .token_addresses
+            .market_registry
+            .assets
             .iter()
-            .map(|(name, address)| {
-                Ok((name.clone(), crate::config::felt(address, "token address")?))
+            .filter(|asset| asset.enabled)
+            .map(|asset| {
+                Ok((
+                    asset.asset_id.0.clone(),
+                    crate::config::felt(&asset.token_address, "token address")?,
+                ))
             })
             .collect::<Result<_, String>>()?;
         Ok(Self {
@@ -174,6 +181,7 @@ impl Market {
             headroom_bps: config.searcher_headroom_bps,
             reference_signer: config.reference_price_signer,
             latest: Default::default(),
+            batch_refresh: Default::default(),
         })
     }
 
@@ -210,6 +218,8 @@ impl Market {
         let attestation = MarketAttestation::from_reference(&response.attestation)
             .map_err(|error| error.to_string())?;
         if from_core(attestation.pair_id) != pair.pair_id
+            || from_core(attestation.base_asset_id) != pair.base_asset_id
+            || from_core(attestation.quote_asset_id) != pair.quote_asset_id
             || attestation.scale != pair.scale
             || from_core(attestation.signer) != self.reference_signer
             || !attestation.verify(to_core(self.exchange))
@@ -229,6 +239,14 @@ impl Market {
     /// one authenticated batch for an epoch: every direct market observation and the usdc
     /// objective vector derived from its direct asset/usdc members share one commitment.
     pub async fn attest_batch(
+        &self,
+        pairs: &[PairRuntime],
+    ) -> Result<Vec<MarketAttestation>, String> {
+        let _refresh = self.batch_refresh.lock().await;
+        self.attest_batch_inner(pairs).await
+    }
+
+    async fn attest_batch_inner(
         &self,
         pairs: &[PairRuntime],
     ) -> Result<Vec<MarketAttestation>, String> {
@@ -273,6 +291,8 @@ impl Market {
         attestations.sort_by_key(|attestation| from_core(attestation.pair_id).to_bytes_be());
         for (attestation, pair) in attestations.iter().zip(pairs) {
             if from_core(attestation.pair_id) != pair.pair_id
+                || from_core(attestation.base_asset_id) != pair.base_asset_id
+                || from_core(attestation.quote_asset_id) != pair.quote_asset_id
                 || attestation.scale != pair.scale
                 || from_core(attestation.signer) != self.reference_signer
                 || !attestation.verify(to_core(self.exchange))
@@ -311,6 +331,47 @@ impl Market {
             return Ok(attestation.clone());
         }
         self.attest(pair).await
+    }
+
+    /// one complete, consistently signed reference-price view for every enabled market.
+    pub async fn references(
+        &self,
+        pairs: &[PairRuntime],
+        now_ms: u64,
+    ) -> Result<Vec<MarketAttestation>, String> {
+        if let Some(attestations) = self.current_references(pairs, now_ms).await {
+            return Ok(attestations);
+        }
+        let _refresh = self.batch_refresh.lock().await;
+        if let Some(attestations) = self.current_references(pairs, now_ms).await {
+            return Ok(attestations);
+        }
+        self.attest_batch_inner(pairs).await
+    }
+
+    async fn current_references(
+        &self,
+        pairs: &[PairRuntime],
+        now_ms: u64,
+    ) -> Option<Vec<MarketAttestation>> {
+        let latest = self.latest.lock().await;
+        let attestations = pairs
+            .iter()
+            .map(|pair| {
+                latest
+                    .get(&pair.pair_id)
+                    .filter(|attestation| attestation.valid_until_ms > now_ms)
+                    .cloned()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        attestations
+            .first()
+            .is_none_or(|first| {
+                attestations.iter().all(|attestation| {
+                    attestation.price_batch_commitment == first.price_batch_commitment
+                })
+            })
+            .then_some(attestations)
     }
 
     /// the attested rate of every traded pair, from the latest valid attestations.
@@ -554,7 +615,10 @@ impl Market {
         else {
             return Ok(false);
         };
-        if required.is_none_or(|required| net < required) || gross < floor {
+        let router_floor = floor.checked_add(leg.outcome_support);
+        if required.is_none_or(|required| net < required)
+            || router_floor.is_none_or(|router_floor| gross < router_floor)
+        {
             return Ok(false);
         }
         let fields = m1.calldata();
@@ -870,6 +934,7 @@ mod tests {
             scale: 1,
             fee_bps: 4,
             external_enabled: true,
+            external_settlement_support_quote: 1,
             min_order_amount: 1,
         }
     }
@@ -969,6 +1034,7 @@ mod tests {
                 &zylith_core::hash::felt_from_hex_str("0x5167").unwrap(),
             )),
             latest: Default::default(),
+            batch_refresh: Default::default(),
         }
     }
 

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -22,13 +22,16 @@ use zylith_core::exchange::{
 };
 
 use crate::config::{from_core, to_core};
-use crate::engine::{Operator, now_ms, start_withdrawal};
+use crate::engine::{
+    Operator, active_closing_epoch, cancellation_can_settle_offchain, now_ms, start_withdrawal,
+};
 use crate::state::{CancellationTombstone, PendingOrder, key};
 
 #[derive(Clone)]
 struct Api {
     operator: Arc<Operator>,
-    limiter: Arc<Mutex<HashMap<IpAddr, (u64, u32)>>>,
+    private_limiter: Arc<Mutex<HashMap<IpAddr, (u64, u32)>>>,
+    public_limiter: Arc<Mutex<HashMap<IpAddr, (u64, u32)>>>,
 }
 
 type Response = Result<Json<Value>, (StatusCode, Json<Value>)>;
@@ -47,16 +50,14 @@ pub fn router(operator: Arc<Operator>) -> Router {
     let max_body = operator.config.max_body_bytes;
     let api = Api {
         operator,
-        limiter: Arc::new(Mutex::new(HashMap::new())),
+        private_limiter: Arc::new(Mutex::new(HashMap::new())),
+        public_limiter: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
         .route("/api/public/execution-keys", get(execution_keys))
         .route("/api/public/exchange", get(exchange_status))
-        .route(
-            "/api/public/reference-prices/{base}/{quote}",
-            get(reference_price),
-        )
+        .route("/api/public/reference-prices", get(reference_prices))
         .route("/api/private/requests", post(private_request))
         .route("/api/internal/status", get(internal_status))
         .with_state(api)
@@ -67,6 +68,14 @@ pub fn router(operator: Arc<Operator>) -> Router {
                 .allow_headers(Any)
                 .allow_origin(AllowOrigin::list(origins)),
         )
+}
+
+async fn health(State(api): State<Api>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "registry_version": api.operator.config.manifest.market_registry.registry_version,
+        "registry_hash": api.operator.config.manifest.market_registry.registry_hash,
+    }))
 }
 
 async fn execution_keys(State(api): State<Api>) -> Json<Value> {
@@ -83,50 +92,50 @@ async fn exchange_status(State(api): State<Api>) -> Json<Value> {
         "epoch_ms": config.policy.epoch_ms,
         "in_flight": state.in_flight.len(),
         "pairs": config.pairs.iter().map(|pair| pair.name.clone()).collect::<Vec<_>>(),
+        "registry_version": config.manifest.market_registry.registry_version,
+        "registry_hash": config.manifest.market_registry.registry_hash,
     }))
 }
 
-async fn reference_price(
+async fn reference_prices(
     State(api): State<Api>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path((base, quote)): Path<(String, String)>,
 ) -> Response {
-    if !allow(&api, client_ip(&api, peer, &headers)).await {
+    if !allow(
+        &api.public_limiter,
+        api.operator.config.private_rate_limit_per_minute,
+        client_ip(&api, peer, &headers),
+    )
+    .await
+    {
         return Err(reject(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
     }
-    let name = format!("{base}/{quote}");
-    let pair = api
-        .operator
-        .config
-        .pairs
-        .iter()
-        .find(|pair| pair.name == name)
-        .ok_or_else(|| reject(StatusCode::NOT_FOUND, "the pair is not traded"))?;
-    let attestation = api
+    let prices = api
         .operator
         .market
-        .reference(pair, now_ms())
+        .references(&api.operator.config.pairs, now_ms())
         .await
         .map_err(|_| {
             reject(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "the reference price is unavailable",
+                "reference prices are unavailable",
             )
         })?;
-    Ok(Json(json!({
-        "pair": name,
+    Ok(Json(
+        json!({ "prices": api.operator.config.pairs.iter().zip(prices).map(|(pair, attestation)| json!({
+        "pair": pair.name,
         "midpoint": attestation.midpoint.to_string(),
         "scale": attestation.scale.to_string(),
         "observed_at_ms": attestation.observed_at_ms,
         "valid_until_ms": attestation.valid_until_ms,
-    })))
+    })).collect::<Vec<_>>() }),
+    ))
 }
 
-async fn allow(api: &Api, peer: IpAddr) -> bool {
-    let limit = api.operator.config.private_rate_limit_per_minute;
+async fn allow(limiter: &Mutex<HashMap<IpAddr, (u64, u32)>>, limit: u32, peer: IpAddr) -> bool {
     let minute = now_ms() / 60_000;
-    let mut limiter = api.limiter.lock().await;
+    let mut limiter = limiter.lock().await;
     if limiter.len() > 100_000 {
         limiter.retain(|_, (window, _)| *window == minute);
     }
@@ -160,12 +169,21 @@ async fn private_request(
     headers: HeaderMap,
     Json(sealed): Json<SealedRequest>,
 ) -> Result<([(header::HeaderName, &'static str); 1], Json<Value>), (StatusCode, Json<Value>)> {
-    if !allow(&api, client_ip(&api, peer, &headers)).await {
+    if !allow(
+        &api.private_limiter,
+        api.operator.config.private_rate_limit_per_minute,
+        client_ip(&api, peer, &headers),
+    )
+    .await
+    {
         return Err(reject(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
     }
     let opened = open_request(&sealed, &api.operator.config.execution_keys)
         .map_err(|_| reject(StatusCode::BAD_REQUEST, "the request does not open"))?;
-    let answer = match answer(&api.operator, opened.request).await {
+    // membership is determined when the authenticated request has opened, not when a contended
+    // state lock later becomes available.
+    let received_at_ms = now_ms();
+    let answer = match answer(&api.operator, opened.request, received_at_ms).await {
         Ok(Value::Object(mut fields)) => {
             fields.insert("ok".into(), Value::Bool(true));
             Value::Object(fields)
@@ -181,7 +199,11 @@ async fn private_request(
     ))
 }
 
-async fn answer(operator: &Arc<Operator>, request: PrivateRequest) -> Result<Value, String> {
+async fn answer(
+    operator: &Arc<Operator>,
+    request: PrivateRequest,
+    received_at_ms: u64,
+) -> Result<Value, String> {
     operator.running()?;
     let chain_context = operator.config.chain_context();
     match request {
@@ -201,7 +223,7 @@ async fn answer(operator: &Arc<Operator>, request: PrivateRequest) -> Result<Val
             request
                 .validate(chain_context, to_core(input_asset), pair.min_order_amount)
                 .map_err(|error| error.to_string())?;
-            if request.terms.expiry_ms <= now_ms() {
+            if request.terms.expiry_ms <= received_at_ms {
                 return Err("the order is already expired".into());
             }
             let order_id = from_core(request.order_id());
@@ -218,14 +240,16 @@ async fn answer(operator: &Arc<Operator>, request: PrivateRequest) -> Result<Val
                     key(&order_id),
                     PendingOrder {
                         request,
-                        received_at_ms: now_ms(),
+                        received_at_ms,
                     },
                 );
                 operator.save(&state).await?;
             }
             Ok(json!({ "order_id": key(&order_id), "state": "received" }))
         }
-        PrivateRequest::Cancel(request) => cancel(operator, chain_context, request).await,
+        PrivateRequest::Cancel(request) => {
+            cancel(operator, chain_context, request, received_at_ms).await
+        }
         PrivateRequest::Withdraw(request) => {
             let nullifier = start_withdrawal(operator, request)
                 .await
@@ -240,6 +264,7 @@ async fn cancel(
     operator: &Operator,
     chain_context: starknet_crypto::Felt,
     request: CancelRequest,
+    cancelled_at: u64,
 ) -> Result<Value, String> {
     let order_id = from_core(request.order_id);
     let order_key = key(&order_id);
@@ -289,32 +314,34 @@ async fn cancel(
     ) {
         return Err("the cancellation is not signed by the order's cancel key".into());
     }
-    let in_flight_position = state.in_flight.iter().position(|transition| {
+    let future_in_flight_position = state.in_flight.iter().position(|transition| {
         transition
             .result
             .reports
             .iter()
             .any(|report| report.order_id == request.order_id)
+            && transition.close_time_ms > cancelled_at
     });
-    let submitted_cutoff = in_flight_position.is_some_and(|position| {
-        matches!(
-            state.in_flight[position].stage,
-            crate::state::TransitionStage::Submitted { .. }
-        )
+    let included_in_closed_epoch = state.in_flight.iter().any(|transition| {
+        transition.close_time_ms <= cancelled_at
+            && transition
+                .result
+                .reports
+                .iter()
+                .any(|report| report.order_id == request.order_id)
     });
-    if let Some(position) = in_flight_position {
-        // an unsent transition is not firm and is rebuilt without the cancelled order. once a
-        // transaction is submitted, preserve it and discard only speculative descendants; if it
-        // lands, the cancellation applies to whatever quantity remains.
-        state.in_flight.truncate(if submitted_cutoff {
-            position + 1
-        } else {
-            position
-        });
+    if let Some(position) = future_in_flight_position {
+        state.in_flight.truncate(position);
     }
-    // a pending order simply leaves; a live one leaves at the next transition.
-    let cancelled_at = now_ms();
-    let pending_removed = !submitted_cutoff && state.pending_orders.remove(&order_key).is_some();
+    // only an order outside every already-closed snapshot can leave purely offchain.
+    let pending_removed = !included_in_closed_epoch
+        && cancellation_can_settle_offchain(
+            &state,
+            &order_key,
+            cancelled_at,
+            active_closing_epoch(operator)?,
+        )
+        && state.pending_orders.remove(&order_key).is_some();
     if !pending_removed {
         state
             .cancellations

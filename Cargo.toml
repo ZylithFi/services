@@ -4,7 +4,8 @@ members = [
     "coordinator",
     "indexer",
     "market_data",
-    "prover",
+    "operator",
+    "proof_job",
 ]
 resolver = "2"
 

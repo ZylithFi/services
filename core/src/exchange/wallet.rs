@@ -181,11 +181,16 @@ pub fn asset_id(name: &str) -> Felt {
     felt_from_hex_str(&encode_starknet_felt("asset-id", name)).expect("the encoding is a felt")
 }
 
-/// a uniformly random felt below 2^251.
+/// a random nonzero felt below 2^251.
 pub fn random_felt() -> Felt {
     let mut bytes: [u8; 32] = rand::random();
     bytes[0] &= 0x07;
-    Felt::from_bytes_be(&bytes)
+    let value = Felt::from_bytes_be(&bytes);
+    if value == Felt::ZERO {
+        Felt::ONE
+    } else {
+        value
+    }
 }
 
 /// an output recovered from a transition's records.
@@ -195,6 +200,13 @@ pub struct RecoveredOutput {
     pub kind: u64,
     pub index: usize,
     pub note: NoteFields,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecoveredResidual {
+    pub seq: u32,
+    pub index: usize,
+    pub note: ResidualNote,
 }
 
 /// the order's outputs among one transition's records: its proceeds in the other asset and its
@@ -239,6 +251,66 @@ pub fn recover_order_outputs(
         }
     }
     recovered
+}
+
+/// recovers the latest residual-order state created for this order in one transition. every
+/// private scalar is independently padded; the distinct residual leaf domain prevents this
+/// record from being redeemed through the ordinary value-note withdrawal statement.
+pub fn recover_order_residual(
+    chain_context: Felt,
+    terms: &OrderTerms,
+    base_asset_id: Felt,
+    quote_asset_id: Felt,
+    seq: u32,
+    records: &[OutputRecord],
+) -> Option<RecoveredResidual> {
+    let input_asset_id = if terms.sell {
+        base_asset_id
+    } else {
+        quote_asset_id
+    };
+    let decode = |value: Felt, kind: u64| {
+        let blinding = output_blinding(terms.owner.nonce, seq, kind, Felt::ZERO);
+        let decoded = value - blinding;
+        (decoded <= Felt::from(u128::MAX)).then(|| u128::try_from(decoded).expect("bounded"))
+    };
+    for (index, record) in records.iter().enumerate() {
+        let Some(funding) = decode(record.enc, OUTPUT_KIND_RESIDUAL) else {
+            continue;
+        };
+        let Some(remaining) = decode(record.enc_remaining, OUTPUT_KIND_RESIDUAL + 1) else {
+            continue;
+        };
+        let Some(reserved) = decode(record.enc_reserved, OUTPUT_KIND_RESIDUAL + 2) else {
+            continue;
+        };
+        let Some(reserved_offset) = decode(record.enc_reserved_offset, OUTPUT_KIND_RESIDUAL + 3)
+        else {
+            continue;
+        };
+        let order = BookOrder {
+            pair_id: terms.pair_id,
+            sell: terms.sell,
+            external: terms.external,
+            remaining,
+            limit: terms.limit,
+            funding,
+            reserved,
+            reserved_offset,
+            reserved_seq: if reserved == 0 { 0 } else { seq },
+            expiry_ms: terms.expiry_ms,
+            owner_digest: terms.owner.digest(),
+            order_id: terms.order_id(),
+            residual_commitment: Felt::ZERO,
+            residual_generation: seq,
+        };
+        let note =
+            ResidualNote::from_order(chain_context, input_asset_id, &order, &terms.owner, seq);
+        if note.output_leaf() == record.leaf {
+            return Some(RecoveredResidual { seq, index, note });
+        }
+    }
+    None
 }
 
 #[cfg(test)]

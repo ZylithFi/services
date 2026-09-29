@@ -47,6 +47,11 @@ const REORG_REWIND_DEPOSITS: u64 = 256;
 const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const UNKNOWN_NOTE_BATCH_INDEX: u64 = u64::MAX;
+
+fn unknown_note_batch_index() -> u64 {
+    UNKNOWN_NOTE_BATCH_INDEX
+}
 
 /// one settled transition's public outputs, as the chain holds them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +62,17 @@ pub struct TransitionOutputs {
     pub new_book_root: String,
     pub note_root: String,
     pub output_root: String,
+    #[serde(default = "unknown_note_batch_index")]
+    pub note_batch_index: u64,
     pub outputs: Vec<OutputRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NoteBatchRootList {
+    pub start: u64,
+    pub end: u64,
+    pub total: u64,
+    pub roots: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +111,7 @@ struct Config {
 struct Index {
     deposits: BTreeMap<u64, DepositActivationRecord>,
     transitions: BTreeMap<u32, TransitionOutputs>,
+    note_batch_roots: Vec<String>,
     next_block: u64,
     /// the hash of block `next_block - 1` when it was scanned; zero before the first scan.
     cursor_hash: Felt,
@@ -116,6 +132,9 @@ type ApiResult<T> = Result<Json<T>, StatusCode>;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| "failed to install the tls crypto provider".to_string())?;
     let config = Config::from_env()?;
     let bind = env::var("ZYLITH_INDEXER_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDR.into());
     let interval = Duration::from_millis(
@@ -154,6 +173,10 @@ fn router(state: AppState) -> Router {
         .route("/api/internal/sync", post(sync_now))
         .route("/api/deposits/range/{start}/{end}", get(deposits_range))
         .route("/api/deposits/recent", get(recent_deposits))
+        .route(
+            "/api/note-batches/range/{start}/{end}",
+            get(note_batches_range),
+        )
         .route(
             "/api/transitions/range/{start}/{end}",
             get(transitions_range),
@@ -326,6 +349,7 @@ impl Store {
                  pragma synchronous=full;
                  create table if not exists deposits (id integer primary key, body text not null);
                  create table if not exists transitions (seq integer primary key, block integer not null, body text not null);
+                 create table if not exists note_batches (batch_index integer primary key, root text not null);
                  create table if not exists cursor (id integer primary key check (id = 0), next_block integer not null, block_hash text not null);",
             )
             .map_err(|error| format!("store schema: {error}"))?;
@@ -362,6 +386,16 @@ impl Store {
                 .map_err(|error| format!("store transition: {error}"))?;
             index.transitions.insert(transition.seq, transition);
         }
+        let mut statement = self
+            .connection
+            .prepare("select root from note_batches order by batch_index")
+            .map_err(fail)?;
+        for root in statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(fail)?
+        {
+            index.note_batch_roots.push(root.map_err(fail)?);
+        }
         if let Some((next_block, block_hash)) = self
             .connection
             .query_row(
@@ -388,6 +422,8 @@ impl Store {
         &mut self,
         deposits: &[DepositActivationRecord],
         transitions: &[TransitionOutputs],
+        note_batches_from: u64,
+        note_batch_roots: &[String],
         cursor: (u64, Felt),
         rewind: Option<Rewind>,
     ) -> Result<(), String> {
@@ -422,6 +458,20 @@ impl Store {
                 .execute(
                     "insert or replace into transitions (seq, block, body) values (?1, ?2, ?3)",
                     params![transition.seq, transition.block_number as i64, body],
+                )
+                .map_err(fail)?;
+        }
+        batch
+            .execute(
+                "delete from note_batches where batch_index >= ?1",
+                params![note_batches_from as i64],
+            )
+            .map_err(fail)?;
+        for (offset, root) in note_batch_roots.iter().enumerate() {
+            batch
+                .execute(
+                    "insert into note_batches (batch_index, root) values (?1, ?2)",
+                    params![note_batches_from as i64 + offset as i64, root],
                 )
                 .map_err(fail)?;
         }
@@ -523,13 +573,14 @@ impl AppState {
     /// the recent transitions and deposits are dropped and rescanned.
     async fn sync(&self) -> Result<(), String> {
         let mut store = self.store.lock().await;
-        let (mut known_deposits, mut next_block, cursor_hash, mut latest_seq) = {
+        let (mut known_deposits, mut next_block, cursor_hash, mut latest_seq, known_batch_roots) = {
             let index = self.index.read().await;
             (
                 index.deposits.len() as u64,
                 index.next_block,
                 index.cursor_hash,
                 index.transitions.keys().next_back().copied(),
+                index.note_batch_roots.clone(),
             )
         };
         let mut rewind = None;
@@ -564,6 +615,120 @@ impl AppState {
         let Some(confirmed) = tip.checked_sub(self.config.confirmation_blocks) else {
             return Ok(());
         };
+
+        let exchange = self.config.exchange;
+        let remote_batch_count = felt_u64(
+            self.call(exchange, "note_batch_count", &[], confirmed)
+                .await?
+                .first()
+                .ok_or("note_batch_count: empty")?,
+        )?;
+        let common = remote_batch_count.min(known_batch_roots.len() as u64);
+        let mut batch_from = common;
+        if common != 0 {
+            let remote_last = self
+                .call(
+                    exchange,
+                    "note_batch_root",
+                    &[Felt::from(common - 1)],
+                    confirmed,
+                )
+                .await?
+                .first()
+                .copied()
+                .ok_or("note_batch_root: empty")?;
+            if hex(remote_last) != known_batch_roots[common as usize - 1] {
+                let mut low = 0_u64;
+                let mut high = common;
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    let remote = self
+                        .call(
+                            exchange,
+                            "note_batch_root",
+                            &[Felt::from(middle)],
+                            confirmed,
+                        )
+                        .await?
+                        .first()
+                        .copied()
+                        .ok_or("note_batch_root: empty")?;
+                    if hex(remote) == known_batch_roots[middle as usize] {
+                        low = middle + 1;
+                    } else {
+                        high = middle;
+                    }
+                }
+                batch_from = low;
+            }
+        }
+        let note_history_changed = batch_from < known_batch_roots.len() as u64;
+        if note_history_changed {
+            let target = Rewind {
+                deposits_from: 0,
+                block: self.config.sync_from_block,
+            };
+            known_deposits = 0;
+            next_block = target.block;
+            latest_seq = None;
+            rewind = Some(target);
+        }
+        let mut note_batch_roots = Vec::with_capacity((remote_batch_count - batch_from) as usize);
+        while batch_from + (note_batch_roots.len() as u64) < remote_batch_count {
+            let start = batch_from + note_batch_roots.len() as u64;
+            let end = (start + MAX_TRANSITION_RANGE as u64 - 1).min(remote_batch_count - 1);
+            let fields = self
+                .call(
+                    exchange,
+                    "note_batch_roots",
+                    &[Felt::from(start), Felt::from(end)],
+                    confirmed,
+                )
+                .await?;
+            let expected = end - start + 1;
+            if fields.first().map(felt_u64).transpose()? != Some(expected)
+                || fields.len() != expected as usize + 1
+            {
+                return Err("note_batch_roots: unexpected layout".into());
+            }
+            note_batch_roots.extend(fields[1..].iter().copied().map(hex));
+        }
+        let mut all_batch_roots = known_batch_roots[..batch_from as usize].to_vec();
+        all_batch_roots.extend(note_batch_roots.iter().cloned());
+        let mut batch_indices = HashMap::with_capacity(all_batch_roots.len());
+        for (index, root) in all_batch_roots.iter().enumerate() {
+            batch_indices.entry(root.as_str()).or_insert(index as u64);
+        }
+
+        // old rows may predate the public batch index, and a replaced canonical suffix may move
+        // a retained row. validate and remap every retained transition before becoming healthy.
+        let transitions_to_validate = self
+            .index
+            .read()
+            .await
+            .transitions
+            .values()
+            .filter(|transition| rewind.is_none_or(|rewind| transition.block_number < rewind.block))
+            .filter(|transition| {
+                transition.note_batch_index == UNKNOWN_NOTE_BATCH_INDEX
+                    || all_batch_roots.get(transition.note_batch_index as usize)
+                        != Some(&transition.output_root)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut transition_updates = Vec::with_capacity(transitions_to_validate.len());
+        for mut transition in transitions_to_validate {
+            transition.note_batch_index = batch_indices
+                .get(transition.output_root.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "transition {} has no authoritative note batch",
+                        transition.seq
+                    )
+                })?;
+            transition_updates.push(transition);
+        }
 
         let registry = self.config.commitment_registry;
         let remote_deposits = felt_u64(
@@ -626,14 +791,25 @@ impl AppState {
                         .get("calldata")
                         .ok_or("the transition transaction has no calldata")?,
                 )?;
+                let output_root = hex(fields[1]);
+                let note_batch_index = batch_indices
+                    .get(output_root.as_str())
+                    .copied()
+                    .ok_or_else(|| format!("transition {seq} has no authoritative note batch"))?;
                 let transition = transition_outputs(
-                    self.config.exchange,
+                    exchange,
                     seq,
                     block_number,
                     transaction_hash,
                     fields,
+                    note_batch_index,
                     &calldata,
                 )?;
+                if all_batch_roots.get(note_batch_index as usize) != Some(&transition.output_root) {
+                    return Err(format!(
+                        "transition {seq}'s note batch index does not name its output root"
+                    ));
+                }
                 let expected = transitions
                     .last()
                     .map(|previous: &TransitionOutputs| previous.seq)
@@ -654,7 +830,16 @@ impl AppState {
         } else {
             (next_block, cursor_hash)
         };
-        store.commit(&deposits, &transitions, cursor, rewind)?;
+        let mut committed_transitions = transition_updates.clone();
+        committed_transitions.extend(transitions.iter().cloned());
+        store.commit(
+            &deposits,
+            &committed_transitions,
+            batch_from,
+            &note_batch_roots,
+            cursor,
+            rewind,
+        )?;
         let mut index = self.index.write().await;
         if let Some(rewind) = rewind {
             index.deposits.retain(|id, _| *id < rewind.deposits_from);
@@ -668,10 +853,11 @@ impl AppState {
                 .map(|record| (record.activation_id, record)),
         );
         index.transitions.extend(
-            transitions
+            committed_transitions
                 .into_iter()
                 .map(|transition| (transition.seq, transition)),
         );
+        index.note_batch_roots = all_batch_roots;
         (index.next_block, index.cursor_hash) = cursor;
         index.last_sync_ms = now_ms();
         Ok(())
@@ -807,6 +993,7 @@ fn transition_outputs(
     block_number: u64,
     transaction_hash: Felt,
     fields: [Felt; 4],
+    note_batch_index: u64,
     calldata: &[Felt],
 ) -> Result<TransitionOutputs, String> {
     let [new_book_root, output_root, note_root, output_count] = fields;
@@ -828,6 +1015,7 @@ fn transition_outputs(
         new_book_root: hex(new_book_root),
         note_root: hex(note_root),
         output_root: hex(output_root),
+        note_batch_index,
         outputs,
     })
 }
@@ -903,6 +1091,31 @@ async fn recent_deposits(
         recent_funding_commitments,
         last_successful_sync_unix_ms: status.last_successful_sync_unix_ms,
         sync_lag_ms: status.sync_lag_ms,
+    }))
+}
+
+async fn note_batches_range(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((start, end)): Path<(u64, u64)>,
+) -> ApiResult<NoteBatchRootList> {
+    state.allow(peer, &headers)?;
+    if start > end || end - start >= MAX_TRANSITION_RANGE as u64 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let index = state.index.read().await;
+    let total = index.note_batch_roots.len() as u64;
+    let roots = if start >= total {
+        Vec::new()
+    } else {
+        index.note_batch_roots[start as usize..=end.min(total - 1) as usize].to_vec()
+    };
+    Ok(Json(NoteBatchRootList {
+        start,
+        end,
+        total,
+        roots,
     }))
 }
 
@@ -995,6 +1208,7 @@ mod tests {
             10,
             Felt::from(0x7a_u8),
             fields,
+            1,
             &calldata,
         )
         .unwrap();
@@ -1008,16 +1222,33 @@ mod tests {
         let mut forged = fields;
         forged[1] += Felt::ONE;
         assert!(
-            transition_outputs(Felt::from(EXCHANGE), 1, 10, Felt::ONE, forged, &calldata).is_err()
+            transition_outputs(Felt::from(EXCHANGE), 1, 10, Felt::ONE, forged, 1, &calldata)
+                .is_err()
         );
         let mut short = fields;
         short[3] -= Felt::ONE;
         assert!(
-            transition_outputs(Felt::from(EXCHANGE), 1, 10, Felt::ONE, short, &calldata).is_err()
+            transition_outputs(Felt::from(EXCHANGE), 1, 10, Felt::ONE, short, 1, &calldata)
+                .is_err()
         );
         assert!(
-            transition_outputs(Felt::from(0xf_u8), 1, 10, Felt::ONE, fields, &calldata).is_err()
+            transition_outputs(Felt::from(0xf_u8), 1, 10, Felt::ONE, fields, 1, &calldata).is_err()
         );
+    }
+
+    #[test]
+    fn legacy_transition_rows_are_marked_for_batch_index_backfill() {
+        let transition: TransitionOutputs = serde_json::from_value(json!({
+            "seq": 1,
+            "block_number": 2,
+            "transaction_hash": "0x3",
+            "new_book_root": "0x4",
+            "note_root": "0x5",
+            "output_root": "0x6",
+            "outputs": []
+        }))
+        .unwrap();
+        assert_eq!(transition.note_batch_index, UNKNOWN_NOTE_BATCH_INDEX);
     }
 
     #[test]
@@ -1036,6 +1267,8 @@ mod tests {
             .commit(
                 std::slice::from_ref(&deposit),
                 std::slice::from_ref(&transition),
+                0,
+                &["0x2".into(), transition.output_root.clone()],
                 (42, Felt::from(0xb10c_u16)),
                 None,
             )
@@ -1043,6 +1276,10 @@ mod tests {
         let index = Store::open(&path).unwrap().load(7).unwrap();
         assert_eq!(index.deposits.get(&0), Some(&deposit));
         assert_eq!(index.transitions.get(&1), Some(&transition));
+        assert_eq!(
+            index.note_batch_roots,
+            vec!["0x2".to_string(), transition.output_root.clone()]
+        );
         assert_eq!(
             (index.next_block, index.cursor_hash),
             (42, Felt::from(0xb10c_u16))
@@ -1054,7 +1291,7 @@ mod tests {
             block: transition.block_number,
         };
         store
-            .commit(&[], &[], (43, Felt::ZERO), Some(rewind))
+            .commit(&[], &[], 0, &[], (43, Felt::ZERO), Some(rewind))
             .unwrap();
         let index = store.load(7).unwrap();
         assert!(index.deposits.is_empty() && index.transitions.is_empty());
@@ -1066,12 +1303,14 @@ mod tests {
             .commit(
                 std::slice::from_ref(&deposit),
                 std::slice::from_ref(&transition),
+                0,
+                &["0x2".into(), transition.output_root.clone()],
                 (44, Felt::ZERO),
                 None,
             )
             .unwrap();
         store
-            .commit(&[], &[], (45, Felt::ZERO), Some(rewind))
+            .commit(&[], &[], 2, &[], (45, Felt::ZERO), Some(rewind))
             .unwrap();
         let index = store.load(7).unwrap();
         assert_eq!(index.deposits.len(), 1);
@@ -1112,13 +1351,15 @@ mod tests {
             .await
             .transitions
             .insert(1, transition.clone());
+        state.index.write().await.note_batch_roots =
+            vec!["0x11".into(), transition.output_root.clone()];
         let app = router(state);
         let (status, body) = get(&app, "/api/transitions/range/1/4", "1.2.3.4:5", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["latest_seq"], 1);
         assert_eq!(
             serde_json::from_value::<Vec<TransitionOutputs>>(body["transitions"].clone()).unwrap(),
-            vec![transition]
+            vec![transition.clone()]
         );
         assert_eq!(
             get(&app, "/api/transitions/range/4/1", "1.2.3.4:5", None)
@@ -1138,6 +1379,10 @@ mod tests {
                 .0,
             StatusCode::OK
         );
+        let (status, body) = get(&app, "/api/note-batches/range/0/255", "1.2.3.4:5", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["roots"], json!(["0x11", transition.output_root]));
         let _ = std::fs::remove_file(&path);
     }
 

@@ -56,7 +56,11 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
       }
 
       if (request.method === "GET" && request.url === "/health") {
-        sendJson(request, response, 200, { status: "ok" });
+        sendJson(request, response, 200, {
+          status: "ok",
+          registry_version: config.registryVersion,
+          registry_hash: config.registryHash,
+        });
         return;
       }
 

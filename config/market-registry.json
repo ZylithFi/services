@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "registry_version": 2,
+  "registry_hash": "9bef814be387127aa02db2623fc5b9902f74f835440f4b45ea5435603fced36e",
+  "network": "sepolia",
+  "chain_id": "0x534e5f5345504f4c4941",
+  "gas_fee_asset_id": "STRK",
+  "connected_wallet_fee_reserve_amount": "5000000000000",
+  "objective_numeraire_asset_id": "USDC",
+  "assets": [
+    {
+      "asset_id": "ETH",
+      "token_address": "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
+      "decimals": 18,
+      "min_trade_amount": "1000000000000000",
+      "erc20_behavior": "vanilla_exact_delta",
+      "enabled": true,
+      "funding_enabled": true,
+      "reference_identity": {
+        "reference_asset_id": "ETH",
+        "relationship": "native"
+      }
+    },
+    {
+      "asset_id": "STRK",
+      "token_address": "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
+      "decimals": 18,
+      "min_trade_amount": "1000000000000000000",
+      "erc20_behavior": "vanilla_exact_delta",
+      "enabled": true,
+      "funding_enabled": true,
+      "reference_identity": {
+        "reference_asset_id": "STRK",
+        "relationship": "native"
+      }
+    },
+    {
+      "asset_id": "USDC",
+      "token_address": "0x0512feAc6339Ff7889822cb5aA2a86C848e9D392bB0E3E237C008674feeD8343",
+      "decimals": 6,
+      "min_trade_amount": "1000000",
+      "erc20_behavior": "vanilla_exact_delta",
+      "enabled": true,
+      "funding_enabled": true,
+      "reference_identity": {
+        "reference_asset_id": "USD",
+        "relationship": "stable_one_to_one"
+      }
+    }
+  ],
+  "markets": [
+    {
+      "market_id": "ETH/USDC",
+      "base_asset_id": "ETH",
+      "quote_asset_id": "USDC",
+      "min_order_amount": "1000000000000000",
+      "price_base_scale": "1000000000000000000",
+      "taker_fee_bps": 2,
+      "enabled": true,
+      "capabilities": {
+        "market_data": true,
+        "external_matching": false
+      },
+      "external_settlement_support_quote": "0",
+      "external_min_profit_quote": "0",
+      "reference_price": {
+        "methodology": "direct_bbo_midpoint",
+        "primary": {
+          "kind": "direct",
+          "adapter": "binance",
+          "symbol": "ETHUSDC"
+        },
+        "corroborating": [
+          {
+            "kind": "same_venue_ratio",
+            "adapter": "coinbase",
+            "base_symbol": "ETH-USD",
+            "quote_symbol": "USDC-USD"
+          },
+          {
+            "kind": "same_venue_ratio",
+            "adapter": "kraken",
+            "base_symbol": "XETHZUSD",
+            "quote_symbol": "USDCUSD"
+          },
+          {
+            "kind": "same_venue_ratio",
+            "adapter": "okx",
+            "base_symbol": "ETH-USDT",
+            "quote_symbol": "USDC-USDT"
+          }
+        ],
+        "min_sources": 3,
+        "max_age_ms": 5000,
+        "max_source_spread_bps": 20,
+        "max_cross_source_deviation_bps": 30,
+        "envelope_bps": 15,
+        "attestation_ttl_ms": 5000
+      }
+    },
+    {
+      "market_id": "STRK/USDC",
+      "base_asset_id": "STRK",
+      "quote_asset_id": "USDC",
+      "min_order_amount": "1000000000000000000",
+      "price_base_scale": "1000000000000000000",
+      "taker_fee_bps": 2,
+      "enabled": true,
+      "capabilities": {
+        "market_data": true,
+        "external_matching": false
+      },
+      "external_settlement_support_quote": "0",
+      "external_min_profit_quote": "0",
+      "reference_price": {
+        "methodology": "direct_bbo_midpoint",
+        "primary": {
+          "kind": "direct",
+          "adapter": "binance",
+          "symbol": "STRKUSDC"
+        },
+        "corroborating": [
+          {
+            "kind": "same_venue_ratio",
+            "adapter": "coinbase",
+            "base_symbol": "STRK-USD",
+            "quote_symbol": "USDC-USD"
+          },
+          {
+            "kind": "same_venue_ratio",
+            "adapter": "kraken",
+            "base_symbol": "STRKUSD",
+            "quote_symbol": "USDCUSD"
+          },
+          {
+            "kind": "same_venue_ratio",
+            "adapter": "okx",
+            "base_symbol": "STRK-USDT",
+            "quote_symbol": "USDC-USDT"
+          }
+        ],
+        "min_sources": 3,
+        "max_age_ms": 5000,
+        "max_source_spread_bps": 20,
+        "max_cross_source_deviation_bps": 30,
+        "envelope_bps": 15,
+        "attestation_ttl_ms": 5000
+      }
+    }
+  ]
+}

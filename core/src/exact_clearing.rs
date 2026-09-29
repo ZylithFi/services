@@ -1,8 +1,8 @@
 //! global clearing with a dual optimality certificate. the solver is exact over the rational
 //! relaxation; the executed allocation is integral, so the certificate proves it optimal within a
-//! protocol-fixed rounding tolerance. the residual check rejects a wholly skipped direct cross
-//! and prevents a zero-fill allocation from hiding a consistent multi-market circulation. small
-//! two-sided residuals may remain only within the certificate's exact integer tolerance.
+//! protocol-fixed rounding tolerance. the residual check bounds opposing direct residual by the
+//! same three integer envelopes per participant and prevents a zero-fill allocation from hiding
+//! a direct cross.
 //!
 //! model: markets price their base asset in their quote asset at a committed midpoint
 //! `midpoint / scale`. every eligible order `i` may fill `x_i` base units, `0 <= x_i <= u_i`
@@ -283,9 +283,9 @@ pub fn clearing_objective(instance: &ClearingInstance, fills: &[u128]) -> BigUin
         .sum()
 }
 
-/// multiplier of the protocol-fixed optimality tolerance: at most this many units of integer
-/// rounding per participating order in each of its two assets, valued at their weights.
-pub const CLEARING_TOLERANCE_UNITS: u128 = MAX_CLEARING_ASSETS as u128 + 2;
+/// three exact units cover the independent quote floor, quote ceiling, and dual-grid rounding
+/// envelopes. direct residuals are exhausted separately, so this cannot suppress a pairwise cross.
+pub const CLEARING_TOLERANCE_UNITS: u128 = 3;
 /// canonical asset weights lie between one and this bound; the most valuable asset of every
 /// component of the market graph carries the bound less one. the range must span the
 /// value of one atom of the cheapest asset against the dearest: an 18-decimal token worth a few
@@ -429,7 +429,7 @@ pub fn usdc_clearing_weights(
 }
 
 /// the numeric tolerance covers only certificate-grid and quote-rounding error. the independent
-/// residual check prevents a wholly skipped direct cross and a hidden zero-fill circulation.
+/// residual check bounds remaining direct-cross dust and rejects a hidden zero-fill cross.
 pub fn clearing_tolerance(instance: &ClearingInstance) -> BigUint {
     let mut units = BigUint::zero();
     let mut market_capacity = vec![BigUint::zero(); instance.markets.len()];
@@ -460,25 +460,130 @@ fn verify_residual_maximality(
     instance: &ClearingInstance,
     fills: &[u128],
 ) -> Result<(), ProtocolError> {
-    let mut residual_sides = vec![[false; 2]; instance.markets.len()];
-    let mut filled_sides = vec![[false; 2]; instance.markets.len()];
+    let mut residual_sides = vec![[0_u128; 2]; instance.markets.len()];
+    let mut filled_sides = vec![[0_u128; 2]; instance.markets.len()];
+    let mut participants = vec![0_u128; instance.markets.len()];
     for (order, fill) in instance.orders.iter().zip(fills) {
-        if *fill > 0 {
-            filled_sides[order.market][usize::from(order.sell)] = true;
+        let side = usize::from(order.sell);
+        if order.capacity != 0 {
+            participants[order.market] += 1;
         }
-        if *fill >= order.capacity {
-            continue;
-        }
-        residual_sides[order.market][usize::from(order.sell)] = true;
+        filled_sides[order.market][side] = filled_sides[order.market][side]
+            .checked_add(*fill)
+            .ok_or_else(|| invalid("clearing side fill overflows"))?;
+        residual_sides[order.market][side] = residual_sides[order.market][side]
+            .checked_add(order.capacity - *fill)
+            .ok_or_else(|| invalid("clearing side residual overflows"))?;
     }
-    if residual_sides
+    for (market, ((residual, filled), participant_count)) in residual_sides
         .iter()
         .zip(filled_sides)
-        .any(|(residual, filled)| residual[0] && residual[1] && !filled[0] && !filled[1])
+        .zip(participants)
+        .enumerate()
     {
-        return Err(invalid("clearing leaves a direct cross unfilled"));
+        let opposing = residual[0].min(residual[1]);
+        let skipped_zero_fill = opposing != 0 && filled[0] == 0 && filled[1] == 0;
+        let allowance = participant_count
+            .checked_mul(CLEARING_TOLERANCE_UNITS)
+            .ok_or_else(|| invalid("clearing residual allowance overflows"))?;
+        if opposing > allowance || skipped_zero_fill {
+            return Err(invalid(format!(
+                "clearing market {market} leaves {opposing} directly crossable base atoms unfilled; rounding permits at most {allowance}"
+            )));
+        }
     }
     Ok(())
+}
+
+/// consumes each market's full opposing residual when that augmentation preserves global
+/// conservation. at most the three explicit atomic rounding envelopes per participant remain.
+fn exhaust_feasible_direct_crosses(
+    instance: &ClearingInstance,
+    fills: &mut [u128],
+) -> Result<(), ProtocolError> {
+    for market_index in 0..instance.markets.len() {
+        let buy_remaining = instance
+            .orders
+            .iter()
+            .zip(fills.iter())
+            .filter(|(order, _)| order.market == market_index && !order.sell)
+            .try_fold(0_u128, |total, (order, fill)| {
+                total
+                    .checked_add(order.capacity - *fill)
+                    .ok_or_else(|| invalid("direct-cross capacity overflows"))
+            })?;
+        let sell_remaining = instance
+            .orders
+            .iter()
+            .zip(fills.iter())
+            .filter(|(order, _)| order.market == market_index && order.sell)
+            .try_fold(0_u128, |total, (order, fill)| {
+                total
+                    .checked_add(order.capacity - *fill)
+                    .ok_or_else(|| invalid("direct-cross capacity overflows"))
+            })?;
+        let cross = buy_remaining.min(sell_remaining);
+        if cross == 0 {
+            continue;
+        }
+        let participant_count = instance
+            .orders
+            .iter()
+            .filter(|order| order.market == market_index && order.capacity != 0)
+            .count() as u128;
+        let direct_dust = participant_count
+            .checked_mul(CLEARING_TOLERANCE_UNITS)
+            .ok_or_else(|| invalid("direct-cross dust allowance overflows"))?;
+        let original = instance
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, order)| order.market == market_index)
+            .map(|(index, _)| (index, fills[index]))
+            .collect::<Vec<_>>();
+        let mut accepted = false;
+        for dust in 0..=direct_dust {
+            let amount = cross.saturating_sub(dust);
+            if amount == 0 || accepted {
+                continue;
+            }
+            for (index, fill) in &original {
+                fills[*index] = *fill;
+            }
+            add_direct_cross(instance, fills, market_index, amount);
+            let (inputs, outputs) = clearing_flows(instance, fills);
+            accepted = inputs
+                .iter()
+                .zip(outputs)
+                .all(|(input, output)| input >= &output);
+        }
+        if !accepted {
+            for (index, fill) in original {
+                fills[index] = fill;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_direct_cross(
+    instance: &ClearingInstance,
+    fills: &mut [u128],
+    market_index: usize,
+    amount: u128,
+) {
+    for sell in [false, true] {
+        let mut remaining = amount;
+        for (order, fill) in instance.orders.iter().zip(fills.iter_mut()) {
+            if order.market != market_index || order.sell != sell || remaining == 0 {
+                continue;
+            }
+            let increment = (order.capacity - *fill).min(remaining);
+            *fill += increment;
+            remaining -= increment;
+        }
+        debug_assert_eq!(remaining, 0);
+    }
 }
 
 fn u128_or(value: BigUint, message: &str) -> Result<u128, ProtocolError> {
@@ -1161,12 +1266,13 @@ pub fn solve_exact_clearing(instance: &ClearingInstance) -> Result<ExactClearing
     };
     // if the balanced relaxation's rounding cannot be repaired, retry from the slack relaxation's
     // allocation, then dive: the dive always ends at a feasible integral allocation.
-    let fills = match round_to_feasible(instance, &balanced.solution())
+    let mut fills = match round_to_feasible(instance, &balanced.solution())
         .or_else(|| round_to_feasible(instance, &priced.solution()))
     {
         Some(fills) => fills,
         None => dive_to_integral(instance, balanced.solution(), &mut budget)?,
     };
+    exhaust_feasible_direct_crosses(instance, &mut fills)?;
     let report = verify_clearing_certificate(instance, &fills, &certificate)?;
     let quote_amounts = instance
         .orders
@@ -1772,6 +1878,21 @@ mod tests {
             "the cycle must clear"
         );
         assert!(clearing.report.upper_bound >= brute_force(&instance));
+        let scaled = ClearingInstance {
+            asset_weights: instance.asset_weights.clone(),
+            markets: instance.markets.clone(),
+            orders: vec![
+                order(0, true, 600),
+                order(1, true, 1_200),
+                order(2, true, 1_800),
+            ],
+        };
+        let scaled_clearing = solve_exact_clearing(&scaled).expect("scaled cycle");
+        assert!(
+            verify_clearing_certificate(&scaled, &[300, 600, 900], &scaled_clearing.certificate)
+                .is_err(),
+            "certificate tolerance may cover atomic dust, not a material multiparty cross"
+        );
     }
 
     #[test]
@@ -1812,6 +1933,65 @@ mod tests {
         assert!(
             verify_clearing_certificate(&instance, &[0, 0], &clearing.certificate).is_err(),
             "a one-atom direct cross is not rounding dust"
+        );
+    }
+
+    #[test]
+    fn rounding_tolerance_cannot_leave_partially_filled_opposing_residuals() {
+        let instance = ClearingInstance {
+            asset_weights: vec![3, 1],
+            markets: vec![market(0, 1, 1, 1)],
+            orders: vec![order(0, false, 8), order(0, true, 8)],
+        };
+        let clearing = solve_exact_clearing(&instance).expect("solve");
+        assert_eq!(clearing.fills, vec![8, 8]);
+        assert!(
+            verify_clearing_certificate(&instance, &[1, 1], &clearing.certificate).is_err(),
+            "opposing residuals remain directly crossable"
+        );
+    }
+
+    #[test]
+    fn one_atom_opposing_residual_after_a_fill_is_rounding_dust() {
+        let instance = ClearingInstance {
+            asset_weights: vec![3, 1],
+            markets: vec![market(0, 1, 1, 1)],
+            orders: vec![order(0, false, 2), order(0, true, 2)],
+        };
+        let clearing = solve_exact_clearing(&instance).expect("solve");
+        verify_clearing_certificate(&instance, &[1, 1], &clearing.certificate)
+            .expect("one atom is within the participant-bounded direct rounding residual");
+    }
+
+    #[test]
+    fn direct_residual_dust_is_bounded_by_participating_orders() {
+        let instance = ClearingInstance {
+            asset_weights: vec![3, 1],
+            markets: vec![market(0, 1, 1, 1)],
+            orders: vec![
+                order(0, false, 7),
+                order(0, false, 7),
+                order(0, true, 7),
+                order(0, true, 7),
+            ],
+        };
+        verify_residual_maximality(&instance, &[1, 1, 1, 1])
+            .expect("four participants permit twelve opposing atoms across three envelopes");
+        assert!(
+            verify_residual_maximality(
+                &ClearingInstance {
+                    orders: vec![
+                        order(0, false, 8),
+                        order(0, false, 8),
+                        order(0, true, 8),
+                        order(0, true, 8),
+                    ],
+                    ..instance
+                },
+                &[1, 2, 1, 2]
+            )
+            .is_err(),
+            "thirteen opposing atoms exceed the four-participant three-envelope bound"
         );
     }
 

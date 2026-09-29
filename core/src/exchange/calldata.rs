@@ -261,10 +261,15 @@ pub fn transition_calldata(
     }
     data.push(felt_u64(public.nullifiers.len() as u64));
     data.extend_from_slice(&public.nullifiers);
+    data.push(felt_u64(public.retired_nullifiers.len() as u64));
+    data.extend_from_slice(&public.retired_nullifiers);
     data.push(felt_u64(public.output_records.len() as u64));
     for record in &public.output_records {
         data.push(record.leaf);
         data.push(record.enc);
+        data.push(record.enc_remaining);
+        data.push(record.enc_reserved);
+        data.push(record.enc_reserved_offset);
     }
     Ok(data)
 }
@@ -316,17 +321,20 @@ pub fn transition_output_records(
     let length =
         |index: usize| usize::try_from(*arguments.get(index).ok_or_else(fail)?).map_err(|_| fail());
     let mut index = 6;
-    for width in [MARKET_ATTESTATION_CALLDATA_LENGTH, 7, 4, 1] {
+    for width in [MARKET_ATTESTATION_CALLDATA_LENGTH, 7, 4, 1, 1] {
         index += 1 + length(index)? * width;
     }
     let count = length(index)?;
     index += 1;
-    let records = arguments.get(index..index + 2 * count).ok_or_else(fail)?;
+    let records = arguments.get(index..index + 5 * count).ok_or_else(fail)?;
     Ok(records
-        .chunks(2)
+        .chunks(5)
         .map(|record| super::transition::OutputRecord {
             leaf: record[0],
             enc: record[1],
+            enc_remaining: record[2],
+            enc_reserved: record[3],
+            enc_reserved_offset: record[4],
         })
         .collect())
 }

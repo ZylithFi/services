@@ -17,19 +17,23 @@ use starknet_rust_core::types::Felt;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use zylith_core::exchange::{
-    Cancellation, OUTPUT_KIND_FEE, Outcome as ChainOutcome, TRANSITION_MESSAGE_DOMAIN,
-    TransitionInput, TransitionResult, WITHDRAWAL_MESSAGE_DOMAIN, WithdrawalInput,
-    bound_statement_message, build_transition, build_withdrawal, proof_message_hash,
-    transition_calldata, withdrawal_calldata,
+    Cancellation, OUTPUT_KIND_FEE, Outcome as ChainOutcome, ResidualNote,
+    TRANSITION_MESSAGE_DOMAIN, TransitionInput, TransitionResult, WITHDRAWAL_MESSAGE_DOMAIN,
+    WithdrawalInput, bound_statement_message, build_transition, build_withdrawal,
+    proof_message_hash, transition_calldata, withdrawal_calldata,
 };
+use zylith_proof_job::ProofStatementKind;
 
 use crate::chain::{CapacityView, Chain, ChainEvent, transition_batch};
 use crate::config::{Config, from_core, to_core};
 use crate::market::{LEG_MIN_PROFIT_INDEX, Market, Rate, Round};
-use crate::snip36::{Outcome, Snip36, call};
+use crate::snip36::{
+    Outcome, ProofJobContext, Snip36, call, canonical_witness_hash, is_retryable_proving_error,
+};
 use crate::state::{
     CancellationTombstone, ClosedOrder, InFlight, OpenCapacity, OperatorState, OrderEvent,
-    PendingOrder, Store, TransitionStage, WithdrawalJob, WithdrawalStage, key,
+    PendingOrder, PendingResidualRecovery, Store, TransitionStage, WithdrawalJob, WithdrawalStage,
+    key,
 };
 
 const DRIVER_INTERVAL_MS: u64 = 250;
@@ -47,6 +51,17 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn private_padding_seed() -> starknet_crypto::Felt {
+    loop {
+        let mut bytes = [0_u8; 32];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes[1..]);
+        let seed = starknet_crypto::Felt::from_bytes_be(&bytes);
+        if seed != starknet_crypto::Felt::ZERO {
+            return seed;
+        }
+    }
+}
+
 pub struct Operator {
     pub config: Config,
     pub snip36: Snip36,
@@ -58,6 +73,11 @@ pub struct Operator {
     /// transition commitments with a proving task running. this is intentionally ephemeral:
     /// persisted proving jobs restart from their encrypted witness after a process restart.
     pub transitions_running: std::sync::Mutex<BTreeSet<String>>,
+    /// order ids captured by an epoch close but not yet persisted as an in-flight transition.
+    /// cancellation consults this cutoff so a post-close request cannot rewrite that auction.
+    /// the aligned close currently being prepared. receipt timestamps, not lock acquisition
+    /// order, decide whether an order or cancellation belongs before this cutoff.
+    pub closing_epoch: std::sync::Mutex<Option<u64>>,
     /// latched by a failed state write: nothing further is acknowledged, proven or sent.
     pub halted: AtomicBool,
 }
@@ -107,17 +127,154 @@ pub fn spawn(operator: Arc<Operator>) {
 
 async fn epoch_loop(operator: Arc<Operator>) {
     let epoch_ms = operator.config.policy.epoch_ms;
+    let prepare_ms = operator.config.policy.epoch_prepare_ms;
     while operator.running().is_ok() {
         let now = now_ms();
         let close = (now / epoch_ms + 1) * epoch_ms;
-        sleep(Duration::from_millis(close - now)).await;
+        sleep(Duration::from_millis(
+            close.saturating_sub(now).saturating_sub(prepare_ms),
+        ))
+        .await;
         if let Err(error) = close_epoch(&operator, close).await {
             eprintln!(
                 "epoch close at {close} skipped: {}",
                 crate::snip36::sanitize(&error)
             );
         }
+        let remaining = close.saturating_sub(now_ms());
+        if remaining != 0 {
+            sleep(Duration::from_millis(remaining)).await;
+        }
     }
+}
+
+fn scheduled_epoch_close(close_ms: u64, epoch_ms: u64) -> bool {
+    epoch_ms != 0 && close_ms.is_multiple_of(epoch_ms)
+}
+
+fn reference_windows_cover_close(
+    windows: impl IntoIterator<Item = (u64, u64)>,
+    close_ms: u64,
+) -> bool {
+    windows.into_iter().all(|(observed_at_ms, valid_until_ms)| {
+        observed_at_ms <= close_ms && close_ms <= valid_until_ms
+    })
+}
+
+fn eligible_before_close(received_at_ms: u64, close_time_ms: u64) -> bool {
+    received_at_ms < close_time_ms
+}
+
+struct ClosingEpoch<'a> {
+    operator: &'a Operator,
+    close_time_ms: u64,
+}
+
+impl Drop for ClosingEpoch<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut closing) = self.operator.closing_epoch.lock()
+            && *closing == Some(self.close_time_ms)
+        {
+            *closing = None;
+        }
+    }
+}
+
+impl<'a> ClosingEpoch<'a> {
+    fn begin(operator: &'a Operator, close_time_ms: u64) -> Result<Self, String> {
+        let mut closing = operator
+            .closing_epoch
+            .lock()
+            .map_err(|_| "the closing-epoch cutoff lock is poisoned")?;
+        if closing.is_some() {
+            return Err("another epoch close is already active".into());
+        }
+        *closing = Some(close_time_ms);
+        Ok(Self {
+            operator,
+            close_time_ms,
+        })
+    }
+}
+
+fn protected_by_closing_epoch(
+    order: &PendingOrder,
+    cancelled_at_ms: u64,
+    closing_epoch: Option<u64>,
+) -> bool {
+    closing_epoch.is_some_and(|close_time_ms| {
+        eligible_before_close(order.received_at_ms, close_time_ms)
+            && !eligible_before_close(cancelled_at_ms, close_time_ms)
+    })
+}
+
+pub(crate) fn active_closing_epoch(operator: &Operator) -> Result<Option<u64>, String> {
+    operator
+        .closing_epoch
+        .lock()
+        .map(|closing| *closing)
+        .map_err(|_| "the closing-epoch cutoff lock is poisoned".into())
+}
+
+fn pending_order_is_in_closed_epoch(
+    state: &OperatorState,
+    order_id: &str,
+    cancelled_at_ms: u64,
+    closing_epoch: Option<u64>,
+) -> bool {
+    state
+        .pending_orders
+        .get(order_id)
+        .is_some_and(|order| protected_by_closing_epoch(order, cancelled_at_ms, closing_epoch))
+}
+
+fn admitted_in_flight(state: &OperatorState, order_id: &str) -> bool {
+    state
+        .in_flight
+        .iter()
+        .any(|transition| transition.admitted.iter().map(key).any(|id| id == order_id))
+}
+
+pub(crate) fn cancellation_can_settle_offchain(
+    state: &OperatorState,
+    order_id: &str,
+    cancelled_at_ms: u64,
+    closing_epoch: Option<u64>,
+) -> bool {
+    state.pending_orders.contains_key(order_id)
+        && !admitted_in_flight(state, order_id)
+        && !pending_order_is_in_closed_epoch(state, order_id, cancelled_at_ms, closing_epoch)
+}
+
+fn settle_pending_cancellations(state: &mut OperatorState, closing_epoch: Option<u64>) -> bool {
+    let order_ids = state
+        .pending_orders
+        .iter()
+        .filter_map(|(order_id, order)| {
+            let (_, cancelled_at_ms) = state.cancellations.get(order_id)?;
+            (!admitted_in_flight(state, order_id)
+                && !protected_by_closing_epoch(order, *cancelled_at_ms, closing_epoch))
+            .then(|| order_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for order_id in &order_ids {
+        let Some(order) = state.pending_orders.remove(order_id) else {
+            continue;
+        };
+        let Some((_, cancelled_at_ms)) = state.cancellations.remove(order_id) else {
+            continue;
+        };
+        state.cancelled_orders.insert(
+            order_id.clone(),
+            CancellationTombstone {
+                cancel_authority: from_core(order.request.terms.owner.cancel_authority),
+                cancelled_at_ms,
+                expires_at_ms: order.request.terms.expiry_ms,
+                effective_after_seq: state.confirmed_seq,
+            },
+        );
+    }
+    !order_ids.is_empty()
 }
 
 async fn driver_loop(operator: Arc<Operator>) {
@@ -147,6 +304,12 @@ async fn sync(operator: &Operator, state: &mut OperatorState) -> Result<bool, St
             let rewind_to = scanned.saturating_sub(REORG_REWIND_BLOCKS);
             eprintln!("block {scanned} was reorganized; rescanning from block {rewind_to}");
             state.notes.rewind(rewind_to)?;
+            state
+                .recovered_residuals
+                .retain(|_, block| *block < rewind_to);
+            state
+                .pending_residual_recoveries
+                .retain(|_, recovery| recovery.requested_block < rewind_to);
             return Ok(true);
         }
     }
@@ -188,6 +351,37 @@ async fn sync(operator: &Operator, state: &mut OperatorState) -> Result<bool, St
                         transaction_hash: Felt::ZERO,
                     };
                     job.updated_at_ms = now_ms();
+                }
+            }
+            ChainEvent::ResidualRecoveryRequested {
+                nullifier,
+                matures_at,
+            } => {
+                let requested_at = matures_at
+                    .checked_sub(operator.config.manifest.runtime.withdrawal_delay_seconds)
+                    .ok_or("residual recovery maturity precedes its configured delay")?;
+                state.pending_residual_recoveries.insert(
+                    key(&nullifier),
+                    PendingResidualRecovery {
+                        nullifier,
+                        requested_at_ms: requested_at
+                            .checked_mul(1_000)
+                            .ok_or("residual recovery request overflows milliseconds")?,
+                        matures_at_ms: matures_at
+                            .checked_mul(1_000)
+                            .ok_or("residual recovery maturity overflows milliseconds")?,
+                        requested_block: block,
+                        retired: false,
+                        finalization_transaction: None,
+                        updated_at_ms: now_ms(),
+                    },
+                );
+            }
+            ChainEvent::ResidualRecoveryFinalized { nullifier } => {
+                let recovery_key = key(&nullifier);
+                let pending = state.pending_residual_recoveries.remove(&recovery_key);
+                if pending.is_none_or(|recovery| !recovery.retired) {
+                    state.recovered_residuals.insert(recovery_key, block);
                 }
             }
         }
@@ -251,6 +445,8 @@ async fn reconcile(operator: &Operator, state: &mut OperatorState) -> Result<boo
                 first.with_leg = false;
                 first.legged.clear();
                 first.leg_dropped = true;
+                first.prepared_submission = None;
+                first.prepared_legged.clear();
                 return Ok(true);
             }
             Some(Outcome::Reverted { reason }) => {
@@ -332,6 +528,18 @@ fn commit(state: &mut OperatorState, landed: InFlight) {
         state.cancellations.remove(&order_key);
     }
     state.book = landed.result.new_book.clone();
+    for nullifier in &landed.result.public.retired_nullifiers {
+        let nullifier = key(&from_core(*nullifier));
+        state.recovered_residuals.remove(&nullifier);
+        if let Some(recovery) = state.pending_residual_recoveries.get_mut(&nullifier) {
+            recovery.retired = true;
+        }
+    }
+    for nullifier in &landed.result.public.nullifiers {
+        state
+            .pending_residual_recoveries
+            .remove(&key(&from_core(*nullifier)));
+    }
     let live_order_ids = state
         .book
         .iter()
@@ -398,42 +606,12 @@ fn commit(state: &mut OperatorState, landed: InFlight) {
     }
 }
 
-/// if a submitted admission later reverts, a cancellation that was waiting behind it becomes a
-/// pending-order cancellation. resolve that durable intersection before another close can admit
-/// the order again.
-fn settle_pending_cancellations(state: &mut OperatorState) -> bool {
-    let order_ids = state
-        .pending_orders
-        .keys()
-        .filter(|order_id| state.cancellations.contains_key(*order_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    for order_id in &order_ids {
-        let Some(order) = state.pending_orders.remove(order_id) else {
-            continue;
-        };
-        let Some((_, cancelled_at_ms)) = state.cancellations.remove(order_id) else {
-            continue;
-        };
-        state.cancelled_orders.insert(
-            order_id.clone(),
-            CancellationTombstone {
-                cancel_authority: from_core(order.request.terms.owner.cancel_authority),
-                cancelled_at_ms,
-                expires_at_ms: order.request.terms.expiry_ms,
-                effective_after_seq: state.confirmed_seq,
-            },
-        );
-    }
-    !order_ids.is_empty()
-}
-
 async fn drive(operator: &Arc<Operator>) -> Result<(), String> {
     operator.running()?;
     let mut state = operator.state.lock().await;
     let mut changed = sync(operator, &mut state).await?;
     changed |= reconcile(operator, &mut state).await?;
-    changed |= settle_pending_cancellations(&mut state);
+    changed |= settle_pending_cancellations(&mut state, active_closing_epoch(operator)?);
 
     let proving = state
         .in_flight
@@ -451,6 +629,7 @@ async fn drive(operator: &Arc<Operator>) -> Result<(), String> {
     // revert: drop it, and the next close rebuilds with fresh midpoints.
     if let Some(first) = state.in_flight.first()
         && first.stage == TransitionStage::Proven
+        && first.prepared_submission.is_none()
         && now_ms() + 5_000 > first.close_time_ms + operator.config.policy.max_close_delay_ms
     {
         eprintln!(
@@ -486,18 +665,32 @@ async fn drive(operator: &Arc<Operator>) -> Result<(), String> {
                 }
             }
             Err(error) => {
-                eprintln!(
-                    "transition {} submission failed: {}",
-                    first.seq,
-                    crate::snip36::sanitize(&error)
-                );
-                state.in_flight.clear();
+                let journaled = state
+                    .in_flight
+                    .iter()
+                    .find(|entry| entry.seq == first.seq)
+                    .is_some_and(|entry| entry.prepared_submission.is_some());
+                if journaled {
+                    eprintln!(
+                        "transition {} submission is unresolved and will rebroadcast its journaled transaction: {}",
+                        first.seq,
+                        crate::snip36::sanitize(&error)
+                    );
+                } else {
+                    eprintln!(
+                        "transition {} is not submit-ready and will be rebuilt: {}",
+                        first.seq,
+                        crate::snip36::sanitize(&error)
+                    );
+                    state.in_flight.clear();
+                }
             }
         }
         changed = true;
     }
 
     changed |= drive_withdrawals(operator, &mut state).await;
+    changed |= drive_residual_recoveries(operator, &mut state).await;
     changed |= prune(&mut state, now_ms());
     if changed {
         operator.save(&state).await?;
@@ -507,7 +700,7 @@ async fn drive(operator: &Arc<Operator>) -> Result<(), String> {
 }
 
 async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<(), String> {
-    let (witness, expected, commitment) = {
+    let (witness, expected, commitment, context) = {
         let state = operator.state.lock().await;
         let Some(entry) = state
             .in_flight
@@ -541,7 +734,24 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
                 entry.result.public.commitment,
             ),
         ));
-        (witness, expected, commitment)
+        let context = ProofJobContext {
+            statement_kind: ProofStatementKind::Transition,
+            transition_id: format!("transition:{commitment:#x}"),
+            epoch_id: Some(u64::from(entry.seq)),
+            exchange_address: format!("{:#x}", operator.config.exchange),
+            input_state_root: Some(format!(
+                "{:#x}",
+                from_core(entry.result.public.prior_book_root)
+            )),
+            expected_output_state_root: Some(format!(
+                "{:#x}",
+                from_core(entry.result.public.new_book_root)
+            )),
+            statement_commitment: format!("{commitment:#x}"),
+            witness_hash: canonical_witness_hash(&witness),
+            program_entrypoint: "compile_transition_proof".into(),
+        };
+        (witness, expected, commitment, context)
     };
 
     let operator = operator.clone();
@@ -557,6 +767,7 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
                     calldata,
                 )],
                 expected,
+                context,
             )
             .await;
         let mut state = operator.state.lock().await;
@@ -571,6 +782,12 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
                 eprintln!(
                     "transition {seq} proven in {}ms",
                     now_ms() - entry.built_at_ms
+                );
+            }
+            (Err(error), Some(_)) if is_retryable_proving_error(&error) => {
+                eprintln!(
+                    "transition {seq} proof job remains pending: {}",
+                    crate::snip36::sanitize(&error)
                 );
             }
             (Err(error), Some(_)) => {
@@ -652,6 +869,13 @@ async fn submit_transition(
     must_pay: bool,
 ) -> Result<(Felt, Vec<(Felt, bool)>), String> {
     let proof = transition.proof.as_ref().ok_or("transition has no proof")?;
+    if let Some(prepared) = transition.prepared_submission.clone() {
+        let hash = operator
+            .snip36
+            .submit_with_gas_durable(Vec::new(), None, None, Some(prepared), |_| async { Ok(()) })
+            .await?;
+        return Ok((hash, transition.prepared_legged.clone()));
+    }
     let settle = call(
         operator.config.exchange,
         "submit_transition",
@@ -670,23 +894,11 @@ async fn submit_transition(
                 simulation.reverted.unwrap_or_default()
             ));
         }
-        // a transition sent only for its legs is never sent without knowing they still pay.
-        Err(error) if must_pay => {
-            return Err(format!(
-                "transition {} was sent for its searcher legs and cannot be simulated: {}",
-                transition.seq,
-                crate::snip36::sanitize(&error)
-            ));
-        }
         Err(error) => {
-            eprintln!(
-                "transition {} cannot be simulated ({}); sending it alone",
+            return Err(format!(
+                "transition {} cannot be simulated and will not be submitted: {}",
                 transition.seq,
                 crate::snip36::sanitize(&error)
-            );
-            return Ok((
-                operator.snip36.submit(vec![settle], Some(proof)).await?,
-                Vec::new(),
             ));
         }
     };
@@ -822,9 +1034,26 @@ async fn submit_transition(
             }
         }
     }
+    let seq = transition.seq;
+    let commitment = from_core(transition.result.public.commitment);
+    let prepared_legged = legged.clone();
     let hash = operator
         .snip36
-        .submit_with_gas(calls, Some(proof), Some(gas))
+        .submit_with_gas_durable(calls, Some(proof), Some(gas), None, |prepared| async move {
+            let mut state = operator.state.lock().await;
+            let entry = state
+                .in_flight
+                .iter_mut()
+                .find(|entry| {
+                    entry.seq == seq
+                        && from_core(entry.result.public.commitment) == commitment
+                        && entry.stage == TransitionStage::Proven
+                })
+                .ok_or("the transition changed before its signed transaction was journaled")?;
+            entry.prepared_submission = Some(prepared);
+            entry.prepared_legged = prepared_legged;
+            operator.save(&state).await
+        })
         .await?;
     Ok((hash, legged))
 }
@@ -839,6 +1068,9 @@ struct PlannedLeg {
     /// the settlement transition's cost in the quote asset, which the one leg that funds it
     /// carries in its on-chain minimum profit.
     settlement_quote: u128,
+    /// the quote amount the router always diverts to the settlement account before paying the
+    /// searcher. this is configured onchain, so third-party fills fund settlement too.
+    external_support_quote: u128,
 }
 
 /// the profitable searcher legs for capacities, each net of its estimated gas, with the rates
@@ -881,7 +1113,7 @@ async fn external_legs(
             continue;
         };
         // gas in fri (strk atoms), priced in the pair's quote asset and rounded up.
-        let strk = operator.config.strk_asset;
+        let strk = operator.config.gas_fee_asset;
         let quote_asset = pair.quote_asset_id;
         let gas_cost = |gas: u64| {
             let fri = u128::from(gas).checked_mul(l2_price)?;
@@ -915,6 +1147,7 @@ async fn external_legs(
                     leg,
                     quote_asset,
                     settlement_quote,
+                    external_support_quote: pair.external_settlement_support_quote,
                 });
             }
             Ok(None) => {}
@@ -944,7 +1177,7 @@ fn price_leg(
     let config = &operator.config;
     let cost = crate::market::convert(
         rates,
-        config.strk_asset,
+        config.gas_fee_asset,
         leg.quote_asset,
         fee_fri,
         Round::Cost,
@@ -956,18 +1189,30 @@ fn price_leg(
     // leg's quote asset, rounded up.
     let opening = crate::market::convert(
         rates,
-        config.strk_asset,
+        config.gas_fee_asset,
         leg.quote_asset,
         opening_fri,
         Round::Cost,
     );
-    let Some(support) = leg_support(opening, leg.settlement_quote, funds_settlement) else {
+    let Some(required_support) = leg_support(opening, leg.settlement_quote, funds_settlement)
+    else {
         return false;
     };
-    match realized_floor(leg.leg.gross_profit_quote, cost, support, margin) {
+    if leg.external_support_quote < required_support {
+        return false;
+    }
+    match realized_floor(
+        leg.leg.gross_profit_quote,
+        cost,
+        leg.external_support_quote,
+        margin,
+    ) {
         Some(floor) => {
-            raise_min_profit(&mut leg.leg.call, floor);
-            leg.leg.outcome_support = support;
+            let Some(searcher_floor) = floor.checked_sub(leg.external_support_quote) else {
+                return false;
+            };
+            raise_min_profit(&mut leg.leg.call, searcher_floor);
+            leg.leg.outcome_support = leg.external_support_quote;
             true
         }
         None => false,
@@ -975,9 +1220,15 @@ fn price_leg(
 }
 
 /// what a leg pays for beyond its own gas and margin: the transition sent only for it (`opening`,
-/// zero otherwise) and, when it is the fill that funds it, the settlement transition.
+/// zero otherwise) and, when it funds the outcome, both settlement and a possible capacity
+/// freeze. an expired window avoids the freeze, but charging the bound keeps external execution
+/// from becoming a protocol subsidy in the conflicting-order case.
 fn leg_support(opening: Option<u128>, settlement: u128, funds_settlement: bool) -> Option<u128> {
-    opening?.checked_add(if funds_settlement { settlement } else { 0 })
+    opening?.checked_add(if funds_settlement {
+        settlement.checked_mul(2)?
+    } else {
+        0
+    })
 }
 
 /// the on-chain minimum profit a leg needs to cover its realized fee, the settlement transition
@@ -1338,6 +1589,8 @@ struct Frontier {
     consumed_cancels: BTreeSet<String>,
     consumed_capacities: Vec<OpenCapacity>,
     spent_nullifiers: BTreeSet<[u8; 32]>,
+    recovered_residuals: BTreeSet<String>,
+    pending_residual_recoveries: BTreeMap<String, PendingResidualRecovery>,
 }
 
 fn frontier(state: &OperatorState) -> Frontier {
@@ -1349,6 +1602,8 @@ fn frontier(state: &OperatorState) -> Frontier {
         consumed_cancels: BTreeSet::new(),
         consumed_capacities: Vec::new(),
         spent_nullifiers: BTreeSet::new(),
+        recovered_residuals: state.recovered_residuals.keys().cloned().collect(),
+        pending_residual_recoveries: state.pending_residual_recoveries.clone(),
     };
     for in_flight in &state.in_flight {
         frontier.seq = in_flight.seq + 1;
@@ -1428,22 +1683,73 @@ fn stale_pending(
 async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), String> {
     operator.running()?;
     let policy = &operator.config.policy;
+    if !scheduled_epoch_close(close_ms, policy.epoch_ms) {
+        return Err("the scheduled close is not aligned to the epoch".into());
+    }
+    let _closing_epoch = ClosingEpoch::begin(operator, close_ms)?;
+    let (prepared_seq, open_capacities) = {
+        let state = operator.state.lock().await;
+        if state.in_flight.len() >= policy.pipeline_depth {
+            return Ok(());
+        }
+        let frontier = frontier(&state);
+        let open_capacities = state
+            .capacities
+            .iter()
+            .filter(|capacity| {
+                !frontier
+                    .consumed_capacities
+                    .iter()
+                    .any(|consumed| consumed.same(capacity))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        (frontier.seq, open_capacities)
+    };
+    let pairs = operator.config.pairs.clone();
+    // establish the external cutoff before sampling. all orders accepted until the aligned
+    // boundary are still included when the private state snapshot is taken below.
+    let capacity_views = freeze_capacities(operator, &open_capacities).await?;
+    let attestations = operator.market.attest_batch(&pairs).await?;
+    if !reference_windows_cover_close(
+        attestations
+            .iter()
+            .map(|attestation| (attestation.observed_at_ms, attestation.valid_until_ms)),
+        close_ms,
+    ) {
+        return Err("the authenticated midpoint does not cover the scheduled epoch close".into());
+    }
+    let now = now_ms();
+    if now > close_ms {
+        return Err("epoch preparation missed the scheduled close".into());
+    }
+    sleep(Duration::from_millis(close_ms - now)).await;
+
     let (frontier, pending, cancels, open_capacities, note_root, memberships) = {
         let state = operator.state.lock().await;
         if state.in_flight.len() >= policy.pipeline_depth {
             return Ok(());
         }
         let frontier = frontier(&state);
+        if frontier.seq != prepared_seq {
+            return Ok(());
+        }
         let pending = state
             .pending_orders
             .iter()
-            .filter(|(order_id, _)| !frontier.consumed_orders.contains(*order_id))
+            .filter(|(order_id, order)| {
+                !frontier.consumed_orders.contains(*order_id)
+                    && eligible_before_close(order.received_at_ms, close_ms)
+            })
             .map(|(_, order)| order.clone())
             .collect::<Vec<_>>();
         let cancels = state
             .cancellations
             .iter()
-            .filter(|(order_id, _)| !frontier.consumed_cancels.contains(*order_id))
+            .filter(|(order_id, (_, received_at_ms))| {
+                !frontier.consumed_cancels.contains(*order_id)
+                    && eligible_before_close(*received_at_ms, close_ms)
+            })
             .map(|(_, cancel)| cancel.clone())
             .collect::<Vec<_>>();
         let open_capacities = state
@@ -1475,6 +1781,15 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             memberships,
         )
     };
+    if open_capacities.len() != capacity_views.len()
+        || open_capacities.iter().any(|capacity| {
+            !capacity_views
+                .iter()
+                .any(|(prepared, _)| prepared.same(capacity))
+        })
+    {
+        return Ok(());
+    }
 
     // the markets this close touches: every pair with a resting order, a new order or an
     // outcome to settle.
@@ -1501,17 +1816,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
     // every active epoch authenticates the full enabled market set. this makes the direct
     // asset/usdc observations used by the objective part of the same batch as every direct
     // execution midpoint, without changing any market's execution price.
-    let pairs = operator.config.pairs.clone();
-    // the cutoff must land before prices are sampled and before the auction witness is built.
-    // this returns the canonical post-freeze totals; uncommitted remainders are released by the
-    // outcome at the start of the transition, before the global internal clearing.
-    let capacity_views = freeze_capacities(operator, &open_capacities).await?;
-    let attestations = operator.market.attest_batch(&pairs).await?;
-    let close_time_ms = attestations
-        .iter()
-        .map(|attestation| attestation.observed_at_ms)
-        .max()
-        .unwrap_or(close_ms);
+    let close_time_ms = close_ms;
     if close_time_ms <= frontier.close_after_ms {
         return Err("the midpoints are not newer than the previous close".into());
     }
@@ -1555,6 +1860,42 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
                 view.scale,
             ));
             applied_capacities.push(capacity.clone());
+        }
+    }
+
+    // accepted permissionless residual exits retire after their request cutoff. the proof
+    // authenticates the exact book authority, while the contract requires the matching pending
+    // request or a finalized nullifier, so this cleanup cannot remove a live order.
+    let mut recovered_order_ids = Vec::new();
+    for entry in &frontier.book {
+        let Some(market) = markets
+            .iter()
+            .find(|market| market.pair_id == entry.order.pair_id)
+        else {
+            continue;
+        };
+        let input_asset = if entry.order.sell {
+            market.base_asset_id
+        } else {
+            market.quote_asset_id
+        };
+        let note = ResidualNote::from_order(
+            operator.config.chain_context(),
+            input_asset,
+            &entry.order,
+            &entry.owner,
+            entry.order.residual_generation,
+        );
+        if note.matches_order(&entry.order)
+            && (frontier
+                .recovered_residuals
+                .contains(&key(&from_core(note.nullifier())))
+                || frontier
+                    .pending_residual_recoveries
+                    .get(&key(&from_core(note.nullifier())))
+                    .is_some_and(|recovery| close_time_ms > recovery.requested_at_ms))
+        {
+            recovered_order_ids.push(entry.order.order_id);
         }
     }
 
@@ -1651,15 +1992,14 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
         } else {
             to_core(note_root)
         },
-        objective_numeraire_asset_id: to_core(operator.config.usdc_asset),
+        objective_numeraire_asset_id: to_core(operator.config.objective_numeraire_asset),
         markets,
         book: frontier.book.clone(),
         new_orders,
         cancellations,
+        recovered_order_ids,
         outcomes,
-        padding_seed: starknet_crypto::Felt::from(rand_core::RngCore::next_u64(
-            &mut rand_core::OsRng,
-        )) + starknet_crypto::Felt::from(close_ms),
+        padding_seed: private_padding_seed(),
     };
     // a transition must prove in one snip-36 transaction: past the step budget, the newest
     // admissions wait for a later close.
@@ -1690,8 +2030,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             input.note_root = starknet_crypto::Felt::ZERO;
         }
     };
-    let Some(for_legs) = worth_sending(operator, &input, &result, &cancels, &open_capacities).await
-    else {
+    let Some(for_legs) = worth_sending(operator, &input, &result, &cancels).await else {
         return Ok(());
     };
 
@@ -1722,17 +2061,35 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
         if frontier.seq != self::frontier(&state).seq {
             return Ok(());
         }
-        // a cancellation can arrive while membership/nullifier reads and clearing run. never
-        // persist an admission whose immutable id has since been tombstoned or scheduled for
-        // cancellation; the next epoch rebuilds from the durable request state.
+        // a cancellation timestamped before this close wins even if it arrived while the build
+        // ran. a request after the cutoff applies only to a later epoch.
         let pending_cancel_won = admitted.iter().any(|order_id| {
-            state.cancelled_orders.contains_key(&key(order_id))
-                || state.cancellations.contains_key(&key(order_id))
+            state
+                .cancelled_orders
+                .get(&key(order_id))
+                .is_some_and(|cancel| eligible_before_close(cancel.cancelled_at_ms, close_time_ms))
+                || state
+                    .cancellations
+                    .get(&key(order_id))
+                    .is_some_and(|(_, received_at_ms)| {
+                        eligible_before_close(*received_at_ms, close_time_ms)
+                    })
         });
-        let live_cancel_won = state.cancellations.keys().any(|order_id| {
-            transition_orders.contains(order_id) && !snapshot_cancellations.contains(order_id)
+        let live_cancel_won = state
+            .cancellations
+            .iter()
+            .any(|(order_id, (_, received_at_ms))| {
+                transition_orders.contains(order_id)
+                    && !snapshot_cancellations.contains(order_id)
+                    && eligible_before_close(*received_at_ms, close_time_ms)
+            });
+        let residual_recovery_won = result.public.nullifiers.iter().any(|nullifier| {
+            state
+                .pending_residual_recoveries
+                .get(&key(&from_core(*nullifier)))
+                .is_some_and(|recovery| close_time_ms > recovery.requested_at_ms)
         });
-        if pending_cancel_won || live_cancel_won {
+        if pending_cancel_won || live_cancel_won || residual_recovery_won {
             return Ok(());
         }
         state.in_flight.push(InFlight {
@@ -1745,6 +2102,8 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             applied_capacities,
             stage: TransitionStage::Proving,
             proof: None,
+            prepared_submission: None,
+            prepared_legged: Vec::new(),
             built_at_ms: now_ms(),
             with_leg: false,
             legged: Vec::new(),
@@ -1763,16 +2122,14 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
 /// valued in strk at the attested midpoints, cover it; when a fill's settlement was funded by
 /// that fill; when a cancellation or an expiry has waited long enough; or when the searcher legs
 /// its reservations enable are expected to pay for it and for the transition that settles them.
-/// a crossing, or a fill no leg of ours funded, that does not pay waits, since orders persist,
-/// until more volume joins it or it has waited the longest a user should, after which the fee
-/// reserve covers it. an unfilled reservation never forces a transition: its release rides on
-/// the next one sent.
+/// an uneconomic internal crossing waits only to the configured liveness bound, after which the
+/// fee reserve covers it. every external fill carries on-chain settlement support. an unfilled
+/// reservation forces nothing; its release rides on the next transition sent.
 async fn worth_sending(
     operator: &Operator,
     input: &TransitionInput,
     result: &TransitionResult,
     cancels: &[(zylith_core::exchange::CancelRequest, u64)],
-    capacities: &[OpenCapacity],
 ) -> Option<bool> {
     let policy = &operator.config.policy;
     let now = now_ms();
@@ -1783,11 +2140,15 @@ async fn worth_sending(
         .reports
         .iter()
         .any(|report| report.removal == Some(zylith_core::exchange::Removal::Expired));
-    let (funded_fill, unfunded_fill) = fill_funding(&input.outcomes, capacities);
+    let forced_recovery = result
+        .reports
+        .iter()
+        .any(|report| report.removal == Some(zylith_core::exchange::Removal::Recovered));
+    let funded_fill = fill_funding(&input.outcomes);
     let crossing = result.reports.iter().any(|report| report.fill_base != 0);
     let reserving = !result.public.capacities.is_empty();
-    let forced = forced_cancel || forced_expiry || funded_fill;
-    let pays = (crossing || unfunded_fill) && fees_cover_cost(operator, result, 0, 1).await;
+    let forced = forced_cancel || forced_expiry || forced_recovery || funded_fill;
+    let pays = crossing && fees_cover_cost(operator, result, 0, 1).await;
     // sent only for its searcher legs: their expected profit must pay for this transition and
     // for the one that later settles their fills.
     let for_legs = !forced
@@ -1797,12 +2158,12 @@ async fn worth_sending(
             operator,
             result,
             expected_leg_value(operator, input.seq, result).await,
-            2,
+            3,
         )
         .await;
 
     let mut state = operator.state.lock().await;
-    if pays || forced || for_legs || !(crossing || unfunded_fill) {
+    if pays || forced || for_legs || !crossing {
         state.uneconomic_since_ms = None;
         return (pays || forced || for_legs).then_some(for_legs);
     }
@@ -1810,7 +2171,7 @@ async fn worth_sending(
     let covered = now.saturating_sub(since) >= policy.uneconomic_max_wait_ms;
     if covered {
         eprintln!(
-            "an uneconomic crossing or fill waited {} ms; the fee reserve covers it",
+            "an uneconomic internal crossing waited {} ms; the fee reserve covers it",
             now - since
         );
         state.uneconomic_since_ms = None;
@@ -1818,27 +2179,12 @@ async fn worth_sending(
     covered.then_some(false)
 }
 
-/// whether the outcomes settle a fill whose settlement a leg of ours funded, and whether they
-/// settle a fill nobody funded (a third-party searcher's, say).
-fn fill_funding(outcomes: &[ChainOutcome], capacities: &[OpenCapacity]) -> (bool, bool) {
-    let filled = outcomes
-        .iter()
-        .filter(|outcome| outcome.consumed_base != 0)
-        .collect::<Vec<_>>();
-    let funded = filled.iter().any(|outcome| {
-        capacities.iter().any(|capacity| {
-            capacity.seq == outcome.seq
-                && to_core(capacity.pair_id) == outcome.pair_id
-                && capacity.sell == outcome.sell
-                && capacity.outcome_funded
-        })
-    });
-    (funded, !funded && !filled.is_empty())
+/// whether the outcomes settle any external fill. the router diverts the market's configured
+/// support to the settlement account for every fill, including fills submitted by third parties.
+fn fill_funding(outcomes: &[ChainOutcome]) -> bool {
+    outcomes.iter().any(|outcome| outcome.consumed_base != 0)
 }
 
-/// whether the transition's fee notes, valued in strk at attested rates less a haircut, cover
-/// the gas a transition costs times the cover ratio, and never less than the configured floor.
-/// a fee note whose asset has no rate right now is worth nothing.
 /// what the searcher legs for a transition's capacities are expected to earn, in strk, net of
 /// their own gas: priced now, at a fresh m1 and ekubo's current routes.
 async fn expected_leg_value(operator: &Operator, seq: u32, result: &TransitionResult) -> u128 {
@@ -1860,6 +2206,9 @@ async fn expected_leg_value(operator: &Operator, seq: u32, result: &TransitionRe
         .fold(0, u128::saturating_add)
 }
 
+/// whether the transition's fee notes, valued in strk at attested rates less a haircut, cover
+/// the gas a transition costs times the cover ratio, and never less than the configured floor.
+/// a fee note whose asset has no rate right now is worth nothing.
 async fn fees_cover_cost(
     operator: &Operator,
     result: &TransitionResult,
@@ -1887,7 +2236,7 @@ async fn fees_cover_cost(
     fees_cover(
         fees,
         &rates,
-        config.strk_asset,
+        config.gas_fee_asset,
         gas,
         l2_price,
         config.fee_cover_percent,
@@ -2054,6 +2403,65 @@ async fn drive_withdrawals(operator: &Arc<Operator>, state: &mut OperatorState) 
     changed
 }
 
+/// finalizes accepted residual exits after their delay so an offline user still receives funds.
+async fn drive_residual_recoveries(operator: &Arc<Operator>, state: &mut OperatorState) -> bool {
+    let now = now_ms();
+    let recoveries = state
+        .pending_residual_recoveries
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for recovery in recoveries {
+        let Ok(nullifier_state) = operator.chain().nullifier_state(recovery.nullifier).await else {
+            continue;
+        };
+        if nullifier_state != NULLIFIER_EXIT_PENDING || now < recovery.matures_at_ms {
+            continue;
+        }
+        let mut transaction = recovery.finalization_transaction;
+        if let Some(transaction_hash) = transaction {
+            match operator.snip36.receipt(transaction_hash).await {
+                Some(Outcome::Accepted { .. }) => continue,
+                Some(Outcome::Reverted { .. }) => transaction = None,
+                None if now.saturating_sub(recovery.updated_at_ms) >= 60_000 => {
+                    transaction = None;
+                }
+                None => continue,
+            }
+        }
+        if transaction.is_none() && now.saturating_sub(recovery.updated_at_ms) >= 5_000 {
+            match operator
+                .snip36
+                .submit(
+                    vec![call(
+                        operator.config.exchange,
+                        "finalize_residual_recovery",
+                        vec![recovery.nullifier],
+                    )],
+                    None,
+                )
+                .await
+            {
+                Ok(transaction_hash) => transaction = Some(transaction_hash),
+                Err(error) => eprintln!(
+                    "residual recovery finalization failed: {}",
+                    crate::snip36::sanitize(&error)
+                ),
+            }
+            if let Some(entry) = state
+                .pending_residual_recoveries
+                .get_mut(&key(&recovery.nullifier))
+            {
+                entry.finalization_transaction = transaction;
+                entry.updated_at_ms = now;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 async fn pending_exit_maturity_ms(operator: &Operator, job: &WithdrawalJob) -> Result<u64, String> {
     let exit = operator.chain().pending_exit(job.nullifier).await?;
     if exit.asset_id != from_core(job.request.note.asset_id)
@@ -2109,6 +2517,7 @@ pub async fn start_withdrawal(
             request,
             nullifier,
             stage: WithdrawalStage::Proving,
+            prepared_submission: None,
             updated_at_ms: now_ms(),
         },
     );
@@ -2129,20 +2538,51 @@ fn start_proving(operator: &Arc<Operator>, state: &OperatorState, job: &Withdraw
     }
     let request = job.request.clone();
     let nullifier = job.nullifier;
+    let prepared_submission = job.prepared_submission.clone();
     let membership = state
         .notes
         .membership(from_core(request.note.output_leaf()));
     let note_root = state.notes.root();
     let operator = operator.clone();
     tokio::spawn(async move {
-        let stage = prove_and_request(&operator, request, nullifier, membership, note_root)
-            .await
-            .unwrap_or_else(|reason| WithdrawalStage::Failed {
-                reason: crate::snip36::sanitize(&reason),
-            });
+        let outcome = prove_and_request(
+            &operator,
+            request,
+            nullifier,
+            membership,
+            note_root,
+            prepared_submission,
+        )
+        .await;
         let mut state = operator.state.lock().await;
         if let Some(job) = state.withdrawals.get_mut(&job_key) {
+            let (stage, retain_prepared) = match outcome {
+                Ok(stage) => (stage, false),
+                Err((reason, true)) => {
+                    eprintln!(
+                        "withdrawal submission remains pending: {}",
+                        crate::snip36::sanitize(&reason)
+                    );
+                    (WithdrawalStage::Proving, true)
+                }
+                Err((reason, false)) if is_retryable_proving_error(&reason) => {
+                    eprintln!(
+                        "withdrawal proof job remains pending: {}",
+                        crate::snip36::sanitize(&reason)
+                    );
+                    (WithdrawalStage::Proving, false)
+                }
+                Err((reason, false)) => (
+                    WithdrawalStage::Failed {
+                        reason: crate::snip36::sanitize(&reason),
+                    },
+                    false,
+                ),
+            };
             job.stage = stage;
+            if !retain_prepared {
+                job.prepared_submission = None;
+            }
             job.updated_at_ms = now_ms();
         }
         // a failed write halts the operator; the job resumes from its durable stage.
@@ -2157,25 +2597,34 @@ fn start_proving(operator: &Arc<Operator>, state: &OperatorState, job: &Withdraw
 }
 
 async fn prove_and_request(
-    operator: &Operator,
+    operator: &Arc<Operator>,
     request: zylith_core::exchange::WithdrawRequest,
     nullifier: Felt,
     membership: Option<zylith_core::exchange::NoteMembership>,
     note_root: Felt,
-) -> Result<WithdrawalStage, String> {
+    prepared_submission: Option<crate::snip36::PreparedSubmission>,
+) -> Result<WithdrawalStage, (String, bool)> {
     // a job resumed after a restart may already have landed.
-    match operator.chain().nullifier_state(nullifier).await? {
+    match operator
+        .chain()
+        .nullifier_state(nullifier)
+        .await
+        .map_err(|error| (error, prepared_submission.is_some()))?
+    {
         NULLIFIER_UNUSED => {}
         NULLIFIER_EXIT_PENDING => {
             let job = WithdrawalJob {
                 request,
                 nullifier,
                 stage: WithdrawalStage::Proving,
+                prepared_submission: None,
                 updated_at_ms: now_ms(),
             };
             return Ok(WithdrawalStage::Requested {
                 transaction_hash: Felt::ZERO,
-                matures_at_ms: pending_exit_maturity_ms(operator, &job).await?,
+                matures_at_ms: pending_exit_maturity_ms(operator, &job)
+                    .await
+                    .map_err(|error| (error, true))?,
             });
         }
         NULLIFIER_EXITED => {
@@ -2183,7 +2632,15 @@ async fn prove_and_request(
                 transaction_hash: Felt::ZERO,
             });
         }
-        _ => return Err("the note is already spent".into()),
+        _ => return Err(("the note is already spent".into(), false)),
+    }
+    if let Some(prepared) = prepared_submission {
+        let transaction_hash = operator
+            .snip36
+            .submit_with_gas_durable(Vec::new(), None, None, Some(prepared), |_| async { Ok(()) })
+            .await
+            .map_err(|error| (error, true))?;
+        return settle_withdrawal_request(operator, request, nullifier, transaction_hash).await;
     }
     let (public, witness) = build_withdrawal(&WithdrawalInput {
         chain_context: operator.config.chain_context(),
@@ -2191,10 +2648,11 @@ async fn prove_and_request(
         exit_commitment: request.exit_commitment,
         exit_authority: request.exit_authority,
         note: request.note.clone(),
-        membership: membership.ok_or("the note is not on chain yet")?,
+        membership: membership
+            .ok_or_else(|| ("the note is not on chain yet".to_string(), false))?,
         authorization: request.authorization,
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| (error.to_string(), false))?;
     let expected = from_core(proof_message_hash(
         to_core(operator.config.proof_program),
         WITHDRAWAL_MESSAGE_DOMAIN,
@@ -2204,8 +2662,20 @@ async fn prove_and_request(
             public.commitment,
         ),
     ));
+    let witness = witness.into_iter().map(from_core).collect::<Vec<_>>();
+    let context = ProofJobContext {
+        statement_kind: ProofStatementKind::Withdrawal,
+        transition_id: format!("withdrawal:{:#x}", from_core(public.commitment)),
+        epoch_id: None,
+        exchange_address: format!("{:#x}", operator.config.exchange),
+        input_state_root: Some(format!("{note_root:#x}")),
+        expected_output_state_root: None,
+        statement_commitment: format!("{:#x}", from_core(public.commitment)),
+        witness_hash: canonical_witness_hash(&witness),
+        program_entrypoint: "compile_withdrawal_proof".into(),
+    };
     let mut calldata = vec![operator.config.exchange, Felt::from(witness.len() as u64)];
-    calldata.extend(witness.into_iter().map(from_core));
+    calldata.extend(witness);
     let proof = operator
         .snip36
         .prove(
@@ -2215,38 +2685,84 @@ async fn prove_and_request(
                 calldata,
             )],
             expected,
+            context,
         )
-        .await?;
+        .await
+        .map_err(|error| (error, false))?;
     let request_calldata = withdrawal_calldata(&public)
         .into_iter()
         .map(from_core)
         .collect();
+    let calls = vec![call(
+        operator.config.exchange,
+        "request_withdrawal",
+        request_calldata,
+    )];
+    let simulation = operator
+        .snip36
+        .simulate(calls.clone(), Some(&proof))
+        .await
+        .map_err(|error| (error, false))?;
+    if let Some(reason) = simulation.reverted {
+        return Err((
+            format!("withdrawal proof simulation reverted: {reason}"),
+            false,
+        ));
+    }
+    let durable_operator = operator.clone();
+    let durable_key = key(&nullifier);
     let transaction_hash = operator
         .snip36
-        .submit(
-            vec![call(
-                operator.config.exchange,
-                "request_withdrawal",
-                request_calldata,
-            )],
+        .submit_with_gas_durable(
+            calls,
             Some(&proof),
+            Some(simulation.l2_gas),
+            None,
+            move |prepared| async move {
+                let mut state = durable_operator.state.lock().await;
+                let job = state
+                    .withdrawals
+                    .get_mut(&durable_key)
+                    .ok_or_else(|| "withdrawal job disappeared before submission".to_string())?;
+                if !matches!(job.stage, WithdrawalStage::Proving) {
+                    return Err("withdrawal job changed before submission".into());
+                }
+                job.prepared_submission = Some(prepared);
+                job.updated_at_ms = now_ms();
+                durable_operator.save(&state).await
+            },
         )
-        .await?;
+        .await
+        .map_err(|error| (error, true))?;
+    settle_withdrawal_request(operator, request, nullifier, transaction_hash).await
+}
+
+async fn settle_withdrawal_request(
+    operator: &Operator,
+    request: zylith_core::exchange::WithdrawRequest,
+    nullifier: Felt,
+    transaction_hash: Felt,
+) -> Result<WithdrawalStage, (String, bool)> {
     match operator.snip36.wait(transaction_hash).await {
         Some(Outcome::Accepted { .. }) => {
             let job = WithdrawalJob {
                 request,
                 nullifier,
                 stage: WithdrawalStage::Proving,
+                prepared_submission: None,
                 updated_at_ms: now_ms(),
             };
             Ok(WithdrawalStage::Requested {
                 transaction_hash,
-                matures_at_ms: pending_exit_maturity_ms(operator, &job).await?,
+                matures_at_ms: pending_exit_maturity_ms(operator, &job)
+                    .await
+                    .map_err(|error| (error, true))?,
             })
         }
-        Some(Outcome::Reverted { reason }) => Err(format!("withdrawal reverted: {reason}")),
-        None => Err("withdrawal was not included".to_string()),
+        Some(Outcome::Reverted { reason }) => {
+            Err((format!("withdrawal reverted: {reason}"), false))
+        }
+        None => Err(("withdrawal was not included".to_string(), true)),
     }
 }
 
@@ -2257,6 +2773,24 @@ mod tests {
 
     use super::*;
     use crate::state::PendingOrder;
+
+    #[test]
+    fn scheduled_closes_and_reference_windows_are_exact() {
+        assert!(scheduled_epoch_close(12_000, 6_000));
+        assert!(!scheduled_epoch_close(12_001, 6_000));
+        assert!(!scheduled_epoch_close(12_000, 0));
+        assert!(eligible_before_close(11_999, 12_000));
+        assert!(!eligible_before_close(12_000, 12_000));
+        assert!(!eligible_before_close(12_001, 12_000));
+        assert!(reference_windows_cover_close([(11_999, 12_001)], 12_000));
+        assert!(reference_windows_cover_close([(12_000, 12_000)], 12_000));
+        assert!(!reference_windows_cover_close([(12_001, 13_000)], 12_000));
+        assert!(!reference_windows_cover_close([(11_000, 11_999)], 12_000));
+        assert!(!reference_windows_cover_close(
+            [(11_000, 13_000), (12_001, 13_000)],
+            12_000,
+        ));
+    }
 
     #[test]
     fn fees_cover_only_what_they_are_worth_in_strk() {
@@ -2345,7 +2879,7 @@ mod tests {
         state.pending_orders.insert(
             key(&order_id),
             PendingOrder {
-                request,
+                request: request.clone(),
                 received_at_ms: 0,
             },
         );
@@ -2361,6 +2895,8 @@ mod tests {
                 transaction_hash: Felt::ONE,
             },
             proof: None,
+            prepared_submission: None,
+            prepared_legged: Vec::new(),
             built_at_ms: 0,
             with_leg: false,
             legged: Vec::new(),
@@ -2370,6 +2906,23 @@ mod tests {
         state.in_flight.push(landed.clone());
         assert_eq!(frontier(&state).seq, 2);
         assert!(frontier(&state).consumed_orders.contains(&key(&order_id)));
+        state.cancellations.insert(
+            key(&order_id),
+            (
+                CancelRequest {
+                    order_id: request.order_id(),
+                    signature: sign_message(
+                        &seller.cancel_key,
+                        &cancel_message(Felt::from(CHAIN), request.order_id()),
+                    )
+                    .unwrap(),
+                },
+                10_002,
+            ),
+        );
+        assert!(!settle_pending_cancellations(&mut state, None));
+        assert!(state.pending_orders.contains_key(&key(&order_id)));
+        state.cancellations.clear();
 
         state.in_flight.clear();
         let capacity = &result.public.capacities[0];
@@ -2477,39 +3030,24 @@ mod tests {
 
     #[test]
     fn a_legs_floor_pays_for_what_it_was_sent_for() {
-        // the first leg of a transition sent only for its legs pays for that transition and for
-        // the settlement; a later leg of the same transition pays for neither.
-        assert_eq!(leg_support(Some(30), 20, true), Some(50));
-        assert_eq!(leg_support(Some(0), 20, true), Some(20));
+        // the first leg of a transition sent only for its legs pays for that transition, the
+        // settlement and a possible freeze; a later leg pays for none of those shared costs.
+        assert_eq!(leg_support(Some(30), 20, true), Some(70));
+        assert_eq!(leg_support(Some(0), 20, true), Some(40));
         assert_eq!(leg_support(Some(0), 20, false), Some(0));
         // a fee that cannot be priced keeps the leg out.
         assert_eq!(leg_support(None, 20, true), None);
     }
 
     #[test]
-    fn only_fills_our_legs_funded_force_their_settlement() {
-        let capacity = |seq, funded| OpenCapacity {
-            seq,
-            pair_id: Felt::ONE,
-            sell: true,
-            opened_at_ms: 0,
-            leg_attempted: false,
-            leg_transaction: None,
-            leg_submissions: 0,
-            leg_retry_at_ms: 0,
-            window_closes_ms: 0,
-            outcome_funded: funded,
-        };
+    fn every_external_fill_funds_its_settlement() {
         let outcome = |seq, consumed_base| {
             ChainOutcome::from_capacity(seq, to_core(Felt::ONE), true, consumed_base, 5, 1, 1)
         };
-        let capacities = [capacity(1, true), capacity(2, false)];
-        assert_eq!(fill_funding(&[outcome(1, 3)], &capacities), (true, false));
-        // a fill no leg of ours funded (a third-party searcher's) waits for a paid transition.
-        assert_eq!(fill_funding(&[outcome(2, 3)], &capacities), (false, true));
+        assert!(fill_funding(&[outcome(1, 3)]));
         // an unfilled capacity forces nothing: its release rides on the next transition.
-        assert_eq!(fill_funding(&[outcome(2, 0)], &capacities), (false, false));
-        assert_eq!(fill_funding(&[], &capacities), (false, false));
+        assert!(!fill_funding(&[outcome(2, 0)]));
+        assert!(!fill_funding(&[]));
     }
 
     #[test]
@@ -2624,7 +3162,17 @@ mod tests {
                 7,
             ),
         );
-        assert!(settle_pending_cancellations(&mut state));
+        let pending_order = &state.pending_orders[&order_key];
+        assert!(protected_by_closing_epoch(pending_order, 7, Some(6)));
+        assert!(!protected_by_closing_epoch(pending_order, 5, Some(6)));
+        assert!(!protected_by_closing_epoch(pending_order, 7, None));
+        let mut at_boundary = pending_order.clone();
+        at_boundary.received_at_ms = 6;
+        assert!(!protected_by_closing_epoch(&at_boundary, 7, Some(6)));
+        assert!(!settle_pending_cancellations(&mut state, Some(6)));
+        assert!(state.pending_orders.contains_key(&order_key));
+        assert!(state.cancellations.contains_key(&order_key));
+        assert!(settle_pending_cancellations(&mut state, None));
         assert!(!state.pending_orders.contains_key(&order_key));
         assert!(!state.cancellations.contains_key(&order_key));
         let tombstone = &state.cancelled_orders[&order_key];

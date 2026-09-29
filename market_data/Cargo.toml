@@ -10,6 +10,7 @@ axum = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 ipnet = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }

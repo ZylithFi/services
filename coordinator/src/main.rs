@@ -5,6 +5,8 @@
 //! to the auth tag of its first upload, stored only as a verifier. records live in sqlite, one row per record, in the
 //! `coordinator_records` table earlier releases already use.
 
+mod proof_queue;
+
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::net::{IpAddr, SocketAddr};
@@ -478,9 +480,54 @@ fn build_state(
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let variable = |name: &str| env::var(name).ok().filter(|value| !value.trim().is_empty());
+    let required = |name: &str| variable(name).ok_or_else(|| format!("{name} is required"));
+    let number = |name: &str, default: u64| -> Result<u64, String> {
+        variable(name)
+            .map(|value| value.parse().map_err(|_| format!("{name} is invalid")))
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
     let store_path = PathBuf::from(
         variable("ZYLITH_COORDINATOR_RECOVERY_PATH").unwrap_or_else(|| DEFAULT_STORE_PATH.into()),
     );
+    let proof_database_path = PathBuf::from(
+        variable("ZYLITH_PROOF_QUEUE_DATABASE_PATH")
+            .unwrap_or_else(|| store_path.to_string_lossy().into_owned()),
+    );
+    let proof_artifact_directory = PathBuf::from(
+        variable("ZYLITH_PROOF_ARTIFACT_DIRECTORY")
+            .unwrap_or_else(|| "data/coordinator/proof-artifacts".into()),
+    );
+    let proof_key = hex::decode(required("ZYLITH_PROOF_ARTIFACT_KEY_HEX")?.trim())
+        .map_err(|_| "ZYLITH_PROOF_ARTIFACT_KEY_HEX is not hex".to_string())?;
+    let proof_key: [u8; 32] = proof_key
+        .try_into()
+        .map_err(|_| "ZYLITH_PROOF_ARTIFACT_KEY_HEX must be 32 bytes".to_string())?;
+    let grant_ttl_ms = number("ZYLITH_PROOF_WORKER_GRANT_TTL_MS", 5 * 60_000)?;
+    let session_ttl_ms = number("ZYLITH_PROOF_WORKER_SESSION_TTL_MS", 30 * 60_000)?;
+    let worker_max_lifetime_ms = number("ZYLITH_PROOF_WORKER_MAX_LIFETIME_MS", 4 * 60 * 60_000)?;
+    let lease_duration_ms = number("ZYLITH_PROOF_JOB_LEASE_MS", 60_000)?;
+    let proof_cleanup_interval_ms = number("ZYLITH_PROOF_JOB_CLEANUP_INTERVAL_MS", 60_000)?;
+    if proof_cleanup_interval_ms == 0 {
+        return Err("ZYLITH_PROOF_JOB_CLEANUP_INTERVAL_MS must be positive".into());
+    }
+    let proof_queue = proof_queue::ProofQueue::open(proof_queue::ProofQueueConfig {
+        database_path: proof_database_path,
+        artifact_directory: proof_artifact_directory,
+        data_key: proof_key,
+        control_token: required("ZYLITH_PROOF_QUEUE_CONTROL_TOKEN")?,
+        monitor_token: required("ZYLITH_PROOF_QUEUE_MONITOR_TOKEN")?,
+        registration_grant_ttl_ms: grant_ttl_ms,
+        session_ttl_ms,
+        worker_max_lifetime_ms,
+        lease_duration_ms,
+        max_request_bytes: number("ZYLITH_PROOF_JOB_MAX_REQUEST_BYTES", 64 * 1024 * 1024)?,
+        completed_retention_ms: number("ZYLITH_PROOF_JOB_COMPLETED_RETENTION_MS", 60 * 60_000)?,
+        abandoned_retention_ms: number(
+            "ZYLITH_PROOF_JOB_ABANDONED_RETENTION_MS",
+            7 * 24 * 60 * 60_000,
+        )?,
+    })?;
     let rate_limit = variable("ZYLITH_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE")
         .map(|value| {
             value
@@ -519,10 +566,24 @@ async fn main() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| format!("bind: {error}"))?;
-    eprintln!("zylith wallet backup service listening on http://{bind}");
+    eprintln!("zylith persistent control plane listening on http://{bind}");
+    let retention_queue = proof_queue.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(proof_cleanup_interval_ms));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = retention_queue.prune().await {
+                eprintln!("proof retention cleanup failed: {error}");
+            }
+        }
+    });
     axum::serve(
         listener,
-        app(state, origins, max_body_bytes).into_make_service_with_connect_info::<SocketAddr>(),
+        app(state, origins, max_body_bytes)
+            .merge(proof_queue::router(proof_queue))
+            .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
     .map_err(|error| format!("server: {error}"))

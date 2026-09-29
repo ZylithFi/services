@@ -1,14 +1,30 @@
 #!/usr/bin/env node
 // probes every running service and checks the invariants an operator watches: each service
 // answers, the indexer keeps up with the chain, and the operator's pipeline is not backed up.
+import { readFileSync } from "node:fs";
+
 const timeoutMs = Number(process.env.ZYLITH_MONITORING_DRILL_TIMEOUT_MS || 8_000);
 const maxIndexerLagMs = Number(process.env.ZYLITH_MONITORING_MAX_INDEXER_LAG_MS || 60_000);
 const maxIndexerSeqLag = Number(process.env.ZYLITH_MONITORING_MAX_INDEXER_SEQ_LAG || 1);
 const maxInFlight = Number(process.env.ZYLITH_MONITORING_MAX_IN_FLIGHT || 3);
+const maxProofPendingMs = Number(process.env.ZYLITH_MONITORING_MAX_PROOF_PENDING_MS || 120_000);
 const controlToken = process.env.ZYLITH_CONTROL_PLANE_TOKEN || "";
+const proofQueueMonitorToken = process.env.ZYLITH_PROOF_QUEUE_MONITOR_TOKEN || "";
 const trim = (value) => value.replace(/\/+$/, "");
 const failures = [];
 const observations = [];
+const manifestPath = process.env.ZYLITH_DEPLOYMENT_MANIFEST || "client/public/deployment.json";
+let expectedRegistry = null;
+try {
+  const document = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const manifest = document.manifest ?? document;
+  expectedRegistry = {
+    registry_version: manifest.market_registry.registry_version,
+    registry_hash: manifest.market_registry.registry_hash,
+  };
+} catch (error) {
+  failures.push(`deployment manifest is unreadable: ${error instanceof Error ? error.message : "error"}`);
+}
 const requiredHealthUrl = (name) => {
   const value = trim(process.env[name] || "");
   if (!value) failures.push(`${name} is required`);
@@ -24,20 +40,30 @@ const services = {
   privacyDiscoveryHealth: requiredHealthUrl("ZYLITH_PRIVACY_DISCOVERY_HEALTH_URL"),
   privacyProverHealth: requiredHealthUrl("ZYLITH_PRIVACY_PROVER_HEALTH_URL"),
 };
-const txProverHealthUrls = (process.env.ZYLITH_TX_PROVER_HEALTH_URLS || "").split(",").map(trim).filter(Boolean);
-if (txProverHealthUrls.length === 0) failures.push("ZYLITH_TX_PROVER_HEALTH_URLS is required");
+const proofQueueHealthUrl = requiredHealthUrl("ZYLITH_PROOF_QUEUE_HEALTH_URL");
 const routeHealthUrl = trim(process.env.ZYLITH_ROUTE_SERVICE_HEALTH_URL || "");
 if (process.env.ZYLITH_ROUTE_SERVICE_URL && !routeHealthUrl) failures.push("ZYLITH_ROUTE_SERVICE_HEALTH_URL is required when external routing is configured");
 
 const exchange = await json("operator exchange", `${services.operator}/api/public/exchange`);
 if (exchange) {
+  checkRegistryIdentity("operator", exchange);
   if (!(exchange.epoch_ms > 0)) failures.push("operator reports no epoch length");
   if (!Array.isArray(exchange.pairs) || exchange.pairs.length === 0) failures.push("operator trades no pairs");
   if (exchange.in_flight > maxInFlight) failures.push(`operator has ${exchange.in_flight} transitions in flight (max ${maxInFlight})`);
   observations.push(`seq ${exchange.seq}, ${exchange.in_flight} in flight`);
-  for (const pair of exchange.pairs ?? []) {
-    const price = await json(`reference price ${pair}`, `${services.operator}/api/public/reference-prices/${pair}`);
-    if (price && !(BigInt(price.midpoint) > 0n)) failures.push(`reference price for ${pair} is zero`);
+  const referenceBatch = await json("reference-price batch", `${services.operator}/api/public/reference-prices`);
+  if (referenceBatch) {
+    const prices = Array.isArray(referenceBatch.prices) ? referenceBatch.prices : [];
+    const expectedPairs = new Set(exchange.pairs ?? []);
+    const actualPairs = new Set(prices.map((price) => price.pair));
+    if (prices.length !== expectedPairs.size || actualPairs.size !== expectedPairs.size) {
+      failures.push("reference-price batch does not contain exactly the enabled pairs");
+    }
+    for (const pair of expectedPairs) {
+      const price = prices.find((candidate) => candidate.pair === pair);
+      if (!price) failures.push(`reference-price batch omits ${pair}`);
+      else if (!(BigInt(price.midpoint) > 0n)) failures.push(`reference price for ${pair} is zero`);
+    }
   }
 }
 if (controlToken) {
@@ -56,13 +82,26 @@ if (indexer) {
   observations.push(`indexer at seq ${indexer.latest_seq}, ${indexer.sync_lag_ms} ms lag`);
 }
 
-await text("attestor health", `${services.attestor}/health`);
+const attestor = await json("attestor health", `${services.attestor}/health`);
+if (attestor) checkRegistryIdentity("attestor", attestor);
 await text("backup service health", `${services.backup}/health`);
-await json("market data health", `${services.marketData}/market-data/health`);
-if (services.paymasterHealth) await json("paymaster health", services.paymasterHealth);
+const marketData = await json("market data health", `${services.marketData}/market-data/health`);
+if (marketData) checkRegistryIdentity("market data", marketData);
+if (services.paymasterHealth) {
+  const paymaster = await json("paymaster health", services.paymasterHealth);
+  if (paymaster) checkRegistryIdentity("paymaster", paymaster);
+}
 if (services.privacyDiscoveryHealth) await text("privacy discovery health", services.privacyDiscoveryHealth);
 if (services.privacyProverHealth) await text("privacy prover health", services.privacyProverHealth);
-for (const [index, url] of txProverHealthUrls.entries()) await text(`transaction prover ${index + 1} health`, url);
+if (proofQueueHealthUrl) {
+  const proofQueue = await json("proof queue health", proofQueueHealthUrl, { "x-zylith-proof-monitor-token": proofQueueMonitorToken });
+  if (proofQueue) {
+    if (proofQueue.pending_jobs > 0 && proofQueue.registered_workers === 0) failures.push("proof jobs are pending with no registered workers");
+    if (proofQueue.oldest_pending_age_ms > maxProofPendingMs) failures.push(`oldest proof job has waited ${proofQueue.oldest_pending_age_ms} ms (max ${maxProofPendingMs})`);
+    if (proofQueue.expired_active_jobs > 0) failures.push(`${proofQueue.expired_active_jobs} proof-job leases expired without being reclaimed`);
+    observations.push(`${proofQueue.pending_jobs} proof jobs pending, ${proofQueue.active_jobs} active, ${proofQueue.registered_workers} workers`);
+  }
+}
 if (routeHealthUrl) await text("external route service health", routeHealthUrl);
 
 for (const observation of observations) console.log(`observed: ${observation}`);
@@ -72,6 +111,16 @@ if (failures.length > 0) {
   process.exit(1);
 }
 console.log("monitoring drill passed");
+
+function checkRegistryIdentity(label, value) {
+  if (!expectedRegistry) return;
+  if (
+    value.registry_version !== expectedRegistry.registry_version ||
+    value.registry_hash !== expectedRegistry.registry_hash
+  ) {
+    failures.push(`${label} market registry identity differs from the deployment manifest`);
+  }
+}
 
 async function json(label, url, headers = {}) {
   const body = await text(label, url, headers);

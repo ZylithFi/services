@@ -12,7 +12,10 @@ import type {
 const MAX_OUTSIDE_EXECUTION_WINDOW_SECONDS = 3_900;
 const MAX_SIGNER_DEPLOYMENT_SPONSORSHIP_WINDOW_SECONDS = 600;
 const CANONICAL_PRIVACY_SIGNER_APPROVAL_LOW = "0xffffffffffffffffffffffffffffffff";
-const SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS = new Set(["apply_actions"]);
+const SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS = new Set([
+  "apply_actions",
+  "request_residual_recovery",
+]);
 const EXECUTE_OUTSIDE_REQUEST_KEYS = new Set([
   "chain_id",
   "signer_address",
@@ -333,7 +336,7 @@ function validateDirectRelayedCall(
   call: StarknetCallPayload,
   hasProof: boolean,
 ): void {
-  if (call.entrypoint === "apply_actions" && hasProof) {
+  if (SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS.has(call.entrypoint) && hasProof) {
     return;
   }
   throw new Error("direct paymaster relay requires proof facts for supported direct calls");

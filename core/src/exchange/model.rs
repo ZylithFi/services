@@ -27,10 +27,12 @@ pub const FEE_BPS_DENOMINATOR: u128 = 10_000;
 pub const MIN_OUTPUT_BUCKET: usize = 16;
 pub const MIN_NULLIFIER_BUCKET: usize = 8;
 pub const NOTE_ACCUMULATOR_DEPTH: usize = 32;
+pub const MAX_OUTPUT_SUBTREE_DEPTH: usize = 16;
 
 pub const OUTPUT_KIND_PROCEEDS: u64 = 1;
 pub const OUTPUT_KIND_REFUND: u64 = 2;
 pub const OUTPUT_KIND_FEE: u64 = 3;
+pub const OUTPUT_KIND_RESIDUAL: u64 = 4;
 
 /// the existing note, nullifier and output-note domains (sha-derived; see `hash::domain_felt`).
 pub const NOTE_COMMITMENT_DOMAIN_HEX: &str =
@@ -41,6 +43,7 @@ pub const OUTPUT_NOTE_LEAF_DOMAIN_HEX: &str =
     "0x0f0c89949c6cba4ac7f170f7f00809b458b997f2e394481c7ab58cc68aa49b3";
 pub const OUTPUT_NOTE_NODE_DOMAIN_HEX: &str =
     "0x03c6998f476a618431be1c1764a6724f13c0739be395bab4c1217bc0a65b2ee7";
+pub const RESIDUAL_NOTE_LEAF_DOMAIN: &str = "zylith_res_leaf_v1";
 pub const NOTE_ACCUMULATOR_LEAF_DOMAIN_HEX: &str =
     "0x7a796c6974685f6e6f74655f6163635f6c6561665f7631";
 pub const NOTE_ACCUMULATOR_NODE_DOMAIN_HEX: &str =
@@ -56,10 +59,13 @@ pub const M0_DOMAIN: &str = "zylith_m0_v1";
 pub const OUTCOMES_DOMAIN: &str = "zylith_outcomes_v1";
 pub const CAPACITY_DOMAIN: &str = "zylith_capacity_v1";
 pub const NULLIFIERS_DOMAIN: &str = "zylith_nullifiers_v1";
+pub const RETIRED_NULLIFIERS_DOMAIN: &str = "zylith_retired_v1";
 pub const OUTPUTS_DOMAIN: &str = "zylith_outputs_v1";
 pub const OUTPUT_BLINDING_DOMAIN: &str = "zylith_out_blind_v1";
+pub const OUTPUT_AUX_BLINDING_DOMAIN: &str = "zylith_out_aux_v1";
 pub const TRANSITION_DOMAIN: &str = "zylith_transition_v1";
 pub const PADDING_DOMAIN: &str = "zylith_pad_v1";
+pub const RESIDUAL_NOTE_DOMAIN: &str = "zylith_residual_v1";
 pub const WITHDRAW_AUTH_DOMAIN: &str = "zylith_withdraw_v2";
 pub const WITHDRAWAL_DOMAIN: &str = "zylith_withdrawal_v2";
 
@@ -336,12 +342,22 @@ pub struct BookOrder {
     /// base amount reserved for the external leg of transition `reserved_seq`.
     #[serde(with = "u128_decimal_serde")]
     pub reserved: u128,
+    /// base reserved before this order in its aggregate capacity. this makes the capacity's
+    /// deterministic greedy allocation independently recoverable from public aggregate totals.
+    #[serde(with = "u128_decimal_serde")]
+    pub reserved_offset: u128,
     pub reserved_seq: u32,
     pub expiry_ms: u64,
     #[serde(with = "felt_hex_serde")]
     pub owner_digest: Felt,
     #[serde(with = "felt_hex_serde")]
     pub order_id: Felt,
+    /// commitment of the latest shielded residual authority. zero exists only transiently while
+    /// a newly admitted order is being evaluated inside its first atomic transition.
+    #[serde(with = "felt_hex_serde")]
+    pub residual_commitment: Felt,
+    /// transition sequence that created the latest residual authority.
+    pub residual_generation: u32,
 }
 
 impl BookOrder {
@@ -354,15 +370,18 @@ impl BookOrder {
             limit: terms.limit,
             funding,
             reserved: 0,
+            reserved_offset: 0,
             reserved_seq: 0,
             expiry_ms: terms.expiry_ms,
             owner_digest: terms.owner.digest(),
             order_id: terms.order_id(),
+            residual_commitment: Felt::ZERO,
+            residual_generation: 0,
         }
     }
 
-    /// `(pair_id, p1, p2, p3, d, order_id)`, the six felts the book sponge absorbs.
-    pub fn leaf_fields(&self) -> [Felt; 6] {
+    /// the nine felts the authenticated book absorbs for one live order.
+    pub fn leaf_fields(&self) -> [Felt; 9] {
         let flags = felt_u64(u64::from(self.sell) + 2 * u64::from(self.external));
         [
             self.pair_id,
@@ -373,6 +392,9 @@ impl BookOrder {
                 + felt_u64(self.expiry_ms) * two_pow(160),
             self.owner_digest,
             self.order_id,
+            felt_u128(self.reserved_offset),
+            self.residual_commitment,
+            felt_u64(u64::from(self.residual_generation)),
         ]
     }
 
@@ -393,6 +415,12 @@ impl BookOrder {
         if (self.reserved == 0) != (self.reserved_seq == 0) {
             return Err(invalid("book order reservation tag is inconsistent"));
         }
+        if self.reserved == 0 && self.reserved_offset != 0 {
+            return Err(invalid("unreserved order has an allocation offset"));
+        }
+        if self.residual_commitment == Felt::ZERO || self.residual_generation == 0 {
+            return Err(invalid("book order residual authority is missing"));
+        }
         Ok(())
     }
 }
@@ -406,7 +434,7 @@ pub struct BookEntry {
 }
 
 pub fn book_root(chain_context: Felt, orders: &[BookOrder]) -> Felt {
-    let mut values = Vec::with_capacity(orders.len() * 6 + 3);
+    let mut values = Vec::with_capacity(orders.len() * 9 + 3);
     values.push(short_string(BOOK_DOMAIN));
     values.push(chain_context);
     for order in orders {
@@ -414,6 +442,125 @@ pub fn book_root(chain_context: Felt, orders: &[BookOrder]) -> Felt {
     }
     values.push(felt_u64(orders.len() as u64));
     sponge(&values)
+}
+
+/// the private, nullifiable authority over one persisted residual order state. its leaf uses a
+/// distinct domain from value notes, so the generic note-withdrawal statement cannot redeem live
+/// order collateral. only the residual-recovery statement may turn it into exits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidualNote {
+    #[serde(with = "felt_hex_serde")]
+    pub chain_context: Felt,
+    #[serde(with = "felt_hex_serde")]
+    pub input_asset_id: Felt,
+    #[serde(with = "felt_hex_serde")]
+    pub pair_id: Felt,
+    pub sell: bool,
+    pub external: bool,
+    #[serde(with = "u128_decimal_serde")]
+    pub remaining: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub limit: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub funding: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub reserved: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub reserved_offset: u128,
+    pub reserved_seq: u32,
+    pub expiry_ms: u64,
+    #[serde(with = "felt_hex_serde")]
+    pub order_id: Felt,
+    pub generation: u32,
+    pub owner: OrderOwner,
+    #[serde(with = "felt_hex_serde")]
+    pub blinding: Felt,
+}
+
+impl ResidualNote {
+    pub fn from_order(
+        chain_context: Felt,
+        input_asset_id: Felt,
+        order: &BookOrder,
+        owner: &OrderOwner,
+        generation: u32,
+    ) -> Self {
+        Self {
+            chain_context,
+            input_asset_id,
+            pair_id: order.pair_id,
+            sell: order.sell,
+            external: order.external,
+            remaining: order.remaining,
+            limit: order.limit,
+            funding: order.funding,
+            reserved: order.reserved,
+            reserved_offset: order.reserved_offset,
+            reserved_seq: order.reserved_seq,
+            expiry_ms: order.expiry_ms,
+            order_id: order.order_id,
+            generation,
+            owner: owner.clone(),
+            blinding: super::transition::output_blinding(
+                owner.nonce,
+                generation,
+                OUTPUT_KIND_RESIDUAL,
+                Felt::ZERO,
+            ),
+        }
+    }
+
+    pub fn commitment(&self) -> Felt {
+        sponge(&[
+            short_string(RESIDUAL_NOTE_DOMAIN),
+            self.chain_context,
+            self.input_asset_id,
+            self.pair_id,
+            felt_bool(self.sell),
+            felt_bool(self.external),
+            felt_u128(self.remaining),
+            felt_u128(self.limit),
+            felt_u128(self.funding),
+            felt_u128(self.reserved),
+            felt_u128(self.reserved_offset),
+            felt_u64(u64::from(self.reserved_seq)),
+            felt_u64(self.expiry_ms),
+            self.order_id,
+            felt_u64(u64::from(self.generation)),
+            self.owner.digest(),
+            self.blinding,
+        ])
+    }
+
+    pub fn nullifier(&self) -> Felt {
+        poseidon_hash(
+            poseidon_hash(domain_hex(NULLIFIER_DOMAIN_HEX), self.commitment()),
+            self.blinding,
+        )
+    }
+
+    pub fn output_leaf(&self) -> Felt {
+        poseidon_hash(short_string(RESIDUAL_NOTE_LEAF_DOMAIN), self.commitment())
+    }
+
+    pub fn matches_order(&self, order: &BookOrder) -> bool {
+        self.chain_context != Felt::ZERO
+            && self.input_asset_id != Felt::ZERO
+            && self.pair_id == order.pair_id
+            && self.sell == order.sell
+            && self.external == order.external
+            && self.remaining == order.remaining
+            && self.limit == order.limit
+            && self.funding == order.funding
+            && self.reserved == order.reserved
+            && self.reserved_offset == order.reserved_offset
+            && self.reserved_seq == order.reserved_seq
+            && self.expiry_ms == order.expiry_ms
+            && self.order_id == order.order_id
+            && self.generation == order.residual_generation
+            && self.owner.digest() == order.owner_digest
+            && self.commitment() == order.residual_commitment
+    }
 }
 
 /// books are grouped by `(pair_id, side)`, strictly increasing by pair and then side.
@@ -679,7 +826,8 @@ pub struct NoteMembership {
 
 impl NoteMembership {
     pub fn root(&self, leaf: Felt) -> Result<Felt, ProtocolError> {
-        if self.subtree_path.len() != self.subtree_directions.len() || self.subtree_path.len() > 16
+        if self.subtree_path.len() != self.subtree_directions.len()
+            || self.subtree_path.len() > MAX_OUTPUT_SUBTREE_DEPTH
         {
             return Err(invalid("note subtree path is malformed"));
         }

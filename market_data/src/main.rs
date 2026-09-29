@@ -7,7 +7,7 @@
 //! see zylith's egress address, never a trader's ip, origin or pair interest.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     convert::Infallible,
     future::Future,
     hash::Hash,
@@ -37,15 +37,12 @@ use tokio::sync::{OnceCell, broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
 const BIND_ADDR_ENV: &str = "ZYLITH_MARKET_DATA_BIND_ADDR";
-const PAIRS_ENV: &str = "ZYLITH_MARKET_DATA_PAIRS";
 const MANIFEST_ENV: &str = "ZYLITH_DEPLOYMENT_MANIFEST";
 const MAX_STREAMS_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAMS";
 const MAX_STREAMS_PER_CLIENT_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAMS_PER_CLIENT";
 const MAX_STREAM_LIFETIME_SECONDS_ENV: &str = "ZYLITH_MARKET_DATA_MAX_STREAM_LIFETIME_SECONDS";
 const TRUSTED_PROXY_CIDRS_ENV: &str = "ZYLITH_TRUSTED_PROXY_CIDRS";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3500";
-#[cfg(test)]
-const DEFAULT_PAIRS: &str = "STRK/USDC,ETH/USDC";
 const DEFAULT_MAX_STREAMS: usize = 4_096;
 const DEFAULT_MAX_STREAMS_PER_CLIENT: usize = 64;
 const DEFAULT_MAX_STREAM_LIFETIME: Duration = Duration::from_secs(300);
@@ -134,26 +131,19 @@ struct Pair {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum BinanceMarket {
+enum VenueMarket {
     Direct(String),
     Ratio { base: String, quote: String },
 }
 
-fn normalize_asset(raw: &str) -> String {
-    raw.trim().to_ascii_uppercase()
+#[derive(Clone, Debug)]
+struct MarketSources {
+    binance_symbol: String,
+    venues: BTreeMap<Venue, VenueMarket>,
 }
 
-/// the pair's own binance book when it has one, as the reference price attestor prices it;
-/// otherwise the ratio of both assets' usdc books.
-fn binance_market(pair: &Pair) -> BinanceMarket {
-    if pair.quote == "USDT" || pair.quote == "USDC" {
-        BinanceMarket::Direct(format!("{}{}", pair.base, pair.quote))
-    } else {
-        BinanceMarket::Ratio {
-            base: format!("{}USDC", pair.base),
-            quote: format!("{}USDC", pair.quote),
-        }
-    }
+fn normalize_asset(raw: &str) -> String {
+    raw.trim().to_ascii_uppercase()
 }
 
 fn valid_book(bid: f64, ask: f64) -> Option<Book> {
@@ -271,6 +261,7 @@ fn combine_candles(base: Candle, quote: Option<Candle>) -> Option<Candle> {
     })
 }
 
+#[cfg(test)]
 fn combine_klines(base: Vec<Candle>, quote: Option<Vec<Candle>>) -> Vec<Candle> {
     let Some(quote) = quote else {
         return base;
@@ -471,6 +462,9 @@ async fn run_binance_stream(
 struct Inner {
     fetch: Fetcher,
     pairs: BTreeSet<Pair>,
+    sources: BTreeMap<Pair, MarketSources>,
+    registry_version: u64,
+    registry_hash: String,
     summaries: Cache<Pair, MarketSummary>,
     candles: Cache<(Pair, &'static str), CandleHistory>,
     binance: Arc<BinanceStreamHub>,
@@ -485,29 +479,42 @@ struct Inner {
 #[derive(Clone)]
 struct AppState(Arc<Inner>);
 
+struct StateConfig {
+    sources: BTreeMap<Pair, MarketSources>,
+    registry_version: u64,
+    registry_hash: String,
+    max_streams: usize,
+    max_streams_per_client: usize,
+    max_stream_lifetime: Duration,
+    trusted_proxies: Vec<ipnet::IpNet>,
+}
+
 impl AppState {
-    fn new(
-        fetch: Fetcher,
-        pairs: BTreeSet<Pair>,
-        max_streams: usize,
-        max_streams_per_client: usize,
-        max_stream_lifetime: Duration,
-        trusted_proxies: Vec<ipnet::IpNet>,
-        binance: Arc<BinanceStreamHub>,
-    ) -> Self {
+    fn new(fetch: Fetcher, config: StateConfig, binance: Arc<BinanceStreamHub>) -> Self {
+        let pairs = config.sources.keys().cloned().collect();
         Self(Arc::new(Inner {
             fetch,
             pairs,
+            sources: config.sources,
+            registry_version: config.registry_version,
+            registry_hash: config.registry_hash,
             summaries: Cache::new(SUMMARY_TTL),
             candles: Cache::new(CANDLES_TTL),
             binance,
             active_streams: AtomicUsize::new(0),
             active_streams_by_client: Mutex::new(HashMap::new()),
-            max_streams,
-            max_streams_per_client,
-            max_stream_lifetime,
-            trusted_proxies,
+            max_streams: config.max_streams,
+            max_streams_per_client: config.max_streams_per_client,
+            max_stream_lifetime: config.max_stream_lifetime,
+            trusted_proxies: config.trusted_proxies,
         }))
+    }
+
+    fn sources(&self, pair: &Pair) -> &MarketSources {
+        self.0
+            .sources
+            .get(pair)
+            .expect("an allowlisted pair always has registry sources")
     }
 
     fn pair(&self, base: &str, quote: &str) -> Result<Pair, StatusCode> {
@@ -552,28 +559,9 @@ impl AppState {
     }
 
     async fn binance_quote_and_stats(&self, pair: &Pair) -> (Option<Book>, Option<MarketStats>) {
-        match binance_market(pair) {
-            BinanceMarket::Direct(symbol) => {
-                let (book, ticker) =
-                    tokio::join!(self.binance_book(&symbol), self.binance_ticker(&symbol));
-                (book, ticker.map(|ticker| combine_tickers(ticker, None)))
-            }
-            BinanceMarket::Ratio { base, quote } => {
-                let (base_book, quote_book, base_ticker, quote_ticker) = tokio::join!(
-                    self.binance_book(&base),
-                    self.binance_book(&quote),
-                    self.binance_ticker(&base),
-                    self.binance_ticker(&quote),
-                );
-                let book = base_book
-                    .zip(quote_book)
-                    .and_then(|(base, quote)| ratio_book(base, quote));
-                let stats = base_ticker
-                    .zip(quote_ticker)
-                    .map(|(base, quote)| combine_tickers(base, Some(quote)));
-                (book, stats)
-            }
-        }
+        let symbol = &self.sources(pair).binance_symbol;
+        let (book, ticker) = tokio::join!(self.binance_book(symbol), self.binance_ticker(symbol));
+        (book, ticker.map(|ticker| combine_tickers(ticker, None)))
     }
 
     async fn venue_book(&self, venue: Venue, symbol: &str) -> Option<Book> {
@@ -611,41 +599,15 @@ impl AppState {
         }
     }
 
-    /// direct market first, else a cross through the venue's bridge asset using
-    /// only that venue's own books.
-    async fn synthetic_book(&self, venue: Venue, base: &str, quote: &str) -> Option<Book> {
-        let separator = venue.separator();
-        let bridge = venue.bridge();
-        if let Some(direct) = self
-            .venue_book(venue, &format!("{base}{separator}{quote}"))
-            .await
-        {
-            return Some(direct);
-        }
-        let base_symbol = format!("{base}{separator}{bridge}");
-        let quote_symbol = format!("{quote}{separator}{bridge}");
-        let (base_leg, quote_leg) = tokio::join!(self.venue_book(venue, &base_symbol), async {
-            if quote == bridge {
-                Some(Book { bid: 1.0, ask: 1.0 })
-            } else {
-                self.venue_book(venue, &quote_symbol).await
-            }
-        });
-        ratio_book(base_leg?, quote_leg?)
-    }
-
     async fn venue_quote(&self, venue: Venue, pair: &Pair) -> Option<Book> {
-        let symbol = |asset: &str| venue.symbol(asset);
-        let (base, quote) = (symbol(&pair.base), symbol(&pair.quote));
-        if venue == Venue::Coinbase {
-            if let Some(direct) = self.venue_book(venue, &format!("{base}-{quote}")).await {
-                return Some(direct);
-            }
-            if quote == "USDC" {
-                return self.venue_book(venue, &format!("{base}-USD")).await;
+        match self.sources(pair).venues.get(&venue)? {
+            VenueMarket::Direct(symbol) => self.venue_book(venue, symbol).await,
+            VenueMarket::Ratio { base, quote } => {
+                let (base, quote) =
+                    tokio::join!(self.venue_book(venue, base), self.venue_book(venue, quote));
+                ratio_book(base?, quote?)
             }
         }
-        self.synthetic_book(venue, &base, &quote).await
     }
 
     async fn fetch_summary(&self, pair: &Pair) -> MarketSummary {
@@ -693,16 +655,9 @@ impl AppState {
             .await
             .map(|value| parse_klines(&value))
         };
-        let candles = match binance_market(pair) {
-            BinanceMarket::Direct(symbol) => klines(symbol).await.unwrap_or_default(),
-            BinanceMarket::Ratio { base, quote } => {
-                let (base, quote) = tokio::join!(klines(base), klines(quote));
-                match (base, quote) {
-                    (Some(base), Some(quote)) => combine_klines(base, Some(quote)),
-                    _ => Vec::new(),
-                }
-            }
-        };
+        let candles = klines(self.sources(pair).binance_symbol.clone())
+            .await
+            .unwrap_or_default();
         let skip = candles.len().saturating_sub(MAX_CANDLES);
         CandleHistory {
             candles: candles.into_iter().skip(skip).collect(),
@@ -710,31 +665,11 @@ impl AppState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Venue {
     Coinbase,
     Kraken,
     Okx,
-}
-
-impl Venue {
-    fn separator(self) -> &'static str {
-        match self {
-            Venue::Kraken => "",
-            Venue::Coinbase | Venue::Okx => "-",
-        }
-    }
-
-    fn bridge(self) -> &'static str {
-        match self {
-            Venue::Okx => "USDT",
-            Venue::Coinbase | Venue::Kraken => "USD",
-        }
-    }
-
-    fn symbol(self, asset: &str) -> String {
-        asset.into()
-    }
 }
 
 fn chart_interval(raw: &str) -> Result<&'static str, StatusCode> {
@@ -745,8 +680,13 @@ fn chart_interval(raw: &str) -> Result<&'static str, StatusCode> {
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-async fn health() -> Json<Value> {
-    Json(serde_json::json!({ "service": "zylith-market-data", "ok": true }))
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::json!({
+        "service": "zylith-market-data",
+        "ok": true,
+        "registry_version": state.0.registry_version,
+        "registry_hash": state.0.registry_hash,
+    }))
 }
 
 async fn candle_history(
@@ -803,15 +743,14 @@ impl AppState {
             .active_streams_by_client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let active_for_client = clients.entry(client_ip).or_default();
-        if *active_for_client >= inner.max_streams_per_client {
+        if clients.get(&client_ip).copied().unwrap_or_default() >= inner.max_streams_per_client {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
         if inner.active_streams.fetch_add(1, Ordering::Relaxed) >= inner.max_streams {
             inner.active_streams.fetch_sub(1, Ordering::Relaxed);
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
-        *active_for_client += 1;
+        *clients.entry(client_ip).or_default() += 1;
         Ok(StreamSlot {
             state: self.clone(),
             client_ip,
@@ -890,16 +829,10 @@ async fn fan_out_market_stream(
     events: mpsc::Sender<Event>,
 ) {
     let hub = state.0.binance.clone();
-    let (mut base_updates, mut quote_updates) = match binance_market(&pair) {
-        BinanceMarket::Direct(symbol) => {
-            (hub.subscribe(&kline_stream_name(&symbol, interval)), None)
-        }
-        BinanceMarket::Ratio { base, quote } => (
-            hub.subscribe(&kline_stream_name(&base, interval)),
-            Some(hub.subscribe(&kline_stream_name(&quote, interval))),
-        ),
-    };
-    let ratio = quote_updates.is_some();
+    let symbol = state.sources(&pair).binance_symbol.clone();
+    let mut base_updates = hub.subscribe(&kline_stream_name(&symbol, interval));
+    let mut quote_updates = None;
+    let ratio = false;
     let mut latest_base: Option<Candle> = None;
     let mut latest_quote: Option<Candle> = None;
     let mut summary_tick = tokio::time::interval(SUMMARY_PUSH_INTERVAL);
@@ -995,82 +928,123 @@ fn valid_asset_symbol(asset: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric())
 }
 
-fn configured_pairs(raw: &str) -> Result<BTreeSet<Pair>, String> {
-    let mut pairs = BTreeSet::new();
-    for entry in raw
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let Some((base, quote)) = entry.split_once('/') else {
-            return Err(format!("{PAIRS_ENV} entry {entry} must be BASE/QUOTE"));
-        };
-        if quote.contains('/') {
-            return Err(format!("{PAIRS_ENV} entry {entry} must be BASE/QUOTE"));
-        }
-        let pair = Pair {
-            base: normalize_asset(base),
-            quote: normalize_asset(quote),
-        };
-        if !valid_asset_symbol(&pair.base)
-            || !valid_asset_symbol(&pair.quote)
-            || pair.base == pair.quote
-        {
-            return Err(format!("{PAIRS_ENV} contains invalid pair {entry}"));
-        }
-        pairs.insert(pair);
-    }
-    if pairs.is_empty() {
-        return Err(format!("{PAIRS_ENV} must list at least one pair"));
-    }
-    Ok(pairs)
+struct RegistryMarkets {
+    sources: BTreeMap<Pair, MarketSources>,
+    registry_version: u64,
+    registry_hash: String,
 }
 
-fn manifest_pairs(raw: &str) -> Result<BTreeSet<Pair>, String> {
+#[cfg(test)]
+fn manifest_markets(raw: &str) -> Result<RegistryMarkets, String> {
+    parse_manifest_markets(raw, false)
+}
+
+fn production_manifest_markets(raw: &str) -> Result<RegistryMarkets, String> {
+    parse_manifest_markets(raw, true)
+}
+
+fn parse_manifest_markets(raw: &str, production: bool) -> Result<RegistryMarkets, String> {
     let value: Value =
         serde_json::from_str(raw).map_err(|error| format!("deployment manifest: {error}"))?;
-    let manifest = value.get("manifest").unwrap_or(&value);
-    let pairs = manifest
-        .pointer("/product/pairs")
-        .and_then(Value::as_object)
-        .ok_or("deployment manifest has no product pairs")?;
-    let names = pairs
-        .values()
-        .filter(|pair| pair.get("enabled").and_then(Value::as_bool) == Some(true))
-        .map(|pair| {
-            let base = pair
-                .get("base_asset_id")
-                .and_then(Value::as_str)
-                .ok_or("enabled manifest pair has no base asset")?;
-            let quote = pair
-                .get("quote_asset_id")
-                .and_then(Value::as_str)
-                .ok_or("enabled manifest pair has no quote asset")?;
-            Ok(format!("{base}/{quote}"))
+    let value = value.get("manifest").cloned().unwrap_or(value);
+    let manifest: zylith_core::DeploymentManifest = serde_json::from_value(value)
+        .map_err(|error| format!("deployment manifest schema: {error}"))?;
+    if production {
+        manifest.validate_production()?;
+    } else {
+        manifest.validate_market_registry()?;
+    }
+    let sources = manifest
+        .market_registry
+        .enabled_markets()
+        .map(|market| {
+            if !market.capabilities.market_data {
+                return Err(format!(
+                    "enabled market {} has no market-data capability",
+                    market.market_id.0
+                ));
+            }
+            let zylith_core::VenueObservation::Direct {
+                adapter: zylith_core::VenueAdapter::Binance,
+                symbol,
+            } = &market.reference_price.primary
+            else {
+                return Err(format!(
+                    "market {} has no supported direct Binance market-data source",
+                    market.market_id.0
+                ));
+            };
+            let mut venues = BTreeMap::new();
+            for observation in &market.reference_price.corroborating {
+                let (adapter, source) = match observation {
+                    zylith_core::VenueObservation::Direct { adapter, symbol } => {
+                        (*adapter, VenueMarket::Direct(symbol.clone()))
+                    }
+                    zylith_core::VenueObservation::SameVenueRatio {
+                        adapter,
+                        base_symbol,
+                        quote_symbol,
+                    } => (
+                        *adapter,
+                        VenueMarket::Ratio {
+                            base: base_symbol.clone(),
+                            quote: quote_symbol.clone(),
+                        },
+                    ),
+                };
+                let venue = match adapter {
+                    zylith_core::VenueAdapter::Coinbase => Venue::Coinbase,
+                    zylith_core::VenueAdapter::Kraken => Venue::Kraken,
+                    zylith_core::VenueAdapter::Okx => Venue::Okx,
+                    zylith_core::VenueAdapter::Binance => {
+                        return Err(format!(
+                            "market {} repeats Binance as a corroborating source",
+                            market.market_id.0
+                        ));
+                    }
+                };
+                if venues.insert(venue, source).is_some() {
+                    return Err(format!(
+                        "market {} repeats a market-data venue",
+                        market.market_id.0
+                    ));
+                }
+            }
+            let pair = Pair {
+                base: market.base_asset_id.0.clone(),
+                quote: market.quote_asset_id.0.clone(),
+            };
+            Ok((
+                pair,
+                MarketSources {
+                    binance_symbol: symbol.clone(),
+                    venues,
+                },
+            ))
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    configured_pairs(&names.join(","))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    Ok(RegistryMarkets {
+        sources,
+        registry_version: manifest.market_registry.registry_version,
+        registry_hash: manifest.market_registry.registry_hash,
+    })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| "failed to install the tls crypto provider".to_string())?;
     let bind_addr = std::env::var(BIND_ADDR_ENV)
         .unwrap_or_else(|_| DEFAULT_BIND_ADDR.into())
         .parse::<SocketAddr>()
         .map_err(|error| format!("{BIND_ADDR_ENV} is invalid: {error}"))?;
     let manifest_path =
         std::env::var(MANIFEST_ENV).map_err(|_| format!("{MANIFEST_ENV} is required"))?;
-    let pairs = manifest_pairs(
+    let markets = production_manifest_markets(
         &std::fs::read_to_string(&manifest_path)
             .map_err(|error| format!("deployment manifest {manifest_path}: {error}"))?,
     )?;
-    if let Ok(configured) = std::env::var(PAIRS_ENV)
-        && configured_pairs(&configured)? != pairs
-    {
-        return Err(format!(
-            "{PAIRS_ENV} differs from the enabled deployment manifest pairs"
-        ));
-    }
     let max_streams = match std::env::var(MAX_STREAMS_ENV) {
         Ok(raw) => raw
             .trim()
@@ -1120,11 +1094,15 @@ async fn main() -> Result<(), String> {
     tokio::spawn(run_binance_stream(hub.clone(), subscribe_requests));
     let state = AppState::new(
         http_fetcher(),
-        pairs,
-        max_streams,
-        max_streams_per_client,
-        max_stream_lifetime,
-        trusted_proxies,
+        StateConfig {
+            sources: markets.sources,
+            registry_version: markets.registry_version,
+            registry_hash: markets.registry_hash,
+            max_streams,
+            max_streams_per_client,
+            max_stream_lifetime,
+            trusted_proxies,
+        },
         hub,
     );
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -1146,6 +1124,31 @@ mod tests {
     use axum::http::Request;
     use std::sync::atomic::AtomicUsize;
     use tower::ServiceExt;
+
+    const DEFAULT_PAIRS: &str = "STRK/USDC,ETH/USDC";
+
+    fn test_sources(pairs: &str) -> BTreeMap<Pair, MarketSources> {
+        let configured = pairs.split(',').collect::<BTreeSet<_>>();
+        manifest_markets(include_str!("../../client/public/deployment.example.json"))
+            .expect("registry markets")
+            .sources
+            .into_iter()
+            .filter(|(pair, _)| {
+                configured.contains(format!("{}/{}", pair.base, pair.quote).as_str())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn production_startup_requires_a_finalized_locked_manifest() {
+        let raw = include_str!("../../client/public/deployment.example.json");
+        assert!(production_manifest_markets(raw).is_err());
+        let mut manifest: Value = serde_json::from_str(raw).unwrap();
+        manifest["deployment"]["finalized"] = Value::Bool(true);
+        manifest["deployment"]["release_commit"] = Value::String("a".repeat(40));
+        manifest["proof"]["config_locked_after_deploy"] = Value::Bool(true);
+        assert!(production_manifest_markets(&manifest.to_string()).is_ok());
+    }
 
     fn fake_fetcher(responses: Vec<(&'static str, Value)>, calls: Arc<AtomicUsize>) -> Fetcher {
         let responses = Arc::new(responses);
@@ -1174,11 +1177,15 @@ mod tests {
         let (hub, _requests) = BinanceStreamHub::new();
         let state = AppState::new(
             fake_fetcher(responses, calls.clone()),
-            configured_pairs(pairs).expect("pairs"),
-            2,
-            1,
-            DEFAULT_MAX_STREAM_LIFETIME,
-            vec!["127.0.0.1/32".parse().unwrap()],
+            StateConfig {
+                sources: test_sources(pairs),
+                registry_version: 1,
+                registry_hash: "test-registry-hash".into(),
+                max_streams: 2,
+                max_streams_per_client: 1,
+                max_stream_lifetime: DEFAULT_MAX_STREAM_LIFETIME,
+                trusted_proxies: vec!["127.0.0.1/32".parse().unwrap()],
+            },
             hub,
         );
         (state, calls)
@@ -1205,17 +1212,17 @@ mod tests {
         assert_eq!(state.pair("STRK/../x", "USDC"), Err(StatusCode::NOT_FOUND));
         assert_eq!(chart_interval("1M"), Ok("1M"));
         assert_eq!(chart_interval("2m"), Err(StatusCode::NOT_FOUND));
-        assert!(configured_pairs("STRK/USDC,STRK/??").is_err());
     }
 
     #[test]
     fn enabled_market_data_pairs_come_from_the_deployment_manifest() {
-        let pairs = manifest_pairs(
-            r#"{"product":{"pairs":{"a":{"base_asset_id":"STRK","quote_asset_id":"USDC","enabled":true},"b":{"base_asset_id":"ETH","quote_asset_id":"USDC","enabled":false}}}}"#,
-        )
-        .unwrap();
-        assert_eq!(pairs, configured_pairs("STRK/USDC").unwrap());
-        assert!(manifest_pairs(r#"{"product":{"pairs":{}}}"#).is_err());
+        let markets =
+            manifest_markets(include_str!("../../client/public/deployment.example.json")).unwrap();
+        assert!(markets.sources.contains_key(&Pair {
+            base: "STRK".into(),
+            quote: "USDC".into(),
+        }));
+        assert!(manifest_markets(r#"{"market_registry":{}}"#).is_err());
     }
 
     #[test]
@@ -1239,26 +1246,15 @@ mod tests {
     }
 
     #[test]
-    fn binance_markets_use_the_pairs_own_book() {
-        let pair = |base: &str, quote: &str| Pair {
-            base: base.into(),
-            quote: quote.into(),
-        };
-        assert_eq!(
-            binance_market(&pair("STRK", "USDT")),
-            BinanceMarket::Direct("STRKUSDT".into())
-        );
-        assert_eq!(
-            binance_market(&pair("STRK", "USDC")),
-            BinanceMarket::Direct("STRKUSDC".into())
-        );
-        assert_eq!(
-            binance_market(&pair("STRK", "ETH")),
-            BinanceMarket::Ratio {
-                base: "STRKUSDC".into(),
-                quote: "ETHUSDC".into()
-            }
-        );
+    fn binance_market_symbols_come_from_the_registry() {
+        let sources = test_sources(DEFAULT_PAIRS);
+        let strk = sources
+            .get(&Pair {
+                base: "STRK".into(),
+                quote: "USDC".into(),
+            })
+            .unwrap();
+        assert_eq!(strk.binance_symbol, "STRKUSDC");
     }
 
     #[test]
@@ -1352,6 +1348,10 @@ mod tests {
                 serde_json::json!({ "bid": "0.0463", "ask": "0.0465" }),
             ),
             (
+                "coinbase.com/products/USDC-USD/",
+                serde_json::json!({ "bid": "1", "ask": "1" }),
+            ),
+            (
                 "kraken.com/0/public/Ticker?pair=STRKUSD",
                 serde_json::json!({ "result": { "STRKUSD": { "a": ["0.0464"], "b": ["0.0462"] } } }),
             ),
@@ -1400,18 +1400,12 @@ mod tests {
     #[tokio::test]
     async fn concurrent_candle_requests_share_one_upstream_fetch() {
         let klines = serde_json::json!([[60_000, "1", "2", "0.5", "1.5"]]);
-        let bridge = serde_json::json!([[60_000, "1", "1", "1", "1"]]);
-        let (state, calls) = state_with_pairs(
-            vec![
-                ("symbol=STRKUSDC&interval=15m", klines),
-                ("symbol=ETHUSDC&interval=15m", bridge),
-            ],
-            "STRK/ETH",
-        );
+        let (state, calls) =
+            state_with_pairs(vec![("symbol=STRKUSDC&interval=15m", klines)], "STRK/USDC");
         let router = app(state);
         let request = || {
             Request::builder()
-                .uri("/market-data/v1/STRK/ETH/candles/15m")
+                .uri("/market-data/v1/STRK/USDC/candles/15m")
                 .body(Body::empty())
                 .expect("request")
         };
@@ -1429,8 +1423,8 @@ mod tests {
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "one fetch per shared ratio leg"
+            1,
+            "one fetch for the registry's shared direct primary market"
         );
     }
 
@@ -1463,10 +1457,19 @@ mod tests {
         );
         let first_client = "192.0.2.1".parse().expect("ip");
         let second_client = "192.0.2.2".parse().expect("ip");
+        let rejected_client = "192.0.2.3".parse().expect("ip");
         let _first = state.acquire_stream_slot(first_client).expect("slot");
         assert!(state.acquire_stream_slot(first_client).is_err());
         let _second = state.acquire_stream_slot(second_client).expect("slot");
-        assert!(state.acquire_stream_slot(second_client).is_err());
+        assert!(state.acquire_stream_slot(rejected_client).is_err());
+        assert!(
+            !state
+                .0
+                .active_streams_by_client
+                .lock()
+                .expect("client map")
+                .contains_key(&rejected_client)
+        );
         drop(_first);
         assert!(state.acquire_stream_slot(first_client).is_ok());
     }
@@ -1477,11 +1480,15 @@ mod tests {
         let (hub, _requests) = BinanceStreamHub::new();
         let state = AppState::new(
             fake_fetcher(vec![], calls),
-            configured_pairs(DEFAULT_PAIRS).expect("pairs"),
-            2,
-            1,
-            Duration::from_millis(1),
-            Vec::new(),
+            StateConfig {
+                sources: test_sources(DEFAULT_PAIRS),
+                registry_version: 1,
+                registry_hash: "test-registry-hash".into(),
+                max_streams: 2,
+                max_streams_per_client: 1,
+                max_stream_lifetime: Duration::from_millis(1),
+                trusted_proxies: Vec::new(),
+            },
             hub,
         );
         let client = SocketAddr::from(([192, 0, 2, 1], 12345));

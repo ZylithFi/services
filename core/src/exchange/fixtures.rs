@@ -82,7 +82,10 @@ impl Notes {
     }
 
     pub fn membership(&self, note: &NoteFields) -> NoteMembership {
-        let leaf = note.output_leaf();
+        self.membership_leaf(note.output_leaf())
+    }
+
+    pub fn membership_leaf(&self, leaf: Felt) -> NoteMembership {
         let (_, batch, leaves) = self
             .located
             .iter()
@@ -198,6 +201,7 @@ pub fn input(
         book,
         new_orders,
         cancellations: vec![],
+        recovered_order_ids: vec![],
         outcomes: vec![],
         padding_seed: Felt::from(0x5a17_u64 + u64::from(seq)),
     }

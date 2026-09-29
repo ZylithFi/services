@@ -108,12 +108,9 @@ const DEFAULT_PAYMASTER_L1_DATA_GAS_FLOOR = 8_000n;
 const DEFAULT_PAYMASTER_L2_GAS_FLOOR = 180_000_000n;
 const PAYMASTER_GAS_PRICE_MULTIPLIER = 2n;
 const DEFAULT_MAX_SPONSORED_FEE_FRI = 1_000_000_000_000_000_000n;
-const STARKNET_STRK_TOKEN_ADDRESS =
-  "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d";
-
 type ProofSubmissionConfig = Pick<
   PaymasterConfig,
-  "rpcUrl" | "chainId" | "accountAddress" | "privateKey"
+  "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "feeTokenAddress"
 > &
   Partial<Pick<PaymasterConfig, "gatewayUrl" | "maxSponsoredFeeFri">>;
 
@@ -340,7 +337,7 @@ async function deployedClassHash(
 
 export async function relayPrivacyProofSignerCall(
   request: RelayPrivacySignerRequest,
-  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "privacySignerClassHash">,
+  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "privacySignerClassHash" | "feeTokenAddress">,
   deps: SubmitterDeps = {}
 ): Promise<ExecuteOutsideResponse> {
   const runtime = deps.runtime ?? defaultRuntime;
@@ -587,7 +584,7 @@ function callPayloadToStarknetCall(call: ExecuteOutsideRequest["call"]): Call {
 async function estimateProofBearingInvokeResourceBounds(input: {
   account: AccountInstance;
   calls: Call[];
-  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress">;
+  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "feeTokenAddress">;
   runtime: StarknetRuntime;
   fetchImpl: typeof fetch;
   nonce: string;
@@ -726,7 +723,7 @@ async function shouldFallbackProofBearingFeeEstimate(
   error: unknown,
   input: {
     calls: Call[];
-    config: Pick<PaymasterConfig, "rpcUrl" | "accountAddress">;
+    config: Pick<PaymasterConfig, "rpcUrl" | "accountAddress" | "feeTokenAddress">;
     fetchImpl: typeof fetch;
   }
 ): Promise<boolean> {
@@ -744,7 +741,8 @@ async function shouldFallbackProofBearingFeeEstimate(
         input.fetchImpl,
         input.config.rpcUrl,
         input.calls,
-        input.config.accountAddress
+        input.config.accountAddress,
+        input.config.feeTokenAddress
       ))
     );
   }
@@ -808,13 +806,7 @@ async function transferFromActionsAreFunded(
     if (balance < action.amount || allowance < action.amount) {
       console.error(JSON.stringify({
         event: "paymaster_transfer_preflight_failed",
-        reason: balance < action.amount ? "insufficient_balance" : "insufficient_allowance",
-        from: shortFelt(action.from),
-        token: shortFelt(action.token),
-        spender: shortFelt(action.spender),
-        amount: action.amount.toString(),
-        balance: balance.toString(),
-        allowance: allowance.toString()
+        reason: balance < action.amount ? "insufficient_balance" : "insufficient_allowance"
       }));
       return false;
     }
@@ -826,17 +818,18 @@ async function poolApplyActionsFeeIsFunded(
   fetchImpl: typeof fetch,
   rpcUrl: string,
   calls: Call[],
-  paymasterAddress: string
+  paymasterAddress: string,
+  feeTokenAddress: string
 ): Promise<boolean> {
   if (calls.length !== 1 || calls[0]?.entrypoint !== "apply_actions") return false;
   const poolAddress = calls[0].contractAddress;
   const feeAmount = await starknetCallFelt(fetchImpl, rpcUrl, poolAddress, "get_fee_amount", []);
   if (feeAmount === 0n) return true;
   const [balance, allowance] = await Promise.all([
-    starknetCallU256(fetchImpl, rpcUrl, STARKNET_STRK_TOKEN_ADDRESS, "balance_of", [
+    starknetCallU256(fetchImpl, rpcUrl, feeTokenAddress, "balance_of", [
       paymasterAddress
     ]),
-    starknetCallU256(fetchImpl, rpcUrl, STARKNET_STRK_TOKEN_ADDRESS, "allowance", [
+    starknetCallU256(fetchImpl, rpcUrl, feeTokenAddress, "allowance", [
       paymasterAddress,
       poolAddress
     ])
@@ -844,22 +837,11 @@ async function poolApplyActionsFeeIsFunded(
   if (balance < feeAmount || allowance < feeAmount) {
     console.error(JSON.stringify({
       event: "paymaster_transfer_preflight_failed",
-      reason: balance < feeAmount ? "insufficient_pool_fee_balance" : "insufficient_pool_fee_allowance",
-      owner: shortFelt(paymasterAddress),
-      token: shortFelt(STARKNET_STRK_TOKEN_ADDRESS),
-      spender: shortFelt(poolAddress),
-      amount: feeAmount.toString(),
-      balance: balance.toString(),
-      allowance: allowance.toString()
+      reason: balance < feeAmount ? "insufficient_pool_fee_balance" : "insufficient_pool_fee_allowance"
     }));
     return false;
   }
   return true;
-}
-
-function shortFelt(value: string): string {
-  const felt = toRpcFelt(value);
-  return felt.length <= 18 ? felt : `${felt.slice(0, 10)}...${felt.slice(-6)}`;
 }
 
 function extractTransferFromActions(calls: Call[]): TransferFromAction[] | null {

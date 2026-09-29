@@ -22,20 +22,19 @@ use starknet_rust_core::types::Felt;
 use url::Url;
 use zeroize::Zeroizing;
 use zylith_core::{
-    AssetId, PairId, ReferencePriceAttestation, ReferencePriceBatchEntry, ReferencePriceEnvelope,
-    ReferencePriceSample, build_reference_price_envelope, reference_price_batch_commitment,
-    reference_price_policy_for_pair, reference_price_source_set_commitment,
-    sign_reference_price_attestation, sign_reference_price_attestation_in_batch,
+    AssetId, DeploymentManifest, PairId, ReferencePriceAttestation, ReferencePriceBatchEntry,
+    ReferencePriceEnvelope, ReferencePricePolicy, ReferencePriceSample, VenueAdapter,
+    VenueObservation, build_reference_price_envelope, reference_price_batch_commitment,
+    reference_price_source_set_commitment, sign_reference_price_attestation,
+    sign_reference_price_attestation_in_batch,
 };
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8790";
-const DEFAULT_ATTESTATION_TTL_MS: u64 = 5_000;
-const MAX_ATTESTATION_TTL_MS: u64 = 15_000;
 /// sources are fetched together and the envelope is stamped before they are, so a source that
-/// answers later than this is dropped rather than aging every attestation past the prover's
+/// answers later than this is dropped rather than aging every attestation past the operator's
 /// five-second freshness bound.
 const DEFAULT_SOURCE_REQUEST_TIMEOUT_MS: u64 = 1_500;
-/// the prover rejects envelopes older than five seconds.
+/// the operator rejects envelopes older than five seconds.
 const MAX_SOURCE_REQUEST_TIMEOUT_MS: u64 = 4_000;
 const MAX_CEX_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -46,11 +45,12 @@ struct AppState {
     exchange_address: Felt,
     signer_private_key: Arc<Zeroizing<String>>,
     auth_token_digest: [u8; 32],
-    attestation_ttl_ms: u64,
     /// each asset's token decimals, from the deployment manifest: the same asset name can be a
     /// different token, with other decimals, on another network.
     decimals: Arc<HashMap<String, u8>>,
     markets: Arc<HashMap<String, PairMarket>>,
+    registry_version: u64,
+    registry_hash: String,
     nonce: Arc<AtomicU64>,
 }
 
@@ -83,13 +83,15 @@ struct PriceBatchResponse {
 struct UnsignedEntry {
     envelope: ReferencePriceEnvelope,
     source_set_commitment: String,
+    max_age_ms: u64,
+    attestation_ttl_ms: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PairMarket {
     base_asset_id: String,
     quote_asset_id: String,
+    price_base_scale: u128,
     binance_symbol: String,
     coinbase_base: String,
     coinbase_quote: String,
@@ -97,13 +99,8 @@ struct PairMarket {
     okx_quote: Option<String>,
     kraken_base: String,
     kraken_quote: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReferenceSourceConfig {
-    version: u32,
-    pairs: HashMap<String, PairMarket>,
+    reference_policy: ReferencePricePolicy,
+    attestation_ttl_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -120,19 +117,16 @@ struct DecimalRatio {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| "failed to install the tls crypto provider".to_string())?;
     let signer_private_key = required_env("ZYLITH_REFERENCE_PRICE_SIGNER_PRIVATE_KEY")?;
     let auth_token = required_env("ZYLITH_REFERENCE_PRICE_ATTESTOR_TOKEN")?;
     let exchange_address = required_felt_env("ZYLITH_EXCHANGE_ADDRESS")?;
-    let attestation_ttl_ms = env::var("ZYLITH_REFERENCE_PRICE_ATTESTATION_TTL_MS")
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()
-        .map_err(|error| format!("invalid attestation TTL: {error}"))?
-        .unwrap_or(DEFAULT_ATTESTATION_TTL_MS);
-    if !(1..=MAX_ATTESTATION_TTL_MS).contains(&attestation_ttl_ms) {
-        return Err(format!(
-            "attestation TTL must be between 1 and {MAX_ATTESTATION_TTL_MS} milliseconds"
-        ));
+    if env::var_os("ZYLITH_REFERENCE_PRICE_ATTESTATION_TTL_MS").is_some() {
+        return Err(
+            "ZYLITH_REFERENCE_PRICE_ATTESTATION_TTL_MS is retired; use the market registry".into(),
+        );
     }
     let source_request_timeout_ms = env::var("ZYLITH_REFERENCE_SOURCE_TIMEOUT_MS")
         .ok()
@@ -157,24 +151,21 @@ async fn main() -> Result<(), String> {
     if starknet_crypto::get_public_key(&signer_secret) != expected_signer {
         return Err("reference price private key does not match the deployment manifest".into());
     }
-    let source_path = required_env("ZYLITH_REFERENCE_PRICE_SOURCES_PATH")?;
-    let markets = reference_markets(
-        &std::fs::read_to_string(&source_path)
-            .map_err(|error| format!("reference price sources {source_path}: {error}"))?,
-        &manifest_raw,
-    )?;
+    let manifest = parse_manifest(&manifest_raw)?;
+    let markets = reference_markets(&manifest)?;
     let state = AppState {
         client,
         exchange_address,
         signer_private_key: Arc::new(Zeroizing::new(signer_private_key)),
         auth_token_digest: sha256(auth_token.as_bytes()),
-        attestation_ttl_ms,
         decimals: Arc::new(manifest_decimals(&manifest_raw)?),
         markets: Arc::new(markets),
+        registry_version: manifest.market_registry.registry_version,
+        registry_hash: manifest.market_registry.registry_hash.clone(),
         nonce: Arc::new(AtomicU64::new(now_unix_ms()?)),
     };
     let app = Router::new()
-        .route("/health", get(|| async { StatusCode::OK }))
+        .route("/health", get(health))
         .route(
             "/api/v1/reference-price-attestations",
             post(attest_reference_price),
@@ -195,17 +186,31 @@ async fn main() -> Result<(), String> {
     .map_err(|error| format!("reference-price attestor failed: {error}"))
 }
 
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    registry_version: u64,
+    registry_hash: String,
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        registry_version: state.registry_version,
+        registry_hash: state.registry_hash.clone(),
+    })
+}
+
 async fn attest_reference_price(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<AttestationRequest>,
 ) -> Result<Json<AttestationResponse>, StatusCode> {
     authenticate(&state, &headers)?;
-    let unsigned = build_unsigned_entry(&state, &request).await?;
-    let valid_until_unix_ms = now_unix_ms()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .checked_add(state.attestation_ttl_ms)
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let observed_at = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let unsigned = build_unsigned_entry(&state, &request, observed_at).await?;
+    let signed_at = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let valid_until_unix_ms = attestation_expiry(&unsigned, signed_at)?;
     let nonce = state.nonce.fetch_add(1, Ordering::Relaxed);
     let attestation = sign_reference_price_attestation(
         state.signer_private_key.as_str(),
@@ -246,28 +251,28 @@ async fn attest_price_batch(
     {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
+    let batch_observed_at = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let unsigned = futures::future::join_all(
         request
             .markets
             .iter()
-            .map(|market| build_unsigned_entry(&state, market)),
+            .map(|market| build_unsigned_entry(&state, market, batch_observed_at)),
     )
     .await
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
-    let valid_until_unix_ms = now_unix_ms()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .checked_add(state.attestation_ttl_ms)
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let valid_from_unix_ms = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let entries = unsigned
         .iter()
-        .map(|entry| ReferencePriceBatchEntry {
-            envelope: entry.envelope.clone(),
-            source_set_commitment: entry.source_set_commitment.clone(),
-            valid_until_unix_ms,
-            nonce: state.nonce.fetch_add(1, Ordering::Relaxed),
+        .map(|entry| {
+            Ok(ReferencePriceBatchEntry {
+                envelope: entry.envelope.clone(),
+                source_set_commitment: entry.source_set_commitment.clone(),
+                valid_until_unix_ms: attestation_expiry(entry, valid_from_unix_ms)?,
+                nonce: state.nonce.fetch_add(1, Ordering::Relaxed),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, StatusCode>>()?;
     let exchange_address = request.markets[0].exchange_address.clone();
     let batch_commitment = reference_price_batch_commitment(&exchange_address, &entries)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -292,6 +297,7 @@ async fn attest_price_batch(
 async fn build_unsigned_entry(
     state: &AppState,
     request: &AttestationRequest,
+    observed_at_unix_ms: u64,
 ) -> Result<UnsignedEntry, StatusCode> {
     // attestations are bound to the exchange; never sign for another context.
     if parse_felt(&request.exchange_address) != Some(state.exchange_address) {
@@ -303,7 +309,7 @@ async fn build_unsigned_entry(
         .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
     if request.base_asset_id.0 != pair.base_asset_id
         || request.quote_asset_id.0 != pair.quote_asset_id
-        || request.price_base_scale == 0
+        || request.price_base_scale != pair.price_base_scale
     {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -313,7 +319,6 @@ async fn build_unsigned_entry(
     ) else {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     };
-    let observed_at_unix_ms = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let base_asset_scale = 10_u128
         .checked_pow(u32::from(base_decimals))
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -333,7 +338,6 @@ async fn build_unsigned_entry(
         );
         StatusCode::BAD_GATEWAY
     })?;
-    let reference_policy = reference_price_policy_for_pair(&request.pair_id);
     let envelope = build_reference_price_envelope(
         request.pair_id.clone(),
         request.base_asset_id.clone(),
@@ -341,7 +345,7 @@ async fn build_unsigned_entry(
         request.price_base_scale,
         observed_at_unix_ms,
         &samples,
-        &reference_policy,
+        &pair.reference_policy,
     )
     .map_err(|error| {
         eprintln!("reference envelope rejected: {error}");
@@ -352,7 +356,25 @@ async fn build_unsigned_entry(
     Ok(UnsignedEntry {
         envelope,
         source_set_commitment,
+        max_age_ms: pair.reference_policy.max_age_ms,
+        attestation_ttl_ms: pair.attestation_ttl_ms,
     })
+}
+
+fn attestation_expiry(entry: &UnsignedEntry, signed_at_ms: u64) -> Result<u64, StatusCode> {
+    let source_deadline = entry
+        .envelope
+        .observed_at_unix_ms
+        .checked_add(entry.max_age_ms)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let signature_deadline = signed_at_ms
+        .checked_add(entry.attestation_ttl_ms)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let valid_until = source_deadline.min(signature_deadline);
+    if valid_until <= signed_at_ms {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(valid_until)
 }
 
 fn parse_felt(value: &str) -> Option<Felt> {
@@ -386,119 +408,107 @@ fn required_env(name: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{name} is required"))
 }
 
-/// every asset's token decimals from the deployment manifest (`product.assets.<name>.decimals`).
 fn manifest_decimals(raw: &str) -> Result<HashMap<String, u8>, String> {
+    Ok(parse_manifest(raw)?
+        .market_registry
+        .assets
+        .into_iter()
+        .map(|asset| (asset.asset_id.0, asset.decimals))
+        .collect())
+}
+
+fn parse_manifest(raw: &str) -> Result<DeploymentManifest, String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|error| format!("deployment manifest: {error}"))?;
-    let manifest = value.get("manifest").unwrap_or(&value);
-    let assets = manifest
-        .pointer("/product/assets")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("deployment manifest has no product assets")?;
-    assets
-        .iter()
-        .map(|(name, asset)| {
-            let decimals = asset
-                .get("decimals")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|decimals| *decimals <= 36)
-                .ok_or_else(|| format!("deployment manifest asset {name} has no decimals"))?;
-            Ok((name.clone(), decimals as u8))
-        })
-        .collect()
+    let value = value.get("manifest").cloned().unwrap_or(value);
+    let manifest: DeploymentManifest = serde_json::from_value(value)
+        .map_err(|error| format!("deployment manifest schema: {error}"))?;
+    manifest.validate_market_registry()?;
+    Ok(manifest)
 }
 
 fn manifest_reference_signer(raw: &str) -> Result<Felt, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|error| format!("deployment manifest: {error}"))?;
-    let manifest = value.get("manifest").unwrap_or(&value);
-    if manifest
-        .pointer("/deployment/finalized")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        || manifest
-            .pointer("/proof/config_locked_after_deploy")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-    {
-        return Err("reference price attestor requires a finalized, locked deployment".into());
-    }
-    manifest
-        .pointer("/roles/reference_price_signer")
-        .and_then(serde_json::Value::as_str)
-        .and_then(parse_felt)
+    let manifest = parse_manifest(raw)?;
+    manifest.validate_production()?;
+    parse_felt(&manifest.roles.reference_price_signer)
         .ok_or_else(|| "deployment manifest has no reference price signer".into())
 }
 
-fn reference_markets(
-    sources_raw: &str,
-    manifest_raw: &str,
-) -> Result<HashMap<String, PairMarket>, String> {
-    let sources: ReferenceSourceConfig = serde_json::from_str(sources_raw)
-        .map_err(|error| format!("reference price sources: {error}"))?;
-    if sources.version != 1 {
-        return Err("reference price sources use an unsupported version".into());
-    }
-    let markets = sources
-        .pairs
-        .into_iter()
-        .map(|(name, market)| {
-            let symbols = [
-                Some(market.binance_symbol.as_str()),
-                Some(market.coinbase_base.as_str()),
-                Some(market.coinbase_quote.as_str()),
-                market.okx_base.as_deref(),
-                market.okx_quote.as_deref(),
-                Some(market.kraken_base.as_str()),
-                Some(market.kraken_quote.as_str()),
-            ];
-            if symbols.into_iter().flatten().any(|symbol| {
-                symbol.is_empty()
-                    || !symbol
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-            }) {
+fn reference_markets(manifest: &DeploymentManifest) -> Result<HashMap<String, PairMarket>, String> {
+    manifest
+        .market_registry
+        .enabled_markets()
+        .map(|market| {
+            let VenueObservation::Direct {
+                adapter: VenueAdapter::Binance,
+                symbol: binance_symbol,
+            } = &market.reference_price.primary
+            else {
                 return Err(format!(
-                    "reference price source {name} has an invalid venue symbol"
+                    "market {} primary source is not supported by the attestor",
+                    market.market_id.0
                 ));
+            };
+            let mut coinbase = None;
+            let mut kraken = None;
+            let mut okx = None;
+            for observation in &market.reference_price.corroborating {
+                let VenueObservation::SameVenueRatio {
+                    adapter,
+                    base_symbol,
+                    quote_symbol,
+                } = observation
+                else {
+                    return Err(format!(
+                        "market {} has an unsupported corroborating source",
+                        market.market_id.0
+                    ));
+                };
+                let slot = match adapter {
+                    VenueAdapter::Coinbase => &mut coinbase,
+                    VenueAdapter::Kraken => &mut kraken,
+                    VenueAdapter::Okx => &mut okx,
+                    VenueAdapter::Binance => {
+                        return Err(format!(
+                            "market {} repeats the primary venue",
+                            market.market_id.0
+                        ));
+                    }
+                };
+                if slot
+                    .replace((base_symbol.clone(), quote_symbol.clone()))
+                    .is_some()
+                {
+                    return Err(format!(
+                        "market {} repeats a corroborating venue",
+                        market.market_id.0
+                    ));
+                }
             }
-            Ok((name, market))
+            let (coinbase_base, coinbase_quote) = coinbase
+                .ok_or_else(|| format!("market {} has no Coinbase source", market.market_id.0))?;
+            let (kraken_base, kraken_quote) = kraken
+                .ok_or_else(|| format!("market {} has no Kraken source", market.market_id.0))?;
+            let (okx_base, okx_quote) = okx.unzip();
+            Ok((
+                market.market_id.0.clone(),
+                PairMarket {
+                    base_asset_id: market.base_asset_id.0.clone(),
+                    quote_asset_id: market.quote_asset_id.0.clone(),
+                    price_base_scale: market.price_base_scale,
+                    binance_symbol: binance_symbol.clone(),
+                    coinbase_base,
+                    coinbase_quote,
+                    okx_base,
+                    okx_quote,
+                    kraken_base,
+                    kraken_quote,
+                    reference_policy: market.reference_price_policy(),
+                    attestation_ttl_ms: market.reference_price.attestation_ttl_ms,
+                },
+            ))
         })
-        .collect::<Result<HashMap<_, _>, String>>()?;
-
-    let manifest: serde_json::Value = serde_json::from_str(manifest_raw)
-        .map_err(|error| format!("deployment manifest: {error}"))?;
-    let manifest = manifest.get("manifest").unwrap_or(&manifest);
-    let enabled = manifest
-        .pointer("/product/pairs")
-        .and_then(serde_json::Value::as_object)
-        .ok_or("deployment manifest has no product pairs")?
-        .iter()
-        .filter(|(_, pair)| pair.get("enabled").and_then(serde_json::Value::as_bool) == Some(true))
-        .map(|(name, pair)| {
-            let base = pair
-                .get("base_asset_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("manifest pair {name} has no base asset"))?;
-            let quote = pair
-                .get("quote_asset_id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("manifest pair {name} has no quote asset"))?;
-            Ok((name.clone(), (base.to_owned(), quote.to_owned())))
-        })
-        .collect::<Result<HashMap<_, _>, String>>()?;
-    if markets.len() != enabled.len() || enabled.keys().any(|name| !markets.contains_key(name)) {
-        return Err("reference price source pairs differ from the enabled deployment pairs".into());
-    }
-    for (name, (base, quote)) in enabled {
-        let market = markets.get(&name).expect("enabled source checked");
-        if market.base_asset_id != base || market.quote_asset_id != quote {
-            return Err(format!(
-                "reference price source {name} has different assets than the manifest"
-            ));
-        }
-    }
-    Ok(markets)
+        .collect()
 }
 
 async fn fetch_samples(
@@ -982,54 +992,50 @@ mod tests {
     use starknet_rust_core::types::Felt;
 
     use super::{
-        Book, constant_time_eq, manifest_decimals, manifest_reference_signer, parse_decimal_ratio,
-        parse_okx_book, ratio_to_units, reference_markets, sample_from_ratio_books,
+        Book, UnsignedEntry, attestation_expiry, constant_time_eq, manifest_decimals,
+        manifest_reference_signer, parse_decimal_ratio, parse_manifest, parse_okx_book,
+        ratio_to_units, reference_markets, sample_from_ratio_books,
     };
+    use zylith_core::{AssetId, PairId, ReferencePriceEnvelope};
 
     #[test]
     fn reference_markets_are_data_driven_and_match_the_manifest() {
-        let markets = reference_markets(
-            include_str!("../../../ops/config/reference-price-sources.mainnet.json"),
-            include_str!("../../../client/public/deployment.example.json"),
-        )
+        let manifest = parse_manifest(include_str!(
+            "../../../client/public/deployment.example.json"
+        ))
         .unwrap();
+        let markets = reference_markets(&manifest).unwrap();
         assert_eq!(markets["STRK/USDC"].binance_symbol, "STRKUSDC");
         assert_eq!(markets["ETH/USDC"].kraken_base, "XETHZUSD");
-
-        let source = serde_json::json!({ "version": 1, "pairs": {
-            "ETH/STRK": {
-                "base_asset_id": "ETH", "quote_asset_id": "STRK",
-                "binance_symbol": "ETHSTRK", "coinbase_base": "ETH-USD",
-                "coinbase_quote": "STRK-USD", "okx_base": "ETH-USDT",
-                "okx_quote": "STRK-USDT", "kraken_base": "ETHUSD",
-                "kraken_quote": "STRKUSD"
-            }
-        }});
-        let manifest = serde_json::json!({ "product": { "pairs": {
-            "ETH/STRK": { "base_asset_id": "ETH", "quote_asset_id": "STRK", "enabled": true }
-        }}});
-        assert!(reference_markets(&source.to_string(), &manifest.to_string()).is_ok());
     }
 
     #[test]
     fn decimals_come_from_the_deployment_manifest() {
         // the same asset name can be a different token, with other decimals, on another
         // network: the manifest of the network being attested decides.
-        let decimals = manifest_decimals(
-            r#"{"manifest":{"product":{"assets":{"STRK":{"decimals":18},"USDC":{"decimals":6}}}}}"#,
-        )
+        let decimals = manifest_decimals(include_str!(
+            "../../../client/public/deployment.example.json"
+        ))
         .unwrap();
         assert_eq!(decimals["STRK"], 18);
         assert_eq!(decimals["USDC"], 6);
-        assert!(manifest_decimals(r#"{"product":{"assets":{"USDC":{}}}}"#).is_err());
-        assert!(manifest_decimals(r#"{"product":{}}"#).is_err());
+        assert!(manifest_decimals(r#"{"market_registry":{}}"#).is_err());
     }
 
     #[test]
     fn signer_pin_requires_a_finalized_locked_manifest() {
-        let valid = r#"{"deployment":{"finalized":true},"proof":{"config_locked_after_deploy":true},"roles":{"reference_price_signer":"0x123"}}"#;
+        let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../client/public/deployment.example.json"
+        ))
+        .unwrap();
+        manifest["deployment"]["finalized"] = serde_json::json!(true);
+        manifest["deployment"]["release_commit"] =
+            serde_json::json!("1111111111111111111111111111111111111111");
+        manifest["proof"]["config_locked_after_deploy"] = serde_json::json!(true);
+        manifest["roles"]["reference_price_signer"] = serde_json::json!("0x123");
+        let valid = manifest.to_string();
         assert_eq!(
-            manifest_reference_signer(valid).unwrap(),
+            manifest_reference_signer(&valid).unwrap(),
             Felt::from(0x123_u16)
         );
         assert!(manifest_reference_signer(&valid.replace("true", "false")).is_err());
@@ -1088,5 +1094,27 @@ mod tests {
         assert!(constant_time_eq(b"token", b"token"));
         assert!(!constant_time_eq(b"token", b"token2"));
         assert!(!constant_time_eq(b"token", b"tokem"));
+    }
+
+    #[test]
+    fn attestation_expiry_never_outlives_the_primary_observation() {
+        let entry = UnsignedEntry {
+            envelope: ReferencePriceEnvelope {
+                pair_id: PairId("ETH/USDC".into()),
+                base_asset_id: AssetId("ETH".into()),
+                quote_asset_id: AssetId("USDC".into()),
+                midpoint_price: 1,
+                lower_price: 1,
+                upper_price: 1,
+                price_base_scale: 1,
+                source_count: 3,
+                observed_at_unix_ms: 1_000,
+            },
+            source_set_commitment: "commitment".into(),
+            max_age_ms: 5_000,
+            attestation_ttl_ms: 5_000,
+        };
+        assert_eq!(attestation_expiry(&entry, 2_000).unwrap(), 6_000);
+        assert!(attestation_expiry(&entry, 6_000).is_err());
     }
 }
