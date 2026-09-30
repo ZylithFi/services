@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     net::SocketAddr,
     sync::{
@@ -24,9 +24,9 @@ use zeroize::Zeroizing;
 use zylith_core::{
     AssetId, DeploymentManifest, PairId, ReferencePriceAttestation, ReferencePriceBatchEntry,
     ReferencePriceEnvelope, ReferencePricePolicy, ReferencePriceSample, VenueAdapter,
-    VenueObservation, build_reference_price_envelope, reference_price_batch_commitment,
-    reference_price_source_set_commitment, sign_reference_price_attestation,
-    sign_reference_price_attestation_in_batch,
+    VenueObservation, build_reference_price_envelope, build_synthetic_cross_envelope,
+    reference_price_batch_commitment, reference_price_source_set_commitment,
+    sign_reference_price_attestation, sign_reference_price_attestation_in_batch,
 };
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8790";
@@ -80,6 +80,7 @@ struct PriceBatchResponse {
     attestations: Vec<ReferencePriceAttestation>,
 }
 
+#[derive(Clone)]
 struct UnsignedEntry {
     envelope: ReferencePriceEnvelope,
     source_set_commitment: String,
@@ -92,6 +93,24 @@ struct PairMarket {
     base_asset_id: String,
     quote_asset_id: String,
     price_base_scale: u128,
+    reference: PairReference,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PairReference {
+    Direct(DirectMarket),
+    Synthetic {
+        base_market_id: String,
+        quote_market_id: String,
+        max_leg_skew_ms: u64,
+        max_age_ms: u64,
+        envelope_bps: u32,
+        attestation_ttl_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectMarket {
     binance_symbol: String,
     coinbase_base: String,
     coinbase_quote: String,
@@ -207,8 +226,7 @@ async fn attest_reference_price(
     Json(request): Json<AttestationRequest>,
 ) -> Result<Json<AttestationResponse>, StatusCode> {
     authenticate(&state, &headers)?;
-    let observed_at = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let unsigned = build_unsigned_entry(&state, &request, observed_at).await?;
+    let unsigned = build_unsigned_entry(&state, &request).await?;
     let signed_at = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let valid_until_unix_ms = attestation_expiry(&unsigned, signed_at)?;
     let nonce = state.nonce.fetch_add(1, Ordering::Relaxed);
@@ -251,16 +269,69 @@ async fn attest_price_batch(
     {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    let batch_observed_at = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let unsigned = futures::future::join_all(
-        request
-            .markets
-            .iter()
-            .map(|market| build_unsigned_entry(&state, market, batch_observed_at)),
-    )
+    for market in &request.markets {
+        validate_request(&state, market)?;
+    }
+    let direct = futures::future::join_all(request.markets.iter().filter_map(|request| {
+        let market = state.markets.get(&request.pair_id.0)?;
+        matches!(market.reference, PairReference::Direct(_)).then(|| async {
+            Ok::<_, StatusCode>((
+                request.pair_id.0.clone(),
+                build_unsigned_direct(&state, request, market).await?,
+            ))
+        })
+    }))
     .await
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
+    let mut unsigned_by_pair = direct.into_iter().collect::<BTreeMap<_, _>>();
+    for request in &request.markets {
+        let market = &state.markets[&request.pair_id.0];
+        let PairReference::Synthetic {
+            base_market_id,
+            quote_market_id,
+            max_leg_skew_ms,
+            max_age_ms,
+            envelope_bps,
+            attestation_ttl_ms,
+        } = &market.reference
+        else {
+            continue;
+        };
+        let base = unsigned_by_pair
+            .get(base_market_id)
+            .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+        let quote = unsigned_by_pair
+            .get(quote_market_id)
+            .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+        let now = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let entry = derive_synthetic_entry(
+            request,
+            base_market_id,
+            quote_market_id,
+            *max_leg_skew_ms,
+            *max_age_ms,
+            *envelope_bps,
+            *attestation_ttl_ms,
+            base,
+            quote,
+            now,
+        )
+        .map_err(|error| {
+            eprintln!("synthetic reference envelope rejected: {error}");
+            StatusCode::BAD_GATEWAY
+        })?;
+        unsigned_by_pair.insert(request.pair_id.0.clone(), entry);
+    }
+    let unsigned = request
+        .markets
+        .iter()
+        .map(|market| {
+            unsigned_by_pair
+                .remove(&market.pair_id.0)
+                .ok_or(StatusCode::UNPROCESSABLE_ENTITY)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let valid_from_unix_ms = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let entries = unsigned
         .iter()
@@ -297,9 +368,105 @@ async fn attest_price_batch(
 async fn build_unsigned_entry(
     state: &AppState,
     request: &AttestationRequest,
-    observed_at_unix_ms: u64,
 ) -> Result<UnsignedEntry, StatusCode> {
-    // attestations are bound to the exchange; never sign for another context.
+    validate_request(state, request)?;
+    let pair = &state.markets[&request.pair_id.0];
+    let PairReference::Synthetic {
+        base_market_id,
+        quote_market_id,
+        max_leg_skew_ms,
+        max_age_ms,
+        envelope_bps,
+        attestation_ttl_ms,
+    } = &pair.reference
+    else {
+        return build_unsigned_direct(state, request, pair).await;
+    };
+    let base_market = state
+        .markets
+        .get(base_market_id)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let quote_market = state
+        .markets
+        .get(quote_market_id)
+        .ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let direct_request = |market_id: &str, market: &PairMarket| AttestationRequest {
+        pair_id: PairId(market_id.into()),
+        base_asset_id: AssetId(market.base_asset_id.clone()),
+        quote_asset_id: AssetId(market.quote_asset_id.clone()),
+        price_base_scale: market.price_base_scale,
+        exchange_address: request.exchange_address.clone(),
+    };
+    let base_request = direct_request(base_market_id, base_market);
+    let quote_request = direct_request(quote_market_id, quote_market);
+    let (base, quote) = tokio::join!(
+        build_unsigned_direct(state, &base_request, base_market),
+        build_unsigned_direct(state, &quote_request, quote_market),
+    );
+    let now = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    derive_synthetic_entry(
+        request,
+        base_market_id,
+        quote_market_id,
+        *max_leg_skew_ms,
+        *max_age_ms,
+        *envelope_bps,
+        *attestation_ttl_ms,
+        &base?,
+        &quote?,
+        now,
+    )
+    .map_err(|error| {
+        eprintln!("synthetic reference envelope rejected: {error}");
+        StatusCode::BAD_GATEWAY
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_synthetic_entry(
+    request: &AttestationRequest,
+    base_market_id: &str,
+    quote_market_id: &str,
+    max_leg_skew_ms: u64,
+    max_age_ms: u64,
+    envelope_bps: u32,
+    attestation_ttl_ms: u64,
+    base: &UnsignedEntry,
+    quote: &UnsignedEntry,
+    now_unix_ms: u64,
+) -> Result<UnsignedEntry, String> {
+    let envelope = build_synthetic_cross_envelope(
+        request.pair_id.clone(),
+        request.base_asset_id.clone(),
+        request.quote_asset_id.clone(),
+        request.price_base_scale,
+        PairId(base_market_id.into()),
+        PairId(quote_market_id.into()),
+        &base.envelope,
+        &quote.envelope,
+        now_unix_ms,
+        max_leg_skew_ms,
+        max_age_ms,
+        envelope_bps,
+    )
+    .map_err(|error| error.to_string())?;
+    let source_set_commitment = reference_price_source_set_commitment(&(
+        "synthetic_cross_bbo_v1",
+        base_market_id,
+        &base.source_set_commitment,
+        quote_market_id,
+        &quote.source_set_commitment,
+    ))
+    .map_err(|error| error.to_string())?;
+    Ok(UnsignedEntry {
+        envelope,
+        source_set_commitment,
+        max_age_ms,
+        attestation_ttl_ms,
+    })
+}
+
+fn validate_request(state: &AppState, request: &AttestationRequest) -> Result<(), StatusCode> {
     if parse_felt(&request.exchange_address) != Some(state.exchange_address) {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -313,6 +480,17 @@ async fn build_unsigned_entry(
     {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
+    Ok(())
+}
+
+async fn build_unsigned_direct(
+    state: &AppState,
+    request: &AttestationRequest,
+    pair: &PairMarket,
+) -> Result<UnsignedEntry, StatusCode> {
+    let PairReference::Direct(reference) = &pair.reference else {
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    };
     let (Some(&base_decimals), Some(&quote_decimals)) = (
         state.decimals.get(&pair.base_asset_id),
         state.decimals.get(&pair.quote_asset_id),
@@ -322,13 +500,13 @@ async fn build_unsigned_entry(
     let base_asset_scale = 10_u128
         .checked_pow(u32::from(base_decimals))
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let samples = fetch_samples(
+    let mut samples = fetch_samples(
         &state.client,
-        pair,
+        reference,
         quote_decimals,
         base_asset_scale,
         request.price_base_scale,
-        observed_at_unix_ms,
+        0,
     )
     .await
     .map_err(|error| {
@@ -338,6 +516,10 @@ async fn build_unsigned_entry(
         );
         StatusCode::BAD_GATEWAY
     })?;
+    let observed_at_unix_ms = now_unix_ms().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    for sample in &mut samples {
+        sample.observed_at_unix_ms = observed_at_unix_ms;
+    }
     let envelope = build_reference_price_envelope(
         request.pair_id.clone(),
         request.base_asset_id.clone(),
@@ -345,7 +527,7 @@ async fn build_unsigned_entry(
         request.price_base_scale,
         observed_at_unix_ms,
         &samples,
-        &pair.reference_policy,
+        &reference.reference_policy,
     )
     .map_err(|error| {
         eprintln!("reference envelope rejected: {error}");
@@ -356,8 +538,8 @@ async fn build_unsigned_entry(
     Ok(UnsignedEntry {
         envelope,
         source_set_commitment,
-        max_age_ms: pair.reference_policy.max_age_ms,
-        attestation_ttl_ms: pair.attestation_ttl_ms,
+        max_age_ms: reference.reference_policy.max_age_ms,
+        attestation_ttl_ms: reference.attestation_ttl_ms,
     })
 }
 
@@ -439,72 +621,102 @@ fn reference_markets(manifest: &DeploymentManifest) -> Result<HashMap<String, Pa
         .market_registry
         .enabled_markets()
         .map(|market| {
-            let VenueObservation::Direct {
-                adapter: VenueAdapter::Binance,
-                symbol: binance_symbol,
-            } = &market.reference_price.primary
-            else {
-                return Err(format!(
-                    "market {} primary source is not supported by the attestor",
-                    market.market_id.0
-                ));
-            };
-            let mut coinbase = None;
-            let mut kraken = None;
-            let mut okx = None;
-            for observation in &market.reference_price.corroborating {
-                let VenueObservation::SameVenueRatio {
-                    adapter,
-                    base_symbol,
-                    quote_symbol,
-                } = observation
-                else {
-                    return Err(format!(
-                        "market {} has an unsupported corroborating source",
-                        market.market_id.0
-                    ));
-                };
-                let slot = match adapter {
-                    VenueAdapter::Coinbase => &mut coinbase,
-                    VenueAdapter::Kraken => &mut kraken,
-                    VenueAdapter::Okx => &mut okx,
-                    VenueAdapter::Binance => {
+            let reference = match &market.reference_price {
+                zylith_core::MarketReferencePrice::DirectBboMidpoint {
+                    primary,
+                    corroborating,
+                    ..
+                } => {
+                    let VenueObservation::Direct {
+                        adapter: VenueAdapter::Binance,
+                        symbol: binance_symbol,
+                    } = primary
+                    else {
                         return Err(format!(
-                            "market {} repeats the primary venue",
+                            "market {} primary source is not supported by the attestor",
                             market.market_id.0
                         ));
+                    };
+                    let mut coinbase = None;
+                    let mut kraken = None;
+                    let mut okx = None;
+                    for observation in corroborating {
+                        let VenueObservation::SameVenueRatio {
+                            adapter,
+                            base_symbol,
+                            quote_symbol,
+                        } = observation
+                        else {
+                            return Err(format!(
+                                "market {} has an unsupported corroborating source",
+                                market.market_id.0
+                            ));
+                        };
+                        let slot = match adapter {
+                            VenueAdapter::Coinbase => &mut coinbase,
+                            VenueAdapter::Kraken => &mut kraken,
+                            VenueAdapter::Okx => &mut okx,
+                            VenueAdapter::Binance => {
+                                return Err(format!(
+                                    "market {} repeats the primary venue",
+                                    market.market_id.0
+                                ));
+                            }
+                        };
+                        if slot
+                            .replace((base_symbol.clone(), quote_symbol.clone()))
+                            .is_some()
+                        {
+                            return Err(format!(
+                                "market {} repeats a corroborating venue",
+                                market.market_id.0
+                            ));
+                        }
                     }
-                };
-                if slot
-                    .replace((base_symbol.clone(), quote_symbol.clone()))
-                    .is_some()
-                {
-                    return Err(format!(
-                        "market {} repeats a corroborating venue",
-                        market.market_id.0
-                    ));
+                    let (coinbase_base, coinbase_quote) = coinbase.ok_or_else(|| {
+                        format!("market {} has no Coinbase source", market.market_id.0)
+                    })?;
+                    let (kraken_base, kraken_quote) = kraken.ok_or_else(|| {
+                        format!("market {} has no Kraken source", market.market_id.0)
+                    })?;
+                    let (okx_base, okx_quote) = okx.unzip();
+                    PairReference::Direct(DirectMarket {
+                        binance_symbol: binance_symbol.clone(),
+                        coinbase_base,
+                        coinbase_quote,
+                        okx_base,
+                        okx_quote,
+                        kraken_base,
+                        kraken_quote,
+                        reference_policy: market.reference_price_policy().ok_or_else(|| {
+                            format!("market {} has no direct price policy", market.market_id.0)
+                        })?,
+                        attestation_ttl_ms: market.reference_price.attestation_ttl_ms(),
+                    })
                 }
-            }
-            let (coinbase_base, coinbase_quote) = coinbase
-                .ok_or_else(|| format!("market {} has no Coinbase source", market.market_id.0))?;
-            let (kraken_base, kraken_quote) = kraken
-                .ok_or_else(|| format!("market {} has no Kraken source", market.market_id.0))?;
-            let (okx_base, okx_quote) = okx.unzip();
+                zylith_core::MarketReferencePrice::SyntheticCrossBboMidpoint {
+                    base_market_id,
+                    quote_market_id,
+                    max_leg_skew_ms,
+                    max_age_ms,
+                    envelope_bps,
+                    attestation_ttl_ms,
+                } => PairReference::Synthetic {
+                    base_market_id: base_market_id.0.clone(),
+                    quote_market_id: quote_market_id.0.clone(),
+                    max_leg_skew_ms: *max_leg_skew_ms,
+                    max_age_ms: *max_age_ms,
+                    envelope_bps: *envelope_bps,
+                    attestation_ttl_ms: *attestation_ttl_ms,
+                },
+            };
             Ok((
                 market.market_id.0.clone(),
                 PairMarket {
                     base_asset_id: market.base_asset_id.0.clone(),
                     quote_asset_id: market.quote_asset_id.0.clone(),
                     price_base_scale: market.price_base_scale,
-                    binance_symbol: binance_symbol.clone(),
-                    coinbase_base,
-                    coinbase_quote,
-                    okx_base,
-                    okx_quote,
-                    kraken_base,
-                    kraken_quote,
-                    reference_policy: market.reference_price_policy(),
-                    attestation_ttl_ms: market.reference_price.attestation_ttl_ms,
+                    reference,
                 },
             ))
         })
@@ -513,7 +725,7 @@ fn reference_markets(manifest: &DeploymentManifest) -> Result<HashMap<String, Pa
 
 async fn fetch_samples(
     client: &Client,
-    market: &PairMarket,
+    market: &DirectMarket,
     quote_decimals: u8,
     base_asset_scale: u128,
     price_base_scale: u128,
@@ -992,11 +1204,12 @@ mod tests {
     use starknet_rust_core::types::Felt;
 
     use super::{
-        Book, UnsignedEntry, attestation_expiry, constant_time_eq, manifest_decimals,
-        manifest_reference_signer, parse_decimal_ratio, parse_manifest, parse_okx_book,
-        ratio_to_units, reference_markets, sample_from_ratio_books,
+        AttestationRequest, Book, PairReference, UnsignedEntry, attestation_expiry,
+        constant_time_eq, derive_synthetic_entry, manifest_decimals, manifest_reference_signer,
+        parse_decimal_ratio, parse_manifest, parse_okx_book, ratio_to_units, reference_markets,
+        sample_from_ratio_books,
     };
-    use zylith_core::{AssetId, PairId, ReferencePriceEnvelope};
+    use zylith_core::{AssetId, PairId, ReferencePriceDerivation, ReferencePriceEnvelope};
 
     #[test]
     fn reference_markets_are_data_driven_and_match_the_manifest() {
@@ -1005,8 +1218,18 @@ mod tests {
         ))
         .unwrap();
         let markets = reference_markets(&manifest).unwrap();
-        assert_eq!(markets["STRK/USDC"].binance_symbol, "STRKUSDC");
-        assert_eq!(markets["ETH/USDC"].kraken_base, "XETHZUSD");
+        let PairReference::Direct(strk) = &markets["STRK/USDC"].reference else {
+            panic!("expected direct STRK market")
+        };
+        let PairReference::Direct(eth) = &markets["ETH/USDC"].reference else {
+            panic!("expected direct ETH market")
+        };
+        assert_eq!(strk.binance_symbol, "STRKUSDC");
+        assert_eq!(eth.kraken_base, "XETHZUSD");
+        assert!(matches!(
+            markets["STRK/ETH"].reference,
+            PairReference::Synthetic { .. }
+        ));
     }
 
     #[test]
@@ -1109,6 +1332,10 @@ mod tests {
                 price_base_scale: 1,
                 source_count: 3,
                 observed_at_unix_ms: 1_000,
+                derivation: ReferencePriceDerivation::DirectBbo {
+                    bid_price: 1,
+                    ask_price: 1,
+                },
             },
             source_set_commitment: "commitment".into(),
             max_age_ms: 5_000,
@@ -1116,5 +1343,55 @@ mod tests {
         };
         assert_eq!(attestation_expiry(&entry, 2_000).unwrap(), 6_000);
         assert!(attestation_expiry(&entry, 6_000).is_err());
+    }
+
+    #[test]
+    fn a_single_synthetic_attestation_is_derived_from_both_direct_legs() {
+        let direct = |pair: &str, base: &str, bid: u128, ask: u128| UnsignedEntry {
+            envelope: ReferencePriceEnvelope {
+                pair_id: PairId(pair.into()),
+                base_asset_id: AssetId(base.into()),
+                quote_asset_id: AssetId("USDC".into()),
+                midpoint_price: (bid + ask) / 2,
+                lower_price: bid,
+                upper_price: ask,
+                price_base_scale: 1_000_000,
+                source_count: 3,
+                observed_at_unix_ms: 9_900,
+                derivation: ReferencePriceDerivation::DirectBbo {
+                    bid_price: bid,
+                    ask_price: ask,
+                },
+            },
+            source_set_commitment: format!("{pair}-sources"),
+            max_age_ms: 5_000,
+            attestation_ttl_ms: 5_000,
+        };
+        let request = AttestationRequest {
+            pair_id: PairId("STRK/ETH".into()),
+            base_asset_id: AssetId("STRK".into()),
+            quote_asset_id: AssetId("ETH".into()),
+            price_base_scale: 1_000_000,
+            exchange_address: "0x1".into(),
+        };
+        let entry = derive_synthetic_entry(
+            &request,
+            "STRK/USDC",
+            "ETH/USDC",
+            1_500,
+            5_000,
+            15,
+            5_000,
+            &direct("STRK/USDC", "STRK", 41_000, 42_000),
+            &direct("ETH/USDC", "ETH", 2_600_000_000, 2_700_000_000),
+            10_000,
+        )
+        .unwrap();
+        assert_eq!(entry.envelope.pair_id.0, "STRK/ETH");
+        assert!(matches!(
+            entry.envelope.derivation,
+            ReferencePriceDerivation::SyntheticCrossBbo { .. }
+        ));
+        assert_ne!(entry.source_set_commitment, "STRK/USDC-sources");
     }
 }

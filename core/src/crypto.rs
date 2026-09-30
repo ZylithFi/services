@@ -47,6 +47,44 @@ pub fn reference_price_source_set_commitment<T: Serialize>(
     tagged_field_hex("zylith/reference-price-source-set-v1", sources)
 }
 
+fn reference_price_derivation_fields(envelope: &ReferencePriceEnvelope) -> [String; 8] {
+    match &envelope.derivation {
+        crate::ReferencePriceDerivation::DirectBbo {
+            bid_price,
+            ask_price,
+        } => [
+            encode_u64(u64::from(crate::exchange::REFERENCE_METHOD_DIRECT_BBO)),
+            encode_u64(0),
+            encode_u64(0),
+            encode_u128(*bid_price),
+            encode_u128(*ask_price),
+            encode_u128(0),
+            encode_u128(0),
+            encode_u64(0),
+        ],
+        crate::ReferencePriceDerivation::SyntheticCrossBbo {
+            base_market_id,
+            quote_market_id,
+            max_leg_skew_ms,
+            base_bid_price,
+            base_ask_price,
+            quote_bid_price,
+            quote_ask_price,
+        } => [
+            encode_u64(u64::from(
+                crate::exchange::REFERENCE_METHOD_SYNTHETIC_CROSS_BBO,
+            )),
+            encode_starknet_felt("pair-id", &base_market_id.0),
+            encode_starknet_felt("pair-id", &quote_market_id.0),
+            encode_u128(*base_bid_price),
+            encode_u128(*base_ask_price),
+            encode_u128(*quote_bid_price),
+            encode_u128(*quote_ask_price),
+            encode_u64(*max_leg_skew_ms),
+        ],
+    }
+}
+
 pub fn reference_price_attestation_commitment(
     attestation: &ReferencePriceAttestation,
 ) -> Result<String, ProtocolError> {
@@ -55,7 +93,7 @@ pub fn reference_price_attestation_commitment(
         domain_felt(REFERENCE_PRICE_ATTESTATION_DOMAIN_TAG),
         felt_from_hex_str(&normalize_felt_hex(&attestation.exchange_address)?)?,
     );
-    for field in [
+    let mut fields = vec![
         encode_starknet_felt("pair-id", &envelope.pair_id.0),
         encode_asset_id(&envelope.base_asset_id.0),
         encode_asset_id(&envelope.quote_asset_id.0),
@@ -63,6 +101,9 @@ pub fn reference_price_attestation_commitment(
         encode_u128(envelope.lower_price),
         encode_u128(envelope.upper_price),
         encode_u128(envelope.price_base_scale),
+    ];
+    fields.extend(reference_price_derivation_fields(envelope));
+    fields.extend([
         encode_usize(envelope.source_count),
         encode_u64(envelope.observed_at_unix_ms),
         encode_u64(attestation.valid_until_unix_ms),
@@ -70,7 +111,8 @@ pub fn reference_price_attestation_commitment(
         encode_u64(attestation.nonce),
         normalize_felt_hex(&attestation.price_batch_commitment)?,
         normalize_felt_hex(&attestation.signer_public_key)?,
-    ] {
+    ]);
+    for field in fields {
         state = poseidon_hash(state, felt_from_hex_str(&field)?);
     }
     Ok(felt_hex(&state))
@@ -126,7 +168,7 @@ pub fn reference_price_batch_commitment(
     state = poseidon_hash(state, Felt::from(entries.len() as u64));
     for entry in entries {
         let envelope = &entry.envelope;
-        for field in [
+        let mut fields = vec![
             encode_starknet_felt("pair-id", &envelope.pair_id.0),
             encode_asset_id(&envelope.base_asset_id.0),
             encode_asset_id(&envelope.quote_asset_id.0),
@@ -134,12 +176,16 @@ pub fn reference_price_batch_commitment(
             encode_u128(envelope.lower_price),
             encode_u128(envelope.upper_price),
             encode_u128(envelope.price_base_scale),
+        ];
+        fields.extend(reference_price_derivation_fields(envelope));
+        fields.extend([
             encode_usize(envelope.source_count),
             encode_u64(envelope.observed_at_unix_ms),
             encode_u64(entry.valid_until_unix_ms),
             normalize_felt_hex(&entry.source_set_commitment)?,
             encode_u64(entry.nonce),
-        ] {
+        ]);
+        for field in fields {
             state = poseidon_hash(state, felt_from_hex_str(&field)?);
         }
     }

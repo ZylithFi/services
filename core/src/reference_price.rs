@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use num_bigint::BigUint;
+use num_integer::Integer;
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -67,6 +70,31 @@ pub struct ReferencePriceEnvelope {
     pub price_base_scale: u128,
     pub source_count: usize,
     pub observed_at_unix_ms: u64,
+    pub derivation: ReferencePriceDerivation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "methodology", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReferencePriceDerivation {
+    DirectBbo {
+        #[serde(with = "crate::types::serde_u128_decimal")]
+        bid_price: u128,
+        #[serde(with = "crate::types::serde_u128_decimal")]
+        ask_price: u128,
+    },
+    SyntheticCrossBbo {
+        base_market_id: PairId,
+        quote_market_id: PairId,
+        max_leg_skew_ms: u64,
+        #[serde(with = "crate::types::serde_u128_decimal")]
+        base_bid_price: u128,
+        #[serde(with = "crate::types::serde_u128_decimal")]
+        base_ask_price: u128,
+        #[serde(with = "crate::types::serde_u128_decimal")]
+        quote_bid_price: u128,
+        #[serde(with = "crate::types::serde_u128_decimal")]
+        quote_ask_price: u128,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +159,7 @@ pub fn build_reference_price_envelope(
     }
     let mut fresh_midpoints = Vec::<(String, u128)>::new();
     let mut fresh_venues = BTreeSet::<String>::new();
-    let mut primary = None::<(u128, u64)>;
+    let mut primary = None::<(u128, u128, u128, u64)>;
     for sample in samples {
         validate_reference_source_name(&sample.source)?;
         if !is_allowed_reference_source(&sample.source) {
@@ -188,7 +216,7 @@ pub fn build_reference_price_envelope(
                     policy.primary_source
                 )));
             }
-            primary = Some((mid, sample.observed_at_unix_ms));
+            primary = Some((bid, ask, mid, sample.observed_at_unix_ms));
         }
         fresh_midpoints.push((source, mid));
     }
@@ -201,7 +229,7 @@ pub fn build_reference_price_envelope(
         )));
     }
 
-    let (midpoint, primary_observed_at) = primary.ok_or_else(|| {
+    let (primary_bid, primary_ask, midpoint, primary_observed_at) = primary.ok_or_else(|| {
         ProtocolError::InvalidSettlementProof(format!(
             "reference price requires fresh primary {} source",
             policy.primary_source
@@ -235,17 +263,7 @@ pub fn build_reference_price_envelope(
         )));
     }
 
-    let lower_price = midpoint
-        .checked_mul(BPS_DENOMINATOR - policy.envelope_bps as u128)
-        .map(|value| value / BPS_DENOMINATOR)
-        .ok_or_else(|| {
-            ProtocolError::InvalidSettlementProof("reference lower envelope overflows".into())
-        })?;
-    let upper_price = ceil_mul_div(
-        midpoint,
-        BPS_DENOMINATOR + policy.envelope_bps as u128,
-        BPS_DENOMINATOR,
-    )?;
+    let (lower_price, upper_price) = price_envelope(midpoint, policy.envelope_bps)?;
 
     Ok(ReferencePriceEnvelope {
         pair_id,
@@ -257,7 +275,124 @@ pub fn build_reference_price_envelope(
         price_base_scale,
         source_count: corroborating_source_count,
         observed_at_unix_ms: primary_observed_at,
+        derivation: ReferencePriceDerivation::DirectBbo {
+            bid_price: primary_bid,
+            ask_price: primary_ask,
+        },
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_synthetic_cross_envelope(
+    pair_id: PairId,
+    base_asset_id: AssetId,
+    quote_asset_id: AssetId,
+    price_base_scale: u128,
+    base_market_id: PairId,
+    quote_market_id: PairId,
+    base_leg: &ReferencePriceEnvelope,
+    quote_leg: &ReferencePriceEnvelope,
+    now_unix_ms: u64,
+    max_leg_skew_ms: u64,
+    max_age_ms: u64,
+    envelope_bps: u32,
+) -> Result<ReferencePriceEnvelope, ProtocolError> {
+    if price_base_scale == 0
+        || base_leg.price_base_scale != price_base_scale
+        || quote_leg.price_base_scale != price_base_scale
+        || base_leg.pair_id != base_market_id
+        || quote_leg.pair_id != quote_market_id
+        || base_leg.base_asset_id != base_asset_id
+        || quote_leg.base_asset_id != quote_asset_id
+        || base_leg.quote_asset_id != quote_leg.quote_asset_id
+    {
+        return Err(invalid_reference(
+            "synthetic cross legs do not match the market",
+        ));
+    }
+    let ReferencePriceDerivation::DirectBbo {
+        bid_price: base_bid,
+        ask_price: base_ask,
+    } = base_leg.derivation
+    else {
+        return Err(invalid_reference("synthetic base leg is not a direct bbo"));
+    };
+    let ReferencePriceDerivation::DirectBbo {
+        bid_price: quote_bid,
+        ask_price: quote_ask,
+    } = quote_leg.derivation
+    else {
+        return Err(invalid_reference("synthetic quote leg is not a direct bbo"));
+    };
+    let skew = base_leg
+        .observed_at_unix_ms
+        .abs_diff(quote_leg.observed_at_unix_ms);
+    if max_leg_skew_ms == 0 || skew > max_leg_skew_ms {
+        return Err(invalid_reference(
+            "synthetic cross legs exceed the timestamp skew bound",
+        ));
+    }
+    let observed_at_unix_ms = base_leg
+        .observed_at_unix_ms
+        .min(quote_leg.observed_at_unix_ms);
+    let age = now_unix_ms
+        .checked_sub(observed_at_unix_ms)
+        .ok_or_else(|| invalid_reference("synthetic cross is from the future"))?;
+    if max_age_ms == 0 || age > max_age_ms {
+        return Err(invalid_reference("synthetic cross is stale"));
+    }
+    let (bid, ask) =
+        derive_synthetic_cross_bbo(base_bid, base_ask, quote_bid, quote_ask, price_base_scale)?;
+    if bid == 0 || bid > ask {
+        return Err(invalid_reference("synthetic cross produced an invalid bbo"));
+    }
+    let midpoint = midpoint_price(bid, ask)?;
+    let (lower_price, upper_price) = price_envelope(midpoint, envelope_bps)?;
+    Ok(ReferencePriceEnvelope {
+        pair_id,
+        base_asset_id,
+        quote_asset_id,
+        midpoint_price: midpoint,
+        lower_price,
+        upper_price,
+        price_base_scale,
+        source_count: base_leg.source_count.min(quote_leg.source_count),
+        observed_at_unix_ms,
+        derivation: ReferencePriceDerivation::SyntheticCrossBbo {
+            base_market_id,
+            quote_market_id,
+            max_leg_skew_ms,
+            base_bid_price: base_bid,
+            base_ask_price: base_ask,
+            quote_bid_price: quote_bid,
+            quote_ask_price: quote_ask,
+        },
+    })
+}
+
+pub fn derive_synthetic_cross_bbo(
+    base_bid: u128,
+    base_ask: u128,
+    quote_bid: u128,
+    quote_ask: u128,
+    price_base_scale: u128,
+) -> Result<(u128, u128), ProtocolError> {
+    if base_bid == 0
+        || quote_bid == 0
+        || base_bid > base_ask
+        || quote_bid > quote_ask
+        || price_base_scale == 0
+    {
+        return Err(invalid_reference(
+            "synthetic cross has an invalid component bbo",
+        ));
+    }
+    let bid = mul_div(base_bid, price_base_scale, quote_ask, false)?;
+    let ask = mul_div(base_ask, price_base_scale, quote_bid, true)?;
+    if bid == 0 || bid > ask {
+        return Err(invalid_reference("synthetic cross produced an invalid bbo"));
+    }
+    Ok((bid, ask))
 }
 
 fn validate_reference_source_name(source: &str) -> Result<(), ProtocolError> {
@@ -292,6 +427,50 @@ fn midpoint_price(bid: u128, ask: u128) -> Result<u128, ProtocolError> {
     bid.checked_add(ask)
         .map(|value| value / 2)
         .ok_or_else(|| ProtocolError::InvalidSettlementProof("midpoint overflows".into()))
+}
+
+fn invalid_reference(message: &str) -> ProtocolError {
+    ProtocolError::InvalidSettlementProof(message.into())
+}
+
+fn mul_div(
+    left: u128,
+    right: u128,
+    denominator: u128,
+    round_up: bool,
+) -> Result<u128, ProtocolError> {
+    if denominator == 0 {
+        return Err(invalid_reference("reference price division by zero"));
+    }
+    let numerator = BigUint::from(left) * BigUint::from(right);
+    let denominator = BigUint::from(denominator);
+    let value = if round_up {
+        numerator.div_ceil(&denominator)
+    } else {
+        numerator / denominator
+    };
+    value
+        .to_u128()
+        .ok_or_else(|| invalid_reference("reference price multiplication overflows"))
+}
+
+fn price_envelope(midpoint: u128, envelope_bps: u32) -> Result<(u128, u128), ProtocolError> {
+    if envelope_bps as u128 >= BPS_DENOMINATOR {
+        return Err(invalid_reference("reference price envelope is too wide"));
+    }
+    let lower = mul_div(
+        midpoint,
+        BPS_DENOMINATOR - envelope_bps as u128,
+        BPS_DENOMINATOR,
+        false,
+    )?;
+    let upper = mul_div(
+        midpoint,
+        BPS_DENOMINATOR + envelope_bps as u128,
+        BPS_DENOMINATOR,
+        true,
+    )?;
+    Ok((lower, upper))
 }
 
 fn rescale_price(price: u128, from_scale: u128, to_scale: u128) -> Result<u128, ProtocolError> {
@@ -627,6 +806,69 @@ mod tests {
         .expect_err("unconfigured cex source rejected");
 
         assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn synthetic_cross_uses_executable_bbo_bounds_and_rejects_skew() {
+        let direct = |pair: &str, base: &str, bid, ask, observed| ReferencePriceEnvelope {
+            pair_id: PairId(pair.into()),
+            base_asset_id: AssetId(base.into()),
+            quote_asset_id: AssetId("USDC".into()),
+            midpoint_price: (bid + ask) / 2,
+            lower_price: bid,
+            upper_price: ask,
+            price_base_scale: SCALE,
+            source_count: 3,
+            observed_at_unix_ms: observed,
+            derivation: ReferencePriceDerivation::DirectBbo {
+                bid_price: bid,
+                ask_price: ask,
+            },
+        };
+        let strk = direct("STRK/USDC", "STRK", 39_990, 40_010, 9_900);
+        let eth = direct("ETH/USDC", "ETH", 3_999_000_000, 4_001_000_000, 9_950);
+        let cross = build_synthetic_cross_envelope(
+            PairId("STRK/ETH".into()),
+            AssetId("STRK".into()),
+            AssetId("ETH".into()),
+            SCALE,
+            PairId("STRK/USDC".into()),
+            PairId("ETH/USDC".into()),
+            &strk,
+            &eth,
+            10_000,
+            100,
+            500,
+            5,
+        )
+        .expect("synthetic cross");
+        assert_eq!(cross.midpoint_price, 10);
+        assert!(matches!(
+            cross.derivation,
+            ReferencePriceDerivation::SyntheticCrossBbo {
+                max_leg_skew_ms: 100,
+                ..
+            }
+        ));
+        assert!(
+            build_synthetic_cross_envelope(
+                PairId("STRK/ETH".into()),
+                AssetId("STRK".into()),
+                AssetId("ETH".into()),
+                SCALE,
+                PairId("STRK/USDC".into()),
+                PairId("ETH/USDC".into()),
+                &strk,
+                &eth,
+                10_000,
+                10,
+                500,
+                5,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("skew")
+        );
     }
 
     fn sample(

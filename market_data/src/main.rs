@@ -138,7 +138,7 @@ enum VenueMarket {
 
 #[derive(Clone, Debug)]
 struct MarketSources {
-    binance_symbol: String,
+    binance: VenueMarket,
     venues: BTreeMap<Venue, VenueMarket>,
 }
 
@@ -201,8 +201,8 @@ fn combine_tickers(base: Ticker, quote: Option<Ticker>) -> MarketStats {
         change_percent: (last - previous_close) / previous_close * 100.0,
         high: base.high / quote.low,
         low: base.low / quote.high,
-        // the base leg is usdt-denominated, the closest usd notional for a ratio market.
-        quote_volume: base.quote_volume,
+        // convert the base leg's common-reference notional into this market's quote asset.
+        quote_volume: base.quote_volume / quote.last,
     }
 }
 
@@ -261,7 +261,6 @@ fn combine_candles(base: Candle, quote: Option<Candle>) -> Option<Candle> {
     })
 }
 
-#[cfg(test)]
 fn combine_klines(base: Vec<Candle>, quote: Option<Vec<Candle>>) -> Vec<Candle> {
     let Some(quote) = quote else {
         return base;
@@ -559,9 +558,26 @@ impl AppState {
     }
 
     async fn binance_quote_and_stats(&self, pair: &Pair) -> (Option<Book>, Option<MarketStats>) {
-        let symbol = &self.sources(pair).binance_symbol;
-        let (book, ticker) = tokio::join!(self.binance_book(symbol), self.binance_ticker(symbol));
-        (book, ticker.map(|ticker| combine_tickers(ticker, None)))
+        match &self.sources(pair).binance {
+            VenueMarket::Direct(symbol) => {
+                let (book, ticker) =
+                    tokio::join!(self.binance_book(symbol), self.binance_ticker(symbol));
+                (book, ticker.map(|ticker| combine_tickers(ticker, None)))
+            }
+            VenueMarket::Ratio { base, quote } => {
+                let (base_book, quote_book, base_ticker, quote_ticker) = tokio::join!(
+                    self.binance_book(base),
+                    self.binance_book(quote),
+                    self.binance_ticker(base),
+                    self.binance_ticker(quote),
+                );
+                let book = base_book
+                    .zip(quote_book)
+                    .and_then(|(base, quote)| ratio_book(base, quote));
+                let stats = base_ticker.map(|ticker| combine_tickers(ticker, quote_ticker));
+                (book, stats)
+            }
+        }
     }
 
     async fn venue_book(&self, venue: Venue, symbol: &str) -> Option<Book> {
@@ -655,9 +671,13 @@ impl AppState {
             .await
             .map(|value| parse_klines(&value))
         };
-        let candles = klines(self.sources(pair).binance_symbol.clone())
-            .await
-            .unwrap_or_default();
+        let candles = match &self.sources(pair).binance {
+            VenueMarket::Direct(symbol) => klines(symbol.clone()).await.unwrap_or_default(),
+            VenueMarket::Ratio { base, quote } => {
+                let (base, quote) = tokio::join!(klines(base.clone()), klines(quote.clone()));
+                combine_klines(base.unwrap_or_default(), quote)
+            }
+        };
         let skip = candles.len().saturating_sub(MAX_CANDLES);
         CandleHistory {
             candles: candles.into_iter().skip(skip).collect(),
@@ -829,10 +849,15 @@ async fn fan_out_market_stream(
     events: mpsc::Sender<Event>,
 ) {
     let hub = state.0.binance.clone();
-    let symbol = state.sources(&pair).binance_symbol.clone();
-    let mut base_updates = hub.subscribe(&kline_stream_name(&symbol, interval));
-    let mut quote_updates = None;
-    let ratio = false;
+    let (base_symbol, quote_symbol) = match &state.sources(&pair).binance {
+        VenueMarket::Direct(symbol) => (symbol.clone(), None),
+        VenueMarket::Ratio { base, quote } => (base.clone(), Some(quote.clone())),
+    };
+    let mut base_updates = hub.subscribe(&kline_stream_name(&base_symbol, interval));
+    let mut quote_updates = quote_symbol
+        .as_deref()
+        .map(|symbol| hub.subscribe(&kline_stream_name(symbol, interval)));
+    let ratio = quote_updates.is_some();
     let mut latest_base: Option<Candle> = None;
     let mut latest_quote: Option<Candle> = None;
     let mut summary_tick = tokio::time::interval(SUMMARY_PUSH_INTERVAL);
@@ -943,6 +968,45 @@ fn production_manifest_markets(raw: &str) -> Result<RegistryMarkets, String> {
     parse_manifest_markets(raw, true)
 }
 
+fn source_from_observation(
+    observation: &zylith_core::VenueObservation,
+) -> (zylith_core::VenueAdapter, VenueMarket) {
+    match observation {
+        zylith_core::VenueObservation::Direct { adapter, symbol } => {
+            (*adapter, VenueMarket::Direct(symbol.clone()))
+        }
+        zylith_core::VenueObservation::SameVenueRatio {
+            adapter,
+            base_symbol,
+            quote_symbol,
+        } => (
+            *adapter,
+            VenueMarket::Ratio {
+                base: base_symbol.clone(),
+                quote: quote_symbol.clone(),
+            },
+        ),
+    }
+}
+
+fn cross_market(base: &VenueMarket, quote: &VenueMarket) -> Result<VenueMarket, String> {
+    let (base_symbol, base_reference) = match base {
+        VenueMarket::Direct(symbol) => (symbol, None),
+        VenueMarket::Ratio { base, quote } => (base, Some(quote)),
+    };
+    let (quote_symbol, quote_reference) = match quote {
+        VenueMarket::Direct(symbol) => (symbol, None),
+        VenueMarket::Ratio { base, quote } => (base, Some(quote)),
+    };
+    if base_reference != quote_reference {
+        return Err("synthetic market legs do not share a venue reference symbol".into());
+    }
+    Ok(VenueMarket::Ratio {
+        base: base_symbol.clone(),
+        quote: quote_symbol.clone(),
+    })
+}
+
 fn parse_manifest_markets(raw: &str, production: bool) -> Result<RegistryMarkets, String> {
     let value: Value =
         serde_json::from_str(raw).map_err(|error| format!("deployment manifest: {error}"))?;
@@ -954,44 +1018,42 @@ fn parse_manifest_markets(raw: &str, production: bool) -> Result<RegistryMarkets
     } else {
         manifest.validate_market_registry()?;
     }
-    let sources = manifest
-        .market_registry
-        .enabled_markets()
-        .map(|market| {
+    let mut sources = BTreeMap::new();
+    let mut pairs_by_id = BTreeMap::new();
+    for market in manifest.market_registry.enabled_markets() {
+        pairs_by_id.insert(
+            market.market_id.0.clone(),
+            Pair {
+                base: market.base_asset_id.0.clone(),
+                quote: market.quote_asset_id.0.clone(),
+            },
+        );
+    }
+    for market in manifest.market_registry.enabled_markets() {
+        if let zylith_core::MarketReferencePrice::DirectBboMidpoint {
+            primary,
+            corroborating,
+            ..
+        } = &market.reference_price
+        {
             if !market.capabilities.market_data {
                 return Err(format!(
                     "enabled market {} has no market-data capability",
                     market.market_id.0
                 ));
             }
-            let zylith_core::VenueObservation::Direct {
-                adapter: zylith_core::VenueAdapter::Binance,
-                symbol,
-            } = &market.reference_price.primary
-            else {
+            let (adapter, binance) = source_from_observation(primary);
+            if adapter != zylith_core::VenueAdapter::Binance
+                || !matches!(binance, VenueMarket::Direct(_))
+            {
                 return Err(format!(
                     "market {} has no supported direct Binance market-data source",
                     market.market_id.0
                 ));
-            };
+            }
             let mut venues = BTreeMap::new();
-            for observation in &market.reference_price.corroborating {
-                let (adapter, source) = match observation {
-                    zylith_core::VenueObservation::Direct { adapter, symbol } => {
-                        (*adapter, VenueMarket::Direct(symbol.clone()))
-                    }
-                    zylith_core::VenueObservation::SameVenueRatio {
-                        adapter,
-                        base_symbol,
-                        quote_symbol,
-                    } => (
-                        *adapter,
-                        VenueMarket::Ratio {
-                            base: base_symbol.clone(),
-                            quote: quote_symbol.clone(),
-                        },
-                    ),
-                };
+            for observation in corroborating {
+                let (adapter, source) = source_from_observation(observation);
                 let venue = match adapter {
                     zylith_core::VenueAdapter::Coinbase => Venue::Coinbase,
                     zylith_core::VenueAdapter::Kraken => Venue::Kraken,
@@ -1010,19 +1072,60 @@ fn parse_manifest_markets(raw: &str, production: bool) -> Result<RegistryMarkets
                     ));
                 }
             }
-            let pair = Pair {
-                base: market.base_asset_id.0.clone(),
-                quote: market.quote_asset_id.0.clone(),
-            };
-            Ok((
-                pair,
-                MarketSources {
-                    binance_symbol: symbol.clone(),
-                    venues,
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
+            sources.insert(
+                pairs_by_id[&market.market_id.0].clone(),
+                MarketSources { binance, venues },
+            );
+        }
+    }
+    for market in manifest.market_registry.enabled_markets() {
+        let zylith_core::MarketReferencePrice::SyntheticCrossBboMidpoint {
+            base_market_id,
+            quote_market_id,
+            ..
+        } = &market.reference_price
+        else {
+            continue;
+        };
+        let base_pair = pairs_by_id
+            .get(&base_market_id.0)
+            .ok_or_else(|| format!("market {} has no base source pair", market.market_id.0))?;
+        let quote_pair = pairs_by_id
+            .get(&quote_market_id.0)
+            .ok_or_else(|| format!("market {} has no quote source pair", market.market_id.0))?;
+        let base = sources
+            .get(base_pair)
+            .cloned()
+            .ok_or_else(|| format!("market {} base source is not direct", market.market_id.0))?;
+        let quote = sources
+            .get(quote_pair)
+            .cloned()
+            .ok_or_else(|| format!("market {} quote source is not direct", market.market_id.0))?;
+        let binance = cross_market(&base.binance, &quote.binance)?;
+        let mut venues = BTreeMap::new();
+        for venue in [Venue::Coinbase, Venue::Kraken, Venue::Okx] {
+            let base_source = base.venues.get(&venue).ok_or_else(|| {
+                format!(
+                    "market {} base leg lacks a venue source",
+                    market.market_id.0
+                )
+            })?;
+            let quote_source = quote.venues.get(&venue).ok_or_else(|| {
+                format!(
+                    "market {} quote leg lacks a venue source",
+                    market.market_id.0
+                )
+            })?;
+            venues.insert(venue, cross_market(base_source, quote_source)?);
+        }
+        sources.insert(
+            pairs_by_id[&market.market_id.0].clone(),
+            MarketSources { binance, venues },
+        );
+    }
+    if sources.len() != manifest.market_registry.enabled_markets().count() {
+        return Err("not every enabled market has market-data sources".into());
+    }
     Ok(RegistryMarkets {
         sources,
         registry_version: manifest.market_registry.registry_version,
@@ -1125,7 +1228,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tower::ServiceExt;
 
-    const DEFAULT_PAIRS: &str = "STRK/USDC,ETH/USDC";
+    const DEFAULT_PAIRS: &str = "STRK/USDC,STRK/ETH,ETH/USDC";
 
     fn test_sources(pairs: &str) -> BTreeMap<Pair, MarketSources> {
         let configured = pairs.split(',').collect::<BTreeSet<_>>();
@@ -1201,7 +1304,13 @@ mod tests {
                 quote: "USDC".into()
             })
         );
-        assert_eq!(state.pair("STRK", "ETH"), Err(StatusCode::NOT_FOUND));
+        assert_eq!(
+            state.pair("STRK", "ETH"),
+            Ok(Pair {
+                base: "STRK".into(),
+                quote: "ETH".into(),
+            })
+        );
         // the derivative token is its own asset and is not traded.
         assert_eq!(state.pair("strkBTC", "USDC"), Err(StatusCode::NOT_FOUND));
         assert_eq!(state.pair("BTC", "USDC"), Err(StatusCode::NOT_FOUND));
@@ -1254,7 +1363,20 @@ mod tests {
                 quote: "USDC".into(),
             })
             .unwrap();
-        assert_eq!(strk.binance_symbol, "STRKUSDC");
+        assert_eq!(strk.binance, VenueMarket::Direct("STRKUSDC".into()));
+        let cross = sources
+            .get(&Pair {
+                base: "STRK".into(),
+                quote: "ETH".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            cross.binance,
+            VenueMarket::Ratio {
+                base: "STRKUSDC".into(),
+                quote: "ETHUSDC".into(),
+            }
+        );
     }
 
     #[test]

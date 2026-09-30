@@ -8,7 +8,7 @@ const felt = (n) => `0x${n.toString(16)}`;
 const manifest = JSON.parse(readFileSync(new URL("../client/public/deployment.example.json", import.meta.url), "utf8"));
 Object.assign(manifest, {
   deployment: { finalized: true, release_commit: "a".repeat(40) },
-  contracts: { commitment_registry: felt(1), privacy_deposit_bridge: felt(2), ekubo_external_match_router: felt(0), exchange: felt(4) },
+  contracts: { commitment_registry: felt(1), privacy_deposit_bridge: felt(2), ekubo_external_match_router: felt(3), exchange: felt(4) },
   roles: { ...manifest.roles, reference_price_signer: felt(14) },
 });
 Object.assign(manifest.proof, {
@@ -82,7 +82,9 @@ const env = {
   ZYLITH_PROOF_JOB_ABANDONED_RETENTION_MS: "604800000",
   ZYLITH_PROOF_JOB_CLEANUP_INTERVAL_MS: "60000",
   ZYLITH_MIN_TRANSITION_FEE_STRK: "1000000000000000000",
-  ZYLITH_EXTERNAL_MATCHING_DISABLED: "1",
+  ZYLITH_EXTERNAL_MATCHING_DISABLED: "",
+  ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example",
+  ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/health",
 };
 
 const run = (overrides = {}, manifestOverride = manifest) =>
@@ -155,23 +157,22 @@ test("a missing fee floor, retired fee settings and epoch drift fail", () => {
 });
 
 test("external matching is either fully configured or explicitly disabled", () => {
-  const external = (window) => ({
-    ...structuredClone(manifest),
-    runtime: { ...manifest.runtime, external_window_seconds: window },
-  });
-  const externalManifest = (window) => {
-    const value = external(window);
-    value.market_registry.markets[0].capabilities.external_matching = true;
-    value.market_registry.markets[0].external_settlement_support_quote = "5000";
-    value.market_registry.markets[0].external_min_profit_quote = "1000";
-    value.contracts.ekubo_external_match_router = felt(3);
-    return rehash(value);
-  };
-  assert.ok(run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "" }).some((failure) => failure.includes("ZYLITH_EXTERNAL_MATCHING_DISABLED=1")));
-  const incomplete = run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "" }, externalManifest(0));
-  assert.ok(incomplete.some((failure) => failure.includes("ZYLITH_ROUTE_SERVICE_URL")));
-  assert.ok(incomplete.some((failure) => failure.includes("external_window_seconds")));
-  assert.ok(run({}, externalManifest(12)).some((failure) => failure.includes("match externally")));
-  const configured = { ZYLITH_EXTERNAL_MATCHING_DISABLED: "", ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example", ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/health" };
-  assert.deepEqual(run(configured, externalManifest(12)), []);
+  const incomplete = structuredClone(manifest);
+  incomplete.runtime.external_window_seconds = 0;
+  assert.ok(run({ ZYLITH_ROUTE_SERVICE_URL: "" }, incomplete).some((failure) => failure.includes("ZYLITH_ROUTE_SERVICE_URL")));
+  const failures = run({}, incomplete);
+  assert.ok(failures.some((failure) => failure.includes("external_window_seconds")));
+  assert.ok(run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "1" }).some((failure) => failure.includes("match externally")));
+
+  const disabled = structuredClone(manifest);
+  disabled.contracts.ekubo_external_match_router = felt(0);
+  disabled.runtime.external_window_seconds = 0;
+  for (const market of disabled.market_registry.markets) {
+    market.capabilities.external_matching = false;
+    market.external_settlement_support_quote = "0";
+    market.external_min_profit_quote = "0";
+  }
+  rehash(disabled);
+  const disabledEnv = { ZYLITH_EXTERNAL_MATCHING_DISABLED: "1", ZYLITH_ROUTE_SERVICE_URL: "", ZYLITH_ROUTE_SERVICE_HEALTH_URL: "" };
+  assert.deepEqual(run(disabledEnv, disabled), []);
 });

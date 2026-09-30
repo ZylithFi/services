@@ -348,8 +348,13 @@ async fn check_exchange_configuration(config: &Config, snip36: &Snip36) -> Resul
         let expected = [
             pair.base_asset_id,
             pair.quote_asset_id,
+            Felt::from(pair.scale),
             Felt::from(pair.fee_bps),
             Felt::from(pair.external_settlement_support_quote),
+            Felt::from(u64::from(pair.reference_methodology)),
+            pair.derivation_base_market_id,
+            pair.derivation_quote_market_id,
+            Felt::from(pair.max_leg_skew_ms),
         ];
         if values.as_slice() != expected {
             return Err(format!(

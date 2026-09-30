@@ -404,6 +404,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         observed_at_ms: 9_000,
         valid_until_ms: 11_000,
         fee_bps: 10,
+        reference_methodology: REFERENCE_METHOD_DIRECT_BBO,
+        derivation_base_market_id: Felt::ZERO,
+        derivation_quote_market_id: Felt::ZERO,
+        derivation_base_bid: 50,
+        derivation_base_ask: 50,
+        derivation_quote_bid: 0,
+        derivation_quote_ask: 0,
+        max_leg_skew_ms: 0,
     };
     let mut notes = Notes::default();
     let users = (8..14).map(user).collect::<Vec<_>>();
@@ -470,20 +478,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         100,
     );
     multi_input.markets.push(second_market.clone());
-    // the direct base/second-base midpoint diverges from the usdc-implied cross (2) and is still
-    // valid: it is an execution price, not an objective-vector edge.
+    // the non-numeraire market is derived from the two direct numeraire bbo observations.
     multi_input.markets.push(Market {
         pair_id: Felt::from(0x9a3_u64),
         base_asset_id: Felt::from(BASE),
         quote_asset_id: second_base,
-        midpoint: 3,
+        midpoint: 2,
         scale: 1,
         observed_at_ms: 9_000,
         valid_until_ms: 11_000,
         fee_bps: 10,
+        reference_methodology: REFERENCE_METHOD_SYNTHETIC_CROSS_BBO,
+        derivation_base_market_id: Felt::from(PAIR),
+        derivation_quote_market_id: second_pair,
+        derivation_base_bid: 100,
+        derivation_base_ask: 100,
+        derivation_quote_bid: 50,
+        derivation_quote_ask: 50,
+        max_leg_skew_ms: 1_500,
     });
     let multi = build_transition(&multi_input)?;
     vectors.accept("multi_market", &multi)?;
+    vectors.tamper("reject_synthetic_midpoint", &multi, |witness, _| {
+        let market_start = 12 + 3 * 3;
+        let synthetic_midpoint = market_start + 2 * 16 + 3;
+        witness[synthetic_midpoint] += Felt::ONE;
+    })?;
     notes.add_outputs(&multi.public);
     // only the first market this time: the second pair's resting orders pass through.
     let resting_input = input(2, multi.new_book.clone(), vec![], Felt::ZERO, 100);

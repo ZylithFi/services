@@ -47,10 +47,24 @@ pub struct Market {
     pub valid_until_ms: u64,
     #[serde(with = "u128_decimal_serde")]
     pub fee_bps: u128,
+    pub reference_methodology: u8,
+    #[serde(with = "felt_hex_serde")]
+    pub derivation_base_market_id: Felt,
+    #[serde(with = "felt_hex_serde")]
+    pub derivation_quote_market_id: Felt,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_base_bid: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_base_ask: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_quote_bid: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_quote_ask: u128,
+    pub max_leg_skew_ms: u64,
 }
 
 impl Market {
-    pub fn fields(&self) -> [Felt; 8] {
+    pub fn fields(&self) -> [Felt; 16] {
         [
             self.pair_id,
             self.base_asset_id,
@@ -60,6 +74,14 @@ impl Market {
             felt_u64(self.observed_at_ms),
             felt_u64(self.valid_until_ms),
             felt_u128(self.fee_bps),
+            felt_u64(u64::from(self.reference_methodology)),
+            self.derivation_base_market_id,
+            self.derivation_quote_market_id,
+            felt_u128(self.derivation_base_bid),
+            felt_u128(self.derivation_base_ask),
+            felt_u128(self.derivation_quote_bid),
+            felt_u128(self.derivation_quote_ask),
+            felt_u64(self.max_leg_skew_ms),
         ]
     }
 }
@@ -644,11 +666,82 @@ fn validate_markets(input: &TransitionInput) -> Result<(), ProtocolError> {
         if market.fee_bps > MAX_FEE_BPS {
             return Err(invalid("market fee exceeds the maximum"));
         }
+        match market.reference_methodology {
+            super::calldata::REFERENCE_METHOD_DIRECT_BBO => {
+                if market.derivation_base_market_id != Felt::ZERO
+                    || market.derivation_quote_market_id != Felt::ZERO
+                    || market.derivation_base_bid == 0
+                    || market.derivation_base_bid > market.derivation_base_ask
+                    || market.derivation_quote_bid != 0
+                    || market.derivation_quote_ask != 0
+                    || market.max_leg_skew_ms != 0
+                    || market
+                        .derivation_base_bid
+                        .checked_add(market.derivation_base_ask)
+                        .map(|sum| sum / 2)
+                        != Some(market.midpoint)
+                {
+                    return Err(invalid("direct market has an invalid bbo derivation"));
+                }
+            }
+            super::calldata::REFERENCE_METHOD_SYNTHETIC_CROSS_BBO => {
+                if market.derivation_base_market_id == Felt::ZERO
+                    || market.derivation_quote_market_id == Felt::ZERO
+                    || market.derivation_base_market_id == market.derivation_quote_market_id
+                    || market.max_leg_skew_ms == 0
+                {
+                    return Err(invalid("synthetic market has invalid reference legs"));
+                }
+            }
+            _ => return Err(invalid("market reference methodology is unsupported")),
+        }
         if !pairs.insert((
             felt_to_u256_bytes(&market.base_asset_id),
             felt_to_u256_bytes(&market.quote_asset_id),
         )) {
             return Err(invalid("two markets share an asset pair"));
+        }
+    }
+    for market in input.markets.iter().filter(|market| {
+        market.reference_methodology == super::calldata::REFERENCE_METHOD_SYNTHETIC_CROSS_BBO
+    }) {
+        let base = input
+            .markets
+            .iter()
+            .find(|candidate| candidate.pair_id == market.derivation_base_market_id)
+            .ok_or_else(|| invalid("synthetic base market is missing"))?;
+        let quote = input
+            .markets
+            .iter()
+            .find(|candidate| candidate.pair_id == market.derivation_quote_market_id)
+            .ok_or_else(|| invalid("synthetic quote market is missing"))?;
+        if base.reference_methodology != super::calldata::REFERENCE_METHOD_DIRECT_BBO
+            || quote.reference_methodology != super::calldata::REFERENCE_METHOD_DIRECT_BBO
+            || base.base_asset_id != market.base_asset_id
+            || quote.base_asset_id != market.quote_asset_id
+            || base.quote_asset_id != quote.quote_asset_id
+            || base.scale != market.scale
+            || quote.scale != market.scale
+            || market.derivation_base_bid != base.derivation_base_bid
+            || market.derivation_base_ask != base.derivation_base_ask
+            || market.derivation_quote_bid != quote.derivation_base_bid
+            || market.derivation_quote_ask != quote.derivation_base_ask
+            || base.observed_at_ms.abs_diff(quote.observed_at_ms) > market.max_leg_skew_ms
+            || market.observed_at_ms != base.observed_at_ms.min(quote.observed_at_ms)
+        {
+            return Err(invalid(
+                "synthetic market derivation does not match its direct legs",
+            ));
+        }
+        let (bid, ask) = crate::derive_synthetic_cross_bbo(
+            market.derivation_base_bid,
+            market.derivation_base_ask,
+            market.derivation_quote_bid,
+            market.derivation_quote_ask,
+            market.scale,
+        )?;
+        if bid.checked_add(ask).map(|sum| sum / 2) != Some(market.midpoint) {
+            return Err(invalid("synthetic market midpoint is incorrect"));
         }
     }
     Ok(())
@@ -1526,6 +1619,14 @@ fn serialize_witness(
             felt_u64(market.observed_at_ms),
             felt_u64(market.valid_until_ms),
             felt_u128(market.fee_bps),
+            felt_u64(u64::from(market.reference_methodology)),
+            market.derivation_base_market_id,
+            market.derivation_quote_market_id,
+            felt_u128(market.derivation_base_bid),
+            felt_u128(market.derivation_base_ask),
+            felt_u128(market.derivation_quote_bid),
+            felt_u128(market.derivation_quote_ask),
+            felt_u64(market.max_leg_skew_ms),
         ]);
     }
     for index in 0..assets.ids.len() {

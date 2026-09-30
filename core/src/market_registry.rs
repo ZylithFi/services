@@ -64,20 +64,66 @@ pub enum VenueObservation {
 #[serde(rename_all = "snake_case")]
 pub enum ReferencePriceMethodology {
     DirectBboMidpoint,
+    SyntheticCrossBboMidpoint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MarketReferencePrice {
-    pub methodology: ReferencePriceMethodology,
-    pub primary: VenueObservation,
-    pub corroborating: Vec<VenueObservation>,
-    pub min_sources: usize,
-    pub max_age_ms: u64,
-    pub max_source_spread_bps: u32,
-    pub max_cross_source_deviation_bps: u32,
-    pub envelope_bps: u32,
-    pub attestation_ttl_ms: u64,
+#[serde(tag = "methodology", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MarketReferencePrice {
+    DirectBboMidpoint {
+        primary: VenueObservation,
+        corroborating: Vec<VenueObservation>,
+        min_sources: usize,
+        max_age_ms: u64,
+        max_source_spread_bps: u32,
+        max_cross_source_deviation_bps: u32,
+        envelope_bps: u32,
+        attestation_ttl_ms: u64,
+    },
+    SyntheticCrossBboMidpoint {
+        base_market_id: PairId,
+        quote_market_id: PairId,
+        max_leg_skew_ms: u64,
+        max_age_ms: u64,
+        envelope_bps: u32,
+        attestation_ttl_ms: u64,
+    },
+}
+
+impl MarketReferencePrice {
+    pub fn methodology(&self) -> ReferencePriceMethodology {
+        match self {
+            Self::DirectBboMidpoint { .. } => ReferencePriceMethodology::DirectBboMidpoint,
+            Self::SyntheticCrossBboMidpoint { .. } => {
+                ReferencePriceMethodology::SyntheticCrossBboMidpoint
+            }
+        }
+    }
+
+    pub fn envelope_bps(&self) -> u32 {
+        match self {
+            Self::DirectBboMidpoint { envelope_bps, .. }
+            | Self::SyntheticCrossBboMidpoint { envelope_bps, .. } => *envelope_bps,
+        }
+    }
+
+    pub fn attestation_ttl_ms(&self) -> u64 {
+        match self {
+            Self::DirectBboMidpoint {
+                attestation_ttl_ms, ..
+            }
+            | Self::SyntheticCrossBboMidpoint {
+                attestation_ttl_ms, ..
+            } => *attestation_ttl_ms,
+        }
+    }
+
+    pub fn max_age_ms(&self) -> u64 {
+        match self {
+            Self::DirectBboMidpoint { max_age_ms, .. }
+            | Self::SyntheticCrossBboMidpoint { max_age_ms, .. } => *max_age_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,17 +168,27 @@ pub struct MarketRegistryMarket {
 }
 
 impl MarketRegistryMarket {
-    pub fn reference_price_policy(&self) -> ReferencePricePolicy {
-        ReferencePricePolicy {
-            primary_source: observation_adapter(&self.reference_price.primary)
-                .as_str()
-                .to_owned(),
-            min_sources: self.reference_price.min_sources,
-            max_age_ms: self.reference_price.max_age_ms,
-            max_source_spread_bps: self.reference_price.max_source_spread_bps,
-            max_cross_source_deviation_bps: self.reference_price.max_cross_source_deviation_bps,
-            envelope_bps: self.reference_price.envelope_bps,
-        }
+    pub fn reference_price_policy(&self) -> Option<ReferencePricePolicy> {
+        let MarketReferencePrice::DirectBboMidpoint {
+            primary,
+            min_sources,
+            max_age_ms,
+            max_source_spread_bps,
+            max_cross_source_deviation_bps,
+            envelope_bps,
+            ..
+        } = &self.reference_price
+        else {
+            return None;
+        };
+        Some(ReferencePricePolicy {
+            primary_source: observation_adapter(primary).as_str().to_owned(),
+            min_sources: *min_sources,
+            max_age_ms: *max_age_ms,
+            max_source_spread_bps: *max_source_spread_bps,
+            max_cross_source_deviation_bps: *max_cross_source_deviation_bps,
+            envelope_bps: *envelope_bps,
+        })
     }
 }
 
@@ -266,6 +322,14 @@ impl MarketRegistry {
 
         for market in &self.markets {
             validate_market(market, &assets)?;
+        }
+        let markets = self
+            .markets
+            .iter()
+            .map(|market| (market.market_id.0.as_str(), market))
+            .collect::<BTreeMap<_, _>>();
+        for market in &self.markets {
+            validate_synthetic_market(market, &markets, &self.objective_numeraire_asset_id)?;
         }
         for asset in self.assets.iter().filter(|asset| asset.enabled) {
             let used = self.markets.iter().any(|market| {
@@ -412,9 +476,55 @@ fn validate_market(
             market.market_id.0
         ));
     }
-    validate_observation(&market.reference_price.primary)?;
+    validate_reference_policy(market)?;
+    Ok(())
+}
+
+fn valid_common_reference_policy(max_age_ms: u64, envelope_bps: u32, ttl_ms: u64) -> bool {
+    max_age_ms > 0
+        && max_age_ms <= 15_000
+        && envelope_bps > 0
+        && envelope_bps < 10_000
+        && ttl_ms > 0
+        && ttl_ms <= 15_000
+}
+
+fn validate_reference_policy(market: &MarketRegistryMarket) -> Result<(), String> {
+    let MarketReferencePrice::DirectBboMidpoint {
+        primary,
+        corroborating,
+        min_sources,
+        max_age_ms,
+        max_source_spread_bps,
+        max_cross_source_deviation_bps,
+        envelope_bps,
+        attestation_ttl_ms,
+    } = &market.reference_price
+    else {
+        let MarketReferencePrice::SyntheticCrossBboMidpoint {
+            max_leg_skew_ms,
+            max_age_ms,
+            envelope_bps,
+            attestation_ttl_ms,
+            ..
+        } = &market.reference_price
+        else {
+            unreachable!()
+        };
+        if *max_leg_skew_ms == 0
+            || *max_leg_skew_ms > *max_age_ms
+            || !valid_common_reference_policy(*max_age_ms, *envelope_bps, *attestation_ttl_ms)
+        {
+            return Err(format!(
+                "market {} has invalid synthetic reference-price policy",
+                market.market_id.0
+            ));
+        }
+        return Ok(());
+    };
+    validate_observation(primary)?;
     if !matches!(
-        market.reference_price.primary,
+        primary,
         VenueObservation::Direct {
             adapter: VenueAdapter::Binance,
             ..
@@ -425,34 +535,28 @@ fn validate_market(
             market.market_id.0
         ));
     }
-    if market.reference_price.corroborating.len() < 2 {
+    if corroborating.len() < 2 {
         return Err(format!(
             "market {} has insufficient reference sources",
             market.market_id.0
         ));
     }
-    let reference = &market.reference_price;
-    let available_sources = 1 + reference.corroborating.len();
-    if reference.min_sources < 3
-        || reference.min_sources > available_sources
-        || reference.max_age_ms == 0
-        || reference.max_age_ms > 15_000
-        || reference.max_source_spread_bps == 0
-        || reference.max_source_spread_bps >= 10_000
-        || reference.max_cross_source_deviation_bps == 0
-        || reference.max_cross_source_deviation_bps >= 10_000
-        || reference.envelope_bps == 0
-        || reference.envelope_bps >= 10_000
-        || reference.attestation_ttl_ms == 0
-        || reference.attestation_ttl_ms > 15_000
+    let available_sources = 1 + corroborating.len();
+    if *min_sources < 3
+        || *min_sources > available_sources
+        || *max_source_spread_bps == 0
+        || *max_source_spread_bps >= 10_000
+        || *max_cross_source_deviation_bps == 0
+        || *max_cross_source_deviation_bps >= 10_000
+        || !valid_common_reference_policy(*max_age_ms, *envelope_bps, *attestation_ttl_ms)
     {
         return Err(format!(
             "market {} has invalid reference-price policy",
             market.market_id.0
         ));
     }
-    let mut adapters = BTreeSet::from([observation_adapter(&market.reference_price.primary)]);
-    for observation in &market.reference_price.corroborating {
+    let mut adapters = BTreeSet::from([observation_adapter(primary)]);
+    for observation in corroborating {
         validate_observation(observation)?;
         if !matches!(observation, VenueObservation::SameVenueRatio { .. }) {
             return Err(format!(
@@ -474,6 +578,62 @@ fn validate_market(
                 market.market_id.0
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_synthetic_market(
+    market: &MarketRegistryMarket,
+    markets: &BTreeMap<&str, &MarketRegistryMarket>,
+    numeraire: &AssetId,
+) -> Result<(), String> {
+    let MarketReferencePrice::SyntheticCrossBboMidpoint {
+        base_market_id,
+        quote_market_id,
+        ..
+    } = &market.reference_price
+    else {
+        if market.quote_asset_id != *numeraire {
+            return Err(format!(
+                "direct market {} must quote the objective numeraire",
+                market.market_id.0
+            ));
+        }
+        return Ok(());
+    };
+    if market.base_asset_id == *numeraire || market.quote_asset_id == *numeraire {
+        return Err(format!(
+            "synthetic market {} must connect two non-numeraire assets",
+            market.market_id.0
+        ));
+    }
+    let base_leg = markets
+        .get(base_market_id.0.as_str())
+        .ok_or_else(|| format!("market {} has an unknown base leg", market.market_id.0))?;
+    let quote_leg = markets
+        .get(quote_market_id.0.as_str())
+        .ok_or_else(|| format!("market {} has an unknown quote leg", market.market_id.0))?;
+    let valid_leg = |leg: &MarketRegistryMarket, asset: &AssetId| {
+        leg.enabled
+            && leg.base_asset_id == *asset
+            && leg.quote_asset_id == *numeraire
+            && matches!(
+                leg.reference_price,
+                MarketReferencePrice::DirectBboMidpoint { .. }
+            )
+    };
+    if !valid_leg(base_leg, &market.base_asset_id)
+        || !valid_leg(quote_leg, &market.quote_asset_id)
+        || market.price_base_scale != base_leg.price_base_scale
+        || market.price_base_scale != quote_leg.price_base_scale
+        || base_market_id == quote_market_id
+        || base_market_id == &market.market_id
+        || quote_market_id == &market.market_id
+    {
+        return Err(format!(
+            "market {} has invalid synthetic reference legs",
+            market.market_id.0
+        ));
     }
     Ok(())
 }
@@ -630,6 +790,25 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Strin
 mod tests {
     use super::*;
 
+    fn direct_reference_mut(
+        market: &mut MarketRegistryMarket,
+    ) -> (
+        &mut VenueObservation,
+        &mut Vec<VenueObservation>,
+        &mut usize,
+    ) {
+        let MarketReferencePrice::DirectBboMidpoint {
+            primary,
+            corroborating,
+            min_sources,
+            ..
+        } = &mut market.reference_price
+        else {
+            panic!("expected direct reference policy")
+        };
+        (primary, corroborating, min_sources)
+    }
+
     fn registry() -> MarketRegistry {
         let mut registry: MarketRegistry =
             serde_json::from_str(include_str!("../../config/market-registry.json")).unwrap();
@@ -687,9 +866,59 @@ mod tests {
         assert!(value.validate().unwrap_err().contains("funding capability"));
 
         let mut value = registry();
-        value.markets[0].capabilities.external_matching = true;
+        value.markets[0].external_settlement_support_quote = 0;
         value.registry_hash = value.computed_hash().unwrap();
         assert!(value.validate().unwrap_err().contains("external matching"));
+    }
+
+    #[test]
+    fn synthetic_markets_require_the_exact_direct_numeraire_legs() {
+        let mut value = registry();
+        let synthetic = value
+            .markets
+            .iter_mut()
+            .find(|market| market.market_id.0 == "STRK/ETH")
+            .unwrap();
+        let MarketReferencePrice::SyntheticCrossBboMidpoint { base_market_id, .. } =
+            &mut synthetic.reference_price
+        else {
+            panic!("expected synthetic market")
+        };
+        *base_market_id = PairId("ETH/USDC".into());
+        value.registry_hash = value.computed_hash().unwrap();
+        assert!(
+            value
+                .validate()
+                .unwrap_err()
+                .contains("invalid synthetic reference legs")
+        );
+
+        let mut value = registry();
+        value
+            .markets
+            .iter_mut()
+            .find(|market| market.market_id.0 == "STRK/ETH")
+            .unwrap()
+            .price_base_scale = 1_000_000;
+        value.registry_hash = value.computed_hash().unwrap();
+        assert!(
+            value
+                .validate()
+                .unwrap_err()
+                .contains("invalid synthetic reference legs")
+        );
+
+        let mut value = registry();
+        let synthetic = value
+            .markets
+            .iter_mut()
+            .find(|market| market.market_id.0 == "STRK/ETH")
+            .unwrap();
+        synthetic.capabilities.external_matching = true;
+        synthetic.external_settlement_support_quote = 1;
+        synthetic.external_min_profit_quote = 1;
+        value.registry_hash = value.computed_hash().unwrap();
+        value.validate().unwrap();
     }
 
     #[test]
@@ -708,7 +937,7 @@ mod tests {
         assert!(value.validate().unwrap_err().contains("starknet field"));
 
         let mut value = registry();
-        value.markets[0].reference_price.corroborating[0] = VenueObservation::SameVenueRatio {
+        direct_reference_mut(&mut value.markets[0]).1[0] = VenueObservation::SameVenueRatio {
             adapter: VenueAdapter::Binance,
             base_symbol: "ETHUSDC".into(),
             quote_symbol: "USDCUSDC".into(),
@@ -717,7 +946,7 @@ mod tests {
         assert!(value.validate().unwrap_err().contains("repeats"));
 
         let mut value = registry();
-        value.markets[0].reference_price.primary = VenueObservation::Direct {
+        *direct_reference_mut(&mut value.markets[0]).0 = VenueObservation::Direct {
             adapter: VenueAdapter::Binance,
             symbol: "https://untrusted.example".into(),
         };
@@ -725,7 +954,7 @@ mod tests {
         assert!(value.validate().unwrap_err().contains("venue symbol"));
 
         let mut value = registry();
-        value.markets[0].reference_price.primary = VenueObservation::Direct {
+        *direct_reference_mut(&mut value.markets[0]).0 = VenueObservation::Direct {
             adapter: VenueAdapter::Coinbase,
             symbol: "ETH-USDC".into(),
         };
@@ -733,7 +962,7 @@ mod tests {
         assert!(value.validate().unwrap_err().contains("direct binance"));
 
         let mut value = registry();
-        value.markets[0].reference_price.corroborating[0] = VenueObservation::Direct {
+        direct_reference_mut(&mut value.markets[0]).1[0] = VenueObservation::Direct {
             adapter: VenueAdapter::Coinbase,
             symbol: "ETH-USDC".into(),
         };
@@ -746,9 +975,8 @@ mod tests {
         );
 
         let mut value = registry();
-        value.markets[0]
-            .reference_price
-            .corroborating
+        direct_reference_mut(&mut value.markets[0])
+            .1
             .retain(|source| {
                 !matches!(
                     source,
@@ -775,7 +1003,7 @@ mod tests {
         );
 
         let mut value = registry();
-        value.markets[0].reference_price.min_sources = 5;
+        *direct_reference_mut(&mut value.markets[0]).2 = 5;
         value.registry_hash = value.computed_hash().unwrap();
         assert!(
             value
@@ -787,11 +1015,6 @@ mod tests {
         let mut value = registry();
         value.objective_numeraire_asset_id = AssetId("STRK".into());
         value.registry_hash = value.computed_hash().unwrap();
-        assert!(
-            value
-                .validate()
-                .unwrap_err()
-                .contains("objective-numeraire")
-        );
+        assert!(value.validate().unwrap_err().contains("direct market"));
     }
 }

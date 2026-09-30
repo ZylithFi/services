@@ -45,6 +45,10 @@ pub struct PairRuntime {
     pub quote_asset_id: Felt,
     pub scale: u128,
     pub fee_bps: u128,
+    pub reference_methodology: u8,
+    pub derivation_base_market_id: Felt,
+    pub derivation_quote_market_id: Felt,
+    pub max_leg_skew_ms: u64,
     pub external_enabled: bool,
     /// quote atoms every permissionless fill pays onchain for settlement and a possible freeze.
     pub external_settlement_support_quote: u128,
@@ -326,6 +330,30 @@ impl Config {
                     pair.quote_asset_id.0, pair.external_min_profit_quote
                 ));
             }
+            let (
+                reference_methodology,
+                derivation_base_market_id,
+                derivation_quote_market_id,
+                max_leg_skew_ms,
+            ) = match &pair.reference_price {
+                zylith_core::MarketReferencePrice::DirectBboMidpoint { .. } => (
+                    zylith_core::exchange::REFERENCE_METHOD_DIRECT_BBO,
+                    Felt::ZERO,
+                    Felt::ZERO,
+                    0,
+                ),
+                zylith_core::MarketReferencePrice::SyntheticCrossBboMidpoint {
+                    base_market_id,
+                    quote_market_id,
+                    max_leg_skew_ms,
+                    ..
+                } => (
+                    zylith_core::exchange::REFERENCE_METHOD_SYNTHETIC_CROSS_BBO,
+                    pair_felt(&base_market_id.0),
+                    pair_felt(&quote_market_id.0),
+                    *max_leg_skew_ms,
+                ),
+            };
             pairs.push(PairRuntime {
                 name: pair.market_id.0.clone(),
                 base_name: pair.base_asset_id.0.clone(),
@@ -335,6 +363,10 @@ impl Config {
                 quote_asset_id,
                 scale: pair.price_base_scale,
                 fee_bps: u128::from(pair.taker_fee_bps),
+                reference_methodology,
+                derivation_base_market_id,
+                derivation_quote_market_id,
+                max_leg_skew_ms,
                 external_enabled: pair.capabilities.external_matching,
                 external_settlement_support_quote: pair.external_settlement_support_quote,
                 min_order_amount: pair.min_order_amount,

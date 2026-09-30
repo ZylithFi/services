@@ -223,6 +223,7 @@ function loadDeploymentAuthority(path: string): DeploymentAuthority {
   const markets = registry.markets.map((value, index) => expectRecord(value, `market_registry.markets[${index}]`));
   const marketIds = markets.map((market) => expectRegistryIdentifier(market.market_id, "market_id"));
   if (!strictlySortedUnique(marketIds)) throw new Error("deployment market registry market ids must be sorted and unique");
+  const objectiveNumeraire = expectRegistryIdentifier(registry.objective_numeraire_asset_id, "objective_numeraire_asset_id");
   for (const market of markets) {
     const capabilities = expectRecord(market.capabilities, `${String(market.market_id)}.capabilities`);
     if (market.enabled !== true && capabilities.external_matching === true) {
@@ -238,9 +239,8 @@ function loadDeploymentAuthority(path: string): DeploymentAuthority {
     }
     const capabilities = expectRecord(market.capabilities, `${id}.capabilities`);
     if (capabilities.market_data !== true) throw new Error(`deployment market registry market ${id} has no market data`);
-    validateReferencePrice(expectRecord(market.reference_price, `${id}.reference_price`), id);
+    validateReferencePrice(expectRecord(market.reference_price, `${id}.reference_price`), market, markets, objectiveNumeraire);
   }
-  const objectiveNumeraire = expectRegistryIdentifier(registry.objective_numeraire_asset_id, "objective_numeraire_asset_id");
   const enabledMarkets = markets.filter((candidate) => candidate.enabled === true);
   for (const [assetId, asset] of assetsById) {
     if (asset.enabled !== true) continue;
@@ -287,7 +287,30 @@ function loadDeploymentAuthority(path: string): DeploymentAuthority {
   };
 }
 
-function validateReferencePrice(reference: Record<string, unknown>, marketId: string): void {
+function validateReferencePrice(
+  reference: Record<string, unknown>,
+  market: Record<string, unknown>,
+  markets: Record<string, unknown>[],
+  objectiveNumeraire: string,
+): void {
+  const marketId = expectString(market.market_id, "market_id");
+  const maxAgeMs = Number(reference.max_age_ms);
+  const attestationTtlMs = Number(reference.attestation_ttl_ms);
+  const envelopeBps = Number(reference.envelope_bps);
+  if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > 15_000 || !Number.isSafeInteger(attestationTtlMs) || attestationTtlMs < 1 || attestationTtlMs > 15_000 || !Number.isSafeInteger(envelopeBps) || envelopeBps < 1 || envelopeBps >= 10_000) {
+    throw new Error(`deployment market registry market ${marketId} has invalid reference policy`);
+  }
+  if (reference.methodology === "synthetic_cross_bbo_midpoint") {
+    const baseMarketId = expectString(reference.base_market_id, `${marketId}.base_market_id`);
+    const quoteMarketId = expectString(reference.quote_market_id, `${marketId}.quote_market_id`);
+    const base = markets.find((candidate) => candidate.market_id === baseMarketId);
+    const quote = markets.find((candidate) => candidate.market_id === quoteMarketId);
+    const maxLegSkewMs = Number(reference.max_leg_skew_ms);
+    if (!base || !quote || base.enabled !== true || quote.enabled !== true || expectRecord(base.reference_price, "base reference").methodology !== "direct_bbo_midpoint" || expectRecord(quote.reference_price, "quote reference").methodology !== "direct_bbo_midpoint" || base.base_asset_id !== market.base_asset_id || quote.base_asset_id !== market.quote_asset_id || base.quote_asset_id !== objectiveNumeraire || quote.quote_asset_id !== objectiveNumeraire || base.price_base_scale !== market.price_base_scale || quote.price_base_scale !== market.price_base_scale || baseMarketId === quoteMarketId || !Number.isSafeInteger(maxLegSkewMs) || maxLegSkewMs < 1 || maxLegSkewMs > maxAgeMs) {
+      throw new Error(`deployment market registry market ${marketId} has invalid synthetic reference policy`);
+    }
+    return;
+  }
   const primary = expectRecord(reference.primary, `${marketId}.reference_price.primary`);
   const corroborating = Array.isArray(reference.corroborating)
     ? reference.corroborating.map((value, index) => expectRecord(value, `${marketId}.reference_price.corroborating[${index}]`))
@@ -300,10 +323,8 @@ function validateReferencePrice(reference: Record<string, unknown>, marketId: st
     throw new Error(`deployment market registry market ${marketId} has invalid reference sources`);
   }
   const minSources = Number(reference.min_sources);
-  const maxAgeMs = Number(reference.max_age_ms);
-  const attestationTtlMs = Number(reference.attestation_ttl_ms);
-  const bps = [reference.max_source_spread_bps, reference.max_cross_source_deviation_bps, reference.envelope_bps].map(Number);
-  if (!Number.isSafeInteger(minSources) || minSources < 3 || minSources > sources.length || !Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1 || maxAgeMs > 15_000 || !Number.isSafeInteger(attestationTtlMs) || attestationTtlMs < 1 || attestationTtlMs > 15_000 || bps.some((value) => !Number.isSafeInteger(value) || value < 1 || value >= 10_000)) {
+  const bps = [reference.max_source_spread_bps, reference.max_cross_source_deviation_bps].map(Number);
+  if (market.quote_asset_id !== objectiveNumeraire || !Number.isSafeInteger(minSources) || minSources < 3 || minSources > sources.length || bps.some((value) => !Number.isSafeInteger(value) || value < 1 || value >= 10_000)) {
     throw new Error(`deployment market registry market ${marketId} has invalid reference policy`);
   }
 }

@@ -214,12 +214,20 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
         if (!assets.has(asset)) fail(`market ${pair.market_id} refers to unknown asset ${asset}`);
       }
       if (pair.capabilities?.market_data !== true) fail(`enabled market ${pair.market_id} is missing market-data capability`);
-      if (pair.reference_price?.methodology !== "direct_bbo_midpoint" || pair.reference_price?.primary?.kind !== "direct") fail(`market ${pair.market_id} has invalid direct reference pricing`);
-      const sources = [pair.reference_price?.primary, ...(pair.reference_price?.corroborating ?? [])];
-      const adapters = sources.map((source) => source?.adapter);
-      if (sources.length < 3 || new Set(adapters).size !== adapters.length || adapters.some((adapter) => !["binance", "coinbase", "kraken", "okx"].includes(adapter))) fail(`market ${pair.market_id} has invalid reference sources`);
       const policy = pair.reference_price ?? {};
-      if (!Number.isSafeInteger(policy.min_sources) || policy.min_sources < 3 || policy.min_sources > sources.length || !Number.isSafeInteger(policy.max_age_ms) || policy.max_age_ms < 1 || policy.max_age_ms > 15_000 || !Number.isSafeInteger(policy.attestation_ttl_ms) || policy.attestation_ttl_ms < 1 || policy.attestation_ttl_ms > 15_000 || [policy.max_source_spread_bps, policy.max_cross_source_deviation_bps, policy.envelope_bps].some((number) => !Number.isSafeInteger(number) || number < 1 || number >= 10_000)) fail(`market ${pair.market_id} has invalid reference policy`);
+      if (!Number.isSafeInteger(policy.max_age_ms) || policy.max_age_ms < 1 || policy.max_age_ms > 15_000 || !Number.isSafeInteger(policy.attestation_ttl_ms) || policy.attestation_ttl_ms < 1 || policy.attestation_ttl_ms > 15_000 || !Number.isSafeInteger(policy.envelope_bps) || policy.envelope_bps < 1 || policy.envelope_bps >= 10_000) fail(`market ${pair.market_id} has invalid reference policy`);
+      if (policy.methodology === "direct_bbo_midpoint") {
+        const sources = [policy.primary, ...(policy.corroborating ?? [])];
+        const adapters = sources.map((source) => source?.adapter);
+        if (pair.quote_asset_id !== registry.objective_numeraire_asset_id || policy.primary?.kind !== "direct" || policy.primary?.adapter !== "binance" || sources.length < 3 || new Set(adapters).size !== adapters.length || adapters.some((adapter) => !["binance", "coinbase", "kraken", "okx"].includes(adapter))) fail(`market ${pair.market_id} has invalid direct reference sources`);
+        if (!Number.isSafeInteger(policy.min_sources) || policy.min_sources < 3 || policy.min_sources > sources.length || [policy.max_source_spread_bps, policy.max_cross_source_deviation_bps].some((number) => !Number.isSafeInteger(number) || number < 1 || number >= 10_000)) fail(`market ${pair.market_id} has invalid direct reference policy`);
+      } else if (policy.methodology === "synthetic_cross_bbo_midpoint") {
+        const base = pairs.find((candidate) => candidate.market_id === policy.base_market_id);
+        const quote = pairs.find((candidate) => candidate.market_id === policy.quote_market_id);
+        if (!base || !quote || base.reference_price?.methodology !== "direct_bbo_midpoint" || quote.reference_price?.methodology !== "direct_bbo_midpoint" || base.base_asset_id !== pair.base_asset_id || quote.base_asset_id !== pair.quote_asset_id || base.quote_asset_id !== registry.objective_numeraire_asset_id || quote.quote_asset_id !== registry.objective_numeraire_asset_id || base.price_base_scale !== pair.price_base_scale || quote.price_base_scale !== pair.price_base_scale || !Number.isSafeInteger(policy.max_leg_skew_ms) || policy.max_leg_skew_ms < 1 || policy.max_leg_skew_ms > policy.max_age_ms) fail(`market ${pair.market_id} has invalid synthetic reference policy`);
+      } else {
+        fail(`market ${pair.market_id} has unsupported reference pricing`);
+      }
     }
     for (const asset of rawAssets.filter((candidate) => candidate.enabled && candidate.asset_id !== registry?.objective_numeraire_asset_id)) {
       const direct = pairs.filter((pair) => (pair.base_asset_id === asset.asset_id && pair.quote_asset_id === registry.objective_numeraire_asset_id) || (pair.quote_asset_id === asset.asset_id && pair.base_asset_id === registry.objective_numeraire_asset_id));

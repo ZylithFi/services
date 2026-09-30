@@ -217,13 +217,7 @@ impl Market {
             .map_err(|error| format!("attestor {}: {error}", pair.name))?;
         let attestation = MarketAttestation::from_reference(&response.attestation)
             .map_err(|error| error.to_string())?;
-        if from_core(attestation.pair_id) != pair.pair_id
-            || from_core(attestation.base_asset_id) != pair.base_asset_id
-            || from_core(attestation.quote_asset_id) != pair.quote_asset_id
-            || attestation.scale != pair.scale
-            || from_core(attestation.signer) != self.reference_signer
-            || !attestation.verify(to_core(self.exchange))
-        {
+        if !attestation_matches_pair(&attestation, pair, self.exchange, self.reference_signer) {
             return Err(format!(
                 "attestor returned a different market for {}",
                 pair.name
@@ -290,13 +284,7 @@ impl Market {
             .map_err(|error| error.to_string())?;
         attestations.sort_by_key(|attestation| from_core(attestation.pair_id).to_bytes_be());
         for (attestation, pair) in attestations.iter().zip(pairs) {
-            if from_core(attestation.pair_id) != pair.pair_id
-                || from_core(attestation.base_asset_id) != pair.base_asset_id
-                || from_core(attestation.quote_asset_id) != pair.quote_asset_id
-                || attestation.scale != pair.scale
-                || from_core(attestation.signer) != self.reference_signer
-                || !attestation.verify(to_core(self.exchange))
-            {
+            if !attestation_matches_pair(attestation, pair, self.exchange, self.reference_signer) {
                 return Err(format!("price batch mismatches {}", pair.name));
             }
         }
@@ -692,6 +680,24 @@ impl Market {
     }
 }
 
+fn attestation_matches_pair(
+    attestation: &MarketAttestation,
+    pair: &PairRuntime,
+    exchange: Felt,
+    reference_signer: Felt,
+) -> bool {
+    from_core(attestation.pair_id) == pair.pair_id
+        && from_core(attestation.base_asset_id) == pair.base_asset_id
+        && from_core(attestation.quote_asset_id) == pair.quote_asset_id
+        && attestation.scale == pair.scale
+        && attestation.methodology == pair.reference_methodology
+        && from_core(attestation.derivation_base_market_id) == pair.derivation_base_market_id
+        && from_core(attestation.derivation_quote_market_id) == pair.derivation_quote_market_id
+        && attestation.max_leg_skew_ms == pair.max_leg_skew_ms
+        && from_core(attestation.signer) == reference_signer
+        && attestation.verify(to_core(exchange))
+}
+
 const REFINE_ROUNDS: usize = 2;
 /// how many times a sweep is re-quoted when its sizes come back from different blocks.
 const SWEEP_ATTEMPTS: usize = 2;
@@ -933,6 +939,10 @@ mod tests {
             quote_asset_id: asset_felt("USDC"),
             scale: 1,
             fee_bps: 4,
+            reference_methodology: zylith_core::exchange::REFERENCE_METHOD_DIRECT_BBO,
+            derivation_base_market_id: Felt::ZERO,
+            derivation_quote_market_id: Felt::ZERO,
+            max_leg_skew_ms: 0,
             external_enabled: true,
             external_settlement_support_quote: 1,
             min_order_amount: 1,
@@ -961,6 +971,10 @@ mod tests {
                 price_base_scale: 1,
                 source_count: 3,
                 observed_at_unix_ms: 1,
+                derivation: zylith_core::ReferencePriceDerivation::DirectBbo {
+                    bid_price: M1,
+                    ask_price: M1,
+                },
             },
             "0x5e7",
             u64::MAX / 2,
@@ -1045,6 +1059,24 @@ mod tests {
         assert!(
             market
                 .attest(&pair())
+                .await
+                .unwrap_err()
+                .contains("different market")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_operator_rejects_an_attestation_for_another_reference_methodology() {
+        let market = market().await;
+        let mut configured = pair();
+        configured.reference_methodology =
+            zylith_core::exchange::REFERENCE_METHOD_SYNTHETIC_CROSS_BBO;
+        configured.derivation_base_market_id = pair_felt("STRK/USDC");
+        configured.derivation_quote_market_id = pair_felt("ETH/USDC");
+        configured.max_leg_skew_ms = 1_500;
+        assert!(
+            market
+                .attest(&configured)
                 .await
                 .unwrap_err()
                 .contains("different market")
@@ -1243,6 +1275,34 @@ mod tests {
         assert!(validate_quote_buy(&quote("-1", &["-1"], 0)).is_err());
         assert!(validate_quote_buy(&quote("-1", &["-1"], MAX_HOPS + 1)).is_err());
         assert!(validate_quote_buy(&quote("-17", &["-1"; MAX_SPLITS + 1], 1)).is_err());
+    }
+
+    #[test]
+    fn a_synthetic_pair_can_hedge_through_a_continuous_multihop_route() {
+        let (strk, usdc, eth) = (Felt::from(1_u8), Felt::from(2_u8), Felt::from(3_u8));
+        let node = |token0: Felt, token1: Felt| RouteNode {
+            pool_key: PoolKey {
+                token0: format!("{token0:#x}"),
+                token1: format!("{token1:#x}"),
+                fee: "0x0".into(),
+                tick_spacing: 1,
+                extension: "0x0".into(),
+            },
+            sqrt_ratio_limit: "0x1".into(),
+            skip_ahead: 0,
+        };
+        let split = Split {
+            amount_specified: "7".into(),
+            amount_calculated: "1".into(),
+            route: vec![node(strk, usdc), node(usdc, eth)],
+        };
+        assert!(encode_swaps(std::slice::from_ref(&split), strk, eth, 7, false).is_ok());
+
+        let disconnected = Split {
+            route: vec![node(strk, usdc), node(Felt::from(4_u8), eth)],
+            ..split
+        };
+        assert!(encode_swaps(&[disconnected], strk, eth, 7, false).is_err());
     }
 
     #[test]

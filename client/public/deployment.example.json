@@ -14,8 +14,8 @@
   },
   "market_registry": {
     "schema_version": 1,
-    "registry_version": 2,
-    "registry_hash": "9bef814be387127aa02db2623fc5b9902f74f835440f4b45ea5435603fced36e",
+    "registry_version": 1,
+    "registry_hash": "9eda0934361cad9186afd2b18c38393fe74836b0fbf393e9be95a5549bf26434",
     "network": "sepolia",
     "chain_id": "0x534e5f5345504f4c4941",
     "gas_fee_asset_id": "STRK",
@@ -73,10 +73,10 @@
         "enabled": true,
         "capabilities": {
           "market_data": true,
-          "external_matching": false
+          "external_matching": true
         },
-        "external_settlement_support_quote": "0",
-        "external_min_profit_quote": "0",
+        "external_settlement_support_quote": "250000",
+        "external_min_profit_quote": "5000",
         "reference_price": {
           "methodology": "direct_bbo_midpoint",
           "primary": {
@@ -113,6 +113,30 @@
         }
       },
       {
+        "market_id": "STRK/ETH",
+        "base_asset_id": "STRK",
+        "quote_asset_id": "ETH",
+        "min_order_amount": "1000000000000000000",
+        "price_base_scale": "1000000000000000000",
+        "taker_fee_bps": 2,
+        "enabled": true,
+        "capabilities": {
+          "market_data": true,
+          "external_matching": true
+        },
+        "external_settlement_support_quote": "100000000000000",
+        "external_min_profit_quote": "2000000000000",
+        "reference_price": {
+          "methodology": "synthetic_cross_bbo_midpoint",
+          "base_market_id": "STRK/USDC",
+          "quote_market_id": "ETH/USDC",
+          "max_leg_skew_ms": 1500,
+          "max_age_ms": 5000,
+          "envelope_bps": 15,
+          "attestation_ttl_ms": 5000
+        }
+      },
+      {
         "market_id": "STRK/USDC",
         "base_asset_id": "STRK",
         "quote_asset_id": "USDC",
@@ -122,10 +146,10 @@
         "enabled": true,
         "capabilities": {
           "market_data": true,
-          "external_matching": false
+          "external_matching": true
         },
-        "external_settlement_support_quote": "0",
-        "external_min_profit_quote": "0",
+        "external_settlement_support_quote": "250000",
+        "external_min_profit_quote": "5000",
         "reference_price": {
           "methodology": "direct_bbo_midpoint",
           "primary": {
@@ -201,7 +225,7 @@
     "epoch_ms": 6000,
     "max_close_delay_ms": 60000,
     "withdrawal_delay_seconds": 120,
-    "external_window_seconds": 0,
+    "external_window_seconds": 30,
     "max_book_orders": 499,
     "max_admissions_per_transition": 80,
     "max_internal_deferral_epochs": 2

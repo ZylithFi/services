@@ -7,14 +7,16 @@ use starknet_crypto::{Felt, poseidon_hash, poseidon_hash_many};
 use super::model::*;
 use super::transition::{Market, TransitionPublic};
 use super::withdrawal::WithdrawalPublic;
-use crate::ProtocolError;
+use crate::{ProtocolError, ReferencePriceDerivation};
 
 pub const REFERENCE_PRICE_ATTESTATION_DOMAIN_HEX: &str =
     "0x79508ce25b318644e4a7aea66c1edc2342856b522eb62152b5c118fc1ef3e67";
 pub const REFERENCE_PRICE_BATCH_DOMAIN: &str = "zylith_price_batch_v1";
 pub const TRANSITION_MESSAGE_DOMAIN: &str = "zylith_transition_msg_v1";
 pub const WITHDRAWAL_MESSAGE_DOMAIN: &str = "zylith_withdraw_msg_v1";
-pub const MARKET_ATTESTATION_CALLDATA_LENGTH: usize = 13;
+pub const MARKET_ATTESTATION_CALLDATA_LENGTH: usize = 21;
+pub const REFERENCE_METHOD_DIRECT_BBO: u8 = 0;
+pub const REFERENCE_METHOD_SYNTHETIC_CROSS_BBO: u8 = 1;
 
 /// one market's attested reference price, as the reference-price attestor signs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +35,20 @@ pub struct MarketAttestation {
     pub upper_price: u128,
     #[serde(with = "u128_decimal_serde")]
     pub scale: u128,
+    pub methodology: u8,
+    #[serde(with = "felt_hex_serde")]
+    pub derivation_base_market_id: Felt,
+    #[serde(with = "felt_hex_serde")]
+    pub derivation_quote_market_id: Felt,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_base_bid: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_base_ask: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_quote_bid: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub derivation_quote_ask: u128,
+    pub max_leg_skew_ms: u64,
     pub source_count: u64,
     pub observed_at_ms: u64,
     pub valid_until_ms: u64,
@@ -58,6 +74,14 @@ impl MarketAttestation {
             felt_u128(self.lower_price),
             felt_u128(self.upper_price),
             felt_u128(self.scale),
+            felt_u64(u64::from(self.methodology)),
+            self.derivation_base_market_id,
+            self.derivation_quote_market_id,
+            felt_u128(self.derivation_base_bid),
+            felt_u128(self.derivation_base_ask),
+            felt_u128(self.derivation_quote_bid),
+            felt_u128(self.derivation_quote_ask),
+            felt_u64(self.max_leg_skew_ms),
             felt_u64(self.source_count),
             felt_u64(self.observed_at_ms),
             felt_u64(self.valid_until_ms),
@@ -91,6 +115,48 @@ impl MarketAttestation {
     ) -> Result<Self, ProtocolError> {
         use crate::hash::{encode_starknet_felt, felt_from_hex_str};
         let envelope = &attestation.envelope;
+        let (
+            methodology,
+            derivation_base_market_id,
+            derivation_quote_market_id,
+            derivation_base_bid,
+            derivation_base_ask,
+            derivation_quote_bid,
+            derivation_quote_ask,
+            max_leg_skew_ms,
+        ) = match &envelope.derivation {
+            ReferencePriceDerivation::DirectBbo {
+                bid_price,
+                ask_price,
+            } => (
+                REFERENCE_METHOD_DIRECT_BBO,
+                Felt::ZERO,
+                Felt::ZERO,
+                *bid_price,
+                *ask_price,
+                0,
+                0,
+                0,
+            ),
+            ReferencePriceDerivation::SyntheticCrossBbo {
+                base_market_id,
+                quote_market_id,
+                base_bid_price,
+                base_ask_price,
+                quote_bid_price,
+                quote_ask_price,
+                max_leg_skew_ms,
+            } => (
+                REFERENCE_METHOD_SYNTHETIC_CROSS_BBO,
+                felt_from_hex_str(&encode_starknet_felt("pair-id", &base_market_id.0))?,
+                felt_from_hex_str(&encode_starknet_felt("pair-id", &quote_market_id.0))?,
+                *base_bid_price,
+                *base_ask_price,
+                *quote_bid_price,
+                *quote_ask_price,
+                *max_leg_skew_ms,
+            ),
+        };
         Ok(Self {
             pair_id: felt_from_hex_str(&encode_starknet_felt("pair-id", &envelope.pair_id.0))?,
             base_asset_id: felt_from_hex_str(&encode_starknet_felt(
@@ -105,6 +171,14 @@ impl MarketAttestation {
             lower_price: envelope.lower_price,
             upper_price: envelope.upper_price,
             scale: envelope.price_base_scale,
+            methodology,
+            derivation_base_market_id,
+            derivation_quote_market_id,
+            derivation_base_bid,
+            derivation_base_ask,
+            derivation_quote_bid,
+            derivation_quote_ask,
+            max_leg_skew_ms,
             source_count: envelope.source_count as u64,
             observed_at_ms: envelope.observed_at_unix_ms,
             valid_until_ms: attestation.valid_until_unix_ms,
@@ -130,6 +204,14 @@ impl MarketAttestation {
             observed_at_ms: self.observed_at_ms,
             valid_until_ms: self.valid_until_ms,
             fee_bps,
+            reference_methodology: self.methodology,
+            derivation_base_market_id: self.derivation_base_market_id,
+            derivation_quote_market_id: self.derivation_quote_market_id,
+            derivation_base_bid: self.derivation_base_bid,
+            derivation_base_ask: self.derivation_base_ask,
+            derivation_quote_bid: self.derivation_quote_bid,
+            derivation_quote_ask: self.derivation_quote_ask,
+            max_leg_skew_ms: self.max_leg_skew_ms,
         }
     }
 
@@ -141,6 +223,14 @@ impl MarketAttestation {
             felt_u128(self.lower_price),
             felt_u128(self.upper_price),
             felt_u128(self.scale),
+            felt_u64(u64::from(self.methodology)),
+            self.derivation_base_market_id,
+            self.derivation_quote_market_id,
+            felt_u128(self.derivation_base_bid),
+            felt_u128(self.derivation_base_ask),
+            felt_u128(self.derivation_quote_bid),
+            felt_u128(self.derivation_quote_ask),
+            felt_u64(self.max_leg_skew_ms),
             felt_u64(self.source_count),
             felt_u64(self.observed_at_ms),
             felt_u64(self.valid_until_ms),
@@ -165,6 +255,14 @@ pub fn price_batch_commitment(verifier: Felt, attestations: &[MarketAttestation]
             felt_u128(market.lower_price),
             felt_u128(market.upper_price),
             felt_u128(market.scale),
+            felt_u64(u64::from(market.methodology)),
+            market.derivation_base_market_id,
+            market.derivation_quote_market_id,
+            felt_u128(market.derivation_base_bid),
+            felt_u128(market.derivation_base_ask),
+            felt_u128(market.derivation_quote_bid),
+            felt_u128(market.derivation_quote_ask),
+            felt_u64(market.max_leg_skew_ms),
             felt_u64(market.source_count),
             felt_u64(market.observed_at_ms),
             felt_u64(market.valid_until_ms),
@@ -227,6 +325,14 @@ pub fn transition_calldata(
                     || attestation.scale != market.scale
                     || attestation.observed_at_ms != market.observed_at_ms
                     || attestation.valid_until_ms != market.valid_until_ms
+                    || attestation.methodology != market.reference_methodology
+                    || attestation.derivation_base_market_id != market.derivation_base_market_id
+                    || attestation.derivation_quote_market_id != market.derivation_quote_market_id
+                    || attestation.derivation_base_bid != market.derivation_base_bid
+                    || attestation.derivation_base_ask != market.derivation_base_ask
+                    || attestation.derivation_quote_bid != market.derivation_quote_bid
+                    || attestation.derivation_quote_ask != market.derivation_quote_ask
+                    || attestation.max_leg_skew_ms != market.max_leg_skew_ms
                     || attestation.price_batch_commitment != batch_commitment
             })
     {

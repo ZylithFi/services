@@ -779,7 +779,10 @@ fn a_sealed_request_opens_only_with_every_execution_key() {
 
 #[test]
 fn an_attestor_signed_price_verifies_as_the_exchange_checks_it() {
-    use crate::{AssetId, PairId, ReferencePriceEnvelope, sign_reference_price_attestation};
+    use crate::{
+        AssetId, PairId, ReferencePriceDerivation, ReferencePriceEnvelope,
+        sign_reference_price_attestation,
+    };
     let envelope = ReferencePriceEnvelope {
         pair_id: PairId("STRK/USDC".into()),
         base_asset_id: AssetId("STRK".into()),
@@ -790,6 +793,10 @@ fn an_attestor_signed_price_verifies_as_the_exchange_checks_it() {
         price_base_scale: 1_000_000,
         source_count: 3,
         observed_at_unix_ms: 9_000,
+        derivation: ReferencePriceDerivation::DirectBbo {
+            bid_price: 999,
+            ask_price: 1_001,
+        },
     };
     let signed =
         sign_reference_price_attestation("0x5167", "0x5eed", envelope, "0x5e7", 11_000, 4).unwrap();

@@ -29,8 +29,9 @@ pub use market_registry::{
     ReferencePriceMethodology, ReferenceRelationship, VenueAdapter, VenueObservation,
 };
 pub use reference_price::{
-    ReferencePriceAttestation, ReferencePriceEnvelope, ReferencePricePolicy, ReferencePriceSample,
-    build_reference_price_envelope,
+    ReferencePriceAttestation, ReferencePriceDerivation, ReferencePriceEnvelope,
+    ReferencePricePolicy, ReferencePriceSample, build_reference_price_envelope,
+    build_synthetic_cross_envelope, derive_synthetic_cross_bbo,
 };
 pub use types::{
     AssetId, DeploymentContracts, DeploymentManifest, DeploymentMetadata, DeploymentProofConfig,
