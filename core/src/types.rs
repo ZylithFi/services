@@ -581,7 +581,9 @@ pub struct DeploymentProofConfig {
     /// prover and consumed through the transaction's proof facts.
     pub scheme: String,
     pub proof_version: String,
-    pub proof_program_address: String,
+    pub transition_proof_program_address: String,
+    pub withdrawal_proof_program_address: String,
+    pub residual_recovery_proof_program_address: String,
     pub virtual_program_hash: String,
     pub starknet_os_config_hash: String,
     pub proof_account_address: String,

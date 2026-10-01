@@ -89,7 +89,9 @@ pub struct Config {
     pub rpc_url: Url,
     pub chain_id: Felt,
     pub exchange: Felt,
-    pub proof_program: Felt,
+    pub transition_proof_program: Felt,
+    pub withdrawal_proof_program: Felt,
+    pub residual_recovery_proof_program: Felt,
     pub router: Felt,
     pub settlement: Account,
     pub proof_account: Account,
@@ -285,6 +287,14 @@ impl Config {
                 "proof account key",
             )?,
         };
+        if proof_account.address
+            != felt(
+                &manifest.proof.proof_account_address,
+                "manifest proof account",
+            )?
+        {
+            return Err("the proof account does not match the deployment manifest".into());
+        }
         let proof_queue_url = required("ZYLITH_PROOF_QUEUE_URL")?;
         Url::parse(&proof_queue_url).map_err(|error| format!("proof queue url: {error}"))?;
         let prover_build_id = optional("ZYLITH_PROVER_BUILD_ID")
@@ -481,7 +491,18 @@ impl Config {
             rpc_url,
             chain_id,
             exchange: nonzero(&manifest.contracts.exchange, "exchange")?,
-            proof_program: nonzero(&manifest.proof.proof_program_address, "proof program")?,
+            transition_proof_program: nonzero(
+                &manifest.proof.transition_proof_program_address,
+                "transition proof program",
+            )?,
+            withdrawal_proof_program: nonzero(
+                &manifest.proof.withdrawal_proof_program_address,
+                "withdrawal proof program",
+            )?,
+            residual_recovery_proof_program: nonzero(
+                &manifest.proof.residual_recovery_proof_program_address,
+                "residual recovery proof program",
+            )?,
             router: felt(&manifest.contracts.ekubo_external_match_router, "router")?,
             settlement,
             proof_account,

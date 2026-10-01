@@ -207,7 +207,9 @@
   "proof": {
     "scheme": "snip36-stwo",
     "proof_version": "PROOF1",
-    "proof_program_address": "0x0",
+    "transition_proof_program_address": "0x0",
+    "withdrawal_proof_program_address": "0x0",
+    "residual_recovery_proof_program_address": "0x0",
     "virtual_program_hash": "0x0",
     "starknet_os_config_hash": "0x0",
     "proof_account_address": "0x0",

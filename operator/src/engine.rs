@@ -726,7 +726,7 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
             .map(from_core)
             .collect::<Vec<_>>();
         let expected = from_core(proof_message_hash(
-            to_core(operator.config.proof_program),
+            to_core(operator.config.transition_proof_program),
             TRANSITION_MESSAGE_DOMAIN,
             bound_statement_message(
                 TRANSITION_MESSAGE_DOMAIN,
@@ -762,7 +762,7 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
             .snip36
             .prove(
                 vec![call(
-                    operator.config.proof_program,
+                    operator.config.transition_proof_program,
                     "compile_transition_proof",
                     calldata,
                 )],
@@ -2654,7 +2654,7 @@ async fn prove_and_request(
     })
     .map_err(|error| (error.to_string(), false))?;
     let expected = from_core(proof_message_hash(
-        to_core(operator.config.proof_program),
+        to_core(operator.config.withdrawal_proof_program),
         WITHDRAWAL_MESSAGE_DOMAIN,
         bound_statement_message(
             WITHDRAWAL_MESSAGE_DOMAIN,
@@ -2680,7 +2680,7 @@ async fn prove_and_request(
         .snip36
         .prove(
             vec![call(
-                operator.config.proof_program,
+                operator.config.withdrawal_proof_program,
                 "compile_withdrawal_proof",
                 calldata,
             )],

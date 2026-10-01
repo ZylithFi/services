@@ -133,7 +133,7 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     for (const contract of ["commitment_registry", "privacy_deposit_bridge", "exchange"]) {
       if (!isNonZeroFelt(manifest.contracts?.[contract])) fail(`manifest contracts.${contract} must be deployed`);
     }
-    for (const field of ["proof_program_address", "virtual_program_hash", "starknet_os_config_hash", "proof_account_address", "settlement_account_address"]) {
+    for (const field of ["transition_proof_program_address", "withdrawal_proof_program_address", "residual_recovery_proof_program_address", "virtual_program_hash", "starknet_os_config_hash", "proof_account_address", "settlement_account_address"]) {
       if (!isNonZeroFelt(manifest.proof?.[field])) fail(`manifest proof.${field} must be set`);
     }
     // wallets seal only to the execution keys the manifest pins; the operator checks its own

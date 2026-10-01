@@ -69,8 +69,17 @@ async fn main() -> Result<(), String> {
             );
             Ok(())
         }
+        Some("proof-public-key") => {
+            let private_key = felt(
+                &env::var("ZYLITH_PROOF_ACCOUNT_PRIVATE_KEY")
+                    .map_err(|_| "ZYLITH_PROOF_ACCOUNT_PRIVATE_KEY is required")?,
+                "proof account key",
+            )?;
+            println!("{:#x}", starknet_crypto::get_public_key(&private_key));
+            Ok(())
+        }
         Some(other) => Err(format!(
-            "unknown command {other}; use `serve`, `bench <witness.json>...`, `ids <name>...` or `fingerprint <keys.json>`"
+            "unknown command {other}; use `serve`, `bench <witness.json>...`, `ids <name>...`, `fingerprint <keys.json>` or `proof-public-key`"
         )),
     }
 }
@@ -230,7 +239,12 @@ async fn check_exchange_configuration(config: &Config, snip36: &Snip36) -> Resul
             "pause_guardian",
             felt(&manifest.roles.pause_guardian_address, "pause guardian")?,
         ),
-        ("proof_program", config.proof_program),
+        ("transition_proof_program", config.transition_proof_program),
+        ("withdrawal_proof_program", config.withdrawal_proof_program),
+        (
+            "residual_recovery_proof_program",
+            config.residual_recovery_proof_program,
+        ),
         (
             "virtual_program_hash",
             felt(&manifest.proof.virtual_program_hash, "virtual program hash")?,
@@ -265,6 +279,29 @@ async fn check_exchange_configuration(config: &Config, snip36: &Snip36) -> Resul
         if actual != expected {
             return Err(format!(
                 "exchange {entrypoint} {actual:#x} differs from the deployment manifest's {expected:#x}"
+            ));
+        }
+    }
+    let proof_account_public_key =
+        starknet_crypto::get_public_key(&config.proof_account.private_key);
+    for (entrypoint, expected) in [
+        ("public_key", proof_account_public_key),
+        ("transition_program", config.transition_proof_program),
+        ("withdrawal_program", config.withdrawal_proof_program),
+        (
+            "residual_recovery_program",
+            config.residual_recovery_proof_program,
+        ),
+    ] {
+        let actual = snip36
+            .view(config.proof_account.address, entrypoint, Vec::new())
+            .await?
+            .first()
+            .copied()
+            .ok_or_else(|| format!("proof account returned no {entrypoint}"))?;
+        if actual != expected {
+            return Err(format!(
+                "proof account {entrypoint} {actual:#x} differs from the configured {expected:#x}"
             ));
         }
     }
@@ -466,7 +503,10 @@ async fn bench(paths: &[String]) -> Result<(), String> {
         timeout_seconds: 900,
         blocks_back: 20,
     });
-    let proof_program = felt(&required("ZYLITH_PROOF_PROGRAM_ADDRESS")?, "proof program")?;
+    let proof_program = felt(
+        &required("ZYLITH_TRANSITION_PROOF_PROGRAM_ADDRESS")?,
+        "transition proof program",
+    )?;
     let exchange = felt(&required("ZYLITH_EXCHANGE_ADDRESS")?, "exchange")?;
     for path in paths {
         let raw = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;

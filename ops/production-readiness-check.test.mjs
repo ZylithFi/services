@@ -12,7 +12,7 @@ Object.assign(manifest, {
   roles: { ...manifest.roles, reference_price_signer: felt(14) },
 });
 Object.assign(manifest.proof, {
-  proof_program_address: felt(7), virtual_program_hash: felt(8), starknet_os_config_hash: felt(9),
+  transition_proof_program_address: felt(7), withdrawal_proof_program_address: felt(17), residual_recovery_proof_program_address: felt(18), virtual_program_hash: felt(8), starknet_os_config_hash: felt(9),
   proof_account_address: felt(10), settlement_account_address: felt(11), proof_validity_blocks: 450,
   config_locked_after_deploy: true, prover_build_id: "stwo-production-v1",
 });
