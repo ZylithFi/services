@@ -242,8 +242,28 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
       if (manifest.runtime?.external_window_seconds !== 0) fail("external window must be zero when every registry market disables external matching");
     } else {
       if (value("ZYLITH_EXTERNAL_MATCHING_DISABLED") === "1") fail(`ZYLITH_EXTERNAL_MATCHING_DISABLED is set but ${external.map((pair) => pair.market_id).join(", ")} match externally`);
-      if (!value("ZYLITH_ROUTE_SERVICE_URL")) fail("external matching needs ZYLITH_ROUTE_SERVICE_URL");
+      const routeServiceUrl = value("ZYLITH_ROUTE_SERVICE_URL");
+      if (!routeServiceUrl) fail("external matching needs ZYLITH_ROUTE_SERVICE_URL");
       healthUrls("ZYLITH_ROUTE_SERVICE_HEALTH_URL");
+      const routeHealthUrl = value("ZYLITH_ROUTE_SERVICE_HEALTH_URL");
+      if (routeServiceUrl && routeHealthUrl) {
+        let expected;
+        try {
+          const chainId = BigInt(manifest.chain_id).toString(10);
+          expected = new URL(`${routeServiceUrl.replace(/\/+$/, "")}/${chainId}/health`).href;
+        } catch {
+          fail("deployment chain_id or ZYLITH_ROUTE_SERVICE_URL is invalid for route health validation");
+        }
+        if (expected) {
+          let actual;
+          try {
+            actual = new URL(routeHealthUrl).href;
+          } catch {
+            actual = "";
+          }
+          if (actual !== expected) fail(`ZYLITH_ROUTE_SERVICE_HEALTH_URL must probe the configured chain: ${expected}`);
+        }
+      }
       integer("ZYLITH_SEARCHER_HEADROOM_BPS", 1, 500, 5);
       const window = manifest.runtime?.external_window_seconds;
       if (!Number.isSafeInteger(window) || window < 1 || window > 300) fail("external matching needs runtime.external_window_seconds in [1, 300]");

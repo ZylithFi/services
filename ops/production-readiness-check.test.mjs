@@ -84,7 +84,7 @@ const env = {
   ZYLITH_MIN_TRANSITION_FEE_STRK: "1000000000000000000",
   ZYLITH_EXTERNAL_MATCHING_DISABLED: "",
   ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example",
-  ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/health",
+  ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/393402133025997798000961/health",
 };
 
 const run = (overrides = {}, manifestOverride = manifest) =>
@@ -175,4 +175,9 @@ test("external matching is either fully configured or explicitly disabled", () =
   rehash(disabled);
   const disabledEnv = { ZYLITH_EXTERNAL_MATCHING_DISABLED: "1", ZYLITH_ROUTE_SERVICE_URL: "", ZYLITH_ROUTE_SERVICE_HEALTH_URL: "" };
   assert.deepEqual(run(disabledEnv, disabled), []);
+});
+
+test("external route health probes the configured chain", () => {
+  const failures = run({ ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/health" });
+  assert.ok(failures.some((failure) => failure.includes("must probe the configured chain")));
 });
