@@ -6,9 +6,11 @@ import { loadConfig } from "./config.js";
 
 const manifest = JSON.parse(readFileSync("../client/public/deployment.example.json", "utf8"));
 manifest.funding.starknet_privacy.privacy_pool = "0x123";
+manifest.funding.starknet_privacy.privacy_pool_class_hash = "0x124";
 manifest.funding.starknet_privacy.paymaster_address = "0xabc";
 manifest.funding.starknet_privacy.proof_signer_class_hash = "0x987";
 manifest.contracts.exchange = "0x456";
+manifest.contracts.privacy_deposit_bridge = "0x789";
 manifest.deployment = { finalized: true, release_commit: "a".repeat(40) };
 manifest.proof.config_locked_after_deploy = true;
 const manifestPath = join(mkdtempSync(join(tmpdir(), "zylith-paymaster-test-")), "deployment.json");
@@ -16,7 +18,6 @@ writeFileSync(manifestPath, JSON.stringify(manifest));
 
 const BASE_ENV = {
   ZYLITH_PAYMASTER_RPC_URL: "https://rpc.zylith.example",
-  ZYLITH_PAYMASTER_GATEWAY_URL: "https://gateway.zylith.example/add_transaction",
   ZYLITH_PAYMASTER_CHAIN_ID: "0x534e5f5345504f4c4941",
   ZYLITH_PAYMASTER_ACCOUNT_ADDRESS: "0xabc",
   ZYLITH_PAYMASTER_PRIVATE_KEY: "1".repeat(64),
@@ -27,8 +28,8 @@ const BASE_ENV = {
   ZYLITH_PAYMASTER_ALLOWED_ORIGINS: "https://app.zylith.example",
   ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH: "0x987",
   ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH: "/var/lib/zylith/submissions.json",
-  ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LOG_PATH: "/var/lib/zylith/signer-deployments.json",
   ZYLITH_PAYMASTER_SIGNER_RELAY_LOG_PATH: "/var/lib/zylith/signer-relays.json",
+  ZYLITH_PAYMASTER_SPONSORED_FEE_LOG_PATH: "/var/lib/zylith/sponsored-fees.json",
 } satisfies NodeJS.ProcessEnv;
 
 describe("paymaster config", () => {
@@ -37,12 +38,11 @@ describe("paymaster config", () => {
       ...BASE_ENV,
       ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI: "900000000000000000",
       ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY: "250",
-      ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY: "1",
     });
 
     expect(config.maxSponsoredFeeFri).toBe(900_000_000_000_000_000n);
     expect(config.signerRelayLimitPerDay).toBe(250);
-    expect(config.signerDeploymentLimitPerPrincipalPerDay).toBe(1);
+    expect(config.dailySponsoredFeePerPrincipalFri).toBe(5_000_000_000_000_000_000n);
   });
 
   it("rejects non-positive sponsored fee limits", () => {
@@ -52,6 +52,16 @@ describe("paymaster config", () => {
         ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI: "0",
       })
     ).toThrow(/positive integer/);
+  });
+
+  it("requires the daily fee budget to cover one maximum transaction", () => {
+    expect(() =>
+      loadConfig({
+        ...BASE_ENV,
+        ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI: "100",
+        ZYLITH_PAYMASTER_DAILY_SPONSORED_FEE_FRI: "99",
+      }),
+    ).toThrow(/cover at least one transaction/);
   });
 
   it("loads the production allowlist snapshot exactly", () => {
@@ -168,15 +178,6 @@ describe("paymaster config", () => {
         ZYLITH_PAYMASTER_RPC_URL: "http://127.0.0.1:9545",
       }).rpcUrl,
     ).toBe("http://127.0.0.1:9545");
-  });
-
-  it("requires a valid proof gateway URL", () => {
-    expect(() =>
-      loadConfig({
-        ...BASE_ENV,
-        ZYLITH_PAYMASTER_GATEWAY_URL: "not-a-url",
-      }),
-    ).toThrow(/ZYLITH_PAYMASTER_GATEWAY_URL must be a valid http\(s\) URL/);
   });
 
   it("derives contract and spender allowlists from the deployment registry", () => {

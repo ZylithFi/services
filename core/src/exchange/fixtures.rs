@@ -111,6 +111,7 @@ pub fn market(midpoint: u128) -> Market {
         observed_at_ms: 9_000,
         valid_until_ms: 11_000,
         fee_bps: 30,
+        min_order_quote_amount: 1,
         reference_methodology: super::calldata::REFERENCE_METHOD_DIRECT_BBO,
         derivation_base_market_id: Felt::ZERO,
         derivation_quote_market_id: Felt::ZERO,

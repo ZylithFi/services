@@ -512,8 +512,7 @@ impl ProofQueue {
 
     pub async fn prune(&self) -> Result<u64, String> {
         let queue = self.clone();
-        let write_lock = self.write_lock.clone();
-        let _guard = write_lock.lock().await;
+        let _guard = self.write_lock.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || queue.prune_sync())
             .await
             .map_err(|error| format!("proof retention task: {error}"))?
@@ -1017,9 +1016,10 @@ async fn require_registration_middleware(
     next: Next,
 ) -> Result<Response, QueueError> {
     let headers = request.headers().clone();
-    tokio::task::spawn_blocking(move || queue.require_registration_grant(&headers))
-        .await
-        .map_err(|error| QueueError::Internal(format!("registration auth task: {error}")))??;
+    blocking("registration auth", move || {
+        queue.require_registration_grant(&headers)
+    })
+    .await?;
     Ok(next.run(request).await)
 }
 
@@ -1029,49 +1029,45 @@ async fn require_worker_middleware(
     next: Next,
 ) -> Result<Response, QueueError> {
     let token = queue.worker_token(request.headers())?.to_owned();
-    tokio::task::spawn_blocking(move || queue.authorize_worker(&token))
-        .await
-        .map_err(|error| QueueError::Internal(format!("worker auth task: {error}")))??;
+    blocking("worker auth", move || queue.authorize_worker(&token)).await?;
     Ok(next.run(request).await)
+}
+
+/// runs a blocking queue operation off the async runtime.
+async fn blocking<T: Send + 'static>(
+    label: &str,
+    task: impl FnOnce() -> Result<T, QueueError> + Send + 'static,
+) -> Result<T, QueueError> {
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| QueueError::Internal(format!("{label} task: {error}")))?
 }
 
 async fn enqueue(
     State(queue): State<ProofQueue>,
-    headers: HeaderMap,
     Json(request): Json<EnqueueProofJob>,
 ) -> Result<Json<ProofJobStatus>, QueueError> {
-    queue.require_control(&headers)?;
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    tokio::task::spawn_blocking(move || queue.enqueue_sync(request))
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("enqueue", move || queue.enqueue_sync(request))
         .await
-        .map_err(|error| QueueError::Internal(format!("enqueue task: {error}")))?
         .map(Json)
 }
 
 async fn status(
     State(queue): State<ProofQueue>,
-    headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Result<Json<ProofJobStatus>, QueueError> {
-    queue.require_control(&headers)?;
-    tokio::task::spawn_blocking(move || queue.status_sync(&job_id))
+    blocking("status", move || queue.status_sync(&job_id))
         .await
-        .map_err(|error| QueueError::Internal(format!("status task: {error}")))?
         .map(Json)
 }
 
 async fn delete_job(
     State(queue): State<ProofQueue>,
-    headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Result<StatusCode, QueueError> {
-    queue.require_control(&headers)?;
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    tokio::task::spawn_blocking(move || queue.delete_job_sync(&job_id))
-        .await
-        .map_err(|error| QueueError::Internal(format!("delete task: {error}")))??;
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("delete", move || queue.delete_job_sync(&job_id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1085,26 +1081,22 @@ async fn register(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    tokio::task::spawn_blocking(move || queue.register_sync(&grant, request))
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("registration", move || queue.register_sync(&grant, request))
         .await
-        .map_err(|error| QueueError::Internal(format!("registration task: {error}")))?
         .map(Json)
 }
 
 async fn issue_registration_grant(
     State(queue): State<ProofQueue>,
-    headers: HeaderMap,
     Json(request): Json<RegisterProofWorker>,
 ) -> Result<Json<ProofWorkerRegistrationGrant>, QueueError> {
-    queue.require_control(&headers)?;
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    tokio::task::spawn_blocking(move || queue.issue_registration_grant_sync(request))
-        .await
-        .map_err(|error| QueueError::Internal(format!("grant task: {error}")))?
-        .map(Json)
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("grant", move || {
+        queue.issue_registration_grant_sync(request)
+    })
+    .await
+    .map(Json)
 }
 
 async fn refresh_session(
@@ -1112,11 +1104,9 @@ async fn refresh_session(
     headers: HeaderMap,
 ) -> Result<Json<RegisterProofWorkerResponse>, QueueError> {
     let token = queue.worker_token(&headers)?.to_owned();
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    tokio::task::spawn_blocking(move || queue.refresh_session_sync(&token))
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("refresh", move || queue.refresh_session_sync(&token))
         .await
-        .map_err(|error| QueueError::Internal(format!("refresh task: {error}")))?
         .map(Json)
 }
 
@@ -1125,11 +1115,8 @@ async fn claim(
     headers: HeaderMap,
 ) -> Result<Response, QueueError> {
     let token = queue.worker_token(&headers)?.to_owned();
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    let claim = tokio::task::spawn_blocking(move || queue.claim_sync(&token))
-        .await
-        .map_err(|error| QueueError::Internal(format!("claim task: {error}")))??;
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    let claim = blocking("claim", move || queue.claim_sync(&token)).await?;
     Ok(match claim {
         Some(claim) => Json(claim).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
@@ -1143,11 +1130,9 @@ async fn start(
     Json(request): Json<ProofJobLeaseRequest>,
 ) -> Result<Json<ProofJobStatus>, QueueError> {
     let token = queue.worker_token(&headers)?.to_owned();
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    tokio::task::spawn_blocking(move || queue.start_sync(&token, &job_id, request))
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("start", move || queue.start_sync(&token, &job_id, request))
         .await
-        .map_err(|error| QueueError::Internal(format!("start task: {error}")))?
         .map(Json)
 }
 
@@ -1157,9 +1142,7 @@ async fn artifact(
     Path(job_id): Path<String>,
 ) -> Result<Response, QueueError> {
     let token = queue.worker_token(&headers)?.to_owned();
-    let bytes = tokio::task::spawn_blocking(move || queue.artifact_sync(&token, &job_id))
-        .await
-        .map_err(|error| QueueError::Internal(format!("artifact task: {error}")))??;
+    let bytes = blocking("artifact", move || queue.artifact_sync(&token, &job_id)).await?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/json"),
@@ -1177,33 +1160,29 @@ async fn complete(
     Json(request): Json<CompleteProofJob>,
 ) -> Result<Json<ProofJobStatus>, QueueError> {
     let token = queue.worker_token(&headers)?.to_owned();
-    let write_lock = queue.write_lock.clone();
-    let _guard = write_lock.lock().await;
-    tokio::task::spawn_blocking(move || queue.complete_sync(&token, &job_id, request))
-        .await
-        .map_err(|error| QueueError::Internal(format!("completion task: {error}")))?
-        .map(Json)
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("completion", move || {
+        queue.complete_sync(&token, &job_id, request)
+    })
+    .await
+    .map(Json)
 }
 
 async fn health(State(queue): State<ProofQueue>) -> Result<Json<serde_json::Value>, QueueError> {
-    tokio::task::spawn_blocking(move || {
+    blocking("health", move || {
         queue
             .connection()
             .map(|_| serde_json::json!({"status": "ok"}))
     })
     .await
-    .map_err(|error| QueueError::Internal(format!("health task: {error}")))?
     .map(Json)
 }
 
 async fn internal_health(
     State(queue): State<ProofQueue>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, QueueError> {
-    queue.require_monitor(&headers)?;
-    tokio::task::spawn_blocking(move || queue.health_sync())
+    blocking("health", move || queue.health_sync())
         .await
-        .map_err(|error| QueueError::Internal(format!("health task: {error}")))?
         .map(Json)
 }
 

@@ -205,32 +205,11 @@ pub fn residual_recovery_amounts(
     Ok((input_amount, output_amount, fee_amount))
 }
 
+/// the statement's commitment: its domain and chain context over the contract calldata.
 fn public_commitment(public: &ResidualRecoveryPublic) -> Felt {
-    sponge(&[
-        short_string(RESIDUAL_RECOVERY_DOMAIN),
-        public.chain_context,
-        public.note_root,
-        public.nullifier,
-        public.pair_id,
-        felt_bool(public.sell),
-        felt_u128(public.fee_bps),
-        felt_u64(u64::from(public.reserved_seq)),
-        felt_u64(public.capacity.generation),
-        felt_u64(u64::from(public.capacity.status)),
-        felt_u128(public.capacity.total),
-        felt_u128(public.capacity.consumed_base),
-        felt_u128(public.capacity.pool_quote),
-        felt_u128(public.capacity.scale),
-        public.input_asset_id,
-        felt_u128(public.input_amount),
-        public.output_asset_id,
-        felt_u128(public.output_amount),
-        felt_u128(public.fee_amount),
-        public.input_exit.commitment,
-        public.input_exit.authority,
-        public.output_exit.commitment,
-        public.output_exit.authority,
-    ])
+    let mut fields = vec![short_string(RESIDUAL_RECOVERY_DOMAIN), public.chain_context];
+    fields.extend(residual_recovery_calldata(public));
+    sponge(&fields)
 }
 
 fn build_residual_recovery_inner(

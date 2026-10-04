@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
-use starknet_crypto::Felt;
+use starknet_crypto::{Felt, poseidon_hash};
 use zylith_core::exchange::fixtures::*;
 use zylith_core::exchange::*;
 
@@ -185,6 +185,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?,
         note: deposits[0].clone(),
     })?;
+    let duplicate_exit_authority = public_key(&Felt::from(0xe41c_u64));
+    let (duplicate_exit, _) = build_withdrawal(&WithdrawalInput {
+        chain_context: Felt::from(CHAIN),
+        note_root: notes.root(),
+        exit_commitment: exit,
+        exit_authority: duplicate_exit_authority,
+        membership: notes.membership(&deposits[1]),
+        authorization: sign_message(
+            &buyer.withdraw_key,
+            &withdrawal_authorization_message(
+                Felt::from(CHAIN),
+                deposits[1].nullifier(),
+                exit,
+                duplicate_exit_authority,
+            ),
+        )?,
+        note: deposits[1].clone(),
+    })?;
     let cross = build_transition(&input(
         1,
         vec![],
@@ -209,19 +227,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .find(|output| output.note.owner_public_key == seller.owner.owner_public_key)
         .unwrap();
+    let proceeds_exit = Felt::from(0xe418_u64);
+    let proceeds_exit_authority = public_key(&Felt::from(0xe41b_u64));
     let (withdrawal, _) = build_withdrawal(&WithdrawalInput {
         chain_context: Felt::from(CHAIN),
         note_root: notes.root(),
-        exit_commitment: exit,
-        exit_authority,
+        exit_commitment: proceeds_exit,
+        exit_authority: proceeds_exit_authority,
         membership: notes.membership(&proceeds.note),
         authorization: sign_message(
             &seller.withdraw_key,
             &withdrawal_authorization_message(
                 Felt::from(CHAIN),
                 proceeds.note.nullifier(),
-                exit,
-                exit_authority,
+                proceeds_exit,
+                proceeds_exit_authority,
             ),
         )?,
         note: proceeds.note.clone(),
@@ -231,6 +251,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fixture.withdrawal(&raced);
     fixture.transition(&cross)?;
     fixture.withdrawal(&withdrawal);
+    fixture.withdrawal(&duplicate_exit);
     fixture.write(&dir, "exchange_cross")?;
     if let Some(program_dir) = &program_dir {
         // the proof program's inputs: its exchange, the expected commitment and the witness.
@@ -238,16 +259,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         let (withdrawal_public, withdrawal_witness) = build_withdrawal(&WithdrawalInput {
             chain_context: Felt::from(CHAIN),
             note_root: notes.root(),
-            exit_commitment: exit,
-            exit_authority,
+            exit_commitment: proceeds_exit,
+            exit_authority: proceeds_exit_authority,
             membership: notes.membership(&proceeds.note),
             authorization: sign_message(
                 &seller.withdraw_key,
                 &withdrawal_authorization_message(
                     Felt::from(CHAIN),
                     proceeds.note.nullifier(),
-                    exit,
-                    exit_authority,
+                    proceeds_exit,
+                    proceeds_exit_authority,
                 ),
             )?,
             note: proceeds.note.clone(),
@@ -275,8 +296,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // a resting order's latest residual authority exits without operator cooperation.
     let mut notes = Notes::default();
     let owner = user(30);
+    let colliding_owner = user(31);
     let funding = deposit(&owner, BASE, 10, 30);
+    let colliding_funding = deposit(&colliding_owner, BASE, 1, 31);
     notes.add_deposit(&funding);
+    notes.add_deposit(&colliding_funding);
     let admission = build_transition(&input(
         1,
         vec![],
@@ -317,6 +341,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         &residual_recovery_authorization_message(preview.commitment),
     )?;
     let (recovery, recovery_witness) = build_residual_recovery(&recovery_input)?;
+    let colliding_exit_authority = public_key(&Felt::from(0x3032_u64));
+    let (colliding_withdrawal, _) = build_withdrawal(&WithdrawalInput {
+        chain_context: Felt::from(CHAIN),
+        note_root: notes.root(),
+        exit_commitment: recovery_input.input_exit.commitment,
+        exit_authority: colliding_exit_authority,
+        membership: notes.membership(&colliding_funding),
+        authorization: sign_message(
+            &colliding_owner.withdraw_key,
+            &withdrawal_authorization_message(
+                Felt::from(CHAIN),
+                colliding_funding.nullifier(),
+                recovery_input.input_exit.commitment,
+                colliding_exit_authority,
+            ),
+        )?,
+        note: colliding_funding.clone(),
+    })?;
     let mut cancel_input = input(2, admission.new_book.clone(), vec![], Felt::ZERO, 100);
     cancel_input.close_time_ms = 12_000;
     cancel_input.markets[0].observed_at_ms = 12_000;
@@ -336,11 +378,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     retire_input.recovered_order_ids = vec![residual.order_id];
     let retired = build_transition(&retire_input)?;
     let mut fixture = Fixture::new();
-    fixture.deposits(&[funding]);
+    fixture.deposits(&[funding, colliding_funding]);
     fixture.transition(&admission)?;
     fixture.residual_recovery(&recovery);
     fixture.transition(&cancelled)?;
     fixture.transition(&retired)?;
+    fixture.withdrawal(&colliding_withdrawal);
     fixture.write(&dir, "exchange_residual_recovery")?;
     if let Some(program_dir) = &program_dir {
         let mut program = Fixture {
@@ -425,6 +468,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         &residual_recovery_authorization_message(full_recovery_preview.commitment),
     )?;
     let (full_recovery, _) = build_residual_recovery(&full_recovery_input)?;
+    let mut colliding_recovery_input = full_recovery_input.clone();
+    colliding_recovery_input.output_exit.commitment = poseidon_hash(
+        short_string("zylith_res_fee_exit_v1"),
+        full_residual.nullifier(),
+    );
+    let colliding_preview = preview_residual_recovery(&colliding_recovery_input)?;
+    colliding_recovery_input.authorization = sign_message(
+        &external.withdraw_key,
+        &residual_recovery_authorization_message(colliding_preview.commitment),
+    )?;
+    let (colliding_recovery, _) = build_residual_recovery(&colliding_recovery_input)?;
     let mut retire_full_input = input(2, reserve.new_book.clone(), vec![], Felt::ZERO, 100);
     retire_full_input.close_time_ms = 133_000;
     retire_full_input.markets[0].observed_at_ms = 132_000;
@@ -468,6 +522,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fixture.lines.extend(m1.calldata());
     fixture.residual_recovery(&full_recovery);
     fixture.transition(&retire_full)?;
+    fixture.residual_recovery(&colliding_recovery);
     fixture.write(&dir, "exchange_external_full")?;
 
     // mainnet-scale external fills for the ekubo fork tests, 1000 strk (18 decimals) against usdc

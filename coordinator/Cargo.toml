@@ -23,5 +23,4 @@ zylith-core = { path = "../core" }
 zylith-proof-job = { path = "../proof_job" }
 
 [dev-dependencies]
-http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

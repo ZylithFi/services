@@ -387,6 +387,7 @@ async fn check_exchange_configuration(config: &Config, snip36: &Snip36) -> Resul
             pair.quote_asset_id,
             Felt::from(pair.scale),
             Felt::from(pair.fee_bps),
+            Felt::from(pair.min_order_quote_amount),
             Felt::from(pair.external_settlement_support_quote),
             Felt::from(u64::from(pair.reference_methodology)),
             pair.derivation_base_market_id,

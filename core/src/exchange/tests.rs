@@ -35,6 +35,131 @@ fn per_order_bounds_keep_full_book_aggregates_in_range() {
     );
 }
 
+#[test]
+fn an_order_cannot_reuse_a_funding_note() {
+    let mut notes = Notes::default();
+    let owner = user(100);
+    let funding = deposit(&owner, BASE, 10, 100);
+    notes.add_deposit(&funding);
+    let admitted = new_order(
+        &notes,
+        &owner,
+        true,
+        false,
+        10,
+        1,
+        std::slice::from_ref(&funding),
+    );
+    let mut request = OrderRequest {
+        terms: admitted.terms,
+        funding: vec![funding.clone(), funding],
+        authorization: Signature {
+            r: Felt::ZERO,
+            s: Felt::ZERO,
+        },
+    };
+    request.authorization = sign_message(
+        &owner.spend_key,
+        &request.authorization_message(Felt::from(CHAIN)),
+    )
+    .unwrap();
+    assert!(
+        request
+            .validate(Felt::from(CHAIN), Felt::from(BASE), 1, 1, 1)
+            .is_err()
+    );
+}
+
+#[test]
+fn buy_orders_require_the_full_rounded_quote_value_and_the_market_minimum() {
+    fn request(owner: &User, funding: NoteFields, amount: u128, limit: u128) -> OrderRequest {
+        let mut notes = Notes::default();
+        notes.add_deposit(&funding);
+        let admitted = new_order(
+            &notes,
+            owner,
+            false,
+            false,
+            amount,
+            limit,
+            std::slice::from_ref(&funding),
+        );
+        OrderRequest {
+            terms: admitted.terms,
+            funding: vec![funding],
+            authorization: admitted.authorization,
+        }
+    }
+
+    let underfunded_owner = user(103);
+    let underfunded = request(
+        &underfunded_owner,
+        deposit(&underfunded_owner, QUOTE, 10, 103),
+        10,
+        105,
+    );
+    assert!(
+        underfunded
+            .validate(Felt::from(CHAIN), Felt::from(QUOTE), 1, 1, 100)
+            .is_err()
+    );
+
+    let dust_owner = user(104);
+    let dust = request(&dust_owner, deposit(&dust_owner, QUOTE, 1, 104), 10, 1);
+    assert!(
+        dust.validate(Felt::from(CHAIN), Felt::from(QUOTE), 1, 2, 100)
+            .is_err()
+    );
+
+    let exact_owner = user(105);
+    let exact = request(&exact_owner, deposit(&exact_owner, QUOTE, 11, 105), 10, 105);
+    exact
+        .validate(Felt::from(CHAIN), Felt::from(QUOTE), 1, 11, 100)
+        .unwrap();
+}
+
+#[test]
+fn canonical_books_reject_duplicate_order_ids() {
+    let mut notes = Notes::default();
+    let owner = user(101);
+    let funding = deposit(&owner, BASE, 10, 101);
+    notes.add_deposit(&funding);
+    let admitted = build_transition(&input(
+        1,
+        vec![],
+        vec![new_order(&notes, &owner, true, false, 10, 1, &[funding])],
+        notes.root(),
+        100,
+    ))
+    .unwrap();
+    let duplicate = vec![
+        admitted.new_book[0].order.clone(),
+        admitted.new_book[0].order.clone(),
+    ];
+    assert!(assert_canonical_book(&duplicate).is_err());
+}
+
+#[test]
+fn admission_rejects_an_order_beyond_the_protocol_lifetime() {
+    let mut notes = Notes::default();
+    let owner = user(102);
+    let funding = deposit(&owner, BASE, 10, 102);
+    notes.add_deposit(&funding);
+    let mut order = new_order(&notes, &owner, true, false, 10, 1, &[funding]);
+    let transition = input(1, vec![], vec![], Felt::ZERO, 100);
+    order.terms.expiry_ms = transition.close_time_ms + MAX_ORDER_LIFETIME_MS + 1;
+    order.authorization = sign_message(
+        &owner.spend_key,
+        &order.authorization_message(transition.chain_context),
+    )
+    .unwrap();
+    let mut transition = transition;
+    transition.note_root = notes.root();
+    transition.new_orders = vec![order];
+
+    assert!(build_transition(&transition).is_err());
+}
+
 fn book_funding(book: &[BookEntry], sell: bool) -> u128 {
     book.iter()
         .filter(|entry| entry.order.sell == sell)
@@ -135,7 +260,7 @@ fn a_partial_fill_replaces_exactly_one_residual_generation() {
     let old = first.residual_outputs[0].note.clone();
     notes.add_outputs(&first.public);
 
-    let quote = deposit(&buyer, QUOTE, 500, 32);
+    let quote = deposit(&buyer, QUOTE, 525, 32);
     notes.add_deposit(&quote);
     let second = build_transition(&input(
         2,
@@ -175,7 +300,7 @@ fn a_full_fill_consumes_the_residual_authority_without_replacing_it() {
     let authority = admitted.residual_outputs[0].note.clone();
     let order_id = authority.order_id;
     notes.add_outputs(&admitted.public);
-    let quote = deposit(&buyer, QUOTE, 1_000, 38);
+    let quote = deposit(&buyer, QUOTE, 1_050, 38);
     notes.add_deposit(&quote);
     let filled = build_transition(&input(
         2,
@@ -208,7 +333,7 @@ fn repeated_partial_fills_replace_only_the_latest_residual_authority() {
     let first_authority = admitted.residual_outputs[0].note.clone();
     notes.add_outputs(&admitted.public);
 
-    let first_quote = deposit(&first_buyer, QUOTE, 500, 42);
+    let first_quote = deposit(&first_buyer, QUOTE, 525, 42);
     notes.add_deposit(&first_quote);
     let first_fill = build_transition(&input(
         2,
@@ -235,7 +360,7 @@ fn repeated_partial_fills_replace_only_the_latest_residual_authority() {
     );
     notes.add_outputs(&first_fill.public);
 
-    let second_quote = deposit(&second_buyer, QUOTE, 500, 43);
+    let second_quote = deposit(&second_buyer, QUOTE, 525, 43);
     notes.add_deposit(&second_quote);
     let second_fill = build_transition(&input(
         3,
@@ -738,7 +863,7 @@ fn a_sealed_request_opens_only_with_every_execution_key() {
             order_id: Felt::from(7_u8),
             after_seq: 0,
         }],
-        nullifiers: vec![],
+        withdrawals: vec![],
     });
     let (sealed, response_key) = seal_request(&registry, &status).unwrap();
     let opened = open_request(&sealed, &keys).unwrap();
@@ -939,7 +1064,15 @@ fn widened<T: serde::Serialize>(value: &T) -> serde_json::Value {
             }
             serde_json::Value::Number(_) => *value = serde_json::json!(u64::MAX),
             serde_json::Value::Array(items) => items.iter_mut().for_each(widen),
-            serde_json::Value::Object(fields) => fields.values_mut().for_each(widen),
+            serde_json::Value::Object(fields) => {
+                for (name, field) in fields {
+                    if name == "nonce" && field.is_string() {
+                        *field = serde_json::Value::String(u64::MAX.to_string());
+                    } else {
+                        widen(field);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -995,7 +1128,13 @@ fn every_request_seals_to_one_size_within_the_wire_limits() {
             };
             MAX_STATUS_ITEMS / 2
         ],
-        nullifiers: vec![full; MAX_STATUS_ITEMS / 2],
+        withdrawals: vec![
+            WithdrawalQuery {
+                nullifier: full,
+                authorization: Signature { r: full, s: full },
+            };
+            MAX_STATUS_ITEMS / 2
+        ],
     });
     let cancel = PrivateRequest::Cancel(CancelRequest {
         order_id: Felt::ONE,
@@ -1019,7 +1158,16 @@ fn every_request_seals_to_one_size_within_the_wire_limits() {
     // past the limits nothing seals.
     let too_many = PrivateRequest::Status(StatusRequest {
         orders: vec![],
-        nullifiers: vec![Felt::ONE; MAX_STATUS_ITEMS + 1],
+        withdrawals: vec![
+            WithdrawalQuery {
+                nullifier: Felt::ONE,
+                authorization: Signature {
+                    r: Felt::ONE,
+                    s: Felt::ONE
+                },
+            };
+            MAX_STATUS_ITEMS + 1
+        ],
     });
     assert!(seal_request(&registry, &too_many).is_err());
     let empty = PrivateRequest::Status(StatusRequest::default());
@@ -1034,20 +1182,28 @@ fn status_lookups_chunk_in_order_within_the_limit() {
             after_seq: index,
         })
         .collect::<Vec<_>>();
-    let nullifiers = (100..130_u32).map(Felt::from).collect::<Vec<_>>();
+    let withdrawals = (100..130_u32)
+        .map(|index| WithdrawalQuery {
+            nullifier: Felt::from(index),
+            authorization: Signature {
+                r: Felt::ONE,
+                s: Felt::ONE,
+            },
+        })
+        .collect::<Vec<_>>();
     let chunks = chunk_status(StatusRequest {
         orders: orders.clone(),
-        nullifiers: nullifiers.clone(),
+        withdrawals: withdrawals.clone(),
     });
     let sizes = chunks
         .iter()
-        .map(|chunk| chunk.orders.len() + chunk.nullifiers.len())
+        .map(|chunk| chunk.orders.len() + chunk.withdrawals.len())
         .collect::<Vec<_>>();
     assert_eq!(sizes, vec![8, 8, 8, 8, 8, 8, 8, 8, 6]);
     let rejoined_orders = chunks.iter().flat_map(|chunk| chunk.orders.clone());
     assert_eq!(rejoined_orders.collect::<Vec<_>>(), orders);
-    let rejoined_nullifiers = chunks.iter().flat_map(|chunk| chunk.nullifiers.clone());
-    assert_eq!(rejoined_nullifiers.collect::<Vec<_>>(), nullifiers);
+    let rejoined_withdrawals = chunks.iter().flat_map(|chunk| chunk.withdrawals.clone());
+    assert_eq!(rejoined_withdrawals.collect::<Vec<_>>(), withdrawals);
     assert!(chunk_status(StatusRequest::default()).is_empty());
 }
 

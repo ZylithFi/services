@@ -1,5 +1,5 @@
 import { AddressInfo } from "node:net";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,8 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PaymasterConfig } from "./config.js";
 import {
   FixedWindowRateLimiter,
-  SignerDeploymentBudget,
   SignerRelayBudget,
+  SponsoredFeeBudget,
   SubmissionQueues,
   createPaymasterServer
 } from "./server.js";
@@ -237,6 +237,66 @@ describe("paymaster server", () => {
     expect(submits).toBe(1);
   });
 
+  it("persists and enforces the aggregate sponsored fee budget", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "zylith-sponsored-fee-"));
+    const path = join(directory, "budget.json");
+    try {
+      const first = new SponsoredFeeBudget(20n, path);
+      await first.reserve(12n);
+      await expect(first.reserve(9n)).rejects.toThrow("budget exhausted");
+
+      const restored = new SponsoredFeeBudget(20n, path);
+      await restored.reserve(8n);
+      await expect(restored.reserve(1n)).rejects.toThrow("budget exhausted");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("refunds a failed submission reservation exactly once", async () => {
+    const budget = new SponsoredFeeBudget(20n, null);
+    const release = await budget.reserve(20n);
+    await expect(budget.reserve(1n)).rejects.toThrow("budget exhausted");
+
+    await release();
+    await release();
+    await budget.reserve(20n);
+  });
+
+  it("isolates daily sponsorship quotas by authenticated signer principal", async () => {
+    const budget = new SponsoredFeeBudget(20n, null, 10n);
+    await budget.reserve(10n, "0xaaa");
+    await expect(budget.reserve(1n, "0xaaa")).rejects.toThrow(/for principal/);
+    await budget.reserve(10n, "0xbbb");
+  });
+
+  it("rejects a transaction before broadcast when the daily fee budget is exhausted", async () => {
+    let broadcasts = 0;
+    const server = createPaymasterServer(
+      {
+        ...config(),
+        dailySponsoredFeeFri: 43n,
+        dailySponsoredFeePerPrincipalFri: 43n,
+      },
+      {
+        fetchImpl: fakeRpcFetch(() => {
+          broadcasts += 1;
+        }),
+        runtime: fakeRuntime(),
+      },
+    );
+    servers.push(server);
+    const url = await listen(server);
+
+    const response = await postRequest(url, request);
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toEqual({
+      error: "daily sponsored fee budget exhausted",
+    });
+    expect(broadcasts).toBe(0);
+  });
+
   it("ignores forwarded IP headers from untrusted direct clients", async () => {
     const server = createPaymasterServer(
       {
@@ -352,7 +412,7 @@ describe("paymaster server", () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
   });
 
-  it("relays privacy signer approvals without process-local ensure state", async () => {
+  it("relays approvals for an already deployed privacy signer", async () => {
     const server = createPaymasterServer(config(), {
       fetchImpl: fakeRpcFetch(),
       runtime: fakeRuntime()
@@ -382,79 +442,6 @@ describe("paymaster server", () => {
     expect(relayBeforeEnsure.status).toBe(200);
     await expect(relayBeforeEnsure.json()).resolves.toEqual({ transaction_hash: "0xtx" });
 
-    const ensure = await fetch(`${url}/privacy-signer/ensure`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "https://app.example"
-      },
-      body: JSON.stringify({
-        signer_public_key: "0x777",
-        salt: "0x88",
-        class_hash: "0xabc"
-      })
-    });
-    expect(ensure.status).toBe(200);
-    await expect(ensure.json()).resolves.toMatchObject({
-      contract_address: "0x1234"
-    });
-
-    const relayAfterEnsure = await fetch(`${url}/privacy-signer/relay`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "https://app.example"
-      },
-      body: JSON.stringify(relayBody)
-    });
-    expect(relayAfterEnsure.status).toBe(409);
-  });
-
-  it("requires a valid wallet sponsorship before paying for a new signer deployment", async () => {
-    let deployments = 0;
-    const server = createPaymasterServer(config(), {
-      fetchImpl: fakeRpcFetch(),
-      runtime: fakeRuntime({
-        deployed: false,
-        validSponsor: true,
-        onDeploy: () => { deployments += 1; },
-      })
-    });
-    servers.push(server);
-    const url = await listen(server);
-    const base = {
-      signer_public_key: "0x777",
-      salt: "0x88",
-      class_hash: "0xabc",
-    };
-
-    const unauthorized = await fetch(`${url}/privacy-signer/ensure`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "https://app.example"
-      },
-      body: JSON.stringify(base)
-    });
-    expect(unauthorized.status).toBe(401);
-    expect(deployments).toBe(0);
-
-    const authorized = await fetch(`${url}/privacy-signer/ensure`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "https://app.example"
-      },
-      body: JSON.stringify({
-        ...base,
-        sponsor_address: "0x999",
-        sponsor_signature: ["0x1", "0x2"],
-        sponsor_nonce: "0x3",
-        sponsor_expires_at: String(Math.floor(Date.now() / 1000) + 300),
-      })
-    });
-    expect(authorized.status).toBe(200);
-    expect(deployments).toBe(1);
   });
 });
 
@@ -473,50 +460,6 @@ describe("paymaster in-memory bounds", () => {
     const release = await budget.reserve("signer:token:spender");
     await release();
     await expect(budget.reserve("signer:token:spender")).resolves.toBeTypeOf("function");
-  });
-
-  it("enforces per-sponsor signer deployment budgets", async () => {
-    const budget = new SignerDeploymentBudget(3, null, 1);
-    await budget.reserve("0xaaa");
-    await expect(budget.reserve("0xaaa")).rejects.toThrow(/budget exhausted for sponsor/);
-    await expect(budget.reserve("0xbbb")).resolves.toBeTypeOf("function");
-  });
-
-  it("enforces the signer deployment budget and releases reservations", async () => {
-    const budget = new SignerDeploymentBudget(1, null);
-    const release = await budget.reserve();
-    await expect(budget.reserve()).rejects.toThrow(/budget exhausted/);
-    await release();
-    await expect(budget.reserve()).resolves.toBeTypeOf("function");
-  });
-
-  it("treats an empty signer deployment budget file as a new budget", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "zylith-paymaster-budget-"));
-    try {
-      const path = join(directory, "budget.json");
-      await writeFile(path, "");
-      const budget = new SignerDeploymentBudget(1, path);
-
-      await expect(budget.reserve()).resolves.toEqual(expect.any(Function));
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("does not release a previous day's reservation from today's budget", async () => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(new Date("2026-09-16T23:59:00Z"));
-      const budget = new SignerDeploymentBudget(1, null);
-      const releaseYesterday = await budget.reserve();
-
-      vi.setSystemTime(new Date("2026-09-17T00:01:00Z"));
-      await budget.reserve();
-      await releaseYesterday();
-      await expect(budget.reserve()).rejects.toThrow(/budget exhausted/);
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("removes expired rate-limit subjects during periodic sweeps", () => {
@@ -585,11 +528,17 @@ describe("paymaster in-memory bounds", () => {
 
 function config(): PaymasterConfig {
   return {
+    registryVersion: 1,
+    registryHash: "a".repeat(64),
     rpcUrl: "https://rpc.example",
     chainId: "0x534e5f5345504f4c4941",
     accountAddress: "0xabc",
     privateKey: "0xkey",
     privacySignerClassHash: "0xabc",
+    feeTokenAddress: "0x456",
+    privacyBridgeAddress: "0x789",
+    privacyPoolAddress: "0x123",
+    privacyPoolClassHash: "0xabc",
     allowedContracts: new Set(["0x123"]),
     approvalSpenders: new Set(["0x123"]),
     allowedEntrypoints: new Set(["apply_actions"]),
@@ -599,16 +548,16 @@ function config(): PaymasterConfig {
     maxBodyBytes: 1_000_000,
     allowedOrigins: new Set(["https://app.example"]),
     signerLimitPerMinute: 20,
-    signerDeploymentLimitPerDay: 100,
-    signerDeploymentLimitPerPrincipalPerDay: 1,
     signerRelayLimitPerDay: 500,
     maxSponsoredFeeFri: 1_000_000_000_000_000_000n,
+    dailySponsoredFeeFri: 100_000_000_000_000_000_000n,
+    dailySponsoredFeePerPrincipalFri: 5_000_000_000_000_000_000n,
     trustProxyHeaders: false,
     trustedProxyCidrs: [],
     internalApiToken: "test-paymaster-token",
     submissionLogPath: null,
-    signerDeploymentLogPath: null,
-    signerRelayLogPath: null
+    signerRelayLogPath: null,
+    sponsoredFeeLogPath: null
   };
 }
 
@@ -630,6 +579,12 @@ function fakeRpcFetch(onAddInvoke?: () => Promise<void> | void): typeof fetch {
             }
           ]
         }),
+        { status: 200 }
+      );
+    }
+    if (body.method === "starknet_call") {
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: ["0x0"] }),
         { status: 200 }
       );
     }
@@ -672,7 +627,7 @@ const request: ExecuteOutsideRequest = {
   call: {
     contract_address: "0x123",
     entrypoint: "apply_actions",
-    calldata: ["0x1"]
+    calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
   },
   outside_transaction: {
     outsideExecution: {
@@ -684,7 +639,7 @@ const request: ExecuteOutsideRequest = {
         {
           to: "0x123",
           selector: "0x246333a752c1ac637ff1591c5c885e27d56060d241a29aad8475072da0777db",
-          calldata: ["0x1"]
+          calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
         }
       ]
     },

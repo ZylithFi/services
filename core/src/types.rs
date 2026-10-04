@@ -506,6 +506,8 @@ pub struct RecoveryArtifact {
 #[serde(deny_unknown_fields)]
 pub struct RecoveryArtifactUpload {
     pub artifact: RecoveryArtifact,
+    /// the current remote snapshot this update merged; none creates the first snapshot.
+    pub previous_artifact_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -527,6 +529,7 @@ pub enum FundingRailKind {
 #[serde(deny_unknown_fields)]
 pub struct StarknetPrivacyFundingRail {
     pub privacy_pool: String,
+    pub privacy_pool_class_hash: String,
     pub bridge_adapter: String,
     pub discovery_url: String,
     pub proving_url: String,

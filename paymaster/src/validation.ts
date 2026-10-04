@@ -3,14 +3,13 @@ import { selector } from "starknet";
 import type { PaymasterConfig } from "./config.js";
 import { normalizeFelt } from "./config.js";
 import type {
-  EnsurePrivacySignerRequest,
   ExecuteOutsideRequest,
   RelayPrivacySignerRequest,
   StarknetCallPayload
 } from "./types.js";
+import { parsePrivacyPoolActions } from "./privacyPoolActions.js";
 
 const MAX_OUTSIDE_EXECUTION_WINDOW_SECONDS = 3_900;
-const MAX_SIGNER_DEPLOYMENT_SPONSORSHIP_WINDOW_SECONDS = 600;
 const CANONICAL_PRIVACY_SIGNER_APPROVAL_LOW = "0xffffffffffffffffffffffffffffffff";
 const SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS = new Set([
   "apply_actions",
@@ -25,15 +24,6 @@ const EXECUTE_OUTSIDE_REQUEST_KEYS = new Set([
   "relay_nonce",
   "proof",
   "proof_facts",
-]);
-const ENSURE_PRIVACY_SIGNER_REQUEST_KEYS = new Set([
-  "signer_public_key",
-  "salt",
-  "class_hash",
-  "sponsor_address",
-  "sponsor_signature",
-  "sponsor_nonce",
-  "sponsor_expires_at",
 ]);
 const RELAY_PRIVACY_SIGNER_REQUEST_KEYS = new Set([
   "account_address",
@@ -68,6 +58,7 @@ export function validateExecuteOutsideRequest(
     | "allowedEntrypoints"
     | "chainId"
     | "proofRequiredEntrypoints"
+    | "privacyBridgeAddress"
   >,
   nowUnixSeconds = Math.floor(Date.now() / 1000)
 ): ExecuteOutsideRequest {
@@ -114,6 +105,24 @@ export function validateExecuteOutsideRequest(
   }
   if (!proof && proofFacts && proofFacts.length > 0) {
     throw new Error("proof_facts require proof");
+  }
+  if (call.entrypoint === "apply_actions") {
+    const actions = parsePrivacyPoolActions(call.calldata, normalizeFelt);
+    const bridgeInvokes = actions?.filter(
+      (action) => action.variant === 10 && action.target === config.privacyBridgeAddress
+    );
+    if (!actions || bridgeInvokes?.length !== 1) {
+      throw new Error("privacy-pool sponsorship requires exactly one Zylith bridge invoke");
+    }
+    if (
+      actions.some(
+        (action) =>
+          (action.variant === 10 && action.target !== config.privacyBridgeAddress)
+          || action.variant === 11
+      )
+    ) {
+      throw new Error("privacy-pool sponsorship cannot invoke another contract");
+    }
   }
   const outsideTransaction = request.outside_transaction
     ? (expectRecord(request.outside_transaction, "outside_transaction") as unknown as ExecuteOutsideRequest["outside_transaction"])
@@ -202,76 +211,6 @@ function validateOutsideTransaction(
     throw new Error("outside execution is not active yet");
   }
   assertOutsideCallMatchesPayload(call, outsideExecution);
-}
-
-export function validateEnsurePrivacySignerRequest(
-  value: unknown,
-  config: Pick<PaymasterConfig, "privacySignerClassHash">,
-  nowUnixSeconds = Math.floor(Date.now() / 1000)
-): EnsurePrivacySignerRequest {
-  const request = expectRecord(value, "request") as Partial<EnsurePrivacySignerRequest>;
-  assertAllowedKeys(request, ENSURE_PRIVACY_SIGNER_REQUEST_KEYS, "request");
-  const signerPublicKey = normalizeFelt(expectString(request.signer_public_key, "signer_public_key"));
-  const salt = normalizeFelt(expectString(request.salt, "salt"));
-  const classHash = request.class_hash === undefined
-    ? config.privacySignerClassHash
-    : normalizeFelt(expectString(request.class_hash, "class_hash"));
-  if (classHash !== config.privacySignerClassHash) {
-    throw new Error("privacy proof signer class_hash is not allowlisted");
-  }
-  if (signerPublicKey === "0x0") {
-    throw new Error("signer_public_key cannot be zero");
-  }
-  const sponsorshipValues = [
-    request.sponsor_address,
-    request.sponsor_signature,
-    request.sponsor_nonce,
-    request.sponsor_expires_at,
-  ];
-  const sponsorshipCount = sponsorshipValues.filter((entry) => entry !== undefined).length;
-  if (sponsorshipCount !== 0 && sponsorshipCount !== sponsorshipValues.length) {
-    throw new Error("deployment sponsorship fields must be provided together");
-  }
-  const validated: EnsurePrivacySignerRequest = {
-    signer_public_key: signerPublicKey,
-    salt,
-    class_hash: classHash,
-  };
-  if (sponsorshipCount === sponsorshipValues.length) {
-    const sponsorAddress = normalizeFelt(
-      expectString(request.sponsor_address, "sponsor_address")
-    );
-    if (sponsorAddress === "0x0") {
-      throw new Error("sponsor_address cannot be zero");
-    }
-    const sponsorSignature = expectStringArray(
-      request.sponsor_signature,
-      "sponsor_signature"
-    ).map(normalizeFelt);
-    if (sponsorSignature.length === 0 || sponsorSignature.length > 8) {
-      throw new Error("sponsor_signature must contain between one and eight felts");
-    }
-    const sponsorExpiresAt = parseSafeUnsignedInteger(
-      expectString(request.sponsor_expires_at, "sponsor_expires_at"),
-      "sponsor_expires_at"
-    );
-    if (sponsorExpiresAt <= nowUnixSeconds) {
-      throw new Error("deployment sponsorship is expired");
-    }
-    if (
-      sponsorExpiresAt - nowUnixSeconds >
-      MAX_SIGNER_DEPLOYMENT_SPONSORSHIP_WINDOW_SECONDS
-    ) {
-      throw new Error("deployment sponsorship window is too long");
-    }
-    validated.sponsor_address = sponsorAddress;
-    validated.sponsor_signature = sponsorSignature;
-    validated.sponsor_nonce = normalizeFelt(
-      expectString(request.sponsor_nonce, "sponsor_nonce")
-    );
-    validated.sponsor_expires_at = String(sponsorExpiresAt);
-  }
-  return validated;
 }
 
 export function validateRelayPrivacySignerRequest(

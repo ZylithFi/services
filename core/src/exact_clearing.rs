@@ -534,6 +534,7 @@ fn exhaust_feasible_direct_crosses(
         let direct_dust = participant_count
             .checked_mul(CLEARING_TOLERANCE_UNITS)
             .ok_or_else(|| invalid("direct-cross dust allowance overflows"))?;
+        let max_dust = direct_dust.min(cross.saturating_sub(1));
         let original = instance
             .orders
             .iter()
@@ -542,20 +543,31 @@ fn exhaust_feasible_direct_crosses(
             .map(|(index, _)| (index, fills[index]))
             .collect::<Vec<_>>();
         let mut accepted = false;
-        for dust in 0..=direct_dust {
-            let amount = cross.saturating_sub(dust);
-            if amount == 0 || accepted {
-                continue;
+        'allocation: for (buy_reverse, sell_reverse) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            for dust in 0..=max_dust {
+                let amount = cross - dust;
+                for (index, fill) in &original {
+                    fills[*index] = *fill;
+                }
+                add_direct_cross(
+                    instance,
+                    fills,
+                    market_index,
+                    amount,
+                    buy_reverse,
+                    sell_reverse,
+                );
+                let (inputs, outputs) = clearing_flows(instance, fills);
+                accepted = inputs
+                    .iter()
+                    .zip(outputs)
+                    .all(|(input, output)| input >= &output);
+                if accepted {
+                    break 'allocation;
+                }
             }
-            for (index, fill) in &original {
-                fills[*index] = *fill;
-            }
-            add_direct_cross(instance, fills, market_index, amount);
-            let (inputs, outputs) = clearing_flows(instance, fills);
-            accepted = inputs
-                .iter()
-                .zip(outputs)
-                .all(|(input, output)| input >= &output);
         }
         if !accepted {
             for (index, fill) in original {
@@ -571,10 +583,24 @@ fn add_direct_cross(
     fills: &mut [u128],
     market_index: usize,
     amount: u128,
+    buy_reverse: bool,
+    sell_reverse: bool,
 ) {
     for sell in [false, true] {
         let mut remaining = amount;
-        for (order, fill) in instance.orders.iter().zip(fills.iter_mut()) {
+        let mut indexes = instance
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, order)| order.market == market_index && order.sell == sell)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if if sell { sell_reverse } else { buy_reverse } {
+            indexes.reverse();
+        }
+        for index in indexes {
+            let order = &instance.orders[index];
+            let fill = &mut fills[index];
             if order.market != market_index || order.sell != sell || remaining == 0 {
                 continue;
             }
@@ -1606,36 +1632,30 @@ mod tests {
         }
     }
 
-    /// how often the rounding repair fails to certify, by capacity digits and order count; the
-    /// known residual is a rare dust-scale close with many orders across high-rate markets.
+    /// every close in the original deterministic census must certify.
     #[test]
     #[ignore]
     fn failure_census() {
         let mut rng = Rng(0x1357_9bdf_2468_ace0);
-        let mut failures = std::collections::BTreeMap::<(u32, usize), (u32, u32)>::new();
-        for _ in 0..20_000 {
+        for case in 0..20_000 {
             let instance = random_canonical_instance(&mut rng);
-            let magnitude = instance
-                .orders
-                .iter()
-                .map(|o| o.capacity)
-                .max()
-                .unwrap_or(0)
-                .to_string()
-                .len() as u32;
-            let entry = failures
-                .entry((magnitude, instance.orders.len() / 10))
-                .or_default();
-            entry.1 += 1;
-            if solve_exact_clearing(&instance).is_err() {
-                entry.0 += 1;
-            }
+            let clearing = solve_exact_clearing(&instance)
+                .unwrap_or_else(|error| panic!("case {case}: {error:?} {instance:?}"));
+            assert!(feasible(&instance, &clearing.fills));
         }
-        for ((magnitude, orders), (failed, total)) in failures {
-            if failed > 0 {
-                eprintln!("digits {magnitude} orders {}0s: {failed}/{total}", orders);
-            }
-        }
+    }
+
+    #[test]
+    fn direct_cross_repair_tries_both_allocation_directions() {
+        let mut rng = Rng(0x1357_9bdf_2468_ace0);
+        let instance = (0..=3_797)
+            .map(|_| random_canonical_instance(&mut rng))
+            .next_back()
+            .expect("the regression case exists");
+        let clearing = solve_exact_clearing(&instance).expect("the close certifies");
+        verify_residual_maximality(&instance, &clearing.fills)
+            .expect("the close does not leave a crossable residual");
+        assert!(feasible(&instance, &clearing.fills));
     }
 
     /// a dust-scale close across high-rate markets: every rounding of its lp vertex leaves about

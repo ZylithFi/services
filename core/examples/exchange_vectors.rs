@@ -226,6 +226,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     vectors.tamper("reject_amount_changed", &cross, |witness, layout| {
         witness[order_layout(layout, false, 0).start + 1] -= Felt::ONE;
     })?;
+    vectors.tamper("reject_order_value_dust", &cross, |witness, layout| {
+        let asset_count: usize = witness[9].try_into().expect("asset count");
+        let market_start = 12 + 3 * asset_count;
+        witness[market_start + 8] = Felt::from(2_u64);
+        witness[order_layout(layout, false, 0).start + 1] = Felt::ONE;
+        witness[order_layout(layout, false, 0).start + 2] = Felt::ONE;
+    })?;
+    let excessive_expiry = cross.public.close_time_ms + MAX_ORDER_LIFETIME_MS + 1;
+    vectors.tamper("reject_long_expiry", &cross, |witness, layout| {
+        witness[order_layout(layout, false, 0).start + 3] = Felt::from(excessive_expiry);
+    })?;
     vectors.tamper("reject_hidden_market", &cross, |witness, layout| {
         witness[layout.groups[0] + 2] = Felt::ZERO;
     })?;
@@ -404,6 +415,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         observed_at_ms: 9_000,
         valid_until_ms: 11_000,
         fee_bps: 10,
+        min_order_quote_amount: 1,
         reference_methodology: REFERENCE_METHOD_DIRECT_BBO,
         derivation_base_market_id: Felt::ZERO,
         derivation_quote_market_id: Felt::ZERO,
@@ -488,6 +500,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         observed_at_ms: 9_000,
         valid_until_ms: 11_000,
         fee_bps: 10,
+        min_order_quote_amount: 1,
         reference_methodology: REFERENCE_METHOD_SYNTHETIC_CROSS_BBO,
         derivation_base_market_id: Felt::from(PAIR),
         derivation_quote_market_id: second_pair,

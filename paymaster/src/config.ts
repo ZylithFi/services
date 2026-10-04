@@ -5,12 +5,14 @@ export type PaymasterConfig = {
   registryVersion: number;
   registryHash: string;
   rpcUrl: string;
-  gatewayUrl: string;
   chainId: string;
   accountAddress: string;
   privateKey: string;
   privacySignerClassHash: string;
   feeTokenAddress: string;
+  privacyBridgeAddress: string;
+  privacyPoolAddress: string;
+  privacyPoolClassHash: string;
   allowedContracts: Set<string>;
   approvalSpenders: Set<string>;
   allowedEntrypoints: Set<string>;
@@ -20,31 +22,30 @@ export type PaymasterConfig = {
   maxBodyBytes: number;
   allowedOrigins: Set<string>;
   signerLimitPerMinute: number;
-  signerDeploymentLimitPerDay: number;
-  signerDeploymentLimitPerPrincipalPerDay: number;
   signerRelayLimitPerDay: number;
   maxSponsoredFeeFri: bigint;
+  dailySponsoredFeeFri: bigint;
+  dailySponsoredFeePerPrincipalFri: bigint;
   trustProxyHeaders: boolean;
   trustedProxyCidrs: string[];
   internalApiToken: string;
   submissionLogPath: string | null;
-  signerDeploymentLogPath: string | null;
   signerRelayLogPath: string | null;
+  sponsoredFeeLogPath: string | null;
 };
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
 const DEFAULT_SIGNER_LIMIT_PER_MINUTE = 20;
-const DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_DAY = 100;
-const DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY = 1;
 const DEFAULT_SIGNER_RELAY_LIMIT_PER_DAY = 500;
 const DEFAULT_MAX_SPONSORED_FEE_FRI = 1_000_000_000_000_000_000n;
+const DEFAULT_DAILY_SPONSORED_FEE_FRI = 100_000_000_000_000_000_000n;
+const DEFAULT_DAILY_SPONSORED_FEE_PER_PRINCIPAL_FRI = 5_000_000_000_000_000_000n;
 const STARKNET_FIELD_PRIME =
   3618502788666131213697322783095070105623107215331596699973092056135872020481n;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfig {
   const rpcUrl = requiredServiceUrl(env, "ZYLITH_PAYMASTER_RPC_URL");
-  const gatewayUrl = requiredServiceUrl(env, "ZYLITH_PAYMASTER_GATEWAY_URL");
   const chainId = normalizeNonZeroFelt(requiredEnv(env, "ZYLITH_PAYMASTER_CHAIN_ID"));
   const accountAddress = normalizeNonZeroFelt(requiredEnv(env, "ZYLITH_PAYMASTER_ACCOUNT_ADDRESS"));
   const privateKey = requiredEnv(env, "ZYLITH_PAYMASTER_PRIVATE_KEY");
@@ -96,16 +97,43 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     throw new Error("ZYLITH_PAYMASTER_INTERNAL_TOKEN or ZYLITH_CONTROL_PLANE_TOKEN is required");
   }
 
+  const maxSponsoredFeeFri = parsePositiveBigInt(
+    env.ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI,
+    DEFAULT_MAX_SPONSORED_FEE_FRI,
+    "ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI"
+  );
+  const dailySponsoredFeeFri = parsePositiveBigInt(
+    env.ZYLITH_PAYMASTER_DAILY_SPONSORED_FEE_FRI,
+    DEFAULT_DAILY_SPONSORED_FEE_FRI,
+    "ZYLITH_PAYMASTER_DAILY_SPONSORED_FEE_FRI"
+  );
+  const dailySponsoredFeePerPrincipalFri = parsePositiveBigInt(
+    env.ZYLITH_PAYMASTER_DAILY_SPONSORED_FEE_PER_PRINCIPAL_FRI,
+    DEFAULT_DAILY_SPONSORED_FEE_PER_PRINCIPAL_FRI,
+    "ZYLITH_PAYMASTER_DAILY_SPONSORED_FEE_PER_PRINCIPAL_FRI"
+  );
+  if (dailySponsoredFeeFri < maxSponsoredFeeFri) {
+    throw new Error("daily sponsored fee limit must cover at least one transaction");
+  }
+  if (
+    dailySponsoredFeePerPrincipalFri < maxSponsoredFeeFri
+    || dailySponsoredFeePerPrincipalFri > dailySponsoredFeeFri
+  ) {
+    throw new Error("per-principal sponsored fee limit is inconsistent");
+  }
+
   return {
     registryVersion: authority.registryVersion,
     registryHash: authority.registryHash,
     rpcUrl,
-    gatewayUrl,
     chainId,
     accountAddress,
     privateKey,
     privacySignerClassHash,
     feeTokenAddress: authority.feeTokenAddress,
+    privacyBridgeAddress: authority.privacyBridge,
+    privacyPoolAddress: authority.privacyPool,
+    privacyPoolClassHash: authority.privacyPoolClassHash,
     allowedContracts,
     approvalSpenders,
     allowedEntrypoints,
@@ -123,39 +151,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_SIGNER_LIMIT_PER_MINUTE,
       "ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE"
     ),
-    signerDeploymentLimitPerDay: parsePositiveInt(
-      env.ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY,
-      DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_DAY,
-      "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_DAY"
-    ),
-    signerDeploymentLimitPerPrincipalPerDay: parsePositiveInt(
-      env.ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY,
-      DEFAULT_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY,
-      "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LIMIT_PER_PRINCIPAL_PER_DAY"
-    ),
     signerRelayLimitPerDay: parsePositiveInt(
       env.ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY,
       DEFAULT_SIGNER_RELAY_LIMIT_PER_DAY,
       "ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY"
     ),
-    maxSponsoredFeeFri: parsePositiveBigInt(
-      env.ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI,
-      DEFAULT_MAX_SPONSORED_FEE_FRI,
-      "ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI"
-    ),
+    maxSponsoredFeeFri,
+    dailySponsoredFeeFri,
+    dailySponsoredFeePerPrincipalFri,
     trustProxyHeaders,
     trustedProxyCidrs,
     internalApiToken,
     submissionLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH"),
-    signerDeploymentLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SIGNER_DEPLOYMENT_LOG_PATH"),
-    signerRelayLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SIGNER_RELAY_LOG_PATH")
+    signerRelayLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SIGNER_RELAY_LOG_PATH"),
+    sponsoredFeeLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SPONSORED_FEE_LOG_PATH")
   };
 }
 
 type DeploymentAuthority = {
   fundingTokens: string[];
   privacyPool: string;
+  privacyPoolClassHash: string;
   exchange: string;
+  privacyBridge: string;
   chainId: string;
   paymasterAddress: string;
   proofSignerClassHash: string;
@@ -266,8 +284,17 @@ function loadDeploymentAuthority(path: string): DeploymentAuthority {
   return {
     fundingTokens,
     privacyPool: normalizeNonZeroFelt(expectString(privacy.privacy_pool, "privacy_pool")),
+    privacyPoolClassHash: normalizeNonZeroFelt(
+      expectString(privacy.privacy_pool_class_hash, "funding.starknet_privacy.privacy_pool_class_hash")
+    ),
     exchange: normalizeNonZeroFelt(
       expectString(expectRecord(manifest.contracts, "contracts").exchange, "contracts.exchange")
+    ),
+    privacyBridge: normalizeNonZeroFelt(
+      expectString(
+        expectRecord(manifest.contracts, "contracts").privacy_deposit_bridge,
+        "contracts.privacy_deposit_bridge"
+      )
     ),
     chainId: normalizeNonZeroFelt(expectString(registry.chain_id, "market_registry.chain_id")),
     paymasterAddress: normalizeNonZeroFelt(

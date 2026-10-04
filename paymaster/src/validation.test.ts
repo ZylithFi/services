@@ -3,7 +3,6 @@ import { selector } from "starknet";
 
 import type { PaymasterConfig } from "./config.js";
 import {
-  validateEnsurePrivacySignerRequest,
   validateExecuteOutsideRequest,
   validateRelayPrivacySignerRequest
 } from "./validation.js";
@@ -15,12 +14,14 @@ const config: Pick<
   | "allowedEntrypoints"
   | "chainId"
   | "proofRequiredEntrypoints"
+  | "privacyBridgeAddress"
 > = {
   accountAddress: "0xabc",
   chainId: "0x534e5f5345504f4c4941",
   allowedContracts: new Set(["0x123"]),
   allowedEntrypoints: new Set(["apply_actions"]),
   proofRequiredEntrypoints: new Set(["apply_actions"]),
+  privacyBridgeAddress: "0x789",
 };
 
 describe("validateExecuteOutsideRequest", () => {
@@ -125,6 +126,37 @@ describe("validateExecuteOutsideRequest", () => {
     expect(validated.outside_transaction).toBeUndefined();
   });
 
+  it("rejects privacy-pool actions that are not bound to the Zylith bridge", () => {
+    const missing = baseRequest();
+    missing.call.calldata = ["0x1", "0x2", "0x777", "0x456", "0x1"];
+    missing.outside_transaction.outsideExecution.calls[0]!.calldata = missing.call.calldata;
+    expect(() => validateExecuteOutsideRequest(missing, config, 1_700_000_000)).toThrow(
+      "requires exactly one Zylith bridge invoke"
+    );
+
+    const foreign = baseRequest();
+    foreign.call.calldata = [
+      "0x2",
+      "0xa", "0x789", "0x1", "0x0",
+      "0xa", "0x999", "0x1", "0x0",
+    ];
+    foreign.outside_transaction.outsideExecution.calls[0]!.calldata = foreign.call.calldata;
+    expect(() => validateExecuteOutsideRequest(foreign, config, 1_700_000_000)).toThrow(
+      "cannot invoke another contract"
+    );
+
+    const duplicate = baseRequest();
+    duplicate.call.calldata = [
+      "0x2",
+      "0xa", "0x789", "0x1", "0x0",
+      "0xa", "0x789", "0x1", "0x0",
+    ];
+    duplicate.outside_transaction.outsideExecution.calls[0]!.calldata = duplicate.call.calldata;
+    expect(() => validateExecuteOutsideRequest(duplicate, config, 1_700_000_000)).toThrow(
+      "requires exactly one Zylith bridge invoke"
+    );
+  });
+
   it("accepts a direct proof-bearing residual recovery request", () => {
     const request = baseRequest();
     request.call.entrypoint = "request_residual_recovery";
@@ -204,72 +236,6 @@ describe("validateExecuteOutsideRequest", () => {
     expect(() =>
       validateExecuteOutsideRequest(request, unsafeConfig, 1_700_000_000)
     ).toThrow("supported paymaster entrypoint must be proof-required");
-  });
-});
-
-describe("validateEnsurePrivacySignerRequest", () => {
-  it("accepts a complete, short-lived deployment sponsorship", () => {
-    const validated = validateEnsurePrivacySignerRequest(
-      {
-        signer_public_key: "0x1",
-        salt: "0x2",
-        class_hash: "0x123",
-        sponsor_address: "0xabc",
-        sponsor_signature: ["0x4", "0x5"],
-        sponsor_nonce: "0x6",
-        sponsor_expires_at: "1700000300",
-      },
-      { privacySignerClassHash: "0x123" },
-      1_700_000_000
-    );
-
-    expect(validated.sponsor_address).toBe("0xabc");
-    expect(validated.sponsor_signature).toEqual(["0x4", "0x5"]);
-  });
-
-  it("rejects partial and long-lived deployment sponsorships", () => {
-    expect(() =>
-      validateEnsurePrivacySignerRequest(
-        {
-          signer_public_key: "0x1",
-          salt: "0x2",
-          class_hash: "0x123",
-          sponsor_address: "0xabc",
-        },
-        { privacySignerClassHash: "0x123" },
-        1_700_000_000
-      )
-    ).toThrow("deployment sponsorship fields must be provided together");
-
-    expect(() =>
-      validateEnsurePrivacySignerRequest(
-        {
-          signer_public_key: "0x1",
-          salt: "0x2",
-          class_hash: "0x123",
-          sponsor_address: "0xabc",
-          sponsor_signature: ["0x4", "0x5"],
-          sponsor_nonce: "0x6",
-          sponsor_expires_at: "1700003600",
-        },
-        { privacySignerClassHash: "0x123" },
-        1_700_000_000
-      )
-    ).toThrow("deployment sponsorship window is too long");
-  });
-
-  it("rejects unknown signer deployment fields", () => {
-    expect(() =>
-      validateEnsurePrivacySignerRequest(
-        {
-          signer_public_key: "0x1",
-          salt: "0x2",
-          class_hash: "0x123",
-          unsupported_owner: "0xabc",
-        },
-        { privacySignerClassHash: "0x123" }
-      )
-    ).toThrow("request.unsupported_owner is not supported");
   });
 });
 
@@ -425,7 +391,7 @@ function baseRequest() {
     call: {
       contract_address: "0x123",
       entrypoint: "apply_actions",
-      calldata: ["0x1", "0x2"]
+      calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
     },
     outside_transaction: {
       outsideExecution: {
@@ -437,7 +403,7 @@ function baseRequest() {
           {
             to: "0x123",
             selector: "0x246333a752c1ac637ff1591c5c885e27d56060d241a29aad8475072da0777db",
-            calldata: ["0x1", "0x2"]
+            calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
           }
         ]
       },

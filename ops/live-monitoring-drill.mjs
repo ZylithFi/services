@@ -49,8 +49,7 @@ if (exchange) {
   checkRegistryIdentity("operator", exchange);
   if (!(exchange.epoch_ms > 0)) failures.push("operator reports no epoch length");
   if (!Array.isArray(exchange.pairs) || exchange.pairs.length === 0) failures.push("operator trades no pairs");
-  if (exchange.in_flight > maxInFlight) failures.push(`operator has ${exchange.in_flight} transitions in flight (max ${maxInFlight})`);
-  observations.push(`seq ${exchange.seq}, ${exchange.in_flight} in flight`);
+  observations.push(`operator at seq ${exchange.seq}`);
   const referenceBatch = await json("reference-price batch", `${services.operator}/api/public/reference-prices`);
   if (referenceBatch) {
     const prices = Array.isArray(referenceBatch.prices) ? referenceBatch.prices : [];
@@ -68,7 +67,14 @@ if (exchange) {
 }
 if (controlToken) {
   const status = await json("operator internal status", `${services.operator}/api/internal/status`, { authorization: `Bearer ${controlToken}` });
-  if (status) observations.push(`${status.book_orders} resting, ${status.pending_orders} pending, ${status.withdrawals} withdrawals`);
+  if (status) {
+    const inFlight = Array.isArray(status.in_flight) ? status.in_flight.length : Number.NaN;
+    if (!Number.isSafeInteger(inFlight)) failures.push("operator internal status has malformed in-flight state");
+    else if (inFlight > maxInFlight) failures.push(`operator has ${inFlight} transitions in flight (max ${maxInFlight})`);
+    observations.push(`${status.book_orders} resting, ${status.pending_orders} pending, ${status.withdrawals} withdrawals, ${inFlight} in flight`);
+  }
+} else {
+  failures.push("ZYLITH_CONTROL_PLANE_TOKEN is required for private operator monitoring");
 }
 const keys = await json("execution keys", `${services.operator}/api/public/execution-keys`);
 if (keys && !(keys.keys?.length > 0)) failures.push("the operator publishes no execution keys");

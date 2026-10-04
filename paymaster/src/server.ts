@@ -8,15 +8,11 @@ import { dirname } from "node:path";
 import type { PaymasterConfig } from "./config.js";
 import type { SubmitterDeps } from "./starknetSubmitter.js";
 import {
-  ensurePrivacyProofSignerContract,
-  inspectPrivacyProofSignerContract,
   relayPrivacyProofSignerCall,
   submitProofBearingOutsideExecution,
-  verifyPrivacySignerDeploymentSponsorship
 } from "./starknetSubmitter.js";
 import { SubmissionStore } from "./submissionStore.js";
 import {
-  validateEnsurePrivacySignerRequest,
   validateExecuteOutsideRequest,
   validateRelayPrivacySignerRequest
 } from "./validation.js";
@@ -33,15 +29,30 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
   const clientRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute * 3);
   const submissionQueues = new SubmissionQueues(PAYMASTER_MAX_PENDING_SUBMISSIONS);
   const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
-  const signerDeploymentBudget = new SignerDeploymentBudget(
-    config.signerDeploymentLimitPerDay,
-    config.signerDeploymentLogPath,
-    config.signerDeploymentLimitPerPrincipalPerDay
-  );
   const signerRelayBudget = new SignerRelayBudget(
     config.signerRelayLimitPerDay,
     config.signerRelayLogPath
   );
+  const sponsoredFeeBudget = new SponsoredFeeBudget(
+    config.dailySponsoredFeeFri,
+    config.sponsoredFeeLogPath,
+    config.dailySponsoredFeePerPrincipalFri
+  );
+  const budgetedDeps = (principal: string) => ({
+    ...deps,
+    reserveSponsoredFee: async (maximumFeeFri: bigint) => {
+      const upstreamRelease = await deps.reserveSponsoredFee?.(maximumFeeFri);
+      try {
+        const localRelease = await sponsoredFeeBudget.reserve(maximumFeeFri, principal);
+        return async () => {
+          await Promise.all([localRelease(), upstreamRelease?.()]);
+        };
+      } catch (error) {
+        await upstreamRelease?.();
+        throw error;
+      }
+    },
+  });
   const metrics = new PaymasterMetrics();
 
   return createServer(async (request, response) => {
@@ -70,51 +81,18 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         return;
       }
 
-      if (request.method === "POST" && request.url === "/privacy-signer/ensure") {
-        const result = await measuredPaymasterRoute(metrics, "privacy_signer_ensure", async () => {
-          requireJsonContentType(request);
-          const rawBody = await readBody(
-            request,
-            config.maxBodyBytes,
-            PAYMASTER_REQUEST_BODY_TIMEOUT_MS
-          );
-          const body = JSON.parse(rawBody) as unknown;
-          const validated = validateEnsurePrivacySignerRequest(body, config);
-          enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_public_key);
-          return submissionQueues.enqueue(config.accountAddress, async () => {
-            const status = await inspectPrivacyProofSignerContract(validated, config, deps);
-            if (status.deployed) return status;
-            await verifyPrivacySignerDeploymentSponsorship(validated, config, deps);
-            const release = await signerDeploymentBudget.reserve(validated.sponsor_address!);
-            try {
-              const result = await ensurePrivacyProofSignerContract(validated, config, deps);
-              if (!result.deployed) await release();
-              return result;
-            } catch (error) {
-              await release();
-              throw error;
-            }
-          });
-        });
-        sendJson(request, response, 200, result);
-        return;
-      }
-
       if (request.method === "POST" && request.url === "/privacy-signer/relay") {
         const result = await measuredPaymasterRoute(metrics, "privacy_signer_relay", async () => {
-          requireJsonContentType(request);
-          const rawBody = await readBody(
-            request,
-            config.maxBodyBytes,
-            PAYMASTER_REQUEST_BODY_TIMEOUT_MS
-          );
-          const body = JSON.parse(rawBody) as unknown;
-          const validated = validateRelayPrivacySignerRequest(body, config);
+          const validated = validateRelayPrivacySignerRequest(await readJsonBody(request, config), config);
           enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.account_address);
           return submissionQueues.enqueue(config.accountAddress, async () => {
             const release = await signerRelayBudget.reserve(relaySponsorshipKey(validated));
             try {
-              return await relayPrivacyProofSignerCall(validated, config, deps);
+              return await relayPrivacyProofSignerCall(
+                validated,
+                config,
+                budgetedDeps(validated.account_address),
+              );
             } catch (error) {
               await release();
               throw error;
@@ -131,18 +109,15 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
       }
 
       const result = await measuredPaymasterRoute(metrics, "execute_outside", async () => {
-        requireJsonContentType(request);
-        const rawBody = await readBody(
-          request,
-          config.maxBodyBytes,
-          PAYMASTER_REQUEST_BODY_TIMEOUT_MS
-        );
-        const body = JSON.parse(rawBody) as unknown;
-        const validated = validateExecuteOutsideRequest(body, config);
+        const validated = validateExecuteOutsideRequest(await readJsonBody(request, config), config);
         enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.signer_address);
         return submissionStore.runOnce(validated, () =>
           submissionQueues.enqueue(config.accountAddress, () =>
-            submitProofBearingOutsideExecution(validated, config, deps)
+            submitProofBearingOutsideExecution(
+              validated,
+              config,
+              budgetedDeps(validated.signer_address),
+            )
           )
         );
       });
@@ -293,6 +268,13 @@ function ipv4ToUint(value: string): number | null {
     result = ((result << 8) | octet) >>> 0;
   }
   return result;
+}
+
+async function readJsonBody(request: IncomingMessage, config: PaymasterConfig): Promise<unknown> {
+  requireJsonContentType(request);
+  return JSON.parse(
+    await readBody(request, config.maxBodyBytes, PAYMASTER_REQUEST_BODY_TIMEOUT_MS)
+  ) as unknown;
 }
 
 function requireJsonContentType(request: IncomingMessage): void {
@@ -462,7 +444,10 @@ function statusForError(message: string): number {
   if (message.includes("relay budget exhausted")) {
     return 429;
   }
-  if (message.includes("sponsored fee limit exceeded")) {
+  if (
+    message.includes("sponsored fee limit exceeded")
+    || message.includes("sponsored fee budget exhausted")
+  ) {
     return 429;
   }
   if (message.includes("approval was already sponsored")) {
@@ -474,7 +459,7 @@ function statusForError(message: string): number {
 const PAYMASTER_LATENCY_BUCKETS_MS = [
   10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000
 ];
-const PAYMASTER_OPERATIONS = ["execute_outside", "privacy_signer_ensure", "privacy_signer_relay"];
+const PAYMASTER_OPERATIONS = ["execute_outside", "privacy_signer_relay"];
 
 class PaymasterMetrics {
   private readonly outcomes = new Map<string, number>();
@@ -589,154 +574,6 @@ export class FixedWindowRateLimiter {
 
   get size(): number {
     return this.buckets.size;
-  }
-}
-
-type SignerDeploymentBudgetRecord = {
-  utc_day: string;
-  reserved: number;
-  principals: Record<string, number>;
-};
-
-/**
- * deployment sponsorship is globally and per-principal bounded. reservations
- * are released when no deployment was needed or submission failed.
- */
-export class SignerDeploymentBudget {
-  private loaded = false;
-  private loadPromise: Promise<void> | null = null;
-  private record: SignerDeploymentBudgetRecord = {
-    utc_day: utcDay(),
-    reserved: 0,
-    principals: {},
-  };
-  private persistTail: Promise<void> = Promise.resolve();
-
-  constructor(
-    private readonly limitPerDay: number,
-    private readonly path: string | null,
-    private readonly limitPerPrincipalPerDay = 1
-  ) {
-    if (!Number.isSafeInteger(limitPerDay) || limitPerDay <= 0) {
-      throw new Error("signer deployment limit must be a positive integer");
-    }
-    if (
-      !Number.isSafeInteger(limitPerPrincipalPerDay) ||
-      limitPerPrincipalPerDay <= 0
-    ) {
-      throw new Error("per-principal signer deployment limit must be a positive integer");
-    }
-  }
-
-  async reserve(principal = "legacy"): Promise<() => Promise<void>> {
-    await this.load();
-    this.rotateIfNeeded();
-    if (this.record.reserved >= this.limitPerDay) {
-      throw new Error("privacy signer deployment budget exhausted");
-    }
-    const principalCount = this.record.principals[principal] ?? 0;
-    if (principalCount >= this.limitPerPrincipalPerDay) {
-      throw new Error("privacy signer deployment budget exhausted for sponsor");
-    }
-    const reservationDay = this.record.utc_day;
-    this.record.reserved += 1;
-    this.record.principals[principal] = principalCount + 1;
-    await this.persist();
-    let released = false;
-    return async () => {
-      if (released) return;
-      released = true;
-      this.rotateIfNeeded();
-      if (this.record.utc_day !== reservationDay) return;
-      this.record.reserved = Math.max(0, this.record.reserved - 1);
-      const current = this.record.principals[principal] ?? 0;
-      if (current <= 1) delete this.record.principals[principal];
-      else this.record.principals[principal] = current - 1;
-      await this.persist();
-    };
-  }
-
-  private async load(): Promise<void> {
-    if (this.loaded) return;
-    if (this.loadPromise) return this.loadPromise;
-    this.loadPromise = this.loadFromDisk();
-    try {
-      await this.loadPromise;
-      this.loaded = true;
-    } finally {
-      this.loadPromise = null;
-    }
-  }
-
-  private async loadFromDisk(): Promise<void> {
-    if (!this.path) return;
-    let body: string;
-    try {
-      const metadata = await stat(this.path);
-      if (metadata.size > 8_192) throw new Error("signer deployment budget file is too large");
-      body = await readFile(this.path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-      throw error;
-    }
-    if (!body.trim()) return;
-    const parsed = JSON.parse(body) as Partial<SignerDeploymentBudgetRecord>;
-    if (
-      typeof parsed.utc_day !== "string" ||
-      !/^\d{4}-\d{2}-\d{2}$/.test(parsed.utc_day) ||
-      !Number.isSafeInteger(parsed.reserved) ||
-      (parsed.reserved ?? 0) < 0 ||
-      (parsed.reserved ?? 0) > this.limitPerDay
-    ) {
-      throw new Error("signer deployment budget file is invalid");
-    }
-    const principals = parsed.principals ?? {};
-    if (
-      !principals ||
-      typeof principals !== "object" ||
-      Array.isArray(principals) ||
-      Object.values(principals).some(
-        (count) => !Number.isSafeInteger(count) || count < 0
-      )
-    ) {
-      throw new Error("signer deployment budget file is invalid");
-    }
-    this.record = {
-      utc_day: parsed.utc_day,
-      reserved: parsed.reserved as number,
-      principals: principals as Record<string, number>,
-    };
-    this.rotateIfNeeded();
-  }
-
-  private rotateIfNeeded(): void {
-    const today = utcDay();
-    if (this.record.utc_day !== today) {
-      this.record = { utc_day: today, reserved: 0, principals: {} };
-    }
-  }
-
-  private async persist(): Promise<void> {
-    if (!this.path) return;
-    const snapshot = JSON.stringify(this.record) + "\n";
-    this.persistTail = this.persistTail.then(async () => {
-      await mkdir(dirname(this.path!), { recursive: true });
-      const tempPath = `${this.path}.${process.pid}.tmp`;
-      const handle = await open(tempPath, "w");
-      try {
-        await handle.writeFile(snapshot, "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      try {
-        await rename(tempPath, this.path!);
-      } catch (error) {
-        await unlink(tempPath).catch(() => undefined);
-        throw error;
-      }
-    });
-    return this.persistTail;
   }
 }
 
@@ -860,6 +697,164 @@ export class SignerRelayBudget {
       }
     });
     return this.persistTail;
+  }
+}
+
+type SponsoredFeeBudgetRecord = {
+  utc_day: string;
+  spent_fri: string;
+  principals: Record<string, string>;
+};
+
+export class SponsoredFeeBudget {
+  private loaded = false;
+  private record: SponsoredFeeBudgetRecord = {
+    utc_day: utcDay(),
+    spent_fri: "0",
+    principals: {},
+  };
+  private tail: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly limitPerDay: bigint,
+    private readonly path: string | null,
+    private readonly limitPerPrincipalPerDay: bigint = limitPerDay,
+  ) {
+    if (limitPerDay <= 0n) throw new Error("daily sponsored fee limit must be positive");
+    if (limitPerPrincipalPerDay <= 0n || limitPerPrincipalPerDay > limitPerDay) {
+      throw new Error("per-principal sponsored fee limit is invalid");
+    }
+  }
+
+  async reserve(maximumFeeFri: bigint, principal = "legacy"): Promise<() => Promise<void>> {
+    if (maximumFeeFri <= 0n) return Promise.reject(new Error("sponsored fee must be positive"));
+    if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(principal)) {
+      return Promise.reject(new Error("sponsored fee principal is invalid"));
+    }
+    let reservationDay = "";
+    const operation = this.tail.then(async () => {
+      await this.load();
+      this.rotateIfNeeded();
+      reservationDay = this.record.utc_day;
+      const spent = BigInt(this.record.spent_fri);
+      const principalSpent = BigInt(this.record.principals[principal] ?? "0");
+      if (spent + maximumFeeFri > this.limitPerDay) {
+        throw new Error("daily sponsored fee budget exhausted");
+      }
+      if (principalSpent + maximumFeeFri > this.limitPerPrincipalPerDay) {
+        throw new Error("daily sponsored fee budget exhausted for principal");
+      }
+      this.record.spent_fri = String(spent + maximumFeeFri);
+      this.record.principals[principal] = String(principalSpent + maximumFeeFri);
+      await this.persist();
+    });
+    this.tail = operation.catch(() => undefined);
+    await operation;
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      const release = this.tail.then(async () => {
+        await this.load();
+        this.rotateIfNeeded();
+        if (this.record.utc_day !== reservationDay) return;
+        const spent = BigInt(this.record.spent_fri);
+        if (spent < maximumFeeFri) {
+          throw new Error("sponsored fee budget accounting underflow");
+        }
+        this.record.spent_fri = String(spent - maximumFeeFri);
+        const principalSpent = BigInt(this.record.principals[principal] ?? "0");
+        if (principalSpent < maximumFeeFri) {
+          throw new Error("sponsored fee principal accounting underflow");
+        }
+        const remaining = principalSpent - maximumFeeFri;
+        if (remaining === 0n) delete this.record.principals[principal];
+        else this.record.principals[principal] = String(remaining);
+        await this.persist();
+      });
+      this.tail = release.catch(() => undefined);
+      await release;
+    };
+  }
+
+  private async load(): Promise<void> {
+    if (this.loaded) return;
+    if (!this.path) {
+      this.loaded = true;
+      return;
+    }
+    let body: string;
+    try {
+      const metadata = await stat(this.path);
+      if (metadata.size > 8_192) throw new Error("sponsored fee budget file is too large");
+      body = await readFile(this.path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.loaded = true;
+        return;
+      }
+      throw error;
+    }
+    if (body.trim()) {
+      const parsed = JSON.parse(body) as Partial<SponsoredFeeBudgetRecord>;
+      if (
+        typeof parsed.utc_day !== "string"
+        || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.utc_day)
+        || typeof parsed.spent_fri !== "string"
+        || !/^\d+$/.test(parsed.spent_fri)
+        || BigInt(parsed.spent_fri) > this.limitPerDay
+        || !parsed.principals
+        || typeof parsed.principals !== "object"
+        || Array.isArray(parsed.principals)
+        || Object.entries(parsed.principals).some(([principal, spent]) =>
+          !/^[a-zA-Z0-9:_-]{1,160}$/.test(principal)
+          || typeof spent !== "string"
+          || !/^\d+$/.test(spent)
+          || BigInt(spent) > this.limitPerPrincipalPerDay
+        )
+      ) {
+        throw new Error("sponsored fee budget file is invalid");
+      }
+      this.record = {
+        utc_day: parsed.utc_day,
+        spent_fri: parsed.spent_fri,
+        principals: parsed.principals,
+      };
+      this.rotateIfNeeded();
+    }
+    this.loaded = true;
+  }
+
+  private rotateIfNeeded(): void {
+    const today = utcDay();
+    if (this.record.utc_day !== today) {
+      this.record = { utc_day: today, spent_fri: "0", principals: {} };
+    }
+  }
+
+  private async persist(): Promise<void> {
+    if (!this.path) return;
+    await mkdir(dirname(this.path), { recursive: true });
+    const tempPath = `${this.path}.${process.pid}.fee.tmp`;
+    const handle = await open(tempPath, "w");
+    try {
+      await handle.writeFile(`${JSON.stringify(this.record)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await rename(tempPath, this.path);
+    } catch (error) {
+      await unlink(tempPath).catch(() => undefined);
+      throw error;
+    }
+    const directory = await open(dirname(this.path), "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   }
 }
 

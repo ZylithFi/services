@@ -390,11 +390,11 @@ mod tests {
                 vec![quote.clone()],
             )
             .unwrap();
-        sell.validate(chain, Felt::from(BASE), 1).unwrap();
-        buy.validate(chain, Felt::from(QUOTE), 1).unwrap();
+        sell.validate(chain, Felt::from(BASE), 1, 1, 1).unwrap();
+        buy.validate(chain, Felt::from(QUOTE), 1, 1, 1).unwrap();
         // below the pair's minimum size the operator refuses it.
         assert!(
-            sell.validate(chain, Felt::from(BASE), sell.terms.amount + 1)
+            sell.validate(chain, Felt::from(BASE), sell.terms.amount + 1, 1, 1)
                 .is_err()
         );
         assert!(

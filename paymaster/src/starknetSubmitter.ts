@@ -4,9 +4,7 @@ import {
   EDataAvailabilityMode,
   ETransactionVersion3,
   RpcProvider,
-  hash,
-  outsideExecution,
-  typedData
+  outsideExecution
 } from "starknet";
 import type {
   Call,
@@ -16,8 +14,6 @@ import { selector } from "starknet";
 
 import type { PaymasterConfig } from "./config.js";
 import type {
-  EnsurePrivacySignerRequest,
-  EnsurePrivacySignerResponse,
   ExecuteOutsideRequest,
   ExecuteOutsideResponse,
   RelayPrivacySignerRequest,
@@ -27,26 +23,6 @@ import type {
 type AccountInstance = {
   getNonce(blockIdentifier?: string): Promise<string>;
   getCairoVersion(): Promise<string>;
-  deploy(payload: {
-    classHash: string;
-    salt: string;
-    unique: boolean;
-    constructorCalldata: string[];
-  }, details?: Record<string, unknown>): Promise<{
-    transaction_hash?: string;
-    transactionHash?: string;
-    contract_address?: string | string[];
-    contractAddress?: string | string[];
-  }>;
-  estimateDeployFee(
-    payload: {
-      classHash: string;
-      salt: string;
-      unique: boolean;
-      constructorCalldata: string[];
-    },
-    details?: Record<string, unknown>
-  ): Promise<unknown>;
   buildInvocation(calls: Call[], details: Record<string, unknown>): Promise<{
     contractAddress: unknown;
     calldata: unknown[];
@@ -63,11 +39,6 @@ type AccountInstance = {
 
 type RpcProviderInstance = {
   getClassHashAt(contractAddress: string, blockIdentifier?: string): Promise<string>;
-  verifyMessageInStarknet(
-    message: unknown,
-    signature: string[],
-    accountAddress: string
-  ): Promise<boolean>;
 };
 
 type ResourceBoundsLike = {
@@ -84,7 +55,6 @@ export type StarknetRuntime = {
   };
   EDataAvailabilityMode: Pick<typeof EDataAvailabilityMode, "L1">;
   ETransactionVersion3: Pick<typeof ETransactionVersion3, "V3">;
-  hash: Pick<typeof hash, "calculateContractAddressFromHash">;
   outsideExecution: Pick<typeof outsideExecution, "buildExecuteFromOutsideCall">;
 };
 
@@ -94,235 +64,25 @@ const defaultRuntime: StarknetRuntime = {
   CallData,
   EDataAvailabilityMode,
   ETransactionVersion3,
-  hash,
   outsideExecution
 };
 
 const PAYMASTER_SUBMISSION_RETRY_ATTEMPTS = 3;
 const PAYMASTER_NONCE_RETRY_DELAY_MS = 1_500;
-const PAYMASTER_DEPLOY_RETRY_ATTEMPTS = 5;
 const PAYMASTER_RPC_TIMEOUT_MS = 30_000;
 const PAYMASTER_RPC_MAX_RESPONSE_BYTES = 1_000_000;
-const DEFAULT_PAYMASTER_L1_GAS_FLOOR = 0n;
-const DEFAULT_PAYMASTER_L1_DATA_GAS_FLOOR = 8_000n;
-const DEFAULT_PAYMASTER_L2_GAS_FLOOR = 180_000_000n;
-const PAYMASTER_GAS_PRICE_MULTIPLIER = 2n;
 const DEFAULT_MAX_SPONSORED_FEE_FRI = 1_000_000_000_000_000_000n;
 type ProofSubmissionConfig = Pick<
   PaymasterConfig,
   "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "feeTokenAddress"
 > &
-  Partial<Pick<PaymasterConfig, "gatewayUrl" | "maxSponsoredFeeFri">>;
+  Partial<Pick<PaymasterConfig, "maxSponsoredFeeFri">>;
 
 export type SubmitterDeps = {
   runtime?: StarknetRuntime;
   fetchImpl?: typeof fetch;
+  reserveSponsoredFee?: (maximumFeeFri: bigint) => Promise<() => Promise<void>>;
 };
-
-export async function ensurePrivacyProofSignerContract(
-  request: EnsurePrivacySignerRequest,
-  config: Pick<PaymasterConfig, "rpcUrl" | "accountAddress" | "privateKey"> &
-    Partial<Pick<PaymasterConfig, "maxSponsoredFeeFri">>,
-  deps: SubmitterDeps = {}
-): Promise<EnsurePrivacySignerResponse> {
-  const runtime = deps.runtime ?? defaultRuntime;
-  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
-  const classHash = toRpcFelt(request.class_hash, "class_hash");
-  const salt = toRpcFelt(request.salt, "salt");
-  const signerPublicKey = toRpcFelt(request.signer_public_key, "signer_public_key");
-  const constructorCalldata = runtime.CallData.toHex([signerPublicKey]);
-  const contractAddress = toRpcFelt(
-    runtime.hash.calculateContractAddressFromHash(
-      salt,
-      classHash,
-      constructorCalldata,
-      0
-    ),
-    "contract_address"
-  );
-
-  const existingClassHash = await deployedClassHash(provider, contractAddress);
-  if (existingClassHash) {
-    if (toRpcFelt(existingClassHash) !== classHash) {
-      throw new Error("privacy proof signer address has an unexpected class");
-    }
-    return { contract_address: contractAddress, deployed: false };
-  }
-
-  const account = new runtime.Account({
-    provider,
-    address: config.accountAddress,
-    signer: config.privateKey,
-    transactionVersion: runtime.ETransactionVersion3.V3
-  });
-  const result = await deployWithNonceRetry(
-    account,
-    provider,
-    contractAddress,
-    {
-      classHash,
-      salt,
-      unique: false,
-      constructorCalldata: [signerPublicKey]
-    },
-    config.maxSponsoredFeeFri ?? DEFAULT_MAX_SPONSORED_FEE_FRI
-  );
-  const transactionHash = result.transaction_hash ?? result.transactionHash;
-  return {
-    contract_address: contractAddress,
-    deployed: true,
-    ...(transactionHash ? { transaction_hash: transactionHash } : {})
-  };
-}
-
-export async function inspectPrivacyProofSignerContract(
-  request: EnsurePrivacySignerRequest,
-  config: Pick<PaymasterConfig, "rpcUrl">,
-  deps: SubmitterDeps = {}
-): Promise<{ contract_address: string; deployed: boolean }> {
-  const runtime = deps.runtime ?? defaultRuntime;
-  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
-  const classHash = toRpcFelt(request.class_hash, "class_hash");
-  const constructorCalldata = runtime.CallData.toHex([
-    toRpcFelt(request.signer_public_key, "signer_public_key")
-  ]);
-  const contractAddress = toRpcFelt(
-    runtime.hash.calculateContractAddressFromHash(
-      toRpcFelt(request.salt, "salt"),
-      classHash,
-      constructorCalldata,
-      0
-    ),
-    "contract_address"
-  );
-  const existingClassHash = await deployedClassHash(provider, contractAddress);
-  if (existingClassHash && toRpcFelt(existingClassHash) !== classHash) {
-    throw new Error("privacy proof signer address has an unexpected class");
-  }
-  return { contract_address: contractAddress, deployed: Boolean(existingClassHash) };
-}
-
-export async function verifyPrivacySignerDeploymentSponsorship(
-  request: EnsurePrivacySignerRequest,
-  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress">,
-  deps: SubmitterDeps = {}
-): Promise<void> {
-  if (
-    !request.sponsor_address ||
-    !request.sponsor_signature ||
-    !request.sponsor_nonce ||
-    !request.sponsor_expires_at
-  ) {
-    throw new Error("signer deployment authorization required");
-  }
-  const runtime = deps.runtime ?? defaultRuntime;
-  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
-  const message = privacySignerDeploymentTypedData(request, config);
-  const valid = await provider
-    .verifyMessageInStarknet(
-      message,
-      request.sponsor_signature,
-      request.sponsor_address
-    )
-    .catch(() => false);
-  if (!valid) {
-    throw new Error("signer deployment authorization failed");
-  }
-}
-
-export function privacySignerDeploymentTypedData(
-  request: EnsurePrivacySignerRequest,
-  config: Pick<PaymasterConfig, "chainId" | "accountAddress">
-) {
-  if (
-    !request.sponsor_address ||
-    !request.sponsor_nonce ||
-    !request.sponsor_expires_at
-  ) {
-    throw new Error("signer deployment authorization required");
-  }
-  const message = {
-    types: {
-      StarknetDomain: [
-        { name: "name", type: "shortstring" },
-        { name: "version", type: "shortstring" },
-        { name: "chainId", type: "shortstring" },
-        { name: "revision", type: "shortstring" },
-      ],
-      ZylithSignerSponsorship: [
-        { name: "action", type: "shortstring" },
-        { name: "paymaster", type: "ContractAddress" },
-        { name: "signerPublicKey", type: "felt" },
-        { name: "salt", type: "felt" },
-        { name: "classHash", type: "felt" },
-        { name: "nonce", type: "felt" },
-        { name: "expiresAt", type: "u64" },
-      ],
-    },
-    primaryType: "ZylithSignerSponsorship",
-    domain: {
-      name: "Zylith",
-      version: "1",
-      chainId: config.chainId,
-      revision: "1",
-    },
-    message: {
-      action: "DeploySigner",
-      paymaster: config.accountAddress,
-      signerPublicKey: request.signer_public_key,
-      salt: request.salt,
-      classHash: request.class_hash,
-      nonce: request.sponsor_nonce,
-      expiresAt: request.sponsor_expires_at,
-    },
-  };
-  typedData.validateTypedData(message);
-  return message;
-}
-
-async function deployWithNonceRetry(
-  account: AccountInstance,
-  provider: RpcProviderInstance,
-  contractAddress: string,
-  payload: {
-    classHash: string;
-    salt: string;
-    unique: boolean;
-    constructorCalldata: string[];
-  },
-  maxSponsoredFeeFri: bigint
-): ReturnType<AccountInstance["deploy"]> {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < PAYMASTER_DEPLOY_RETRY_ATTEMPTS; attempt += 1) {
-    const existingClassHash = await deployedClassHash(provider, contractAddress);
-    if (existingClassHash) {
-      return { contract_address: contractAddress };
-    }
-    try {
-      const nonce = await account.getNonce("pre_confirmed")
-        .catch(() => account.getNonce());
-      const estimate = await account.estimateDeployFee(payload, { nonce });
-      const rawBounds =
-        (estimate as { resourceBounds?: unknown; resource_bounds?: unknown }).resourceBounds ??
-        (estimate as { resourceBounds?: unknown; resource_bounds?: unknown }).resource_bounds ??
-        estimate;
-      const resourceBounds = resourceBoundsFromRpc(rawBounds);
-      assertSponsoredFeeWithinLimit(resourceBounds, maxSponsoredFeeFri);
-      return await account.deploy(payload, { nonce, resourceBounds });
-    } catch (error) {
-      lastError = error;
-      if (
-        attempt < PAYMASTER_DEPLOY_RETRY_ATTEMPTS - 1 &&
-        isRetryableNonceError(error)
-      ) {
-        await sleep(PAYMASTER_NONCE_RETRY_DELAY_MS * (attempt + 1));
-        continue;
-      }
-      throw error;
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
 
 async function deployedClassHash(
   provider: RpcProviderInstance,
@@ -499,15 +259,37 @@ async function submitPaymasterCallsOnce(
       proof_facts: proofFacts
     });
   }
-
-  const transactionHash = proof && proofFacts && config.gatewayUrl
-    ? await submitProofInvokeToGateway(fetchImpl, config.gatewayUrl, invokeTransaction)
-    : await submitInvokeToRpc(fetchImpl, config.rpcUrl, invokeTransaction);
+  const releaseSponsoredFee = deps.reserveSponsoredFee
+    ? await deps.reserveSponsoredFee(
+      maximumSponsoredFee(feeResourceBounds)
+        + await poolApplyActionsFee(fetchImpl, config.rpcUrl, calls)
+    )
+    : null;
+  let transactionHash: string | undefined;
+  try {
+    transactionHash = await submitInvokeToRpc(fetchImpl, config.rpcUrl, invokeTransaction);
+  } catch (error) {
+    await releaseSponsoredFee?.();
+    throw error;
+  }
   if (!transactionHash) {
+    await releaseSponsoredFee?.();
     throw new Error("Starknet submission response did not include transaction_hash");
   }
 
   return { transaction_hash: transactionHash };
+}
+
+export async function verifyPinnedPrivacyPoolClass(
+  config: Pick<PaymasterConfig, "rpcUrl" | "privacyPoolAddress" | "privacyPoolClassHash">,
+  deps: SubmitterDeps = {}
+): Promise<void> {
+  const runtime = deps.runtime ?? defaultRuntime;
+  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
+  const classHash = await deployedClassHash(provider, config.privacyPoolAddress);
+  if (!classHash || toRpcFelt(classHash) !== config.privacyPoolClassHash) {
+    throw new Error("privacy pool class hash differs from the pinned deployment");
+  }
 }
 
 async function submitInvokeToRpc(
@@ -532,36 +314,6 @@ async function submitInvokeToRpc(
     throw new Error("Starknet RPC response did not include result");
   }
   return rpc.result.transaction_hash;
-}
-
-async function submitProofInvokeToGateway(
-  fetchImpl: typeof fetch,
-  gatewayUrl: string,
-  invokeTransaction: Record<string, unknown>
-): Promise<string | undefined> {
-  const resourceBounds = invokeTransaction.resource_bounds;
-  if (!resourceBounds || typeof resourceBounds !== "object" || Array.isArray(resourceBounds)) {
-    throw new Error("proof-bearing invoke is missing resource_bounds");
-  }
-  const bounds = resourceBounds as Record<string, unknown>;
-  const gatewayTransaction = {
-    ...invokeTransaction,
-    type: "INVOKE_FUNCTION",
-    resource_bounds: {
-      L1_GAS: bounds.l1_gas,
-      L2_GAS: bounds.l2_gas,
-      L1_DATA_GAS: bounds.l1_data_gas
-    }
-  };
-  const response = await gatewayRequestJson(fetchImpl, gatewayUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(gatewayTransaction)
-  });
-  if (!response.transaction_hash) {
-    throw new Error("Starknet gateway response did not include transaction_hash");
-  }
-  return response.transaction_hash;
 }
 
 function isRetryableNonceError(error: unknown): boolean {
@@ -649,13 +401,6 @@ async function estimateProofBearingInvokeResourceBounds(input: {
   });
 
   if ("error" in rpc && rpc.error) {
-    if (
-      input.proof &&
-      input.proofFacts &&
-      (await shouldFallbackProofBearingFeeEstimate(rpc.error, input))
-    ) {
-      return fallbackProofBearingResourceBounds(input.fetchImpl, input.config.rpcUrl);
-    }
     throw new Error(`Starknet RPC rejected proof-bearing fee estimate: ${rpcErrorSummary(rpc.error)}`);
   }
 
@@ -677,285 +422,19 @@ async function estimateProofBearingInvokeResourceBounds(input: {
   }
 }
 
-async function fallbackProofBearingResourceBounds(
-  fetchImpl: typeof fetch,
-  rpcUrl: string
-): Promise<ResourceBoundsLike> {
-  const rpc = await rpcRequestJson(fetchImpl, rpcUrl, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "starknet_getBlockWithTxHashes",
-      params: {
-        block_id: "latest"
-      }
-    })
-  });
-
-  if ("error" in rpc && rpc.error) {
-    throw new Error(`Starknet RPC rejected fallback gas-price query: ${rpcErrorSummary(rpc.error)}`);
-  }
-  if (!("result" in rpc)) {
-    throw new Error("Starknet RPC fallback gas-price response did not include result");
-  }
-
-  return {
-    l1_gas: {
-      max_amount: DEFAULT_PAYMASTER_L1_GAS_FLOOR,
-      max_price_per_unit: gasPriceBound(rpc.result, "l1_gas_price")
-    },
-    l2_gas: {
-      max_amount: DEFAULT_PAYMASTER_L2_GAS_FLOOR,
-      max_price_per_unit: gasPriceBound(rpc.result, "l2_gas_price")
-    },
-    l1_data_gas: {
-      max_amount: DEFAULT_PAYMASTER_L1_DATA_GAS_FLOOR,
-      max_price_per_unit: gasPriceBound(rpc.result, "l1_data_gas_price")
-    }
-  };
-}
-
-async function shouldFallbackProofBearingFeeEstimate(
-  error: unknown,
-  input: {
-    calls: Call[];
-    config: Pick<PaymasterConfig, "rpcUrl" | "accountAddress" | "feeTokenAddress">;
-    fetchImpl: typeof fetch;
-  }
-): Promise<boolean> {
-  if (!error || typeof error !== "object") return false;
-  const record = error as Record<string, unknown>;
-  const code = String(record.code ?? "");
-  const message = String(record.message ?? "");
-  const data = record.data;
-  if (hasMeaningfulRpcErrorData(data)) {
-    if (isProofVersionAdmissionEstimateError(data)) return true;
-    return (
-      isInsufficientErc20AllowanceEstimateError(data) &&
-      (await transferFromActionsAreFunded(input.fetchImpl, input.config.rpcUrl, input.calls)) &&
-      (await poolApplyActionsFeeIsFunded(
-        input.fetchImpl,
-        input.config.rpcUrl,
-        input.calls,
-        input.config.accountAddress,
-        input.config.feeTokenAddress
-      ))
-    );
-  }
-  if (code === "41" && /transaction execution error/i.test(message)) return true;
-  return /PROOF_FACTS_MISSING|EMPTY_PROOF_FACTS/i.test(message);
-}
-
-function isProofVersionAdmissionEstimateError(data: unknown): boolean {
-  return /PROOF_VERSION_NOT_ALLOWED|proof version .* (?:is not allowed under this protocol version|is not accepted by this gateway)/i.test(
-    JSON.stringify(data)
-  );
-}
-
-function isInsufficientErc20AllowanceEstimateError(data: unknown): boolean {
-  return /insufficient erc20 allowance/i.test(JSON.stringify(data));
-}
-
-type TransferFromAction = {
-  from: string;
-  token: string;
-  amount: bigint;
-  spender: string;
-};
-
-async function transferFromActionsAreFunded(
+async function poolApplyActionsFee(
   fetchImpl: typeof fetch,
   rpcUrl: string,
   calls: Call[]
-): Promise<boolean> {
-  const actions = extractTransferFromActions(calls);
-  if (!actions || actions.length === 0) {
-    console.error(JSON.stringify({
-      event: "paymaster_transfer_preflight_failed",
-      reason: actions ? "no_transfer_from_actions" : "unparsed_apply_actions",
-      call_count: calls.length,
-      entrypoint: calls[0]?.entrypoint ?? null,
-      calldata_count: Array.isArray(calls[0]?.calldata) ? calls[0].calldata.length : null
-    }));
-    return false;
-  }
-  const totals = new Map<string, TransferFromAction>();
-  for (const action of actions) {
-    const key = `${toRpcFelt(action.from)}:${toRpcFelt(action.token)}:${toRpcFelt(action.spender)}`;
-    const existing = totals.get(key);
-    if (existing) {
-      existing.amount += action.amount;
-    } else {
-      totals.set(key, { ...action });
-    }
-  }
-  for (const action of totals.values()) {
-    const [balance, allowance] = await Promise.all([
-      starknetCallU256(fetchImpl, rpcUrl, action.token, "balance_of", [
-        action.from
-      ]),
-      starknetCallU256(fetchImpl, rpcUrl, action.token, "allowance", [
-        action.from,
-        action.spender
-      ])
-    ]);
-    if (balance < action.amount || allowance < action.amount) {
-      console.error(JSON.stringify({
-        event: "paymaster_transfer_preflight_failed",
-        reason: balance < action.amount ? "insufficient_balance" : "insufficient_allowance"
-      }));
-      return false;
-    }
-  }
-  return true;
-}
-
-async function poolApplyActionsFeeIsFunded(
-  fetchImpl: typeof fetch,
-  rpcUrl: string,
-  calls: Call[],
-  paymasterAddress: string,
-  feeTokenAddress: string
-): Promise<boolean> {
-  if (calls.length !== 1 || calls[0]?.entrypoint !== "apply_actions") return false;
-  const poolAddress = calls[0].contractAddress;
-  const feeAmount = await starknetCallFelt(fetchImpl, rpcUrl, poolAddress, "get_fee_amount", []);
-  if (feeAmount === 0n) return true;
-  const [balance, allowance] = await Promise.all([
-    starknetCallU256(fetchImpl, rpcUrl, feeTokenAddress, "balance_of", [
-      paymasterAddress
-    ]),
-    starknetCallU256(fetchImpl, rpcUrl, feeTokenAddress, "allowance", [
-      paymasterAddress,
-      poolAddress
-    ])
-  ]);
-  if (balance < feeAmount || allowance < feeAmount) {
-    console.error(JSON.stringify({
-      event: "paymaster_transfer_preflight_failed",
-      reason: balance < feeAmount ? "insufficient_pool_fee_balance" : "insufficient_pool_fee_allowance"
-    }));
-    return false;
-  }
-  return true;
-}
-
-function extractTransferFromActions(calls: Call[]): TransferFromAction[] | null {
-  if (calls.length !== 1) return null;
-  const call = calls[0];
-  if (!call) return null;
-  if (call.entrypoint !== "apply_actions") return null;
-  if (!Array.isArray(call.calldata)) return null;
-  const calldata = call.calldata.map((value: unknown) => toRpcFelt(value));
-  if (calldata.length === 0) return null;
-  const count = Number(toBigIntFelt(calldata[0]));
-  if (!Number.isSafeInteger(count) || count < 0) return null;
-  const actions: TransferFromAction[] = [];
-  let offset = 1;
-  for (let index = 0; index < count; index += 1) {
-    if (offset >= calldata.length) return null;
-    const variant = Number(toBigIntFelt(calldata[offset]));
-    if (!Number.isSafeInteger(variant) || variant < 0) return null;
-    if (variant === 0) {
-      if (offset + 2 >= calldata.length) return null;
-      const spanLength = Number(toBigIntFelt(calldata[offset + 2]));
-      if (!Number.isSafeInteger(spanLength) || spanLength < 0) return null;
-      offset += 3 + spanLength;
-      continue;
-    }
-    if (variant === 1 || variant === 6) {
-      offset += variant === 1 ? 5 : 4;
-      continue;
-    }
-    if (variant === 2 || variant === 3) {
-      if (offset + 3 >= calldata.length) return null;
-      if (variant === 2) {
-        const from = calldata[offset + 1];
-        const token = calldata[offset + 2];
-        const amount = calldata[offset + 3];
-        if (!from || !token || !amount) return null;
-        actions.push({
-          from,
-          token,
-          amount: toBigIntFelt(amount),
-          spender: call.contractAddress
-        });
-      }
-      offset += 4;
-      continue;
-    }
-    if (variant === 4) {
-      offset += 6;
-      continue;
-    }
-    if (variant === 5 || variant === 7) {
-      offset += variant === 5 ? 7 : 6;
-      continue;
-    }
-    if (variant === 8 || variant === 9) {
-      offset += variant === 8 ? 3 : 2;
-      continue;
-    }
-    if (variant === 10 || variant === 11) {
-      if (offset + 2 >= calldata.length) return null;
-      const spanLength = Number(toBigIntFelt(calldata[offset + 2]));
-      if (!Number.isSafeInteger(spanLength) || spanLength < 0) return null;
-      offset += 3 + spanLength;
-      continue;
-    }
-    return null;
-  }
-  return hasValidScreeningSuffix(calldata, offset) ? actions : null;
-}
-
-function hasValidScreeningSuffix(calldata: string[], offset: number): boolean {
-  if (offset === calldata.length) return true;
-  if (offset >= calldata.length) return false;
-  const variant = Number(toBigIntFelt(calldata[offset]));
-  if (!Number.isSafeInteger(variant) || variant < 0) return false;
-  if (variant === 1) return offset + 1 === calldata.length;
-  if (variant === 0) return offset + 4 === calldata.length;
-  return false;
-}
-
-async function starknetCallU256(
-  fetchImpl: typeof fetch,
-  rpcUrl: string,
-  contractAddress: string,
-  entrypoint: "allowance" | "balance_of",
-  calldata: string[]
 ): Promise<bigint> {
-  const rpc = await rpcRequestJson(fetchImpl, rpcUrl, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "starknet_call",
-      params: {
-        request: {
-          contract_address: toRpcFelt(contractAddress),
-          entry_point_selector: toRpcFelt(selector.getSelectorFromName(entrypoint)),
-          calldata: calldata.map((value) => toRpcFelt(value))
-        },
-        block_id: "latest"
-      }
-    })
-  });
-  if ("error" in rpc && rpc.error) {
-    throw new Error(`Starknet RPC rejected ${entrypoint}: ${rpcErrorSummary(rpc.error)}`);
-  }
-  const result = "result" in rpc ? rpc.result : null;
-  if (!Array.isArray(result) || result.length < 2) {
-    throw new Error(`Starknet RPC ${entrypoint} response did not include u256 result`);
-  }
-  return toBigIntFelt(result[0]) + (toBigIntFelt(result[1]) << 128n);
+  if (calls.length !== 1 || calls[0]?.entrypoint !== "apply_actions") return 0n;
+  return starknetCallFelt(
+    fetchImpl,
+    rpcUrl,
+    calls[0].contractAddress,
+    "get_fee_amount",
+    []
+  );
 }
 
 async function starknetCallFelt(
@@ -1032,19 +511,6 @@ function sanitizeErrorText(value: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 400);
-}
-
-function gasPriceBound(block: unknown, field: string): bigint {
-  if (!block || typeof block !== "object") {
-    throw new Error("Starknet RPC fallback gas-price result is invalid");
-  }
-  const raw = (block as Record<string, unknown>)[field];
-  if (!raw || typeof raw !== "object") {
-    throw new Error(`Starknet RPC fallback gas-price result is missing ${field}`);
-  }
-  const record = raw as Record<string, unknown>;
-  const price = toBigIntFelt(record.price_in_fri ?? record.priceInFri);
-  return price > 0n ? price * PAYMASTER_GAS_PRICE_MULTIPLIER : 1n;
 }
 
 async function rpcRequestJson(
@@ -1127,49 +593,6 @@ async function rpcRequestJson(
   }
 }
 
-async function gatewayRequestJson(
-  fetchImpl: typeof fetch,
-  url: string,
-  init: RequestInit
-): Promise<{ transaction_hash?: string }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), PAYMASTER_RPC_TIMEOUT_MS);
-  try {
-    const response = await fetchImpl(url, { ...init, signal: controller.signal });
-    const text = await response.text();
-    if (text.length > PAYMASTER_RPC_MAX_RESPONSE_BYTES) {
-      throw new Error("Starknet gateway response body is too large");
-    }
-    let parsed: unknown;
-    try {
-      parsed = text ? JSON.parse(text) : {};
-    } catch {
-      throw new Error("Starknet gateway returned invalid JSON");
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("Starknet gateway returned an invalid response object");
-    }
-    if (!response.ok) {
-      throw new Error(`Starknet gateway rejected proof-bearing invoke: ${gatewayErrorSummary(parsed)}`);
-    }
-    return parsed as { transaction_hash?: string };
-  } catch (error) {
-    if (isAbortLikeError(error)) {
-      throw new Error("Starknet gateway request timed out");
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function gatewayErrorSummary(value: object): string {
-  const record = value as Record<string, unknown>;
-  const code = typeof record.code === "string" ? record.code : "unknown_gateway_error";
-  const message = typeof record.message === "string" ? sanitizeErrorText(record.message) : "";
-  return message ? `${code} ${message}` : code;
-}
-
 function isAbortLikeError(error: unknown): boolean {
   const message =
     error instanceof Error ? error.message : typeof error === "string" ? error : "";
@@ -1212,7 +635,14 @@ export function assertSponsoredFeeWithinLimit(
   resourceBounds: ResourceBoundsLike,
   maxSponsoredFeeFri: bigint
 ): void {
-  const maximumFee = [
+  const maximumFee = maximumSponsoredFee(resourceBounds);
+  if (maximumFee > maxSponsoredFeeFri) {
+    throw new Error("sponsored fee limit exceeded");
+  }
+}
+
+export function maximumSponsoredFee(resourceBounds: ResourceBoundsLike): bigint {
+  return [
     resourceBounds.l1_gas,
     resourceBounds.l2_gas,
     resourceBounds.l1_data_gas,
@@ -1220,9 +650,6 @@ export function assertSponsoredFeeWithinLimit(
     (total, bound) => total + bound.max_amount * bound.max_price_per_unit,
     0n
   );
-  if (maximumFee > maxSponsoredFeeFri) {
-    throw new Error("sponsored fee limit exceeded");
-  }
 }
 
 function resourceBoundFromRpc(value: unknown): ResourceBoundsLike["l1_gas"] {

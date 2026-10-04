@@ -16,6 +16,7 @@ use crate::ProtocolError;
 /// multiply two of them in the field and check a remainder with one u128 range check.
 pub const AMOUNT_BOUND: u128 = 1 << 120;
 pub const EXPIRY_BOUND_MS: u64 = 1 << 48;
+pub const MAX_ORDER_LIFETIME_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 pub const MAX_BOOK_ORDERS: usize = 1024;
 /// per-order base/funding bound chosen so every full-book aggregate stays below `amount_bound`.
 pub const MAX_ORDER_AMOUNT: u128 = (AMOUNT_BOUND - 1) / MAX_BOOK_ORDERS as u128;
@@ -566,8 +567,12 @@ impl ResidualNote {
 /// books are grouped by `(pair_id, side)`, strictly increasing by pair and then side.
 pub fn assert_canonical_book(orders: &[BookOrder]) -> Result<(), ProtocolError> {
     let mut previous: Option<(Felt, bool)> = None;
+    let mut order_ids = std::collections::BTreeSet::new();
     for order in orders {
         order.validate()?;
+        if !order_ids.insert(order.order_id.to_bytes_be()) {
+            return Err(invalid("book order ids must be unique"));
+        }
         let group = order.group();
         if let Some(last) = previous
             && last != group
@@ -599,6 +604,7 @@ pub struct NoteFields {
     pub withdraw_authority: Felt,
     #[serde(with = "felt_hex_serde")]
     pub blinding: Felt,
+    #[serde(with = "crate::types::serde_u64_decimal")]
     pub nonce: u64,
     #[serde(with = "felt_hex_serde")]
     pub metadata_commitment: Felt,

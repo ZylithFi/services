@@ -100,9 +100,6 @@ pub struct InFlight {
     #[serde(default)]
     pub prepared_legged: Vec<(Felt, bool)>,
     pub built_at_ms: u64,
-    /// the submitted transaction carries the searcher leg.
-    #[serde(default)]
-    pub with_leg: bool,
     /// the capacities, by pair and side, whose legs the submitted transaction carries.
     #[serde(default)]
     pub legged: Vec<(Felt, bool)>,
@@ -479,7 +476,6 @@ mod tests {
             prepared_submission: Some(prepared.clone()),
             prepared_legged: Vec::new(),
             built_at_ms: 6_001,
-            with_leg: false,
             legged: Vec::new(),
             leg_dropped: false,
             for_legs: false,

@@ -54,6 +54,8 @@ pub struct PairRuntime {
     pub external_settlement_support_quote: u128,
     /// the smallest order the operator admits, in base atoms.
     pub min_order_amount: u128,
+    /// the smallest limit-valued order the operator admits, in quote atoms.
+    pub min_order_quote_amount: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,8 @@ pub struct Policy {
     pub pipeline_depth: usize,
     pub max_admissions: usize,
     pub max_book_orders: usize,
+    pub max_pending_orders: usize,
+    pub max_order_lifetime_ms: u64,
     /// the most cairo steps a transition statement may take and still prove in one snip-36
     /// transaction; every transition is estimated against it before proving.
     pub step_budget: u64,
@@ -380,11 +384,18 @@ impl Config {
                 external_enabled: pair.capabilities.external_matching,
                 external_settlement_support_quote: pair.external_settlement_support_quote,
                 min_order_amount: pair.min_order_amount,
+                min_order_quote_amount: pair.min_order_quote_amount,
             });
         }
         // tiny funded orders would crowd the book and the proofs: every pair needs a minimum.
         if let Some(pair) = pairs.iter().find(|pair| pair.min_order_amount == 0) {
             return Err(format!("pair {} has no minimum order amount", pair.name));
+        }
+        if let Some(pair) = pairs.iter().find(|pair| pair.min_order_quote_amount == 0) {
+            return Err(format!(
+                "pair {} has no minimum quote order amount",
+                pair.name
+            ));
         }
         if let Some(pair) = pairs
             .iter()
@@ -455,6 +466,8 @@ impl Config {
             pipeline_depth,
             max_admissions: runtime.max_admissions_per_transition as usize,
             max_book_orders: runtime.max_book_orders as usize,
+            max_pending_orders: runtime.max_book_orders as usize,
+            max_order_lifetime_ms: zylith_core::exchange::MAX_ORDER_LIFETIME_MS,
             step_budget,
             force_after_ms: parsed("ZYLITH_FORCE_AFTER_MS", 60_000_u64)?,
             uneconomic_max_wait_ms: epoch_ms

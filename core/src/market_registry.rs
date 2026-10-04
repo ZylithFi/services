@@ -156,6 +156,8 @@ pub struct MarketRegistryMarket {
     #[serde(with = "serde_u128_decimal")]
     pub min_order_amount: u128,
     #[serde(with = "serde_u128_decimal")]
+    pub min_order_quote_amount: u128,
+    #[serde(with = "serde_u128_decimal")]
     pub price_base_scale: u128,
     pub taker_fee_bps: u16,
     pub enabled: bool,
@@ -447,6 +449,7 @@ fn validate_market(
         ));
     }
     if market.min_order_amount < base.min_trade_amount
+        || market.min_order_quote_amount < quote.min_trade_amount
         || market.price_base_scale == 0
         || market.taker_fee_bps == 0
         || market.taker_fee_bps > 100
@@ -866,7 +869,9 @@ mod tests {
         assert!(value.validate().unwrap_err().contains("funding capability"));
 
         let mut value = registry();
+        value.markets[0].capabilities.external_matching = true;
         value.markets[0].external_settlement_support_quote = 0;
+        value.markets[0].external_min_profit_quote = 1;
         value.registry_hash = value.computed_hash().unwrap();
         assert!(value.validate().unwrap_err().contains("external matching"));
     }

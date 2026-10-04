@@ -8,7 +8,7 @@ const felt = (n) => `0x${n.toString(16)}`;
 const manifest = JSON.parse(readFileSync(new URL("../client/public/deployment.example.json", import.meta.url), "utf8"));
 Object.assign(manifest, {
   deployment: { finalized: true, release_commit: "a".repeat(40) },
-  contracts: { commitment_registry: felt(1), privacy_deposit_bridge: felt(2), ekubo_external_match_router: felt(3), exchange: felt(4) },
+  contracts: { commitment_registry: felt(1), privacy_deposit_bridge: felt(2), ekubo_external_match_router: felt(0), exchange: felt(4) },
   roles: { ...manifest.roles, reference_price_signer: felt(14) },
 });
 Object.assign(manifest.proof, {
@@ -20,6 +20,7 @@ manifest.funding.starknet_privacy.ingress_key_registry_fingerprint = "ab".repeat
 manifest.funding.starknet_privacy.proving_ohttp_policy = "best_effort";
 Object.assign(manifest.funding.starknet_privacy, {
   privacy_pool: felt(16),
+  privacy_pool_class_hash: felt(19),
   bridge_adapter: felt(2),
   discovery_url: "https://discovery.example",
   proving_url: "https://prover.example",
@@ -40,6 +41,18 @@ function rehash(value) {
   delete hashInput.registry_hash;
   registry.registry_hash = createHash("sha256").update(canonicalJson(hashInput)).digest("hex");
   return value;
+}
+
+function externallyEnabledManifest() {
+  const value = structuredClone(manifest);
+  const market = value.market_registry.markets.find((candidate) => candidate.market_id === "STRK/ETH");
+  assert.ok(market);
+  market.capabilities.external_matching = true;
+  market.external_settlement_support_quote = "1";
+  market.external_min_profit_quote = "1";
+  value.contracts.ekubo_external_match_router = felt(3);
+  value.runtime.external_window_seconds = 30;
+  return rehash(value);
 }
 
 const env = {
@@ -82,9 +95,9 @@ const env = {
   ZYLITH_PROOF_JOB_ABANDONED_RETENTION_MS: "604800000",
   ZYLITH_PROOF_JOB_CLEANUP_INTERVAL_MS: "60000",
   ZYLITH_MIN_TRANSITION_FEE_STRK: "1000000000000000000",
-  ZYLITH_EXTERNAL_MATCHING_DISABLED: "",
-  ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example",
-  ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/393402133025997798000961/health",
+  ZYLITH_EXTERNAL_MATCHING_DISABLED: "1",
+  ZYLITH_ROUTE_SERVICE_URL: "",
+  ZYLITH_ROUTE_SERVICE_HEALTH_URL: "",
 };
 
 const run = (overrides = {}, manifestOverride = manifest) =>
@@ -157,12 +170,12 @@ test("a missing fee floor, retired fee settings and epoch drift fail", () => {
 });
 
 test("external matching is either fully configured or explicitly disabled", () => {
-  const incomplete = structuredClone(manifest);
+  const incomplete = externallyEnabledManifest();
   incomplete.runtime.external_window_seconds = 0;
-  assert.ok(run({ ZYLITH_ROUTE_SERVICE_URL: "" }, incomplete).some((failure) => failure.includes("ZYLITH_ROUTE_SERVICE_URL")));
-  const failures = run({}, incomplete);
+  assert.ok(run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "", ZYLITH_ROUTE_SERVICE_URL: "" }, incomplete).some((failure) => failure.includes("ZYLITH_ROUTE_SERVICE_URL")));
+  const failures = run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "", ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example", ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/393402133025997798000961/health" }, incomplete);
   assert.ok(failures.some((failure) => failure.includes("external_window_seconds")));
-  assert.ok(run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "1" }).some((failure) => failure.includes("match externally")));
+  assert.ok(run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "1" }, externallyEnabledManifest()).some((failure) => failure.includes("match externally")));
 
   const disabled = structuredClone(manifest);
   disabled.contracts.ekubo_external_match_router = felt(0);
@@ -178,6 +191,6 @@ test("external matching is either fully configured or explicitly disabled", () =
 });
 
 test("external route health probes the configured chain", () => {
-  const failures = run({ ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/health" });
+  const failures = run({ ZYLITH_EXTERNAL_MATCHING_DISABLED: "", ZYLITH_ROUTE_SERVICE_URL: "https://quoter.example", ZYLITH_ROUTE_SERVICE_HEALTH_URL: "https://quoter.example/health" }, externallyEnabledManifest());
   assert.ok(failures.some((failure) => failure.includes("must probe the configured chain")));
 });

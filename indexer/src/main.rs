@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header::AUTHORIZATION};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header, header::AUTHORIZATION};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ipnet::IpNet;
@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use starknet_crypto::Felt;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use zylith_core::exchange::{
     OutputRecord, multicall_arguments, output_tree_root, transition_output_records,
 };
@@ -183,6 +184,10 @@ fn router(state: AppState) -> Router {
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
         .layer(
             CorsLayer::new()
                 .allow_methods([Method::GET, Method::POST])

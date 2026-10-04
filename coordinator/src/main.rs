@@ -35,7 +35,7 @@ const VAULT_NAMESPACE: &str = "wallet_vault_bundles";
 const MAX_RECOVERY_PAYLOAD_CHARS: usize = 1_048_576;
 const MAX_VAULT_PAYLOAD_CHARS: usize = 65_536;
 const WALLET_VAULT_AUTH_HEADER: &str = "x-zylith-wallet-vault-auth";
-const WALLET_VAULT_ID_DOMAIN: &str = "zylith/wallet-signature-vault/id/v1:";
+const WALLET_VAULT_ID_DOMAIN: &str = "zylith/wallet-signature-vault/id/v2:";
 const RECOVERY_AUTH_DOMAIN: &str = "zylith/recovery-auth/verifier/v1:";
 const VAULT_FIELDS: &[&str] = &[
     "version",
@@ -284,9 +284,26 @@ async fn upload_recovery_artifact(
         Some(_) => {}
         None => account.recovery_auth_verifier = Some(provided),
     }
-    if account.artifacts.iter().any(|existing| {
-        existing.artifact_id == artifact.artifact_id || existing.sequence >= artifact.sequence
-    }) {
+    if let Some(existing) = account
+        .artifacts
+        .iter()
+        .find(|existing| existing.artifact_id == artifact.artifact_id)
+    {
+        return if existing == &artifact {
+            Ok(Json(existing.clone()))
+        } else {
+            Err(StatusCode::CONFLICT)
+        };
+    }
+    let current = account
+        .artifacts
+        .iter()
+        .filter(|existing| existing.kind == RecoveryArtifactKind::Snapshot)
+        .max_by_key(|existing| (existing.sequence, existing.created_at_unix_ms));
+    if current.map(|existing| existing.artifact_id.as_str())
+        != request.previous_artifact_id.as_deref()
+        || current.is_some_and(|existing| existing.sequence >= artifact.sequence)
+    {
         return Err(StatusCode::CONFLICT);
     }
     // single-snapshot retention: no history of upload times or sizes is kept.
@@ -331,13 +348,13 @@ fn validate_vault(bundle: &WalletVaultBundleRecord) -> Result<(), StatusCode> {
     if vault
         .keys()
         .any(|field| !VAULT_FIELDS.contains(&field.as_str()))
-        || vault.get("version").and_then(|value| value.as_u64()) != Some(1)
-        || vault.get("kdf").and_then(|value| value.as_str()) != Some("wallet-signature-sha256-v1")
+        || vault.get("version").and_then(|value| value.as_u64()) != Some(2)
+        || vault.get("kdf").and_then(|value| value.as_str()) != Some("wallet-signature-sha256-v2")
         || vault.get("algorithm").and_then(|value| value.as_str()) != Some("AES-GCM")
         || vault
             .get("message_version")
             .and_then(|value| value.as_u64())
-            != Some(1)
+            != Some(2)
     {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -613,9 +630,9 @@ mod tests {
             "wallet_auth_id": wallet_auth_id,
             "updated_at_unix_ms": 1,
             "vault": {
-                "version": 1, "kdf": "wallet-signature-sha256-v1", "algorithm": "AES-GCM",
+                "version": 2, "kdf": "wallet-signature-sha256-v2", "algorithm": "AES-GCM",
                 "wallet_address": "0x1", "chain_id": "SN_SEPOLIA", "deployment_id": "d", "origin": "o",
-                "message_version": 1, "nonce": "n", "ciphertext": ciphertext,
+                "message_version": 2, "nonce": "n", "ciphertext": ciphertext,
             },
         })
     }
@@ -693,6 +710,63 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn post_recovery(
+        state: &AppState,
+        account_id: &str,
+        tag: &str,
+        artifact_id: &str,
+        sequence: u64,
+        previous_artifact_id: Option<&str>,
+    ) -> StatusCode {
+        let body = serde_json::json!({
+            "artifact": {
+                "artifact_id": artifact_id,
+                "account_id": account_id,
+                "kind": "Snapshot",
+                "sequence": sequence,
+                "created_at_unix_ms": sequence,
+                "payload": { "algorithm": "AES-GCM", "nonce": "n", "ciphertext": "c" },
+            },
+            "previous_artifact_id": previous_artifact_id,
+        });
+        let mut request = Request::post(format!("/api/recovery/{account_id}/artifacts"))
+            .header("content-type", "application/json")
+            .header(zylith_core::RECOVERY_AUTH_HEADER, tag)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 1))));
+        app(state.clone(), vec![], 1 << 20)
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn recovery_snapshot_updates_compare_and_swap_the_remote_head() {
+        let path = temporary_store();
+        let state = build_state(path.clone(), 100, vec![]).unwrap();
+        assert_eq!(
+            post_recovery(&state, "account", "secret", "0xa1", 1, None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_recovery(&state, "account", "secret", "0xa2", 2, None).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_recovery(&state, "account", "secret", "0xa2", 2, Some("0xa1")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_recovery(&state, "account", "secret", "0xa2", 2, Some("0xa1")).await,
+            StatusCode::OK
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

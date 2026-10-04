@@ -12,6 +12,9 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
+use num_bigint::BigUint;
+use num_integer::Integer;
+use num_traits::ToPrimitive;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,6 +51,7 @@ pub const MAX_STATUS_EVENTS_PER_ORDER: usize = 2;
 pub const MAX_SEALED_REQUEST_BYTES: usize = 96 * 1_024;
 /// every private answer uses one wire size across request kinds and populated status lookups.
 pub const RESPONSE_PLAINTEXT_BYTES: usize = 16_384;
+const WITHDRAWAL_STATUS_DOMAIN: &str = "zylith_withdraw_status_v1";
 
 /// what a sealed request asks for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,8 +68,7 @@ pub enum PrivateRequest {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusRequest {
     pub orders: Vec<OrderQuery>,
-    #[serde(with = "felt_vec_hex_serde")]
-    pub nullifiers: Vec<Felt>,
+    pub withdrawals: Vec<WithdrawalQuery>,
 }
 
 /// an order to report on, with the events the wallet already holds left out.
@@ -76,6 +79,22 @@ pub struct OrderQuery {
     /// only events of later transitions are returned.
     #[serde(default)]
     pub after_seq: u32,
+}
+
+/// a private withdrawal lookup authenticated by the note's withdrawal authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawalQuery {
+    #[serde(with = "felt_hex_serde")]
+    pub nullifier: Felt,
+    pub authorization: Signature,
+}
+
+pub fn withdrawal_status_message(chain_context: Felt, nullifier: Felt) -> Felt {
+    sponge(&[
+        short_string(WITHDRAWAL_STATUS_DOMAIN),
+        chain_context,
+        nullifier,
+    ])
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,8 +166,8 @@ pub fn chunk_status(status: StatusRequest) -> Vec<StatusRequest> {
         .orders
         .into_iter()
         .map(Ok)
-        .chain(status.nullifiers.into_iter().map(Err))
-        .collect::<Vec<Result<OrderQuery, Felt>>>();
+        .chain(status.withdrawals.into_iter().map(Err))
+        .collect::<Vec<Result<OrderQuery, WithdrawalQuery>>>();
     if items.is_empty() {
         return vec![];
     }
@@ -156,7 +175,7 @@ pub fn chunk_status(status: StatusRequest) -> Vec<StatusRequest> {
         .chunks(MAX_STATUS_ITEMS)
         .map(|chunk| StatusRequest {
             orders: chunk.iter().filter_map(|item| item.clone().ok()).collect(),
-            nullifiers: chunk.iter().filter_map(|item| item.clone().err()).collect(),
+            withdrawals: chunk.iter().filter_map(|item| item.clone().err()).collect(),
         })
         .collect()
 }
@@ -171,7 +190,7 @@ pub fn seal_request(
         )));
     }
     if let PrivateRequest::Status(status) = request
-        && status.orders.len() + status.nullifiers.len() > MAX_STATUS_ITEMS
+        && status.orders.len() + status.withdrawals.len() > MAX_STATUS_ITEMS
     {
         return Err(ProtocolError::Crypto(format!(
             "a status request asks about at most {MAX_STATUS_ITEMS} items"
@@ -365,16 +384,23 @@ impl OrderRequest {
         chain_context: Felt,
         input_asset: Felt,
         min_order_amount: u128,
+        min_order_quote_amount: u128,
+        price_base_scale: u128,
     ) -> Result<(), ProtocolError> {
         self.terms.validate()?;
         if self.terms.amount < min_order_amount.max(1) {
             return Err(invalid("the order is below the pair's minimum size"));
+        }
+        if price_base_scale == 0 || min_order_quote_amount == 0 {
+            return Err(invalid("the pair's order-value policy is invalid"));
         }
         if self.funding.is_empty() || self.funding.len() > MAX_FUNDING_NOTES {
             return Err(invalid("an order is funded by 1..=4 notes"));
         }
         let spend_authority = self.funding[0].spend_authority;
         let mut total = 0_u128;
+        let mut commitments = std::collections::BTreeSet::new();
+        let mut nullifiers = std::collections::BTreeSet::new();
         for note in &self.funding {
             if note.asset_id != input_asset || note.spend_authority != spend_authority {
                 return Err(invalid(
@@ -384,11 +410,28 @@ impl OrderRequest {
             if note.amount == 0 || note.nonce == 0 || note.blinding == Felt::ZERO {
                 return Err(invalid("a funding note is malformed"));
             }
+            if !commitments.insert(note.commitment().to_bytes_be())
+                || !nullifiers.insert(note.nullifier().to_bytes_be())
+            {
+                return Err(invalid("an order cannot use the same funding note twice"));
+            }
             total = total
                 .checked_add(note.amount)
                 .ok_or_else(|| invalid("funding overflows"))?;
         }
-        if total > super::MAX_ORDER_AMOUNT || (self.terms.sell && total < self.terms.amount) {
+        let quote_value = (BigUint::from(self.terms.amount) * BigUint::from(self.terms.limit))
+            .div_ceil(&BigUint::from(price_base_scale))
+            .to_u128()
+            .ok_or_else(|| invalid("the order value is out of range"))?;
+        let required_funding = if self.terms.sell {
+            self.terms.amount
+        } else {
+            quote_value
+        };
+        if total > super::MAX_ORDER_AMOUNT
+            || total < required_funding
+            || quote_value < min_order_quote_amount
+        {
             return Err(invalid("order funding is out of range"));
         }
         if !verify_message(

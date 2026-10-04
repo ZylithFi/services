@@ -946,6 +946,7 @@ mod tests {
             external_enabled: true,
             external_settlement_support_quote: 1,
             min_order_amount: 1,
+            min_order_quote_amount: 1,
         }
     }
 

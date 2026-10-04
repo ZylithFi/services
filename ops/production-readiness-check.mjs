@@ -142,7 +142,7 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     if (!pins.length || pins.some((pin) => !/^[0-9a-f]{64}$/.test(pin) || /^0+$/.test(pin))) fail("manifest funding.starknet_privacy.ingress_key_registry_fingerprint must pin the execution keys");
     if (manifest.funding?.starknet_privacy?.proving_ohttp_policy !== "best_effort") fail("production funding proving_ohttp_policy must be best_effort");
     const privacyFunding = manifest.funding?.starknet_privacy;
-    for (const field of ["privacy_pool", "bridge_adapter", "paymaster_address", "proof_signer_class_hash"]) {
+    for (const field of ["privacy_pool", "privacy_pool_class_hash", "bridge_adapter", "paymaster_address", "proof_signer_class_hash"]) {
       if (!isNonZeroFelt(privacyFunding?.[field])) fail(`manifest funding.starknet_privacy.${field} must be set`);
     }
     for (const field of ["discovery_url", "proving_url", "paymaster_url"]) {
@@ -204,7 +204,9 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     for (const pair of pairs) {
       if (!Number.isInteger(pair.taker_fee_bps) || pair.taker_fee_bps < 1 || pair.taker_fee_bps > 100) fail(`market ${pair.market_id} fee must be 1..100 bps`);
       if (!/^[1-9]\d*$/.test(String(pair.min_order_amount ?? ""))) fail(`market ${pair.market_id} needs a positive min_order_amount`);
+      if (!/^[1-9]\d*$/.test(String(pair.min_order_quote_amount ?? ""))) fail(`market ${pair.market_id} needs a positive min_order_quote_amount`);
       if (/^[1-9]\d*$/.test(String(pair.min_order_amount ?? "")) && /^[1-9]\d*$/.test(String(assets.get(pair.base_asset_id)?.min_trade_amount ?? "")) && BigInt(pair.min_order_amount) < BigInt(assets.get(pair.base_asset_id).min_trade_amount)) fail(`market ${pair.market_id} minimum is below its base asset minimum`);
+      if (/^[1-9]\d*$/.test(String(pair.min_order_quote_amount ?? "")) && /^[1-9]\d*$/.test(String(assets.get(pair.quote_asset_id)?.min_trade_amount ?? "")) && BigInt(pair.min_order_quote_amount) < BigInt(assets.get(pair.quote_asset_id).min_trade_amount)) fail(`market ${pair.market_id} minimum value is below its quote asset minimum`);
       const support = String(pair.external_settlement_support_quote ?? "");
       const profit = String(pair.external_min_profit_quote ?? "");
       if (!/^\d+$/.test(support) || !/^\d+$/.test(profit) || pair.capabilities?.external_matching !== (BigInt(/^\d+$/.test(support) ? support : 0) > 0n && BigInt(/^\d+$/.test(profit) ? profit : 0) > 0n)) {

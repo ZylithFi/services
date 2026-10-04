@@ -15,7 +15,7 @@
   "market_registry": {
     "schema_version": 1,
     "registry_version": 1,
-    "registry_hash": "9eda0934361cad9186afd2b18c38393fe74836b0fbf393e9be95a5549bf26434",
+    "registry_hash": "2c3ae632757e21f964e0776563a1cf1bc41bf5edbbbce7a5644dd26d6f2a8483",
     "network": "sepolia",
     "chain_id": "0x534e5f5345504f4c4941",
     "gas_fee_asset_id": "STRK",
@@ -68,15 +68,16 @@
         "base_asset_id": "ETH",
         "quote_asset_id": "USDC",
         "min_order_amount": "1000000000000000",
+        "min_order_quote_amount": "1000000",
         "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 2,
         "enabled": true,
         "capabilities": {
           "market_data": true,
-          "external_matching": true
+          "external_matching": false
         },
-        "external_settlement_support_quote": "250000",
-        "external_min_profit_quote": "5000",
+        "external_settlement_support_quote": "0",
+        "external_min_profit_quote": "0",
         "reference_price": {
           "methodology": "direct_bbo_midpoint",
           "primary": {
@@ -117,15 +118,16 @@
         "base_asset_id": "STRK",
         "quote_asset_id": "ETH",
         "min_order_amount": "1000000000000000000",
+        "min_order_quote_amount": "1000000000000000",
         "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 2,
         "enabled": true,
         "capabilities": {
           "market_data": true,
-          "external_matching": true
+          "external_matching": false
         },
-        "external_settlement_support_quote": "100000000000000",
-        "external_min_profit_quote": "2000000000000",
+        "external_settlement_support_quote": "0",
+        "external_min_profit_quote": "0",
         "reference_price": {
           "methodology": "synthetic_cross_bbo_midpoint",
           "base_market_id": "STRK/USDC",
@@ -141,15 +143,16 @@
         "base_asset_id": "STRK",
         "quote_asset_id": "USDC",
         "min_order_amount": "1000000000000000000",
+        "min_order_quote_amount": "1000000",
         "price_base_scale": "1000000000000000000",
         "taker_fee_bps": 2,
         "enabled": true,
         "capabilities": {
           "market_data": true,
-          "external_matching": true
+          "external_matching": false
         },
-        "external_settlement_support_quote": "250000",
-        "external_min_profit_quote": "5000",
+        "external_settlement_support_quote": "0",
+        "external_min_profit_quote": "0",
         "reference_price": {
           "methodology": "direct_bbo_midpoint",
           "primary": {
@@ -191,6 +194,7 @@
     "primary": "starknet_privacy",
     "starknet_privacy": {
       "privacy_pool": "0x0",
+      "privacy_pool_class_hash": "0x0",
       "bridge_adapter": "0x0",
       "discovery_url": "https://discovery.example.invalid",
       "proving_url": "https://prover.example.invalid",
@@ -199,14 +203,14 @@
       "paymaster_url": "https://paymaster.example.invalid/execute-outside",
       "ingress_key_registry_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
       "sdk_package": "@starkware-libs/starknet-privacy-sdk",
-      "sdk_version": "0.14.3-rc.0",
+      "sdk_version": "0.14.3-rc.7",
       "min_proving_delay_blocks": 10,
       "proof_signer_class_hash": "0x0"
     }
   },
   "proof": {
     "scheme": "snip36-stwo",
-    "proof_version": "PROOF1",
+    "proof_version": "PROOF2",
     "transition_proof_program_address": "0x0",
     "withdrawal_proof_program_address": "0x0",
     "residual_recovery_proof_program_address": "0x0",
@@ -227,8 +231,8 @@
     "epoch_ms": 6000,
     "max_close_delay_ms": 60000,
     "withdrawal_delay_seconds": 120,
-    "external_window_seconds": 30,
-    "max_book_orders": 499,
+    "external_window_seconds": 0,
+    "max_book_orders": 477,
     "max_admissions_per_transition": 80,
     "max_internal_deferral_epochs": 2
   }

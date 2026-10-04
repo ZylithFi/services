@@ -194,7 +194,7 @@ impl MarketAttestation {
     }
 
     /// the transition statement's view of this market.
-    pub fn market(&self, fee_bps: u128) -> Market {
+    pub fn market(&self, fee_bps: u128, min_order_quote_amount: u128) -> Market {
         Market {
             pair_id: self.pair_id,
             base_asset_id: self.base_asset_id,
@@ -204,6 +204,7 @@ impl MarketAttestation {
             observed_at_ms: self.observed_at_ms,
             valid_until_ms: self.valid_until_ms,
             fee_bps,
+            min_order_quote_amount,
             reference_methodology: self.methodology,
             derivation_base_market_id: self.derivation_base_market_id,
             derivation_quote_market_id: self.derivation_quote_market_id,

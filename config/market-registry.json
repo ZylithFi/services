@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "registry_version": 1,
-  "registry_hash": "9eda0934361cad9186afd2b18c38393fe74836b0fbf393e9be95a5549bf26434",
+  "registry_hash": "2c3ae632757e21f964e0776563a1cf1bc41bf5edbbbce7a5644dd26d6f2a8483",
   "network": "sepolia",
   "chain_id": "0x534e5f5345504f4c4941",
   "gas_fee_asset_id": "STRK",
@@ -54,15 +54,16 @@
       "base_asset_id": "ETH",
       "quote_asset_id": "USDC",
       "min_order_amount": "1000000000000000",
+      "min_order_quote_amount": "1000000",
       "price_base_scale": "1000000000000000000",
       "taker_fee_bps": 2,
       "enabled": true,
       "capabilities": {
         "market_data": true,
-        "external_matching": true
+        "external_matching": false
       },
-      "external_settlement_support_quote": "250000",
-      "external_min_profit_quote": "5000",
+      "external_settlement_support_quote": "0",
+      "external_min_profit_quote": "0",
       "reference_price": {
         "methodology": "direct_bbo_midpoint",
         "primary": {
@@ -103,15 +104,16 @@
       "base_asset_id": "STRK",
       "quote_asset_id": "ETH",
       "min_order_amount": "1000000000000000000",
+      "min_order_quote_amount": "1000000000000000",
       "price_base_scale": "1000000000000000000",
       "taker_fee_bps": 2,
       "enabled": true,
       "capabilities": {
         "market_data": true,
-        "external_matching": true
+        "external_matching": false
       },
-      "external_settlement_support_quote": "100000000000000",
-      "external_min_profit_quote": "2000000000000",
+      "external_settlement_support_quote": "0",
+      "external_min_profit_quote": "0",
       "reference_price": {
         "methodology": "synthetic_cross_bbo_midpoint",
         "base_market_id": "STRK/USDC",
@@ -127,15 +129,16 @@
       "base_asset_id": "STRK",
       "quote_asset_id": "USDC",
       "min_order_amount": "1000000000000000000",
+      "min_order_quote_amount": "1000000",
       "price_base_scale": "1000000000000000000",
       "taker_fee_bps": 2,
       "enabled": true,
       "capabilities": {
         "market_data": true,
-        "external_matching": true
+        "external_matching": false
       },
-      "external_settlement_support_quote": "250000",
-      "external_min_profit_quote": "5000",
+      "external_settlement_support_quote": "0",
+      "external_min_profit_quote": "0",
       "reference_price": {
         "methodology": "direct_bbo_midpoint",
         "primary": {

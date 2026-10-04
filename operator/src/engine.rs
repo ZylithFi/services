@@ -216,18 +216,6 @@ pub(crate) fn active_closing_epoch(operator: &Operator) -> Result<Option<u64>, S
         .map_err(|_| "the closing-epoch cutoff lock is poisoned".into())
 }
 
-fn pending_order_is_in_closed_epoch(
-    state: &OperatorState,
-    order_id: &str,
-    cancelled_at_ms: u64,
-    closing_epoch: Option<u64>,
-) -> bool {
-    state
-        .pending_orders
-        .get(order_id)
-        .is_some_and(|order| protected_by_closing_epoch(order, cancelled_at_ms, closing_epoch))
-}
-
 fn admitted_in_flight(state: &OperatorState, order_id: &str) -> bool {
     state
         .in_flight
@@ -241,9 +229,10 @@ pub(crate) fn cancellation_can_settle_offchain(
     cancelled_at_ms: u64,
     closing_epoch: Option<u64>,
 ) -> bool {
-    state.pending_orders.contains_key(order_id)
-        && !admitted_in_flight(state, order_id)
-        && !pending_order_is_in_closed_epoch(state, order_id, cancelled_at_ms, closing_epoch)
+    state.pending_orders.get(order_id).is_some_and(|order| {
+        !admitted_in_flight(state, order_id)
+            && !protected_by_closing_epoch(order, cancelled_at_ms, closing_epoch)
+    })
 }
 
 fn settle_pending_cancellations(state: &mut OperatorState, closing_epoch: Option<u64>) -> bool {
@@ -426,7 +415,7 @@ async fn reconcile(operator: &Operator, state: &mut OperatorState) -> Result<boo
             // a transition sent only for its legs is not worth sending without them, unless
             // another transition was built on it.
             Some(Outcome::Reverted { reason })
-                if first.with_leg && first.for_legs && state.in_flight.len() == 1 =>
+                if !first.legged.is_empty() && first.for_legs && state.in_flight.len() == 1 =>
             {
                 eprintln!(
                     "transition {} reverted with the searcher legs it was sent for: {reason}; dropping it",
@@ -435,14 +424,13 @@ async fn reconcile(operator: &Operator, state: &mut OperatorState) -> Result<boo
                 state.in_flight.clear();
                 return Ok(true);
             }
-            Some(Outcome::Reverted { reason }) if first.with_leg => {
+            Some(Outcome::Reverted { reason }) if !first.legged.is_empty() => {
                 eprintln!(
                     "transition {} reverted with its searcher leg: {reason}; resubmitting without it",
                     first.seq
                 );
                 let first = &mut state.in_flight[0];
                 first.stage = TransitionStage::Proven;
-                first.with_leg = false;
                 first.legged.clear();
                 first.leg_dropped = true;
                 first.prepared_submission = None;
@@ -654,21 +642,23 @@ async fn drive(operator: &Arc<Operator>) -> Result<(), String> {
         state = operator.state.lock().await;
         match submitted {
             Ok((transaction_hash, legged)) => {
-                if let Some(entry) = state
-                    .in_flight
-                    .iter_mut()
-                    .find(|entry| entry.seq == first.seq)
-                {
+                let expected_commitment = first.result.public.commitment;
+                if let Some(entry) = state.in_flight.iter_mut().find(|entry| {
+                    entry.seq == first.seq && entry.result.public.commitment == expected_commitment
+                }) {
                     entry.stage = TransitionStage::Submitted { transaction_hash };
-                    entry.with_leg = !legged.is_empty();
                     entry.legged = legged;
                 }
             }
             Err(error) => {
+                let expected_commitment = first.result.public.commitment;
                 let journaled = state
                     .in_flight
                     .iter()
-                    .find(|entry| entry.seq == first.seq)
+                    .find(|entry| {
+                        entry.seq == first.seq
+                            && entry.result.public.commitment == expected_commitment
+                    })
                     .is_some_and(|entry| entry.prepared_submission.is_some());
                 if journaled {
                     eprintln!(
@@ -1593,6 +1583,23 @@ struct Frontier {
     pending_residual_recoveries: BTreeMap<String, PendingResidualRecovery>,
 }
 
+impl Frontier {
+    /// the confirmed capacities no transition in flight applies yet.
+    fn open_capacities(&self, state: &OperatorState) -> Vec<OpenCapacity> {
+        state
+            .capacities
+            .iter()
+            .filter(|capacity| {
+                !self
+                    .consumed_capacities
+                    .iter()
+                    .any(|consumed| consumed.same(capacity))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
 fn frontier(state: &OperatorState) -> Frontier {
     let mut frontier = Frontier {
         seq: state.confirmed_seq + 1,
@@ -1693,17 +1700,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             return Ok(());
         }
         let frontier = frontier(&state);
-        let open_capacities = state
-            .capacities
-            .iter()
-            .filter(|capacity| {
-                !frontier
-                    .consumed_capacities
-                    .iter()
-                    .any(|consumed| consumed.same(capacity))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let open_capacities = frontier.open_capacities(&state);
         (frontier.seq, open_capacities)
     };
     let pairs = operator.config.pairs.clone();
@@ -1752,17 +1749,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             })
             .map(|(_, cancel)| cancel.clone())
             .collect::<Vec<_>>();
-        let open_capacities = state
-            .capacities
-            .iter()
-            .filter(|capacity| {
-                !frontier
-                    .consumed_capacities
-                    .iter()
-                    .any(|consumed| consumed.same(capacity))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let open_capacities = frontier.open_capacities(&state);
         let mut memberships = BTreeMap::new();
         for order in &pending {
             for note in &order.request.funding {
@@ -1823,7 +1810,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
     let markets = attestations
         .iter()
         .zip(&pairs)
-        .map(|(attestation, pair)| attestation.market(pair.fee_bps))
+        .map(|(attestation, pair)| attestation.market(pair.fee_bps, pair.min_order_quote_amount))
         .collect::<Vec<_>>();
     let market_pairs = pairs
         .iter()
@@ -2105,7 +2092,6 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             prepared_submission: None,
             prepared_legged: Vec::new(),
             built_at_ms: now_ms(),
-            with_leg: false,
             legged: Vec::new(),
             leg_dropped: false,
             for_legs,
@@ -2898,7 +2884,6 @@ mod tests {
             prepared_submission: None,
             prepared_legged: Vec::new(),
             built_at_ms: 0,
-            with_leg: false,
             legged: Vec::new(),
             leg_dropped: false,
             for_legs: false,
@@ -2933,7 +2918,6 @@ mod tests {
         commit(
             &mut carried,
             InFlight {
-                with_leg: true,
                 legged: vec![(pair_id, sell)],
                 ..landed.clone()
             },

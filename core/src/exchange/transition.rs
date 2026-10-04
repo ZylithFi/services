@@ -47,6 +47,8 @@ pub struct Market {
     pub valid_until_ms: u64,
     #[serde(with = "u128_decimal_serde")]
     pub fee_bps: u128,
+    #[serde(with = "u128_decimal_serde")]
+    pub min_order_quote_amount: u128,
     pub reference_methodology: u8,
     #[serde(with = "felt_hex_serde")]
     pub derivation_base_market_id: Felt,
@@ -64,7 +66,7 @@ pub struct Market {
 }
 
 impl Market {
-    pub fn fields(&self) -> [Felt; 16] {
+    pub fn fields(&self) -> [Felt; 17] {
         [
             self.pair_id,
             self.base_asset_id,
@@ -74,6 +76,7 @@ impl Market {
             felt_u64(self.observed_at_ms),
             felt_u64(self.valid_until_ms),
             felt_u128(self.fee_bps),
+            felt_u128(self.min_order_quote_amount),
             felt_u64(u64::from(self.reference_methodology)),
             self.derivation_base_market_id,
             self.derivation_quote_market_id,
@@ -827,6 +830,14 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
         if input.close_time_ms >= terms.expiry_ms {
             return Err(invalid("a new order is already expired"));
         }
+        if terms.expiry_ms
+            > input
+                .close_time_ms
+                .checked_add(MAX_ORDER_LIFETIME_MS)
+                .ok_or_else(|| invalid("the order lifetime overflows"))?
+        {
+            return Err(invalid("a new order expires too far after admission"));
+        }
         let Some(market) = market_index(&terms.pair_id) else {
             return Err(invalid("a new order's market must be in the transition"));
         };
@@ -867,11 +878,17 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 return Err(invalid("a funding note is spent twice"));
             }
         }
-        if total > super::MAX_ORDER_AMOUNT {
-            return Err(invalid("order funding is out of range"));
-        }
-        if terms.sell && total < terms.amount {
-            return Err(invalid("a sell order's funding must cover its amount"));
+        let quote_value = mul_div_ceil(terms.amount, terms.limit, input.markets[market].scale);
+        let required_funding = if terms.sell {
+            terms.amount
+        } else {
+            quote_value
+        };
+        if total > super::MAX_ORDER_AMOUNT
+            || total < required_funding
+            || quote_value < input.markets[market].min_order_quote_amount
+        {
+            return Err(invalid("order funding or value is out of range"));
         }
         if !verify_message(
             &spend_authority,
@@ -1619,6 +1636,7 @@ fn serialize_witness(
             felt_u64(market.observed_at_ms),
             felt_u64(market.valid_until_ms),
             felt_u128(market.fee_bps),
+            felt_u128(market.min_order_quote_amount),
             felt_u64(u64::from(market.reference_methodology)),
             market.derivation_base_market_id,
             market.derivation_quote_market_id,
@@ -1856,6 +1874,7 @@ impl StepShape {
             + STEPS_PER_MARKET * self.markets
             + STEPS_PER_RESTING * self.resting
             + STEPS_PER_ADMISSION * self.admissions
+            + STEPS_PER_ORDER_ID * (self.resting + self.admissions)
             + STEPS_PER_CROSSING * self.crossing
             + STEPS_PER_NULLIFIER * self.nullifiers
             + STEPS_PER_NULLIFIER * self.retired_nullifiers
@@ -1907,13 +1926,13 @@ impl StepShape {
     }
 }
 
-// fitted to the vectors with a few percent of headroom: a resting order costs about 397 steps,
-// a crossing one 260 more plus its two padded outputs, an admission about 1960 plus its
-// nullifier.
+// fitted to the vectors with a few percent of headroom. order ids have a separate cost because
+// the statement checks their uniqueness for both resting orders and admissions.
 const STEPS_FIXED: u64 = 3_000;
 const STEPS_PER_MARKET: u64 = 5_500;
 const STEPS_PER_RESTING: u64 = 580;
 const STEPS_PER_ADMISSION: u64 = 2_000;
+const STEPS_PER_ORDER_ID: u64 = 52;
 const STEPS_PER_CROSSING: u64 = 520;
 const STEPS_PER_NULLIFIER: u64 = 64;
 const STEPS_PER_OUTPUT: u64 = 100;

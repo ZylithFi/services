@@ -47,8 +47,23 @@ pub fn reference_price_source_set_commitment<T: Serialize>(
     tagged_field_hex("zylith/reference-price-source-set-v1", sources)
 }
 
-fn reference_price_derivation_fields(envelope: &ReferencePriceEnvelope) -> [String; 8] {
-    match &envelope.derivation {
+/// what the batch commitment absorbs for one attestation, and its signed message starts with.
+fn reference_price_batch_fields(
+    envelope: &ReferencePriceEnvelope,
+    source_set_commitment: &str,
+    valid_until_unix_ms: u64,
+    nonce: u64,
+) -> Result<Vec<String>, ProtocolError> {
+    let mut fields = vec![
+        encode_starknet_felt("pair-id", &envelope.pair_id.0),
+        encode_asset_id(&envelope.base_asset_id.0),
+        encode_asset_id(&envelope.quote_asset_id.0),
+        encode_u128(envelope.midpoint_price),
+        encode_u128(envelope.lower_price),
+        encode_u128(envelope.upper_price),
+        encode_u128(envelope.price_base_scale),
+    ];
+    fields.extend(match &envelope.derivation {
         crate::ReferencePriceDerivation::DirectBbo {
             bid_price,
             ask_price,
@@ -82,33 +97,31 @@ fn reference_price_derivation_fields(envelope: &ReferencePriceEnvelope) -> [Stri
             encode_u128(*quote_ask_price),
             encode_u64(*max_leg_skew_ms),
         ],
-    }
+    });
+    fields.extend([
+        encode_u64(envelope.source_count as u64),
+        encode_u64(envelope.observed_at_unix_ms),
+        encode_u64(valid_until_unix_ms),
+        normalize_felt_hex(source_set_commitment)?,
+        encode_u64(nonce),
+    ]);
+    Ok(fields)
 }
 
 pub fn reference_price_attestation_commitment(
     attestation: &ReferencePriceAttestation,
 ) -> Result<String, ProtocolError> {
-    let envelope = &attestation.envelope;
     let mut state = poseidon_hash(
         domain_felt(REFERENCE_PRICE_ATTESTATION_DOMAIN_TAG),
         felt_from_hex_str(&normalize_felt_hex(&attestation.exchange_address)?)?,
     );
-    let mut fields = vec![
-        encode_starknet_felt("pair-id", &envelope.pair_id.0),
-        encode_asset_id(&envelope.base_asset_id.0),
-        encode_asset_id(&envelope.quote_asset_id.0),
-        encode_u128(envelope.midpoint_price),
-        encode_u128(envelope.lower_price),
-        encode_u128(envelope.upper_price),
-        encode_u128(envelope.price_base_scale),
-    ];
-    fields.extend(reference_price_derivation_fields(envelope));
+    let mut fields = reference_price_batch_fields(
+        &attestation.envelope,
+        &attestation.source_set_commitment,
+        attestation.valid_until_unix_ms,
+        attestation.nonce,
+    )?;
     fields.extend([
-        encode_usize(envelope.source_count),
-        encode_u64(envelope.observed_at_unix_ms),
-        encode_u64(attestation.valid_until_unix_ms),
-        normalize_felt_hex(&attestation.source_set_commitment)?,
-        encode_u64(attestation.nonce),
         normalize_felt_hex(&attestation.price_batch_commitment)?,
         normalize_felt_hex(&attestation.signer_public_key)?,
     ]);
@@ -167,25 +180,12 @@ pub fn reference_price_batch_commitment(
     );
     state = poseidon_hash(state, Felt::from(entries.len() as u64));
     for entry in entries {
-        let envelope = &entry.envelope;
-        let mut fields = vec![
-            encode_starknet_felt("pair-id", &envelope.pair_id.0),
-            encode_asset_id(&envelope.base_asset_id.0),
-            encode_asset_id(&envelope.quote_asset_id.0),
-            encode_u128(envelope.midpoint_price),
-            encode_u128(envelope.lower_price),
-            encode_u128(envelope.upper_price),
-            encode_u128(envelope.price_base_scale),
-        ];
-        fields.extend(reference_price_derivation_fields(envelope));
-        fields.extend([
-            encode_usize(envelope.source_count),
-            encode_u64(envelope.observed_at_unix_ms),
-            encode_u64(entry.valid_until_unix_ms),
-            normalize_felt_hex(&entry.source_set_commitment)?,
-            encode_u64(entry.nonce),
-        ]);
-        for field in fields {
+        for field in reference_price_batch_fields(
+            &entry.envelope,
+            &entry.source_set_commitment,
+            entry.valid_until_unix_ms,
+            entry.nonce,
+        )? {
             state = poseidon_hash(state, felt_from_hex_str(&field)?);
         }
     }
@@ -728,10 +728,6 @@ pub(crate) fn encode_u64(value: u64) -> String {
 }
 
 pub(crate) fn encode_u128(value: u128) -> String {
-    format!("0x{value:x}")
-}
-
-pub(crate) fn encode_usize(value: usize) -> String {
     format!("0x{value:x}")
 }
 
