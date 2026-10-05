@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "registry_version": 1,
-  "registry_hash": "d97b2682bce71b0ee03862f6b0eef3cdbda997eeef46932e826fbd645fbe97e1",
+  "registry_hash": "f2c634fc5c886a7d67e7174a9ae9a64c2c3255a6c8d1c393b39b202a018ff231",
   "network": "sepolia",
   "chain_id": "0x534e5f5345504f4c4941",
   "gas_fee_asset_id": "STRK",
@@ -35,7 +35,7 @@
     },
     {
       "asset_id": "USDC",
-      "token_address": "0x0512feAc6339Ff7889822cb5aA2a86C848e9D392bB0E3E237C008674feeD8343",
+      "token_address": "0x053b40a647cedfca6ca84f542a0fe36736031905a9639a7f19a3c1e66bfd5080",
       "decimals": 6,
       "min_trade_amount": "1000000",
       "erc20_behavior": "vanilla_exact_delta",
