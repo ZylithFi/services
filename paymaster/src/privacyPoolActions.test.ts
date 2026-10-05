@@ -26,8 +26,14 @@ describe("parsePrivacyPoolActions", () => {
     );
 
     expect(actions).not.toBeNull();
-    expect(actions).toHaveLength(4);
-    expect(actions?.map((action) => action.variant)).toEqual([2, 3, 10, 11]);
+    expect(actions).toHaveLength(12);
+    expect(actions?.map((action) => action.variant)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    expect(actions?.[4]).toEqual({ variant: 4 });
+    expect(actions?.[7]).toEqual({
+      variant: 7,
+      token: "0x29",
+      noteId: "0x2a",
+    });
     expect(actions?.at(-2)).toEqual({
       variant: 10,
       target: "0x789",

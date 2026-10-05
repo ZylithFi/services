@@ -7,15 +7,9 @@ import { dirname } from "node:path";
 
 import type { PaymasterConfig } from "./config.js";
 import type { SubmitterDeps } from "./starknetSubmitter.js";
-import {
-  relayPrivacyProofSignerCall,
-  submitProofBearingOutsideExecution,
-} from "./starknetSubmitter.js";
+import { submitProofBearingOutsideExecution } from "./starknetSubmitter.js";
 import { SubmissionStore } from "./submissionStore.js";
-import {
-  validateExecuteOutsideRequest,
-  validateRelayPrivacySignerRequest
-} from "./validation.js";
+import { validateExecuteOutsideRequest } from "./validation.js";
 
 export type PaymasterServerDeps = SubmitterDeps & {
   submissionStore?: SubmissionStore;
@@ -29,10 +23,6 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
   const clientRateLimiter = new FixedWindowRateLimiter(config.signerLimitPerMinute * 3);
   const submissionQueues = new SubmissionQueues(PAYMASTER_MAX_PENDING_SUBMISSIONS);
   const submissionStore = deps.submissionStore ?? new SubmissionStore(config.submissionLogPath);
-  const signerRelayBudget = new SignerRelayBudget(
-    config.signerRelayLimitPerDay,
-    config.signerRelayLogPath
-  );
   const sponsoredFeeBudget = new SponsoredFeeBudget(
     config.dailySponsoredFeeFri,
     config.sponsoredFeeLogPath,
@@ -78,28 +68,6 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
       if (request.method === "GET" && request.url === "/metrics") {
         requireMetricsAuth(request, config);
         sendText(request, response, 200, metrics.renderPrometheus());
-        return;
-      }
-
-      if (request.method === "POST" && request.url === "/privacy-signer/relay") {
-        const result = await measuredPaymasterRoute(metrics, "privacy_signer_relay", async () => {
-          const validated = validateRelayPrivacySignerRequest(await readJsonBody(request, config), config);
-          enforceRequestLimits(request, config, signerRateLimiter, clientRateLimiter, validated.account_address);
-          return submissionQueues.enqueue(config.accountAddress, async () => {
-            const release = await signerRelayBudget.reserve(relaySponsorshipKey(validated));
-            try {
-              return await relayPrivacyProofSignerCall(
-                validated,
-                config,
-                budgetedDeps(validated.account_address),
-              );
-            } catch (error) {
-              await release();
-              throw error;
-            }
-          });
-        });
-        sendJson(request, response, 200, result);
         return;
       }
 
@@ -441,17 +409,11 @@ function statusForError(message: string): number {
   if (message.includes("deployment budget exhausted")) {
     return 429;
   }
-  if (message.includes("relay budget exhausted")) {
-    return 429;
-  }
   if (
     message.includes("sponsored fee limit exceeded")
     || message.includes("sponsored fee budget exhausted")
   ) {
     return 429;
-  }
-  if (message.includes("approval was already sponsored")) {
-    return 409;
   }
   return 400;
 }
@@ -459,7 +421,7 @@ function statusForError(message: string): number {
 const PAYMASTER_LATENCY_BUCKETS_MS = [
   10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000
 ];
-const PAYMASTER_OPERATIONS = ["execute_outside", "privacy_signer_relay"];
+const PAYMASTER_OPERATIONS = ["execute_outside"];
 
 class PaymasterMetrics {
   private readonly outcomes = new Map<string, number>();
@@ -574,129 +536,6 @@ export class FixedWindowRateLimiter {
 
   get size(): number {
     return this.buckets.size;
-  }
-}
-
-type SignerRelayBudgetRecord = {
-  utc_day: string;
-  reserved: number;
-  sponsorships: string[];
-};
-
-export class SignerRelayBudget {
-  private loaded = false;
-  private record: SignerRelayBudgetRecord = {
-    utc_day: utcDay(),
-    reserved: 0,
-    sponsorships: [],
-  };
-  private persistTail: Promise<void> = Promise.resolve();
-
-  constructor(private readonly limitPerDay: number, private readonly path: string | null) {
-    if (!Number.isSafeInteger(limitPerDay) || limitPerDay <= 0) {
-      throw new Error("signer relay limit must be a positive integer");
-    }
-  }
-
-  async reserve(key: string): Promise<() => Promise<void>> {
-    await this.load();
-    this.rotateIfNeeded();
-    if (this.record.sponsorships.includes(key)) {
-      throw new Error("privacy signer approval was already sponsored");
-    }
-    if (this.record.reserved >= this.limitPerDay) {
-      throw new Error("privacy signer relay budget exhausted");
-    }
-    const reservationDay = this.record.utc_day;
-    this.record.reserved += 1;
-    this.record.sponsorships.push(key);
-    await this.persist();
-    let released = false;
-    return async () => {
-      if (released) return;
-      released = true;
-      this.record.sponsorships = this.record.sponsorships.filter(
-        (sponsorship) => sponsorship !== key
-      );
-      this.rotateIfNeeded();
-      if (this.record.utc_day === reservationDay) {
-        this.record.reserved = Math.max(0, this.record.reserved - 1);
-      }
-      await this.persist();
-    };
-  }
-
-  private async load(): Promise<void> {
-    if (this.loaded) return;
-    if (!this.path) {
-      this.loaded = true;
-      return;
-    }
-    let body: string;
-    try {
-      const metadata = await stat(this.path);
-      if (metadata.size > 64 * 1024 * 1024) {
-        throw new Error("signer relay budget file is too large");
-      }
-      body = await readFile(this.path, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        this.loaded = true;
-        return;
-      }
-      throw error;
-    }
-    if (body.trim()) {
-      const parsed = JSON.parse(body) as Partial<SignerRelayBudgetRecord>;
-      if (
-        typeof parsed.utc_day !== "string" ||
-        !/^\d{4}-\d{2}-\d{2}$/.test(parsed.utc_day) ||
-        !Number.isSafeInteger(parsed.reserved) ||
-        (parsed.reserved ?? 0) < 0 ||
-        !Array.isArray(parsed.sponsorships) ||
-        parsed.sponsorships.some((key) => typeof key !== "string")
-      ) {
-        throw new Error("signer relay budget file is invalid");
-      }
-      this.record = {
-        utc_day: parsed.utc_day,
-        reserved: parsed.reserved as number,
-        sponsorships: [...new Set(parsed.sponsorships)],
-      };
-      this.rotateIfNeeded();
-    }
-    this.loaded = true;
-  }
-
-  private rotateIfNeeded(): void {
-    const today = utcDay();
-    if (this.record.utc_day !== today) {
-      this.record.utc_day = today;
-      this.record.reserved = 0;
-    }
-  }
-
-  private async persist(): Promise<void> {
-    if (!this.path) return;
-    const snapshot = JSON.stringify(this.record) + "\n";
-    this.persistTail = this.persistTail.then(async () => {
-      await mkdir(dirname(this.path!), { recursive: true });
-      const tempPath = `${this.path}.${process.pid}.relay.tmp`;
-      const handle = await open(tempPath, "w");
-      try {
-        await handle.writeFile(snapshot, "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      try {
-        await rename(tempPath, this.path!);
-      } catch (error) {
-        await unlink(tempPath).catch(() => undefined);
-        throw error;
-      }
-    });
-    return this.persistTail;
   }
 }
 
@@ -856,15 +695,6 @@ export class SponsoredFeeBudget {
       await directory.close();
     }
   }
-}
-
-function relaySponsorshipKey(request: {
-  account_address: string;
-  calls: Array<{ contract_address: string; calldata: string[] }>;
-}): string {
-  const call = request.calls[0];
-  if (!call) throw new Error("privacy signer relay requires exactly one call");
-  return `${request.account_address}:${call.contract_address}:${call.calldata[0]}`;
 }
 
 function utcDay(now = new Date()): string {

@@ -145,7 +145,7 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     for (const field of ["privacy_pool", "privacy_pool_class_hash", "bridge_adapter", "paymaster_address", "proof_signer_class_hash"]) {
       if (!isNonZeroFelt(privacyFunding?.[field])) fail(`manifest funding.starknet_privacy.${field} must be set`);
     }
-    for (const field of ["discovery_url", "proving_url", "paymaster_url"]) {
+    for (const field of ["proving_url", "paymaster_url"]) {
       if (!/^https:\/\//i.test(privacyFunding?.[field] ?? "")) fail(`manifest funding.starknet_privacy.${field} must use https`);
     }
     if (manifest.proof?.config_locked_after_deploy !== true) fail("manifest proof.config_locked_after_deploy must be true");
@@ -185,7 +185,6 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     const marketIds = (registry?.markets ?? []).map((market) => market.market_id);
     if (!strictlySortedUnique(assetIds) || !strictlySortedUnique(marketIds)) fail("market registry assets and markets must be sorted and unique");
     if (!assets.get(registry?.gas_fee_asset_id)?.enabled || !assets.get(registry?.objective_numeraire_asset_id)?.enabled) fail("market registry gas and numeraire assets must be enabled");
-    if (!/^[1-9]\d*$/.test(String(registry?.connected_wallet_fee_reserve_amount ?? ""))) fail("market registry connected-wallet fee reserve must be positive");
     const tokenAddresses = new Set();
     for (const asset of rawAssets) {
       if (!isNonZeroFelt(asset.token_address) || !Number.isInteger(asset.decimals) || asset.decimals < 0 || asset.decimals > 36) fail(`asset ${asset.asset_id} has invalid token configuration`);

@@ -28,7 +28,6 @@ const BASE_ENV = {
   ZYLITH_PAYMASTER_ALLOWED_ORIGINS: "https://app.zylith.example",
   ZYLITH_PRIVACY_PROOF_SIGNER_CLASS_HASH: "0x987",
   ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH: "/var/lib/zylith/submissions.json",
-  ZYLITH_PAYMASTER_SIGNER_RELAY_LOG_PATH: "/var/lib/zylith/signer-relays.json",
   ZYLITH_PAYMASTER_SPONSORED_FEE_LOG_PATH: "/var/lib/zylith/sponsored-fees.json",
 } satisfies NodeJS.ProcessEnv;
 
@@ -37,11 +36,9 @@ describe("paymaster config", () => {
     const config = loadConfig({
       ...BASE_ENV,
       ZYLITH_PAYMASTER_MAX_SPONSORED_FEE_FRI: "900000000000000000",
-      ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY: "250",
     });
 
     expect(config.maxSponsoredFeeFri).toBe(900_000_000_000_000_000n);
-    expect(config.signerRelayLimitPerDay).toBe(250);
     expect(config.dailySponsoredFeePerPrincipalFri).toBe(5_000_000_000_000_000_000n);
   });
 
@@ -76,7 +73,6 @@ describe("paymaster config", () => {
     expect({
       privacySignerClassHash: config.privacySignerClassHash,
       allowedContracts: [...config.allowedContracts].sort(),
-      approvalSpenders: [...config.approvalSpenders].sort(),
       allowedEntrypoints: [...config.allowedEntrypoints].sort(),
       proofRequiredEntrypoints: [...config.proofRequiredEntrypoints].sort(),
       allowedOrigins: [...config.allowedOrigins].sort(),
@@ -88,6 +84,7 @@ describe("paymaster config", () => {
           "0x4718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
           "0x49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
           "0x512feac6339ff7889822cb5aa2a86c848e9d392bb0e3e237c008674feed8343",
+          "0x789",
         ],
         "allowedEntrypoints": [
           "apply_actions",
@@ -95,9 +92,6 @@ describe("paymaster config", () => {
         "allowedOrigins": [
           "https://app.zylith.example",
           "https://preview.zylith.example",
-        ],
-        "approvalSpenders": [
-          "0x123",
         ],
         "privacySignerClassHash": "0x987",
         "proofRequiredEntrypoints": [

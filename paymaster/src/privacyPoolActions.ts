@@ -5,6 +5,7 @@ export type PrivacyPoolAction = {
   amount?: bigint;
   target?: string;
   calldata?: string[];
+  noteId?: string;
 };
 
 export function parsePrivacyPoolActions(
@@ -28,8 +29,10 @@ export function parsePrivacyPoolActions(
     if (variant === 0) {
       const spanLength = safeNumber(calldata[offset + 2]);
       if (spanLength === null) return null;
+      actions.push({ variant });
       offset += 3 + spanLength;
     } else if (variant === 1) {
+      actions.push({ variant });
       offset += 5;
     } else if (variant === 2 || variant === 3) {
       if (offset + 3 >= calldata.length) return null;
@@ -45,16 +48,28 @@ export function parsePrivacyPoolActions(
       }
       offset += 4;
     } else if (variant === 4) {
+      if (offset + 5 >= calldata.length) return null;
+      actions.push({ variant });
       offset += 6;
     } else if (variant === 5) {
+      actions.push({ variant });
       offset += 7;
     } else if (variant === 6) {
+      actions.push({ variant });
       offset += 4;
     } else if (variant === 7) {
+      if (offset + 5 >= calldata.length) return null;
+      actions.push({
+        variant,
+        token: calldata[offset + 4]!,
+        noteId: calldata[offset + 5]!,
+      });
       offset += 6;
     } else if (variant === 8) {
+      actions.push({ variant });
       offset += 3;
     } else if (variant === 9) {
+      actions.push({ variant });
       offset += 2;
     } else {
       const spanLength = safeNumber(calldata[offset + 2]);

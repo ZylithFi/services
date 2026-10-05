@@ -531,7 +531,6 @@ pub struct StarknetPrivacyFundingRail {
     pub privacy_pool: String,
     pub privacy_pool_class_hash: String,
     pub bridge_adapter: String,
-    pub discovery_url: String,
     pub proving_url: String,
     pub proving_ohttp_policy: OhttpPolicy,
     pub paymaster_address: String,

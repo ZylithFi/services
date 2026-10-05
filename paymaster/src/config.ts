@@ -14,7 +14,6 @@ export type PaymasterConfig = {
   privacyPoolAddress: string;
   privacyPoolClassHash: string;
   allowedContracts: Set<string>;
-  approvalSpenders: Set<string>;
   allowedEntrypoints: Set<string>;
   proofRequiredEntrypoints: Set<string>;
   bindHost: string;
@@ -22,7 +21,6 @@ export type PaymasterConfig = {
   maxBodyBytes: number;
   allowedOrigins: Set<string>;
   signerLimitPerMinute: number;
-  signerRelayLimitPerDay: number;
   maxSponsoredFeeFri: bigint;
   dailySponsoredFeeFri: bigint;
   dailySponsoredFeePerPrincipalFri: bigint;
@@ -30,14 +28,12 @@ export type PaymasterConfig = {
   trustedProxyCidrs: string[];
   internalApiToken: string;
   submissionLogPath: string | null;
-  signerRelayLogPath: string | null;
   sponsoredFeeLogPath: string | null;
 };
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
 const DEFAULT_SIGNER_LIMIT_PER_MINUTE = 20;
-const DEFAULT_SIGNER_RELAY_LIMIT_PER_DAY = 500;
 const DEFAULT_MAX_SPONSORED_FEE_FRI = 1_000_000_000_000_000_000n;
 const DEFAULT_DAILY_SPONSORED_FEE_FRI = 100_000_000_000_000_000_000n;
 const DEFAULT_DAILY_SPONSORED_FEE_PER_PRINCIPAL_FRI = 5_000_000_000_000_000_000n;
@@ -69,8 +65,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     ...authority.fundingTokens,
     authority.privacyPool,
     authority.exchange,
+    authority.privacyBridge,
   ]);
-  const approvalSpenders = new Set([authority.privacyPool]);
   const allowedEntrypoints = parseNameSet(requiredEnv(env, "ZYLITH_PAYMASTER_ALLOWED_ENTRYPOINTS"));
   const proofRequiredEntrypoints = parseOptionalNameSet(
     requiredEnv(env, "ZYLITH_PAYMASTER_PROOF_REQUIRED_ENTRYPOINTS")
@@ -135,7 +131,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     privacyPoolAddress: authority.privacyPool,
     privacyPoolClassHash: authority.privacyPoolClassHash,
     allowedContracts,
-    approvalSpenders,
     allowedEntrypoints,
     proofRequiredEntrypoints,
     bindHost: env.ZYLITH_PAYMASTER_HOST ?? "127.0.0.1",
@@ -151,11 +146,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
       DEFAULT_SIGNER_LIMIT_PER_MINUTE,
       "ZYLITH_PAYMASTER_SIGNER_LIMIT_PER_MINUTE"
     ),
-    signerRelayLimitPerDay: parsePositiveInt(
-      env.ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY,
-      DEFAULT_SIGNER_RELAY_LIMIT_PER_DAY,
-      "ZYLITH_PAYMASTER_SIGNER_RELAY_LIMIT_PER_DAY"
-    ),
     maxSponsoredFeeFri,
     dailySponsoredFeeFri,
     dailySponsoredFeePerPrincipalFri,
@@ -163,7 +153,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PaymasterConfi
     trustedProxyCidrs,
     internalApiToken,
     submissionLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SUBMISSION_LOG_PATH"),
-    signerRelayLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SIGNER_RELAY_LOG_PATH"),
     sponsoredFeeLogPath: requiredEnv(env, "ZYLITH_PAYMASTER_SPONSORED_FEE_LOG_PATH")
   };
 }

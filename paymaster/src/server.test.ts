@@ -8,7 +8,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PaymasterConfig } from "./config.js";
 import {
   FixedWindowRateLimiter,
-  SignerRelayBudget,
   SponsoredFeeBudget,
   SubmissionQueues,
   createPaymasterServer
@@ -315,19 +314,6 @@ describe("paymaster server", () => {
 
     const responses: Response[] = [];
     for (let index = 0; index < 4; index += 1) {
-      const signer = `0x${(0x770 + index).toString(16)}`;
-      const body = {
-        ...request,
-        signer_address: signer,
-        outside_transaction: {
-          ...request.outside_transaction,
-          signerAddress: signer,
-          outsideExecution: {
-            ...request.outside_transaction.outsideExecution,
-            nonce: `0x${(0x90 + index).toString(16)}`
-          }
-        }
-      };
       responses.push(
         await fetch(`${url}/execute-outside`, {
           method: "POST",
@@ -336,7 +322,7 @@ describe("paymaster server", () => {
             origin: "https://app.example",
             "x-forwarded-for": `203.0.113.${index + 1}`
           },
-          body: JSON.stringify(body)
+          body: JSON.stringify(requestWithSigner(index))
         })
       );
     }
@@ -412,56 +398,9 @@ describe("paymaster server", () => {
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 429]);
   });
 
-  it("relays approvals for an already deployed privacy signer", async () => {
-    const server = createPaymasterServer(config(), {
-      fetchImpl: fakeRpcFetch(),
-      runtime: fakeRuntime()
-    });
-    servers.push(server);
-    const url = await listen(server);
-    const relayBody = {
-      account_address: "0x1234",
-      calls: [{
-        contract_address: "0x123",
-        entrypoint: "approve",
-        calldata: ["0x123", "0xffffffffffffffffffffffffffffffff", "0x0"]
-      }],
-      nonce: "0x55",
-      signature_r: "0xaa",
-      signature_s: "0xbb"
-    };
-
-    const relayBeforeEnsure = await fetch(`${url}/privacy-signer/relay`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        origin: "https://app.example"
-      },
-      body: JSON.stringify(relayBody)
-    });
-    expect(relayBeforeEnsure.status).toBe(200);
-    await expect(relayBeforeEnsure.json()).resolves.toEqual({ transaction_hash: "0xtx" });
-
-  });
 });
 
 describe("paymaster in-memory bounds", () => {
-  it("allows only one successful approval sponsorship per signer token and spender", async () => {
-    const budget = new SignerRelayBudget(2, null);
-    await budget.reserve("signer:token:spender");
-    await expect(budget.reserve("signer:token:spender")).rejects.toThrow(
-      "approval was already sponsored"
-    );
-    await expect(budget.reserve("other:token:spender")).resolves.toBeTypeOf("function");
-  });
-
-  it("releases failed approval sponsorship reservations", async () => {
-    const budget = new SignerRelayBudget(1, null);
-    const release = await budget.reserve("signer:token:spender");
-    await release();
-    await expect(budget.reserve("signer:token:spender")).resolves.toBeTypeOf("function");
-  });
-
   it("removes expired rate-limit subjects during periodic sweeps", () => {
     const limiter = new FixedWindowRateLimiter(10);
     for (let index = 0; index < 100; index += 1) {
@@ -540,7 +479,6 @@ function config(): PaymasterConfig {
     privacyPoolAddress: "0x123",
     privacyPoolClassHash: "0xabc",
     allowedContracts: new Set(["0x123"]),
-    approvalSpenders: new Set(["0x123"]),
     allowedEntrypoints: new Set(["apply_actions"]),
     proofRequiredEntrypoints: new Set(["apply_actions"]),
     bindHost: "127.0.0.1",
@@ -548,7 +486,6 @@ function config(): PaymasterConfig {
     maxBodyBytes: 1_000_000,
     allowedOrigins: new Set(["https://app.example"]),
     signerLimitPerMinute: 20,
-    signerRelayLimitPerDay: 500,
     maxSponsoredFeeFri: 1_000_000_000_000_000_000n,
     dailySponsoredFeeFri: 100_000_000_000_000_000_000n,
     dailySponsoredFeePerPrincipalFri: 5_000_000_000_000_000_000n,
@@ -556,7 +493,6 @@ function config(): PaymasterConfig {
     trustedProxyCidrs: [],
     internalApiToken: "test-paymaster-token",
     submissionLogPath: null,
-    signerRelayLogPath: null,
     sponsoredFeeLogPath: null
   };
 }
@@ -627,7 +563,18 @@ const request: ExecuteOutsideRequest = {
   call: {
     contract_address: "0x123",
     entrypoint: "apply_actions",
-    calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
+    calldata: [
+      "0x2",
+      "0x7", "0xaaa", "0xbbb", "0xccc", "0x456", "0x999",
+      "0xa", "0x789", "0xa",
+      "0x0", "0x3", "0x666", "0x999", "0x777",
+      "0x0", "0x0", "0x0", "0x0", "0x0",
+    ]
+  },
+  authorization_call: {
+    contract_address: "0x789",
+    entrypoint: "authorize_strk20_exit_claim",
+    calldata: ["0x666", "0x999", "0x777", "0x1", "0x2"],
   },
   outside_transaction: {
     outsideExecution: {
@@ -639,7 +586,13 @@ const request: ExecuteOutsideRequest = {
         {
           to: "0x123",
           selector: "0x246333a752c1ac637ff1591c5c885e27d56060d241a29aad8475072da0777db",
-          calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
+          calldata: [
+            "0x2",
+            "0x7", "0xaaa", "0xbbb", "0xccc", "0x456", "0x999",
+            "0xa", "0x789", "0xa",
+            "0x0", "0x3", "0x666", "0x999", "0x777",
+            "0x0", "0x0", "0x0", "0x0", "0x0",
+          ]
         }
       ]
     },
@@ -653,15 +606,26 @@ const request: ExecuteOutsideRequest = {
 
 function requestWithSigner(index: number): ExecuteOutsideRequest {
   const signer = `0x${(0x770 + index).toString(16)}`;
+  const calldata = [...request.call.calldata];
+  calldata[14] = signer;
   return {
     ...request,
     signer_address: signer,
+    call: { ...request.call, calldata },
+    authorization_call: {
+      ...request.authorization_call!,
+      calldata: ["0x666", "0x999", signer, "0x1", "0x2"],
+    },
     outside_transaction: {
       ...request.outside_transaction,
       signerAddress: signer,
       outsideExecution: {
         ...request.outside_transaction.outsideExecution,
-        nonce: `0x${(0x90 + index).toString(16)}`
+        nonce: `0x${(0x90 + index).toString(16)}`,
+        calls: [{
+          ...request.outside_transaction!.outsideExecution.calls[0]!,
+          calldata,
+        }],
       }
     }
   };

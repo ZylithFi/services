@@ -16,7 +16,6 @@ import type { PaymasterConfig } from "./config.js";
 import type {
   ExecuteOutsideRequest,
   ExecuteOutsideResponse,
-  RelayPrivacySignerRequest,
   RpcResponse
 } from "./types.js";
 
@@ -95,44 +94,6 @@ async function deployedClassHash(
   );
 }
 
-export async function relayPrivacyProofSignerCall(
-  request: RelayPrivacySignerRequest,
-  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "privacySignerClassHash" | "feeTokenAddress">,
-  deps: SubmitterDeps = {}
-): Promise<ExecuteOutsideResponse> {
-  const runtime = deps.runtime ?? defaultRuntime;
-  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
-  const deployed = await deployedClassHash(provider, request.account_address);
-  if (!deployed) {
-    throw new Error("privacy proof signer account is not deployed");
-  }
-  if (toRpcFelt(deployed, "privacy signer class hash") !== config.privacySignerClassHash) {
-    throw new Error("privacy proof signer account class is not allowlisted");
-  }
-  const calls = request.calls.map((call) => ({
-    contractAddress: call.contract_address,
-    entrypoint: call.entrypoint,
-    calldata: call.calldata,
-  }));
-  const relayCall: Call = {
-    contractAddress: request.account_address,
-    entrypoint: "execute_from_relayer",
-    calldata: [
-      String(calls.length),
-      ...calls.flatMap((call) => [
-        call.contractAddress,
-        selector.getSelectorFromName(call.entrypoint),
-        String(call.calldata?.length ?? 0),
-        ...(call.calldata ?? []),
-      ]),
-      request.nonce,
-      request.signature_r,
-      request.signature_s,
-    ],
-  };
-  return submitPaymasterCalls([relayCall], config, deps);
-}
-
 export async function submitProofBearingOutsideExecution(
   request: ExecuteOutsideRequest,
   config: ProofSubmissionConfig,
@@ -142,11 +103,16 @@ export async function submitProofBearingOutsideExecution(
     throw new Error("proof and proof_facts are required for paymaster execution");
   }
   const runtime = deps.runtime ?? defaultRuntime;
-  const calls = request.outside_transaction
-    ? (runtime.outsideExecution.buildExecuteFromOutsideCall(
-        request.outside_transaction as OutsideTransaction
-      ) as Call[])
-    : [callPayloadToStarknetCall(request.call)];
+  const calls = [
+    ...(request.authorization_call
+      ? [callPayloadToStarknetCall(request.authorization_call)]
+      : []),
+    ...(request.outside_transaction
+      ? (runtime.outsideExecution.buildExecuteFromOutsideCall(
+          request.outside_transaction as OutsideTransaction
+        ) as Call[])
+      : [callPayloadToStarknetCall(request.call)]),
+  ];
   return submitPaymasterCalls(calls, config, deps, request.proof, request.proof_facts);
 }
 
@@ -427,11 +393,12 @@ async function poolApplyActionsFee(
   rpcUrl: string,
   calls: Call[]
 ): Promise<bigint> {
-  if (calls.length !== 1 || calls[0]?.entrypoint !== "apply_actions") return 0n;
+  const poolCalls = calls.filter((call) => call.entrypoint === "apply_actions");
+  if (poolCalls.length !== 1) return 0n;
   return starknetCallFelt(
     fetchImpl,
     rpcUrl,
-    calls[0].contractAddress,
+    poolCalls[0]!.contractAddress,
     "get_fee_amount",
     []
   );

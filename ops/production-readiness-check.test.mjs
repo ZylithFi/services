@@ -22,7 +22,6 @@ Object.assign(manifest.funding.starknet_privacy, {
   privacy_pool: felt(16),
   privacy_pool_class_hash: felt(19),
   bridge_adapter: felt(2),
-  discovery_url: "https://discovery.example",
   proving_url: "https://prover.example",
   paymaster_address: felt(17),
   paymaster_url: "https://paymaster.example",

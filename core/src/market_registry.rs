@@ -203,8 +203,6 @@ pub struct MarketRegistry {
     pub network: String,
     pub chain_id: String,
     pub gas_fee_asset_id: AssetId,
-    #[serde(with = "serde_u128_decimal")]
-    pub connected_wallet_fee_reserve_amount: u128,
     pub objective_numeraire_asset_id: AssetId,
     pub assets: Vec<MarketRegistryAsset>,
     pub markets: Vec<MarketRegistryMarket>,
@@ -242,9 +240,6 @@ impl MarketRegistry {
         }
         if self.assets.is_empty() || self.markets.is_empty() {
             return Err("market registry must contain assets and markets".into());
-        }
-        if self.connected_wallet_fee_reserve_amount == 0 {
-            return Err("connected-wallet fee reserve must be positive".into());
         }
         ensure_sorted_unique(
             self.assets.iter().map(|asset| asset.asset_id.0.as_str()),

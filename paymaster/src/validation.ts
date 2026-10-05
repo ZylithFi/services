@@ -4,13 +4,11 @@ import type { PaymasterConfig } from "./config.js";
 import { normalizeFelt } from "./config.js";
 import type {
   ExecuteOutsideRequest,
-  RelayPrivacySignerRequest,
   StarknetCallPayload
 } from "./types.js";
 import { parsePrivacyPoolActions } from "./privacyPoolActions.js";
 
 const MAX_OUTSIDE_EXECUTION_WINDOW_SECONDS = 3_900;
-const CANONICAL_PRIVACY_SIGNER_APPROVAL_LOW = "0xffffffffffffffffffffffffffffffff";
 const SUPPORTED_EXECUTE_OUTSIDE_ENTRYPOINTS = new Set([
   "apply_actions",
   "request_residual_recovery",
@@ -20,17 +18,11 @@ const EXECUTE_OUTSIDE_REQUEST_KEYS = new Set([
   "signer_address",
   "paymaster_address",
   "call",
+  "authorization_call",
   "outside_transaction",
   "relay_nonce",
   "proof",
   "proof_facts",
-]);
-const RELAY_PRIVACY_SIGNER_REQUEST_KEYS = new Set([
-  "account_address",
-  "calls",
-  "nonce",
-  "signature_r",
-  "signature_s",
 ]);
 const CALL_KEYS = new Set(["contract_address", "entrypoint", "calldata"]);
 const OUTSIDE_TRANSACTION_KEYS = new Set([
@@ -59,12 +51,16 @@ export function validateExecuteOutsideRequest(
     | "chainId"
     | "proofRequiredEntrypoints"
     | "privacyBridgeAddress"
+    | "privacyPoolAddress"
   >,
   nowUnixSeconds = Math.floor(Date.now() / 1000)
 ): ExecuteOutsideRequest {
   const request = expectRecord(value, "request") as Partial<ExecuteOutsideRequest>;
   assertAllowedKeys(request, EXECUTE_OUTSIDE_REQUEST_KEYS, "request");
   const call = validateCall(request.call);
+  const authorizationCall = request.authorization_call
+    ? validateCall(request.authorization_call)
+    : undefined;
 
   const chainId = normalizeFelt(expectString(request.chain_id, "chain_id"));
   const signerAddress = normalizeFelt(expectString(request.signer_address, "signer_address"));
@@ -107,6 +103,25 @@ export function validateExecuteOutsideRequest(
     throw new Error("proof_facts require proof");
   }
   if (call.entrypoint === "apply_actions") {
+    if (call.contract_address !== config.privacyPoolAddress) {
+      throw new Error("privacy-pool sponsorship must target the pinned privacy pool");
+    }
+    if (!authorizationCall) {
+      throw new Error("privacy-pool claim requires an atomic Zylith claim authorization");
+    }
+    if (
+      authorizationCall.contract_address !== config.privacyBridgeAddress
+      || authorizationCall.entrypoint !== "authorize_strk20_exit_claim"
+    ) {
+      throw new Error("privacy-pool claim authorization must target the Zylith bridge");
+    }
+    const authorization = parseClaimAuthorizationCalldata(authorizationCall.calldata);
+    if (!authorization) {
+      throw new Error("privacy-pool claim authorization is malformed");
+    }
+    if (authorization.recipient !== signerAddress) {
+      throw new Error("privacy-pool claim recipient must match the sponsoring principal");
+    }
     const actions = parsePrivacyPoolActions(call.calldata, normalizeFelt);
     const bridgeInvokes = actions?.filter(
       (action) => action.variant === 10 && action.target === config.privacyBridgeAddress
@@ -114,10 +129,25 @@ export function validateExecuteOutsideRequest(
     if (!actions || bridgeInvokes?.length !== 1) {
       throw new Error("privacy-pool sponsorship requires exactly one Zylith bridge invoke");
     }
+    const openNotes = actions.filter((action) => action.variant === 7);
+    const claim = parseClaimBridgeCalldata(bridgeInvokes[0]?.calldata);
+    if (
+      openNotes.length !== 1
+      || !claim
+      || openNotes[0]?.noteId !== claim.openNoteId
+      || openNotes[0]?.noteId !== authorization.openNoteId
+      || claim.exitCommitment !== authorization.exitCommitment
+      || claim.recipient !== authorization.recipient
+      || !openNotes[0]?.token
+    ) {
+      throw new Error("privacy-pool sponsorship requires one exactly bound Zylith claim");
+    }
     if (
       actions.some(
         (action) =>
           (action.variant === 10 && action.target !== config.privacyBridgeAddress)
+          || action.variant === 2
+          || action.variant === 3
           || action.variant === 11
       )
     ) {
@@ -137,12 +167,17 @@ export function validateExecuteOutsideRequest(
     }
   }
 
+  if (call.entrypoint !== "apply_actions" && authorizationCall) {
+    throw new Error("claim authorization is only valid for privacy-pool claims");
+  }
+
   const validated: ExecuteOutsideRequest = {
     chain_id: chainId,
     signer_address: signerAddress,
     paymaster_address: paymasterAddress,
     call,
   };
+  if (authorizationCall) validated.authorization_call = authorizationCall;
   if (outsideTransaction) validated.outside_transaction = outsideTransaction;
   if (request.relay_nonce !== undefined) validated.relay_nonce = normalizeFelt(String(request.relay_nonce));
   if (proof) {
@@ -152,6 +187,33 @@ export function validateExecuteOutsideRequest(
     validated.proof_facts = proofFacts;
   }
   return validated;
+}
+
+function parseClaimBridgeCalldata(calldata: string[] | undefined) {
+  if (!calldata || calldata.length !== 10) return null;
+  const lengths = [calldata[0], calldata[1], calldata[5], calldata[6], calldata[7], calldata[8], calldata[9]];
+  if (lengths.some((value, index) => value !== (index === 1 ? "0x3" : "0x0"))) return null;
+  const exitCommitment = calldata[2];
+  const openNoteId = calldata[3];
+  const recipient = calldata[4];
+  if (
+    !exitCommitment
+    || exitCommitment === "0x0"
+    || !openNoteId
+    || openNoteId === "0x0"
+    || !recipient
+    || recipient === "0x0"
+  ) return null;
+  return { exitCommitment, openNoteId, recipient };
+}
+
+function parseClaimAuthorizationCalldata(calldata: string[]) {
+  if (calldata.length !== 5 || calldata.some((value) => value === "0x0")) return null;
+  return {
+    exitCommitment: calldata[0]!,
+    openNoteId: calldata[1]!,
+    recipient: calldata[2]!,
+  };
 }
 
 function validateOutsideTransaction(
@@ -211,53 +273,6 @@ function validateOutsideTransaction(
     throw new Error("outside execution is not active yet");
   }
   assertOutsideCallMatchesPayload(call, outsideExecution);
-}
-
-export function validateRelayPrivacySignerRequest(
-  value: unknown,
-  config: Pick<PaymasterConfig, "allowedContracts" | "approvalSpenders">
-): RelayPrivacySignerRequest {
-  const request = expectRecord(value, "request") as Partial<RelayPrivacySignerRequest>;
-  assertAllowedKeys(request, RELAY_PRIVACY_SIGNER_REQUEST_KEYS, "request");
-  const accountAddress = normalizeFelt(expectString(request.account_address, "account_address"));
-  const callsValue = request.calls;
-  if (!Array.isArray(callsValue) || callsValue.length !== 1) {
-    throw new Error("privacy signer relay requires exactly one call");
-  }
-  const calls = callsValue.map(validateCall);
-  const call = calls[0];
-  if (!call) {
-    throw new Error("privacy signer relay requires exactly one call");
-  }
-  if (call.entrypoint !== "approve") {
-    throw new Error("privacy signer relay only supports token approve");
-  }
-  if (call.calldata.length !== 3) {
-    throw new Error("token approve calldata is invalid");
-  }
-  const spender = call.calldata[0];
-  if (!spender) {
-    throw new Error("token approve calldata is invalid");
-  }
-  if (!config.allowedContracts.has(call.contract_address)) {
-    throw new Error("token approve contract is not allowlisted");
-  }
-  if (!config.approvalSpenders.has(spender)) {
-    throw new Error("token approve spender is not allowlisted");
-  }
-  if (
-    call.calldata[1] !== CANONICAL_PRIVACY_SIGNER_APPROVAL_LOW ||
-    call.calldata[2] !== "0x0"
-  ) {
-    throw new Error("token approve amount is not canonical");
-  }
-  return {
-    account_address: accountAddress,
-    calls,
-    nonce: normalizeFelt(expectString(request.nonce, "nonce")),
-    signature_r: normalizeFelt(expectString(request.signature_r, "signature_r")),
-    signature_s: normalizeFelt(expectString(request.signature_s, "signature_s")),
-  };
 }
 
 function parseSafeUnsignedInteger(value: string, label: string): number {

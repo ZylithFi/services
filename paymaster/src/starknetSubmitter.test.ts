@@ -2,14 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { StarknetRuntime } from "./starknetSubmitter.js";
 import {
-  relayPrivacyProofSignerCall,
   submitProofBearingOutsideExecution,
   verifyPinnedPrivacyPoolClass
 } from "./starknetSubmitter.js";
-import type {
-  ExecuteOutsideRequest,
-  RelayPrivacySignerRequest
-} from "./types.js";
+import type { ExecuteOutsideRequest } from "./types.js";
 
 describe("submitProofBearingOutsideExecution", () => {
   it("fails startup when the deployed privacy pool class is not pinned", async () => {
@@ -36,24 +32,17 @@ describe("submitProofBearingOutsideExecution", () => {
   it("rejects a transaction whose resource bounds exceed the sponsorship cap", async () => {
     let submissions = 0;
     await expect(
-      relayPrivacyProofSignerCall(
-        relayRequest,
+      submitProofBearingOutsideExecution(
+        request,
         {
           rpcUrl: "https://rpc.example",
           chainId: "0x534e5f5345504f4c4941",
           accountAddress: "0xabc",
           privateKey: "0xkey",
-          privacySignerClassHash: "0xabc",
           maxSponsoredFeeFri: 1n,
         },
         {
-          runtime: {
-            ...fakeRuntime,
-            RpcProvider: class {
-              constructor(_options: { nodeUrl: string }) {}
-              async getClassHashAt() { return "0xabc"; }
-            },
-          },
+          runtime: fakeRuntime,
           fetchImpl: async (_url, init) => {
             const body = JSON.parse(String(init?.body));
             if (body.method === "starknet_estimateFee") {
@@ -215,17 +204,6 @@ describe("submitProofBearingOutsideExecution", () => {
       );
     };
 
-    await relayPrivacyProofSignerCall(
-      relayRequest,
-      {
-        rpcUrl: "https://rpc.configured.example",
-        chainId: "0x534e5f5345504f4c4941",
-        accountAddress: "0xabc",
-        privateKey: "0xkey",
-        privacySignerClassHash: "0xabc"
-      },
-      { runtime, fetchImpl }
-    );
     await submitProofBearingOutsideExecution(
       request,
       {
@@ -1069,89 +1047,6 @@ describe("submitProofBearingOutsideExecution", () => {
     expect(message).not.toContain(privateFelt);
   });
 
-  it("only relays privacy signer calls for the configured signer class hash", async () => {
-    const seen: { body?: unknown } = {};
-    const runtime = {
-      ...fakeRuntime,
-      RpcProvider: class {
-        constructor(_options: { nodeUrl: string }) {}
-
-        async getClassHashAt(contractAddress: string) {
-          if (contractAddress === "0x99") {
-            return "0xabc";
-          }
-          return null;
-        }
-      }
-    } satisfies StarknetRuntime;
-
-    const result = await relayPrivacyProofSignerCall(
-      relayRequest,
-      {
-        rpcUrl: "https://rpc.example",
-        chainId: "0x534e5f5345504f4c4941",
-        accountAddress: "0xabc",
-        privateKey: "0xkey",
-        privacySignerClassHash: "0xabc"
-      },
-      {
-        runtime,
-        fetchImpl: async (_url, init) => {
-          const body = JSON.parse(init?.body as string);
-          if (body.method === "starknet_estimateFee") {
-            return new Response(
-              JSON.stringify({
-                jsonrpc: "2.0",
-                id: 1,
-                result: [
-                  {
-                    l1_gas_consumed: "0x2",
-                    l1_gas_price: "0x4",
-                    l2_gas_consumed: "0x6",
-                    l2_gas_price: "0x8",
-                    l1_data_gas_consumed: "0xa",
-                    l1_data_gas_price: "0xc"
-                  }
-                ]
-              }),
-              { status: 200 }
-            );
-          }
-          seen.body = body;
-          return new Response(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              result: { transaction_hash: "0xrelayed" }
-            }),
-            { status: 200 }
-          );
-        }
-      }
-    );
-
-    expect(result.transaction_hash).toBe("0xrelayed");
-    expect(
-      (seen.body as { params: { invoke_transaction: { calldata: string[] } } }).params
-        .invoke_transaction.calldata
-    ).toEqual(["1", "2"]);
-  });
-
-  it("rejects privacy signer relay calls to non-signer contracts", async () => {
-    await expect(
-      relayPrivacyProofSignerCall(
-        relayRequest,
-        {
-          rpcUrl: "https://rpc.example",
-          chainId: "0x534e5f5345504f4c4941",
-          accountAddress: "0xabc",
-          privateKey: "0xkey",
-          privacySignerClassHash: "0xabc"
-        },
-        { runtime: fakeRuntime }
-      )
-    ).rejects.toThrow("privacy proof signer account is not deployed");
-  });
 });
 
 const request: ExecuteOutsideRequest = {
@@ -1177,20 +1072,6 @@ const request: ExecuteOutsideRequest = {
   },
   proof: "proof-bytes",
   proof_facts: ["0x1"]
-};
-
-const relayRequest: RelayPrivacySignerRequest = {
-  account_address: "0x99",
-  calls: [
-    {
-      contract_address: "0x123",
-      entrypoint: "approve",
-      calldata: ["0x456", "0x1", "0x0"]
-    }
-  ],
-  nonce: "0x1",
-  signature_r: "0x2",
-  signature_s: "0x3"
 };
 
 const fakeRuntime = {

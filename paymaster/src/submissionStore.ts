@@ -263,6 +263,7 @@ function submissionNonce(request: ExecuteOutsideRequest): string {
       chain_id: normalizeFelt(request.chain_id),
       paymaster_address: normalizeFelt(request.paymaster_address),
       call: request.call,
+      authorization_call: request.authorization_call ?? null,
       proof: request.proof ?? null,
       proof_facts: request.proof_facts ?? null
     }))

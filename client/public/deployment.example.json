@@ -15,11 +15,10 @@
   "market_registry": {
     "schema_version": 1,
     "registry_version": 1,
-    "registry_hash": "2c3ae632757e21f964e0776563a1cf1bc41bf5edbbbce7a5644dd26d6f2a8483",
+    "registry_hash": "d97b2682bce71b0ee03862f6b0eef3cdbda997eeef46932e826fbd645fbe97e1",
     "network": "sepolia",
     "chain_id": "0x534e5f5345504f4c4941",
     "gas_fee_asset_id": "STRK",
-    "connected_wallet_fee_reserve_amount": "5000000000000",
     "objective_numeraire_asset_id": "USDC",
     "assets": [
       {
@@ -196,7 +195,6 @@
       "privacy_pool": "0x0",
       "privacy_pool_class_hash": "0x0",
       "bridge_adapter": "0x0",
-      "discovery_url": "https://discovery.example.invalid",
       "proving_url": "https://prover.example.invalid",
       "proving_ohttp_policy": "best_effort",
       "paymaster_address": "0x0",

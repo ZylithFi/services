@@ -2,10 +2,7 @@ import { describe, expect, it } from "vitest";
 import { selector } from "starknet";
 
 import type { PaymasterConfig } from "./config.js";
-import {
-  validateExecuteOutsideRequest,
-  validateRelayPrivacySignerRequest
-} from "./validation.js";
+import { validateExecuteOutsideRequest } from "./validation.js";
 
 const config: Pick<
   PaymasterConfig,
@@ -15,13 +12,15 @@ const config: Pick<
   | "chainId"
   | "proofRequiredEntrypoints"
   | "privacyBridgeAddress"
+  | "privacyPoolAddress"
 > = {
   accountAddress: "0xabc",
   chainId: "0x534e5f5345504f4c4941",
-  allowedContracts: new Set(["0x123"]),
+  allowedContracts: new Set(["0x123", "0x789"]),
   allowedEntrypoints: new Set(["apply_actions"]),
   proofRequiredEntrypoints: new Set(["apply_actions"]),
   privacyBridgeAddress: "0x789",
+  privacyPoolAddress: "0x123",
 };
 
 describe("validateExecuteOutsideRequest", () => {
@@ -126,6 +125,50 @@ describe("validateExecuteOutsideRequest", () => {
     expect(validated.outside_transaction).toBeUndefined();
   });
 
+  it("rejects a claim without its atomic bridge authorization", () => {
+    const request = baseRequest();
+    delete (request as { authorization_call?: unknown }).authorization_call;
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+
+    expect(() => validateExecuteOutsideRequest(request, config, 1_700_000_000)).toThrow(
+      "requires an atomic Zylith claim authorization"
+    );
+  });
+
+  it("rejects apply_actions on any contract except the pinned privacy pool", () => {
+    const request = baseRequest();
+    request.call.contract_address = "0x789";
+    request.outside_transaction.outsideExecution.calls[0]!.to = "0x789";
+
+    expect(() => validateExecuteOutsideRequest(request, config, 1_700_000_000)).toThrow(
+      "must target the pinned privacy pool"
+    );
+  });
+
+  it("rejects recipient and exit mismatches between authorization and proof", () => {
+    const recipientMismatch = baseRequest();
+    recipientMismatch.authorization_call.calldata[2] = "0x778";
+    expect(() => validateExecuteOutsideRequest(recipientMismatch, config, 1_700_000_000)).toThrow(
+      "recipient must match the sponsoring principal"
+    );
+
+    const exitMismatch = baseRequest();
+    exitMismatch.authorization_call.calldata[0] = "0x667";
+    expect(() => validateExecuteOutsideRequest(exitMismatch, config, 1_700_000_000)).toThrow(
+      "requires one exactly bound Zylith claim"
+    );
+  });
+
+  it("rejects a claim whose exact open note differs from its authorization", () => {
+    const request = baseRequest();
+    request.call.calldata[13] = "0x778";
+    delete (request as { outside_transaction?: unknown }).outside_transaction;
+
+    expect(() => validateExecuteOutsideRequest(request, config, 1_700_000_000)).toThrow(
+      "requires one exactly bound Zylith claim"
+    );
+  });
+
   it("rejects privacy-pool actions that are not bound to the Zylith bridge", () => {
     const missing = baseRequest();
     missing.call.calldata = ["0x1", "0x2", "0x777", "0x456", "0x1"];
@@ -142,7 +185,7 @@ describe("validateExecuteOutsideRequest", () => {
     ];
     foreign.outside_transaction.outsideExecution.calls[0]!.calldata = foreign.call.calldata;
     expect(() => validateExecuteOutsideRequest(foreign, config, 1_700_000_000)).toThrow(
-      "cannot invoke another contract"
+      /exactly bound Zylith claim|cannot invoke another contract/
     );
 
     const duplicate = baseRequest();
@@ -161,6 +204,7 @@ describe("validateExecuteOutsideRequest", () => {
     const request = baseRequest();
     request.call.entrypoint = "request_residual_recovery";
     request.call.calldata = ["0x1", "0x2", "0x3"];
+    delete (request as { authorization_call?: unknown }).authorization_call;
     delete (request as { outside_transaction?: unknown }).outside_transaction;
     const recoveryConfig = {
       ...config,
@@ -239,151 +283,14 @@ describe("validateExecuteOutsideRequest", () => {
   });
 });
 
-describe("validateRelayPrivacySignerRequest", () => {
-  it("accepts a signer-owned token approve to the allowlisted privacy pool", () => {
-    const validated = validateRelayPrivacySignerRequest(
-      {
-        account_address: "0x777",
-        calls: [{
-          contract_address: "0x456",
-          entrypoint: "approve",
-          calldata: ["0x123", "0xffffffffffffffffffffffffffffffff", "0x0"]
-        }],
-        nonce: "0x999",
-        signature_r: "0xa",
-        signature_s: "0xb"
-      },
-      { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
-    );
-
-    expect(validated.account_address).toBe("0x777");
-    expect(validated.calls[0]?.entrypoint).toBe("approve");
-  });
-
-  it("rejects approvals that are not the canonical reusable amount", () => {
-    expect(() =>
-      validateRelayPrivacySignerRequest(
-        {
-          account_address: "0x777",
-          calls: [{
-            contract_address: "0x456",
-            entrypoint: "approve",
-            calldata: ["0x123", "0x64", "0x0"]
-          }],
-          nonce: "0x999",
-          signature_r: "0xa",
-          signature_s: "0xb"
-        },
-        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
-      )
-    ).toThrow("token approve amount is not canonical");
-  });
-
-  it("rejects unknown signer relay request fields", () => {
-    expect(() =>
-      validateRelayPrivacySignerRequest(
-        {
-          account_address: "0x777",
-          calls: [{
-            contract_address: "0x456",
-            entrypoint: "approve",
-            calldata: ["0x123", "0x64", "0x0"]
-          }],
-          nonce: "0x999",
-          signature_r: "0xa",
-          signature_s: "0xb",
-          unsupported_paymaster_hint: "unexpected",
-        },
-        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
-      )
-    ).toThrow("request.unsupported_paymaster_hint is not supported");
-  });
-
-  it("rejects signer relays that approve an unallowlisted spender", () => {
-    expect(() =>
-      validateRelayPrivacySignerRequest(
-        {
-          account_address: "0x777",
-          calls: [{
-            contract_address: "0x456",
-            entrypoint: "approve",
-            calldata: ["0xdead", "0x64", "0x0"]
-          }],
-          nonce: "0x999",
-          signature_r: "0xa",
-          signature_s: "0xb"
-        },
-        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
-      )
-    ).toThrow("token approve spender is not allowlisted");
-  });
-
-  it("does not allow token contracts themselves as approval spenders", () => {
-    expect(() =>
-      validateRelayPrivacySignerRequest(
-        {
-          account_address: "0x777",
-          calls: [{
-            contract_address: "0x456",
-            entrypoint: "approve",
-            calldata: ["0x456", "0x64", "0x0"]
-          }],
-          nonce: "0x999",
-          signature_r: "0xa",
-          signature_s: "0xb"
-        },
-        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
-      )
-    ).toThrow("token approve spender is not allowlisted");
-  });
-
-  it("rejects privacy signer multicall bundles", () => {
-    expect(() =>
-      validateRelayPrivacySignerRequest(
-        {
-          account_address: "0x777",
-          calls: [
-            {
-              contract_address: "0x456",
-              entrypoint: "approve",
-              calldata: ["0x123", "0x64", "0x0"]
-            },
-            {
-              contract_address: "0x456",
-              entrypoint: "approve",
-              calldata: ["0x123", "0x64", "0x0"]
-            }
-          ],
-          nonce: "0x999",
-          signature_r: "0xa",
-          signature_s: "0xb"
-        },
-        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
-      )
-    ).toThrow("privacy signer relay requires exactly one call");
-  });
-
-  it("rejects privacy signer relays for non-approve entrypoints", () => {
-    expect(() =>
-      validateRelayPrivacySignerRequest(
-        {
-          account_address: "0x777",
-          calls: [{
-            contract_address: "0x456",
-            entrypoint: "transfer",
-            calldata: ["0x123", "0x64", "0x0"]
-          }],
-          nonce: "0x999",
-          signature_r: "0xa",
-          signature_s: "0xb"
-        },
-        { allowedContracts: new Set(["0x456"]), approvalSpenders: new Set(["0x123"]) }
-      )
-    ).toThrow("privacy signer relay only supports token approve");
-  });
-});
-
 function baseRequest() {
+  const calldata = [
+    "0x2",
+    "0x7", "0xaaa", "0xbbb", "0xccc", "0x456", "0x999",
+    "0xa", "0x789", "0xa",
+    "0x0", "0x3", "0x666", "0x999", "0x777",
+    "0x0", "0x0", "0x0", "0x0", "0x0",
+  ];
   return {
     chain_id: "0x534e5f5345504f4c4941",
     signer_address: "0x777",
@@ -391,7 +298,12 @@ function baseRequest() {
     call: {
       contract_address: "0x123",
       entrypoint: "apply_actions",
-      calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
+      calldata
+    },
+    authorization_call: {
+      contract_address: "0x789",
+      entrypoint: "authorize_strk20_exit_claim",
+      calldata: ["0x666", "0x999", "0x777", "0x1", "0x2"],
     },
     outside_transaction: {
       outsideExecution: {
@@ -403,7 +315,7 @@ function baseRequest() {
           {
             to: "0x123",
             selector: "0x246333a752c1ac637ff1591c5c885e27d56060d241a29aad8475072da0777db",
-            calldata: ["0x1", "0xa", "0x789", "0x1", "0x0"]
+            calldata
           }
         ]
       },

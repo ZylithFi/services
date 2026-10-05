@@ -11,6 +11,7 @@ export type ExecuteOutsideRequest = {
   signer_address: string;
   paymaster_address: string;
   call: StarknetCallPayload;
+  authorization_call?: StarknetCallPayload;
   outside_transaction?: OutsideTransaction;
   relay_nonce?: string;
   proof?: string;
@@ -19,14 +20,6 @@ export type ExecuteOutsideRequest = {
 
 export type ExecuteOutsideResponse = {
   transaction_hash: string;
-};
-
-export type RelayPrivacySignerRequest = {
-  account_address: string;
-  calls: StarknetCallPayload[];
-  nonce: string;
-  signature_r: string;
-  signature_s: string;
 };
 
 export type RpcSuccess = {
