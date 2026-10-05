@@ -1,6 +1,6 @@
 export type PrivacyPoolAction = {
   variant: number;
-  from?: string;
+  recipient?: string;
   token?: string;
   amount?: bigint;
   target?: string;
@@ -39,7 +39,7 @@ export function parsePrivacyPoolActions(
       if (variant === 2) {
         actions.push({
           variant,
-          from: calldata[offset + 1]!,
+          recipient: calldata[offset + 1]!,
           token: calldata[offset + 2]!,
           amount: BigInt(calldata[offset + 3]!),
         });

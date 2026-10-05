@@ -49,6 +49,7 @@ export function validateExecuteOutsideRequest(
     | "allowedContracts"
     | "allowedEntrypoints"
     | "chainId"
+    | "feeTokenAddress"
     | "proofRequiredEntrypoints"
     | "privacyBridgeAddress"
     | "privacyPoolAddress"
@@ -119,9 +120,6 @@ export function validateExecuteOutsideRequest(
     if (!authorization) {
       throw new Error("privacy-pool claim authorization is malformed");
     }
-    if (authorization.recipient !== signerAddress) {
-      throw new Error("privacy-pool claim recipient must match the sponsoring principal");
-    }
     const actions = parsePrivacyPoolActions(call.calldata, normalizeFelt);
     const bridgeInvokes = actions?.filter(
       (action) => action.variant === 10 && action.target === config.privacyBridgeAddress
@@ -130,6 +128,7 @@ export function validateExecuteOutsideRequest(
       throw new Error("privacy-pool sponsorship requires exactly one Zylith bridge invoke");
     }
     const openNotes = actions.filter((action) => action.variant === 7);
+    const reimbursements = actions.filter((action) => action.variant === 2);
     const claim = parseClaimBridgeCalldata(bridgeInvokes[0]?.calldata);
     if (
       openNotes.length !== 1
@@ -137,8 +136,12 @@ export function validateExecuteOutsideRequest(
       || openNotes[0]?.noteId !== claim.openNoteId
       || openNotes[0]?.noteId !== authorization.openNoteId
       || claim.exitCommitment !== authorization.exitCommitment
-      || claim.recipient !== authorization.recipient
       || !openNotes[0]?.token
+      || reimbursements.length !== 1
+      || reimbursements[0]?.recipient !== config.accountAddress
+      || reimbursements[0]?.token !== config.feeTokenAddress
+      || !reimbursements[0]?.amount
+      || signerAddress !== authorization.openNoteId
     ) {
       throw new Error("privacy-pool sponsorship requires one exactly bound Zylith claim");
     }
@@ -146,7 +149,6 @@ export function validateExecuteOutsideRequest(
       actions.some(
         (action) =>
           (action.variant === 10 && action.target !== config.privacyBridgeAddress)
-          || action.variant === 2
           || action.variant === 3
           || action.variant === 11
       )
@@ -190,29 +192,25 @@ export function validateExecuteOutsideRequest(
 }
 
 function parseClaimBridgeCalldata(calldata: string[] | undefined) {
-  if (!calldata || calldata.length !== 10) return null;
-  const lengths = [calldata[0], calldata[1], calldata[5], calldata[6], calldata[7], calldata[8], calldata[9]];
-  if (lengths.some((value, index) => value !== (index === 1 ? "0x3" : "0x0"))) return null;
+  if (!calldata || calldata.length !== 9) return null;
+  const lengths = [calldata[0], calldata[1], calldata[4], calldata[5], calldata[6], calldata[7], calldata[8]];
+  if (lengths.some((value, index) => value !== (index === 1 ? "0x2" : "0x0"))) return null;
   const exitCommitment = calldata[2];
   const openNoteId = calldata[3];
-  const recipient = calldata[4];
   if (
     !exitCommitment
     || exitCommitment === "0x0"
     || !openNoteId
     || openNoteId === "0x0"
-    || !recipient
-    || recipient === "0x0"
   ) return null;
-  return { exitCommitment, openNoteId, recipient };
+  return { exitCommitment, openNoteId };
 }
 
 function parseClaimAuthorizationCalldata(calldata: string[]) {
-  if (calldata.length !== 5 || calldata.some((value) => value === "0x0")) return null;
+  if (calldata.length !== 4 || calldata.some((value) => value === "0x0")) return null;
   return {
     exitCommitment: calldata[0]!,
     openNoteId: calldata[1]!,
-    recipient: calldata[2]!,
   };
 }
 

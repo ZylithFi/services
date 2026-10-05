@@ -29,6 +29,96 @@ describe("submitProofBearingOutsideExecution", () => {
     }, { runtime })).rejects.toThrow(/class hash differs/i);
   });
 
+  it("requires the prepared private claim to reimburse the live pool fee exactly", async () => {
+    const claimRequest: ExecuteOutsideRequest = {
+      ...request,
+      outside_transaction: undefined,
+      call: {
+        contract_address: "0x123",
+        entrypoint: "apply_actions",
+        calldata: [
+          "0x3",
+          "0x2", "0xabc", "0x456", "0x5",
+          "0x7", "0xaaa", "0xbbb", "0xccc", "0x456", "0x999",
+          "0xa", "0x789", "0x9",
+          "0x0", "0x2", "0x666", "0x999",
+          "0x0", "0x0", "0x0", "0x0", "0x0",
+        ],
+      },
+    };
+    let submitted = false;
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "starknet_call") {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: ["0x5"] }));
+      }
+      if (body.method === "starknet_estimateFee") {
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: [{
+            l1_gas_consumed: "0x1", l1_gas_price: "0x1",
+            l2_gas_consumed: "0x1", l2_gas_price: "0x1",
+            l1_data_gas_consumed: "0x1", l1_data_gas_price: "0x1",
+          }],
+        }));
+      }
+      submitted = true;
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0", id: 1, result: { transaction_hash: "0xfee" },
+      }));
+    };
+    const config = {
+      rpcUrl: "https://rpc.example",
+      chainId: "0x534e5f5345504f4c4941",
+      accountAddress: "0xabc",
+      privateKey: "0xkey",
+      feeTokenAddress: "0x456",
+    };
+
+    await expect(submitProofBearingOutsideExecution(
+      {
+        ...claimRequest,
+        authorization_call: {
+          contract_address: "0x789",
+          entrypoint: "authorize_strk20_exit_claim",
+          calldata: ["0x666", "0x999", "0x1", "0x2"],
+        },
+      },
+      config,
+      { runtime: fakeRuntime, fetchImpl },
+    )).resolves.toEqual({ transaction_hash: "0xfee" });
+    expect(submitted).toBe(true);
+
+    const mismatched = structuredClone(claimRequest);
+    mismatched.call.calldata[4] = "0x6";
+    submitted = false;
+    await expect(submitProofBearingOutsideExecution(
+      mismatched,
+      config,
+      { runtime: fakeRuntime, fetchImpl },
+    )).rejects.toThrow(/atomically reimburse its exact pool fee/i);
+    expect(submitted).toBe(false);
+
+    await expect(submitProofBearingOutsideExecution(
+      {
+        ...claimRequest,
+        authorization_call: {
+          contract_address: "0x789",
+          entrypoint: "authorize_strk20_exit_claim",
+          calldata: ["0x666", "0x999", "0x1", "0x2"],
+        },
+      },
+      {
+        rpcUrl: "https://rpc.example",
+        chainId: "0x534e5f5345504f4c4941",
+        accountAddress: "0xabc",
+        privateKey: "0xkey",
+      },
+      { runtime: fakeRuntime, fetchImpl },
+    )).rejects.toThrow(/fee token is not configured/i);
+  });
+
   it("rejects a transaction whose resource bounds exceed the sponsorship cap", async () => {
     let submissions = 0;
     await expect(
@@ -599,8 +689,7 @@ describe("submitProofBearingOutsideExecution", () => {
           rpcUrl: "https://rpc.example",
           chainId: "0x534e5f5345504f4c4941",
           accountAddress: "0xabc",
-          privateKey: "0xkey",
-          feeTokenAddress: "0xfee"
+          privateKey: "0xkey"
         },
         {
           runtime: fakeRuntime,

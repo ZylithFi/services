@@ -13,6 +13,7 @@ const config: Pick<
   | "proofRequiredEntrypoints"
   | "privacyBridgeAddress"
   | "privacyPoolAddress"
+  | "feeTokenAddress"
 > = {
   accountAddress: "0xabc",
   chainId: "0x534e5f5345504f4c4941",
@@ -21,6 +22,7 @@ const config: Pick<
   proofRequiredEntrypoints: new Set(["apply_actions"]),
   privacyBridgeAddress: "0x789",
   privacyPoolAddress: "0x123",
+  feeTokenAddress: "0x456",
 };
 
 describe("validateExecuteOutsideRequest", () => {
@@ -103,7 +105,7 @@ describe("validateExecuteOutsideRequest", () => {
     request.outside_transaction.signature = { r: "0xa", s: "0xb" };
     const validated = validateExecuteOutsideRequest(request, config, 1_700_000_000);
 
-    expect(validated.signer_address).toBe("0x777");
+    expect(validated.signer_address).toBe("0x999");
   });
 
   it("rejects long-lived outside execution windows", () => {
@@ -145,28 +147,40 @@ describe("validateExecuteOutsideRequest", () => {
     );
   });
 
-  it("rejects recipient and exit mismatches between authorization and proof", () => {
-    const recipientMismatch = baseRequest();
-    recipientMismatch.authorization_call.calldata[2] = "0x778";
-    expect(() => validateExecuteOutsideRequest(recipientMismatch, config, 1_700_000_000)).toThrow(
-      "recipient must match the sponsoring principal"
-    );
-
+  it("rejects exit and sponsoring-principal mismatches", () => {
     const exitMismatch = baseRequest();
     exitMismatch.authorization_call.calldata[0] = "0x667";
     expect(() => validateExecuteOutsideRequest(exitMismatch, config, 1_700_000_000)).toThrow(
+      "requires one exactly bound Zylith claim"
+    );
+
+    const principalMismatch = baseRequest();
+    principalMismatch.signer_address = "0x998";
+    delete (principalMismatch as { outside_transaction?: unknown }).outside_transaction;
+    expect(() => validateExecuteOutsideRequest(principalMismatch, config, 1_700_000_000)).toThrow(
       "requires one exactly bound Zylith claim"
     );
   });
 
   it("rejects a claim whose exact open note differs from its authorization", () => {
     const request = baseRequest();
-    request.call.calldata[13] = "0x778";
+    request.call.calldata[17] = "0x778";
     delete (request as { outside_transaction?: unknown }).outside_transaction;
 
     expect(() => validateExecuteOutsideRequest(request, config, 1_700_000_000)).toThrow(
       "requires one exactly bound Zylith claim"
     );
+  });
+
+  it("requires exactly one structurally bound pool-fee reimbursement", () => {
+    for (const [index, value] of [[2, "0xdef"], [3, "0x457"], [4, "0x0"]] as const) {
+      const request = baseRequest();
+      request.call.calldata[index] = value;
+      request.outside_transaction.outsideExecution.calls[0]!.calldata = request.call.calldata;
+      expect(() => validateExecuteOutsideRequest(request, config, 1_700_000_000)).toThrow(
+        "requires one exactly bound Zylith claim",
+      );
+    }
   });
 
   it("rejects privacy-pool actions that are not bound to the Zylith bridge", () => {
@@ -285,15 +299,16 @@ describe("validateExecuteOutsideRequest", () => {
 
 function baseRequest() {
   const calldata = [
-    "0x2",
+    "0x3",
+    "0x2", "0xabc", "0x456", "0x5",
     "0x7", "0xaaa", "0xbbb", "0xccc", "0x456", "0x999",
-    "0xa", "0x789", "0xa",
-    "0x0", "0x3", "0x666", "0x999", "0x777",
+    "0xa", "0x789", "0x9",
+    "0x0", "0x2", "0x666", "0x999",
     "0x0", "0x0", "0x0", "0x0", "0x0",
   ];
   return {
     chain_id: "0x534e5f5345504f4c4941",
-    signer_address: "0x777",
+    signer_address: "0x999",
     paymaster_address: "0xabc",
     call: {
       contract_address: "0x123",
@@ -303,7 +318,7 @@ function baseRequest() {
     authorization_call: {
       contract_address: "0x789",
       entrypoint: "authorize_strk20_exit_claim",
-      calldata: ["0x666", "0x999", "0x777", "0x1", "0x2"],
+      calldata: ["0x666", "0x999", "0x1", "0x2"],
     },
     outside_transaction: {
       outsideExecution: {
@@ -319,7 +334,7 @@ function baseRequest() {
           }
         ]
       },
-      signerAddress: "0x777",
+      signerAddress: "0x999",
       version: "2",
       signature: ["0xa", "0xb"]
     },

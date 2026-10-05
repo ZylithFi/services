@@ -18,6 +18,7 @@ import type {
   ExecuteOutsideResponse,
   RpcResponse
 } from "./types.js";
+import { parsePrivacyPoolActions } from "./privacyPoolActions.js";
 
 type AccountInstance = {
   getNonce(blockIdentifier?: string): Promise<string>;
@@ -73,9 +74,9 @@ const PAYMASTER_RPC_MAX_RESPONSE_BYTES = 1_000_000;
 const DEFAULT_MAX_SPONSORED_FEE_FRI = 1_000_000_000_000_000_000n;
 type ProofSubmissionConfig = Pick<
   PaymasterConfig,
-  "rpcUrl" | "chainId" | "accountAddress" | "privateKey" | "feeTokenAddress"
+  "rpcUrl" | "chainId" | "accountAddress" | "privateKey"
 > &
-  Partial<Pick<PaymasterConfig, "maxSponsoredFeeFri">>;
+  Partial<Pick<PaymasterConfig, "feeTokenAddress" | "maxSponsoredFeeFri">>;
 
 export type SubmitterDeps = {
   runtime?: StarknetRuntime;
@@ -167,6 +168,21 @@ async function submitPaymasterCallsOnce(
           proofFacts
         }
       : {};
+  const hasPoolCall = calls.some((call) => call.entrypoint === "apply_actions");
+  const hasClaimAuthorization = calls.some(
+    (call) => call.entrypoint === "authorize_strk20_exit_claim",
+  );
+  if (hasPoolCall && hasClaimAuthorization && !config.feeTokenAddress) {
+    throw new Error("privacy-pool fee token is not configured");
+  }
+  if (config.feeTokenAddress) {
+    const poolFee = await poolApplyActionsFee(fetchImpl, config.rpcUrl, calls);
+    assertAtomicPoolFeeReimbursement(
+      calls,
+      { accountAddress: config.accountAddress, feeTokenAddress: config.feeTokenAddress },
+      poolFee,
+    );
+  }
   const feeResourceBounds = await estimateProofBearingInvokeResourceBounds({
     account,
     calls,
@@ -228,7 +244,6 @@ async function submitPaymasterCallsOnce(
   const releaseSponsoredFee = deps.reserveSponsoredFee
     ? await deps.reserveSponsoredFee(
       maximumSponsoredFee(feeResourceBounds)
-        + await poolApplyActionsFee(fetchImpl, config.rpcUrl, calls)
     )
     : null;
   let transactionHash: string | undefined;
@@ -244,6 +259,30 @@ async function submitPaymasterCallsOnce(
   }
 
   return { transaction_hash: transactionHash };
+}
+
+function assertAtomicPoolFeeReimbursement(
+  calls: Call[],
+  config: Pick<ProofSubmissionConfig, "accountAddress" | "feeTokenAddress">,
+  poolFee: bigint,
+) {
+  const poolCall = calls.find((call) => call.entrypoint === "apply_actions");
+  if (!poolCall) return;
+  if (poolFee <= 0n) throw new Error("privacy pool returned an invalid fee amount");
+  const rawCalldata = Array.isArray(poolCall.calldata) ? poolCall.calldata : [];
+  const actions = parsePrivacyPoolActions(
+    rawCalldata.map((value: unknown) => String(value)),
+    (value) => toRpcFelt(value),
+  );
+  const reimbursements = actions?.filter((action) => action.variant === 2) ?? [];
+  if (
+    reimbursements.length !== 1
+    || reimbursements[0]?.recipient !== toRpcFelt(config.accountAddress)
+    || reimbursements[0]?.token !== toRpcFelt(config.feeTokenAddress)
+    || reimbursements[0]?.amount !== poolFee
+  ) {
+    throw new Error("privacy-pool claim must atomically reimburse its exact pool fee");
+  }
 }
 
 export async function verifyPinnedPrivacyPoolClass(
@@ -302,7 +341,7 @@ function callPayloadToStarknetCall(call: ExecuteOutsideRequest["call"]): Call {
 async function estimateProofBearingInvokeResourceBounds(input: {
   account: AccountInstance;
   calls: Call[];
-  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress" | "feeTokenAddress">;
+  config: Pick<PaymasterConfig, "rpcUrl" | "chainId" | "accountAddress">;
   runtime: StarknetRuntime;
   fetchImpl: typeof fetch;
   nonce: string;

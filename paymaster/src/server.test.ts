@@ -520,7 +520,7 @@ function fakeRpcFetch(onAddInvoke?: () => Promise<void> | void): typeof fetch {
     }
     if (body.method === "starknet_call") {
       return new Response(
-        JSON.stringify({ jsonrpc: "2.0", id: 1, result: ["0x0"] }),
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: ["0x5"] }),
         { status: 200 }
       );
     }
@@ -558,23 +558,24 @@ function postRequest(url: string, body: ExecuteOutsideRequest): Promise<Response
 
 const request: ExecuteOutsideRequest = {
   chain_id: "0x534e5f5345504f4c4941",
-  signer_address: "0x777",
+  signer_address: "0x999",
   paymaster_address: "0xabc",
   call: {
     contract_address: "0x123",
     entrypoint: "apply_actions",
     calldata: [
-      "0x2",
+      "0x3",
+      "0x2", "0xabc", "0x456", "0x5",
       "0x7", "0xaaa", "0xbbb", "0xccc", "0x456", "0x999",
-      "0xa", "0x789", "0xa",
-      "0x0", "0x3", "0x666", "0x999", "0x777",
+      "0xa", "0x789", "0x9",
+      "0x0", "0x2", "0x666", "0x999",
       "0x0", "0x0", "0x0", "0x0", "0x0",
     ]
   },
   authorization_call: {
     contract_address: "0x789",
     entrypoint: "authorize_strk20_exit_claim",
-    calldata: ["0x666", "0x999", "0x777", "0x1", "0x2"],
+    calldata: ["0x666", "0x999", "0x1", "0x2"],
   },
   outside_transaction: {
     outsideExecution: {
@@ -587,16 +588,17 @@ const request: ExecuteOutsideRequest = {
           to: "0x123",
           selector: "0x246333a752c1ac637ff1591c5c885e27d56060d241a29aad8475072da0777db",
           calldata: [
-            "0x2",
+            "0x3",
+            "0x2", "0xabc", "0x456", "0x5",
             "0x7", "0xaaa", "0xbbb", "0xccc", "0x456", "0x999",
-            "0xa", "0x789", "0xa",
-            "0x0", "0x3", "0x666", "0x999", "0x777",
+            "0xa", "0x789", "0x9",
+            "0x0", "0x2", "0x666", "0x999",
             "0x0", "0x0", "0x0", "0x0", "0x0",
           ]
         }
       ]
     },
-    signerAddress: "0x777",
+    signerAddress: "0x999",
     version: "2",
     signature: ["0xa", "0xb"]
   },
@@ -607,14 +609,15 @@ const request: ExecuteOutsideRequest = {
 function requestWithSigner(index: number): ExecuteOutsideRequest {
   const signer = `0x${(0x770 + index).toString(16)}`;
   const calldata = [...request.call.calldata];
-  calldata[14] = signer;
+  calldata[10] = signer;
+  calldata[17] = signer;
   return {
     ...request,
     signer_address: signer,
     call: { ...request.call, calldata },
     authorization_call: {
       ...request.authorization_call!,
-      calldata: ["0x666", "0x999", signer, "0x1", "0x2"],
+      calldata: ["0x666", signer, "0x1", "0x2"],
     },
     outside_transaction: {
       ...request.outside_transaction,

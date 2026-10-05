@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-const STRK20_EXIT_CLAIM_DOMAIN_HEX: &str = "0x7a796c6974685f7374726b32305f636c61696d5f7633";
+const STRK20_EXIT_CLAIM_DOMAIN_HEX: &str = "0x7a796c6974685f7374726b32305f636c61696d5f7634";
 const REFERENCE_PRICE_ATTESTATION_DOMAIN_TAG: &str = "zylith/reference-price-attestation-v1";
 const REFERENCE_PRICE_BATCH_DOMAIN: &str = "zylith_price_batch_v1";
 const PRIVATE_ORDER_SHARE_ALGORITHM_V1: &str = "ecdh-p256+hkdf-sha256+aes-256-gcm/private-order-v1";
@@ -292,7 +292,6 @@ pub struct Strk20ExitClaimMessage<'a> {
     pub exit_commitment: &'a str,
     pub claim_account: &'a str,
     pub open_note_id: &'a str,
-    pub claim_recipient: &'a str,
 }
 
 pub fn strk20_exit_claim_message_hash(
@@ -309,7 +308,6 @@ pub fn strk20_exit_claim_message_hash(
         exit_commitment,
         claim_account,
         open_note_id,
-        claim_recipient,
     } = message;
     let normalized_asset_id = normalize_asset_id_for_public_hash(asset_id)?;
     let normalized_amount = normalize_u128_for_public_hash(amount)?;
@@ -326,7 +324,6 @@ pub fn strk20_exit_claim_message_hash(
             felt_from_hex_str(exit_commitment)?,
             felt_from_hex_str(claim_account)?,
             felt_from_hex_str(open_note_id)?,
-            felt_from_hex_str(claim_recipient)?,
         ],
     ))
 }
