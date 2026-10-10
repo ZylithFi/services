@@ -1,5 +1,19 @@
 use thiserror::Error;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum WalletDataError {
+    #[error("wallet migration required")]
+    MigrationRequired,
+    #[error("wallet data is invalid")]
+    DataInvalid,
+}
+
+impl From<WalletDataError> for ProtocolError {
+    fn from(error: WalletDataError) -> Self {
+        ProtocolError::Crypto(error.to_string())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("hex decoding failed: {0}")]

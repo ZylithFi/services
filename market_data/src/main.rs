@@ -1250,6 +1250,23 @@ mod tests {
         manifest["deployment"]["finalized"] = Value::Bool(true);
         manifest["deployment"]["release_commit"] = Value::String("a".repeat(40));
         manifest["proof"]["config_locked_after_deploy"] = Value::Bool(true);
+        for field in [
+            "transition_proof_program_address",
+            "withdrawal_proof_program_address",
+            "residual_recovery_proof_program_address",
+            "virtual_program_hash",
+            "starknet_os_config_hash",
+            "proof_account_address",
+            "proof_account_class_hash",
+            "transition_proof_program_class_hash",
+            "withdrawal_proof_program_class_hash",
+            "residual_recovery_proof_program_class_hash",
+            "settlement_account_address",
+        ] {
+            manifest["proof"][field] = Value::String("0x1".into());
+        }
+        manifest["funding"]["starknet_privacy"]["ingress_key_registry_fingerprint"] =
+            Value::String("ab".repeat(32));
         assert!(production_manifest_markets(&manifest.to_string()).is_ok());
     }
 

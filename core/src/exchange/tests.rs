@@ -1,7 +1,503 @@
+use crate::{
+    PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig, PrivateExecutionKeyRegistry,
+};
+use hpke::{Deserializable, Kem, Serializable};
 use starknet_crypto::Felt;
+
+fn envelope_context() -> crate::private_envelope::PrivateEnvelopeContext {
+    crate::private_envelope::PrivateEnvelopeContext {
+        chain_id: Felt::from(0x534e5f5345504f4c4941_u128),
+        deployment_id: Felt::from(0x123_u32),
+    }
+}
 
 use super::fixtures::*;
 use super::*;
+
+#[test]
+fn sealed_request_v3_uses_one_x25519_recipient() {
+    let private = PrivateExecutionKeyPrivateConfig {
+        key_id: "active".into(),
+        algorithm: crate::private_envelope::HPKE_PROFILE_ID.into(),
+        private_key: "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb".into(),
+        public_key: "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a".into(),
+    };
+    let registry = PrivateExecutionKeyRegistry {
+        keys: vec![PrivateExecutionKeyPublicConfig {
+            key_id: private.key_id.clone(),
+            algorithm: private.algorithm.clone(),
+            public_key: private.public_key.clone(),
+        }],
+    };
+    let request = PrivateRequest::Status(StatusRequest::default());
+    let (sealed, _) = seal_request(&registry, envelope_context(), &request).unwrap();
+    assert_eq!(sealed.version, 3);
+    assert_eq!(sealed.key_id, "active");
+    assert_eq!(sealed.encapsulated_key.len(), 64);
+    assert_eq!(sealed.ciphertext.len(), 2 * (REQUEST_PLAINTEXT_BYTES + 16));
+    assert_eq!(
+        open_request(&sealed, envelope_context(), &[private])
+            .unwrap()
+            .request,
+        request
+    );
+}
+
+#[test]
+fn sealed_request_v3_all_four_variants_round_trip() {
+    let registry = registry_of(1);
+    let key = sealed_test_key("execution-key-0", 1);
+    let owner = user(3);
+    let note = deposit(&owner, BASE, 40, 17);
+    let mut notes = Notes::default();
+    notes.add_deposit(&note);
+    let new = new_order(
+        &notes,
+        &owner,
+        true,
+        true,
+        40,
+        95,
+        std::slice::from_ref(&note),
+    );
+    let order = PrivateRequest::Order(OrderRequest {
+        terms: new.terms,
+        funding: vec![note.clone()],
+        authorization: new.authorization,
+    });
+    let cancel = PrivateRequest::Cancel(CancelRequest {
+        order_id: Felt::from(9_u8),
+        signature: Signature {
+            r: Felt::ONE,
+            s: Felt::ONE,
+        },
+    });
+    let exit = Felt::from(87_u8);
+    let exit_authority = public_key(&Felt::from(43_u8));
+    let withdraw = PrivateRequest::Withdraw(WithdrawRequest {
+        authorization: sign_message(
+            &owner.withdraw_key,
+            &withdrawal_authorization_message(
+                Felt::from(CHAIN),
+                note.nullifier(),
+                exit,
+                exit_authority,
+            ),
+        )
+        .unwrap(),
+        note,
+        exit_commitment: exit,
+        exit_authority,
+    });
+    let status = PrivateRequest::Status(StatusRequest {
+        orders: vec![OrderQuery {
+            order_id: Felt::ONE,
+            after_seq: 2,
+        }],
+        withdrawals: vec![],
+    });
+    for request in [order, cancel, withdraw, status] {
+        let (sealed, response_key) = seal_request(&registry, envelope_context(), &request).unwrap();
+        assert_eq!(sealed.encapsulated_key.len(), 64);
+        assert_eq!(sealed.ciphertext.len(), 2 * (REQUEST_PLAINTEXT_BYTES + 16));
+        let opened = open_request(&sealed, envelope_context(), std::slice::from_ref(&key)).unwrap();
+        assert_eq!(opened.request, request);
+        assert_eq!(*opened.response_key, *response_key);
+    }
+}
+
+#[test]
+fn sealed_request_v3_rejects_every_authenticated_field_change() {
+    let registry = registry_of(1);
+    let key = sealed_test_key("execution-key-0", 1);
+    let next = sealed_test_key("next", 2);
+    let request = PrivateRequest::Status(StatusRequest::default());
+    let (sealed, _) = seal_request(&registry, envelope_context(), &request).unwrap();
+    let mut changed = sealed.clone();
+    changed.version = 2;
+    assert!(open_request(&changed, envelope_context(), &[key.clone(), next.clone()]).is_err());
+    changed = sealed.clone();
+    changed.key_id = next.key_id.clone();
+    assert!(open_request(&changed, envelope_context(), &[key.clone(), next.clone()]).is_err());
+    changed = sealed.clone();
+    changed.digest.replace_range(0..2, "00");
+    if changed.digest == sealed.digest {
+        changed.digest.replace_range(0..2, "01");
+    }
+    assert!(open_request(&changed, envelope_context(), std::slice::from_ref(&key)).is_err());
+    changed = sealed.clone();
+    changed.encapsulated_key.replace_range(0..2, "00");
+    if changed.encapsulated_key == sealed.encapsulated_key {
+        changed.encapsulated_key.replace_range(0..2, "01");
+    }
+    assert!(open_request(&changed, envelope_context(), std::slice::from_ref(&key)).is_err());
+    changed = sealed.clone();
+    changed.ciphertext.replace_range(0..2, "00");
+    if changed.ciphertext == sealed.ciphertext {
+        changed.ciphertext.replace_range(0..2, "01");
+    }
+    assert!(open_request(&changed, envelope_context(), std::slice::from_ref(&key)).is_err());
+
+    let mut context = envelope_context();
+    context.chain_id += Felt::ONE;
+    assert!(open_request(&sealed, context, std::slice::from_ref(&key)).is_err());
+    context = envelope_context();
+    context.deployment_id += Felt::ONE;
+    assert!(open_request(&sealed, context, std::slice::from_ref(&key)).is_err());
+    context = envelope_context();
+    std::mem::swap(&mut context.chain_id, &mut context.deployment_id);
+    assert!(open_request(&sealed, context, std::slice::from_ref(&key)).is_err());
+    context = envelope_context();
+    context.chain_id = Felt::ZERO;
+    assert!(seal_request(&registry, context, &request).is_err());
+    assert!(open_request(&sealed, context, std::slice::from_ref(&key)).is_err());
+    context = envelope_context();
+    context.deployment_id = Felt::ZERO;
+    assert!(seal_request(&registry, context, &request).is_err());
+    assert!(open_request(&sealed, context, std::slice::from_ref(&key)).is_err());
+}
+
+#[test]
+fn sealed_request_v3_only_opens_with_matching_configured_key_and_allows_retry() {
+    let registry = registry_of(1);
+    let key = sealed_test_key("execution-key-0", 1);
+    let other = sealed_test_key("other", 2);
+    let request = PrivateRequest::Status(StatusRequest::default());
+    let (sealed, _) = seal_request(&registry, envelope_context(), &request).unwrap();
+    assert!(open_request(&sealed, envelope_context(), std::slice::from_ref(&other)).is_err());
+    let mut wrong = other.clone();
+    wrong.key_id = key.key_id.clone();
+    assert!(open_request(&sealed, envelope_context(), &[wrong]).is_err());
+    assert!(open_request(&sealed, envelope_context(), &[key.clone(), key.clone()]).is_err());
+    assert_eq!(
+        open_request(&sealed, envelope_context(), &[other, key.clone()])
+            .unwrap()
+            .request,
+        request
+    );
+    assert_eq!(
+        open_request(&sealed, envelope_context(), std::slice::from_ref(&key))
+            .unwrap()
+            .request,
+        request
+    );
+    assert_eq!(
+        open_request(&sealed, envelope_context(), std::slice::from_ref(&key))
+            .unwrap()
+            .request,
+        request
+    );
+}
+
+#[test]
+fn rotation_overlap_opens_both_key_ids_then_retirement_rejects_old_id() {
+    let old = sealed_test_key("old", 1);
+    let new = sealed_test_key("new", 2);
+    let request = PrivateRequest::Status(StatusRequest::default());
+    let old_registry = PrivateExecutionKeyRegistry {
+        keys: vec![PrivateExecutionKeyPublicConfig {
+            key_id: old.key_id.clone(),
+            algorithm: old.algorithm.clone(),
+            public_key: old.public_key.clone(),
+        }],
+    };
+    let new_registry = PrivateExecutionKeyRegistry {
+        keys: vec![PrivateExecutionKeyPublicConfig {
+            key_id: new.key_id.clone(),
+            algorithm: new.algorithm.clone(),
+            public_key: new.public_key.clone(),
+        }],
+    };
+    let (old_sealed, _) = seal_request(&old_registry, envelope_context(), &request).unwrap();
+    let (new_sealed, _) = seal_request(&new_registry, envelope_context(), &request).unwrap();
+    let overlap = [old.clone(), new.clone()];
+    assert_eq!(
+        open_request(&old_sealed, envelope_context(), &overlap)
+            .unwrap()
+            .request,
+        request
+    );
+    assert_eq!(
+        open_request(&new_sealed, envelope_context(), &overlap)
+            .unwrap()
+            .request,
+        request
+    );
+    assert!(open_request(&old_sealed, envelope_context(), &[new]).is_err());
+}
+
+#[test]
+fn sealed_request_v3_rejects_noncanonical_wire_and_unknown_fields() {
+    let registry = registry_of(1);
+    let key = sealed_test_key("execution-key-0", 1);
+    let (sealed, _) = seal_request(
+        &registry,
+        envelope_context(),
+        &PrivateRequest::Status(StatusRequest::default()),
+    )
+    .unwrap();
+    let original = serde_json::to_value(&sealed).unwrap();
+    for (field, value) in [
+        ("digest", serde_json::json!("AA".repeat(32))),
+        ("digest", serde_json::json!("00")),
+        ("encapsulated_key", serde_json::json!("FF".repeat(32))),
+        ("encapsulated_key", serde_json::json!("00")),
+        (
+            "ciphertext",
+            serde_json::json!("AA".repeat(REQUEST_PLAINTEXT_BYTES + 16)),
+        ),
+        ("ciphertext", serde_json::json!("00")),
+    ] {
+        let mut wire = original.clone();
+        wire[field] = value;
+        assert!(serde_json::from_value::<SealedRequest>(wire).is_err());
+    }
+    let mut wire = original.clone();
+    wire["extra"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<SealedRequest>(wire).is_err());
+    let mut wire = original.clone();
+    wire["version"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<SealedRequest>(wire).is_err());
+    let mut wire = original.clone();
+    wire["key_id"] = serde_json::json!("Not-Canonical");
+    assert!(serde_json::from_value::<SealedRequest>(wire).is_err());
+    let mut malformed = sealed.clone();
+    malformed.ciphertext = "gg".repeat(REQUEST_PLAINTEXT_BYTES + 16);
+    assert!(open_request(&malformed, envelope_context(), &[key]).is_err());
+}
+
+#[test]
+fn sealed_request_v3_open_does_not_authorize_an_invalid_order() {
+    let owner = user(4);
+    let note = deposit(&owner, BASE, 40, 17);
+    let mut notes = Notes::default();
+    notes.add_deposit(&note);
+    let new = new_order(
+        &notes,
+        &owner,
+        true,
+        true,
+        40,
+        95,
+        std::slice::from_ref(&note),
+    );
+    let mut order = OrderRequest {
+        terms: new.terms,
+        funding: vec![note],
+        authorization: new.authorization,
+    };
+    order
+        .validate(Felt::from(CHAIN), Felt::from(BASE), 1, 1, 1)
+        .unwrap();
+    order.authorization = Signature {
+        r: Felt::ONE,
+        s: Felt::ONE,
+    };
+    let (sealed, _) = seal_request(
+        &registry_of(1),
+        envelope_context(),
+        &PrivateRequest::Order(order),
+    )
+    .unwrap();
+    let opened = open_request(
+        &sealed,
+        envelope_context(),
+        &[sealed_test_key("execution-key-0", 1)],
+    )
+    .unwrap();
+    let PrivateRequest::Order(opened) = opened.request else {
+        panic!("expected order");
+    };
+    assert!(
+        opened
+            .validate(Felt::from(CHAIN), Felt::from(BASE), 1, 1, 1)
+            .is_err()
+    );
+}
+
+#[test]
+fn sealed_request_v3_max_status_fits_and_opens() {
+    let full = Felt::from_hex(&format!("0x7{}", "f".repeat(62))).unwrap();
+    let request = PrivateRequest::Status(StatusRequest {
+        orders: vec![
+            OrderQuery {
+                order_id: full,
+                after_seq: u32::MAX
+            };
+            MAX_STATUS_ITEMS / 2
+        ],
+        withdrawals: vec![
+            WithdrawalQuery {
+                nullifier: full,
+                authorization: Signature { r: full, s: full },
+            };
+            MAX_STATUS_ITEMS / 2
+        ],
+    });
+    let (sealed, _) = seal_request(&registry_of(1), envelope_context(), &request).unwrap();
+    assert_eq!(sealed.ciphertext.len(), 2 * (REQUEST_PLAINTEXT_BYTES + 16));
+    assert!(serde_json::to_vec(&sealed).unwrap().len() <= MAX_SEALED_REQUEST_BYTES);
+    assert_eq!(
+        open_request(
+            &sealed,
+            envelope_context(),
+            &[sealed_test_key("execution-key-0", 1)]
+        )
+        .unwrap()
+        .request,
+        request
+    );
+}
+
+#[test]
+fn wallet_owner_tag_is_stable_and_ownership_checks_all_authorities() {
+    let seed = crate::RecoverySeed([1; 32]);
+    let keys = WalletKeys::from_seed(&seed).unwrap();
+    let restored = WalletKeys::from_seed(&seed).unwrap();
+    let other = WalletKeys::from_seed(&crate::RecoverySeed([2; 32])).unwrap();
+    let owner = keys.owner(Felt::from(42_u8));
+    assert_eq!(
+        hex::encode(owner.owner_public_key.to_bytes_be()),
+        "028204bd403e2e99dbbbc654d2cc20f3a0ec2a15d43f58235b8a5dfb02f6c0d1"
+    );
+    assert_eq!(
+        owner.owner_public_key,
+        crate::wallet_crypto::WalletKeyScheduleV2::from_seed(&seed)
+            .owner_tag()
+            .unwrap()
+    );
+    assert_eq!(owner.owner_public_key, restored.owner_public_key);
+    assert_eq!(
+        owner.owner_public_key,
+        keys.owner(Felt::from(43_u8)).owner_public_key
+    );
+    assert_ne!(owner.owner_public_key, other.owner_public_key);
+    let note = NoteFields {
+        asset_id: Felt::from(BASE),
+        amount: 10,
+        owner_public_key: owner.owner_public_key,
+        spend_authority: owner.spend_authority,
+        withdraw_authority: owner.withdraw_authority,
+        blinding: Felt::from(19_u8),
+        nonce: 42,
+        metadata_commitment: Felt::from(23_u8),
+    };
+    assert!(keys.owns(&note));
+    assert!(restored.owns(&note));
+    assert!(!other.owns(&note));
+    for altered in [
+        NoteFields {
+            owner_public_key: other.owner_public_key,
+            ..note.clone()
+        },
+        NoteFields {
+            spend_authority: public_key(&other.spend_key),
+            ..note.clone()
+        },
+        NoteFields {
+            withdraw_authority: public_key(&other.withdraw_key),
+            ..note.clone()
+        },
+    ] {
+        assert!(!keys.owns(&altered));
+    }
+}
+
+#[test]
+fn wallet_keys_v2_stark_scalars_match_known_answers_and_public_keys() {
+    let keys = WalletKeys::from_seed(&crate::RecoverySeed([1; 32])).unwrap();
+    let owner = keys.owner(Felt::from(42_u8));
+    for (private_key, authority, expected) in [
+        (
+            keys.spend_key,
+            owner.spend_authority,
+            "03a0495ece379aff389ec6c398b7528fa912ce95dad3d26a91588bfd35594422",
+        ),
+        (
+            keys.withdraw_key,
+            owner.withdraw_authority,
+            "06ad8b419bab84618ed6dd0534ef1bbeed054c698924850c5b444a4ec73c91f6",
+        ),
+        (
+            keys.cancel_key,
+            owner.cancel_authority,
+            "0662ca3e99a67df8f7f57d7640a1c3df8054e4c0fb916a9b84ed7434c16dd90a",
+        ),
+    ] {
+        assert_eq!(hex::encode(private_key.to_bytes_be()), expected);
+        assert_eq!(authority, starknet_crypto::get_public_key(&private_key));
+    }
+}
+
+#[test]
+fn wallet_keys_v2_authorizations_keep_existing_semantics() {
+    let keys = WalletKeys::from_seed(&crate::RecoverySeed([1; 32])).unwrap();
+    let other = WalletKeys::from_seed(&crate::RecoverySeed([2; 32])).unwrap();
+    let owner = keys.owner(Felt::from(42_u8));
+    let note = NoteFields {
+        asset_id: Felt::from(BASE),
+        amount: 10,
+        owner_public_key: owner.owner_public_key,
+        spend_authority: owner.spend_authority,
+        withdraw_authority: owner.withdraw_authority,
+        blinding: Felt::from(19_u8),
+        nonce: 42,
+        metadata_commitment: Felt::from(23_u8),
+    };
+    assert!(keys.owns(&note));
+    assert!(!other.owns(&note));
+    let chain = Felt::from(CHAIN);
+    let order = keys
+        .order(
+            chain,
+            Felt::from(PAIR),
+            true,
+            false,
+            10,
+            95,
+            1_000_000,
+            vec![note.clone()],
+        )
+        .unwrap();
+    order.validate(chain, Felt::from(BASE), 1, 1, 1).unwrap();
+    let mut wrong_order = order.clone();
+    wrong_order.authorization =
+        sign_message(&keys.cancel_key, &order.authorization_message(chain)).unwrap();
+    assert!(
+        wrong_order
+            .validate(chain, Felt::from(BASE), 1, 1, 1)
+            .is_err()
+    );
+    let cancel = keys.cancel(chain, order.order_id()).unwrap();
+    let cancel_message = cancel_message(chain, cancel.order_id);
+    assert!(verify_message(
+        &owner.cancel_authority,
+        &cancel_message,
+        &cancel.signature
+    ));
+    assert!(!verify_message(
+        &owner.spend_authority,
+        &cancel_message,
+        &cancel.signature
+    ));
+    let withdrawal = keys
+        .withdraw(chain, note.clone(), Felt::from(43_u8))
+        .unwrap();
+    withdrawal.validate(chain).unwrap();
+    let mut wrong_withdrawal = withdrawal.clone();
+    wrong_withdrawal.authorization = sign_message(
+        &keys.spend_key,
+        &withdrawal_authorization_message(
+            chain,
+            note.nullifier(),
+            withdrawal.exit_commitment,
+            withdrawal.exit_authority,
+        ),
+    )
+    .unwrap();
+    assert!(wrong_withdrawal.validate(chain).is_err());
+    assert!(other.withdraw(chain, note, Felt::from(43_u8)).is_err());
+}
 
 fn outputs_total(result: &TransitionResult, asset: u64) -> u128 {
     result
@@ -66,6 +562,41 @@ fn an_order_cannot_reuse_a_funding_note() {
     assert!(
         request
             .validate(Felt::from(CHAIN), Felt::from(BASE), 1, 1, 1)
+            .is_err()
+    );
+}
+
+#[test]
+fn order_admission_requires_exact_note_membership_cardinality() {
+    let mut notes = Notes::default();
+    let owner = user(101);
+    let funding = deposit(&owner, BASE, 10, 101);
+    notes.add_deposit(&funding);
+    let admitted = new_order(
+        &notes,
+        &owner,
+        true,
+        false,
+        10,
+        1,
+        std::slice::from_ref(&funding),
+    );
+    let request = OrderRequest {
+        terms: admitted.terms,
+        funding: vec![funding.clone()],
+        authorization: admitted.authorization,
+    };
+    let membership = notes.membership(&funding);
+    assert!(
+        request
+            .clone()
+            .try_into_new_order(vec![membership.clone()])
+            .is_ok()
+    );
+    assert!(request.clone().try_into_new_order(vec![]).is_err());
+    assert!(
+        request
+            .try_into_new_order(vec![membership.clone(), membership])
             .is_err()
     );
 }
@@ -832,32 +1363,9 @@ fn withdrawal_proves_membership_and_signs_privately() {
 }
 
 #[test]
-fn a_sealed_request_opens_only_with_every_execution_key() {
-    use crate::types::{
-        PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
-        PrivateExecutionKeyRegistry,
-    };
-    let keys = (1..=2)
-        .map(|index| {
-            let private_key = format!("{index:064x}");
-            let secret = p256::SecretKey::from_slice(&hex::decode(&private_key).unwrap()).unwrap();
-            let public_key = hex::encode(p256::EncodedPoint::from(secret.public_key()).as_bytes());
-            PrivateExecutionKeyPrivateConfig {
-                key_id: format!("k{index}"),
-                private_key,
-                public_key,
-            }
-        })
-        .collect::<Vec<_>>();
-    let registry = PrivateExecutionKeyRegistry {
-        keys: keys
-            .iter()
-            .map(|key| PrivateExecutionKeyPublicConfig {
-                key_id: key.key_id.clone(),
-                public_key: key.public_key.clone(),
-            })
-            .collect(),
-    };
+fn sealed_request_v3_response_key_round_trips_and_hides_request_kind() {
+    let keys = vec![sealed_test_key("execution-key-0", 1)];
+    let registry = registry_of(1);
     let status = PrivateRequest::Status(StatusRequest {
         orders: vec![OrderQuery {
             order_id: Felt::from(7_u8),
@@ -865,14 +1373,14 @@ fn a_sealed_request_opens_only_with_every_execution_key() {
         }],
         withdrawals: vec![],
     });
-    let (sealed, response_key) = seal_request(&registry, &status).unwrap();
-    let opened = open_request(&sealed, &keys).unwrap();
+    let (sealed, response_key) = seal_request(&registry, envelope_context(), &status).unwrap();
+    let opened = open_request(&sealed, envelope_context(), &keys).unwrap();
     assert_eq!(opened.request, status);
     assert_eq!(*opened.response_key, *response_key);
-    assert!(open_request(&sealed, &keys[..1]).is_err());
+    assert!(open_request(&sealed, envelope_context(), &[]).is_err());
     let mut tampered = sealed.clone();
     tampered.digest = "00".repeat(32);
-    assert!(open_request(&tampered, &keys).is_err());
+    assert!(open_request(&tampered, envelope_context(), &keys).is_err());
 
     // the kind is inside and the plaintext is padded: a status looks like a cancellation.
     let cancel = PrivateRequest::Cancel(CancelRequest {
@@ -882,14 +1390,19 @@ fn a_sealed_request_opens_only_with_every_execution_key() {
             s: Felt::ONE,
         },
     });
-    let (other, _) = seal_request(&registry, &cancel).unwrap();
+    let (other, _) = seal_request(&registry, envelope_context(), &cancel).unwrap();
     let body = |sealed: &SealedRequest| serde_json::to_string(sealed).unwrap();
     assert!(!body(&sealed).contains("status") && !body(&other).contains("cancel"));
     assert_eq!(body(&sealed).len(), body(&other).len());
 
-    // the answer opens only with the request's key and digest, and pads to a class.
+    // Every answer derives a fresh subkey from its response root. Both answers open, but their
+    // salts and nonces are independently fresh and the wire is closed and exact-sized.
     let answer = serde_json::json!({ "ok": true, "orders": [] });
     let response = seal_response(&opened.response_key, &sealed.digest, &answer).unwrap();
+    let retried_response = seal_response(&opened.response_key, &sealed.digest, &answer).unwrap();
+    assert_eq!(response.version, 3);
+    assert_eq!(response.salt.len(), 64);
+    assert_eq!(response.nonce.len(), 24);
     assert_eq!(
         response.ciphertext.len(),
         2 * (RESPONSE_PLAINTEXT_BYTES + 16)
@@ -898,8 +1411,72 @@ fn a_sealed_request_opens_only_with_every_execution_key() {
         open_response(&response_key, &sealed.digest, &response).unwrap(),
         answer
     );
+    assert_eq!(
+        open_response(&response_key, &sealed.digest, &retried_response).unwrap(),
+        answer
+    );
+    assert_ne!(response.salt, retried_response.salt);
+    assert_ne!(response.nonce, retried_response.nonce);
     assert!(open_response(&response_key, &other.digest, &response).is_err());
     assert!(open_response(&[0; 32], &sealed.digest, &response).is_err());
+
+    let mut tampered = response.clone();
+    tampered.version = 2;
+    assert!(open_response(&response_key, &sealed.digest, &tampered).is_err());
+    let mut tampered = response.clone();
+    tampered.salt.replace_range(..2, "00");
+    assert!(open_response(&response_key, &sealed.digest, &tampered).is_err());
+    let mut tampered = response.clone();
+    tampered.nonce.replace_range(..2, "00");
+    assert!(open_response(&response_key, &sealed.digest, &tampered).is_err());
+    let mut tampered = response.clone();
+    tampered.ciphertext.replace_range(..2, "00");
+    assert!(open_response(&response_key, &sealed.digest, &tampered).is_err());
+}
+
+#[test]
+fn sealed_response_v3_json_schema_rejects_legacy_unknown_and_noncanonical_values() {
+    let valid = serde_json::json!({
+        "version": 3,
+        "salt": "ab".repeat(32),
+        "nonce": "cd".repeat(12),
+        "ciphertext": "ef".repeat(RESPONSE_PLAINTEXT_BYTES + 16),
+    });
+    serde_json::from_value::<SealedResponse>(valid.clone()).unwrap();
+
+    let mut cases = vec![
+        serde_json::json!({
+            "nonce": "cd".repeat(12),
+            "ciphertext": "ef".repeat(RESPONSE_PLAINTEXT_BYTES + 16),
+        }),
+        serde_json::json!({
+            "version": 2,
+            "salt": "ab".repeat(32),
+            "nonce": "cd".repeat(12),
+            "ciphertext": "ef".repeat(RESPONSE_PLAINTEXT_BYTES + 16),
+        }),
+    ];
+    for (field, value) in [
+        ("salt", "AB".repeat(32)),
+        ("salt", "ab".repeat(31)),
+        ("nonce", "CD".repeat(12)),
+        ("nonce", "cd".repeat(11)),
+        ("ciphertext", "ef".repeat(RESPONSE_PLAINTEXT_BYTES + 15)),
+    ] {
+        let mut changed = valid.clone();
+        changed[field] = serde_json::json!(value);
+        cases.push(changed);
+    }
+    let mut extra = valid;
+    extra["extra"] = serde_json::json!(true);
+    cases.push(extra);
+    for case in cases {
+        assert!(serde_json::from_value::<SealedResponse>(case).is_err());
+    }
+
+    let answer = serde_json::json!({"ok": true});
+    assert!(seal_response(&[0; 32], "not-a-digest", &answer).is_err());
+    assert!(seal_response(&[0; 32], &"D1".repeat(32), &answer).is_err());
 }
 
 #[test]
@@ -1003,7 +1580,7 @@ fn every_value_output_blinds_unused_residual_lanes_and_fee_amounts() {
         let blinding = output_blinding(
             Felt::from(FEE_KEY),
             result.public.seq,
-            OUTPUT_KIND_FEE,
+            OutputKind::Fee,
             fee.note.asset_id,
         );
         assert_eq!(record.enc - blinding, felt_u128(fee.note.amount));
@@ -1012,6 +1589,122 @@ fn every_value_output_blinds_unused_residual_lanes_and_fee_amounts() {
     let mut keyless = input(1, vec![], vec![], Felt::ZERO, 100);
     keyless.fee_key = Felt::ZERO;
     assert!(build_transition(&keyless).is_err());
+}
+
+#[test]
+fn padding_and_auxiliary_streams_are_domain_and_position_separated() {
+    let seed = Felt::from(0x5a17_u64);
+    let first = output_padding_record(seed, 7);
+    assert_eq!(
+        first,
+        [
+            Felt::from_hex("0x38d63a22d32a333bd5f69bc2736d98a5543406ac7471e7c7330cab014ab8534")
+                .unwrap(),
+            Felt::from_hex("0x269836ee9da9baee712ff61a48ff880f00fa607a4ecb646b358d5b85815a7d5")
+                .unwrap(),
+            Felt::from_hex("0x5cd8336af3c364e3fc6bb5359d4d2bbf128f38649889713b0d9187d896bf1c9")
+                .unwrap(),
+            Felt::from_hex("0x4a30e81307e5f8f2c9540cfe1a8a349621bc4221dbe7104277b27a1e7cf8962")
+                .unwrap(),
+            Felt::from_hex("0x7472c276275ac5253e6d6e6365a8c64ab14cb5b6d95b62f6c6b70b3c511fbb6")
+                .unwrap(),
+        ]
+    );
+    assert_eq!(
+        output_aux_blindings(seed),
+        [
+            Felt::from_hex("0x22ee2763316052c532ad3dab4020166d638d3000678b1fe5f4fe808677c12dd")
+                .unwrap(),
+            Felt::from_hex("0x1b2919e1441904ee00dc376333786cf783efa67e47945499301db3be4a43f08")
+                .unwrap(),
+            Felt::from_hex("0x43cf5f4ee18207f9b08c7fdbe5bd6550d7af0662e90c71d8a1e4659abcd094d")
+                .unwrap(),
+        ]
+    );
+    assert_eq!(
+        order_output_blindings(seed, 7),
+        [
+            Felt::from_hex("0x38111f0c2200112b0c987deca5a2b2e07810ab2b2e0aa9b79e844796ce4adc")
+                .unwrap(),
+            Felt::from_hex("0x1604f6032d9c5697bc35f6e6e259b1c830c3c69a7fa95ce068c9c8d95db700e")
+                .unwrap(),
+            Felt::from_hex("0x479fd5fd0c3cef943888ddee24f45f507a70c0f6c1572868117d35d0c4251f6")
+                .unwrap(),
+        ]
+    );
+    assert_eq!(
+        nullifier_padding_value(seed, 7),
+        Felt::from_hex("0x2fd5b28dd91b254115daaa068bf0fb2aa8d6e3618aeec770fa495756dec85ba")
+            .unwrap(),
+    );
+    let repeated = output_padding_record(seed, 7);
+    let next = output_padding_record(seed, 8);
+    assert_eq!(first, repeated);
+    assert_ne!(first, next);
+
+    let values = first
+        .into_iter()
+        .chain(next)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(values.len(), 10);
+
+    let aux = output_aux_blindings(seed);
+    assert_eq!(
+        aux.into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3
+    );
+    assert_ne!(aux[0], first[0]);
+    assert_ne!(
+        nullifier_padding_value(seed, 7),
+        nullifier_padding_value(seed, 8),
+    );
+}
+
+#[test]
+fn every_prg_domain_lane_and_fee_asset_is_separated() {
+    assert_eq!(ORDER_OUTPUT_BLINDING_DOMAIN, "zylith_order_blind_prg_v1");
+    assert_eq!(OUTPUT_AUX_BLINDING_DOMAIN, "zylith_out_aux_prg_v1");
+    assert_eq!(OUTPUT_PADDING_DOMAIN, "zylith_out_pad_v1");
+    assert_eq!(NULLIFIER_PADDING_DOMAIN, "zylith_null_pad_v1");
+
+    let key = Felt::from(0x5a17_u64);
+    let mut values = Vec::new();
+    values.extend(order_output_blindings(key, 7));
+    values.extend(output_aux_blindings(key));
+    values.extend(output_padding_record(key, 7));
+    values.push(nullifier_padding_value(key, 7));
+    assert_eq!(
+        values
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        values.len(),
+        "the frozen cross-domain vector must not reuse a field element"
+    );
+
+    let fee_key = Felt::from(FEE_KEY);
+    let first_asset = Felt::from(0x111_u64);
+    let second_asset = Felt::from(0x222_u64);
+    let first = output_blinding(fee_key, 7, OutputKind::Fee, first_asset);
+    let second = output_blinding(fee_key, 7, OutputKind::Fee, second_asset);
+    assert_ne!(first, second);
+    assert_eq!(
+        first,
+        output_blinding(fee_key, 7, OutputKind::Fee, first_asset)
+    );
+}
+
+#[test]
+fn unknown_output_kinds_fail_closed_before_derivation() {
+    for kind in [0, 5, u64::MAX] {
+        assert_eq!(
+            OutputKind::try_from(kind).unwrap_err().to_string(),
+            "invalid order: unknown output kind"
+        );
+    }
 }
 
 #[test]
@@ -1081,19 +1774,26 @@ fn widened<T: serde::Serialize>(value: &T) -> serde_json::Value {
     value
 }
 
-fn registry_of(count: usize) -> crate::PrivateExecutionKeyRegistry {
-    crate::PrivateExecutionKeyRegistry {
+fn sealed_test_key(key_id: &str, scalar: u8) -> PrivateExecutionKeyPrivateConfig {
+    let bytes = [scalar; 32];
+    let secret = <hpke::kem::X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&bytes).unwrap();
+    PrivateExecutionKeyPrivateConfig {
+        key_id: key_id.into(),
+        algorithm: crate::private_envelope::HPKE_PROFILE_ID.into(),
+        private_key: hex::encode(bytes),
+        public_key: hex::encode(hpke::kem::X25519HkdfSha256::sk_to_pk(&secret).to_bytes()),
+    }
+}
+
+fn registry_of(count: usize) -> PrivateExecutionKeyRegistry {
+    PrivateExecutionKeyRegistry {
         keys: (0..count)
             .map(|index| {
-                let secret = p256::SecretKey::from_slice(
-                    &hex::decode(format!("{:064x}", index + 1)).unwrap(),
-                )
-                .unwrap();
-                crate::PrivateExecutionKeyPublicConfig {
-                    key_id: format!("execution-key-{index}"),
-                    public_key: hex::encode(
-                        p256::EncodedPoint::from(secret.public_key()).as_bytes(),
-                    ),
+                let key = sealed_test_key(&format!("execution-key-{index}"), (index + 1) as u8);
+                PrivateExecutionKeyPublicConfig {
+                    key_id: key.key_id.clone(),
+                    algorithm: key.algorithm.clone(),
+                    public_key: key.public_key.clone(),
                 }
             })
             .collect(),
@@ -1143,13 +1843,17 @@ fn every_request_seals_to_one_size_within_the_wire_limits() {
             s: Felt::ONE,
         },
     });
-    let registry = registry_of(MAX_EXECUTION_KEYS);
+    let registry = registry_of(1);
     let sizes = [order, status, cancel]
         .iter()
         .map(|request| {
-            serde_json::to_vec(&seal_request(&registry, request).unwrap().0)
-                .unwrap()
-                .len()
+            serde_json::to_vec(
+                &seal_request(&registry, envelope_context(), request)
+                    .unwrap()
+                    .0,
+            )
+            .unwrap()
+            .len()
         })
         .collect::<Vec<_>>();
     assert!(sizes.iter().all(|size| *size == sizes[0]), "{sizes:?}");
@@ -1169,9 +1873,16 @@ fn every_request_seals_to_one_size_within_the_wire_limits() {
             MAX_STATUS_ITEMS + 1
         ],
     });
-    assert!(seal_request(&registry, &too_many).is_err());
+    assert!(seal_request(&registry, envelope_context(), &too_many).is_err());
     let empty = PrivateRequest::Status(StatusRequest::default());
-    assert!(seal_request(&registry_of(MAX_EXECUTION_KEYS + 1), &empty).is_err());
+    assert!(
+        seal_request(
+            &registry_of(MAX_EXECUTION_KEYS + 1),
+            envelope_context(),
+            &empty
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -1238,7 +1949,7 @@ fn the_widest_status_answer_fits_the_fixed_response() {
         "orders": vec![order; MAX_STATUS_ITEMS],
         "withdrawals": [],
     });
-    let response = seal_response(&[1; 32], "digest", &answer).unwrap();
+    let response = seal_response(&[1; 32], &"d1".repeat(32), &answer).unwrap();
     assert_eq!(
         response.ciphertext.len(),
         2 * (RESPONSE_PLAINTEXT_BYTES + 16)

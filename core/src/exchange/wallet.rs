@@ -9,9 +9,10 @@ use super::envelope::{CancelRequest, OrderRequest, WithdrawRequest};
 use super::model::*;
 use super::transition::{OutputRecord, order_output_note, output_blinding};
 use super::withdrawal::withdrawal_authorization_message;
+use crate::ProtocolError;
 use crate::hash::{encode_starknet_felt, felt_from_hex_str};
-use crate::keys::{RecoverySeed, derive_user_keys};
-use crate::{ProtocolError, note_recognition_public_key_from_raw_key_hex};
+use crate::keys::RecoverySeed;
+use crate::wallet_crypto::{WalletFieldPurpose, WalletKeyScheduleV2};
 
 /// the stark keys behind a wallet's notes and orders.
 #[derive(Clone)]
@@ -19,7 +20,7 @@ pub struct WalletKeys {
     pub spend_key: Felt,
     pub withdraw_key: Felt,
     pub cancel_key: Felt,
-    /// the note recognition key's public half, as notes carry it.
+    /// the public pseudonymous owner tag carried by this wallet's notes.
     pub owner_public_key: Felt,
 }
 
@@ -34,21 +35,15 @@ impl fmt::Debug for WalletKeys {
 
 impl WalletKeys {
     pub fn from_seed(seed: &RecoverySeed) -> Result<Self, ProtocolError> {
-        let keys = derive_user_keys(seed);
-        let stark_key = |kind: &str, raw: &[u8; 32]| {
-            felt_from_hex_str(&encode_starknet_felt(kind, &hex::encode(raw)))
-        };
-        let recognition =
-            note_recognition_public_key_from_raw_key_hex(&hex::encode(keys.note_recognition_key))?;
-        // the same encodings the deposit flow gives a note's owner, spend and withdraw fields.
+        let schedule = WalletKeyScheduleV2::from_seed(seed);
         Ok(Self {
-            spend_key: stark_key("spend-auth-key", &keys.spend_auth_key)?,
-            withdraw_key: stark_key("withdraw-auth-key", &keys.withdraw_auth_key)?,
-            cancel_key: stark_key("cancel-auth-key", &keys.order_cancellation_key)?,
-            owner_public_key: felt_from_hex_str(&encode_starknet_felt(
-                "owner-public-key",
-                &recognition,
-            ))?,
+            spend_key: schedule
+                .derive_nonzero_stark_scalar(WalletFieldPurpose::SpendAuthorization, &[])?,
+            withdraw_key: schedule
+                .derive_nonzero_stark_scalar(WalletFieldPurpose::WithdrawAuthorization, &[])?,
+            cancel_key: schedule
+                .derive_nonzero_stark_scalar(WalletFieldPurpose::Cancellation, &[])?,
+            owner_public_key: schedule.owner_tag()?,
         })
     }
 
@@ -228,8 +223,8 @@ pub fn recover_order_outputs(
     let bound = Felt::from(u128::MAX);
     let mut recovered = Vec::new();
     for (kind, asset_id) in [
-        (OUTPUT_KIND_PROCEEDS, output_asset),
-        (OUTPUT_KIND_REFUND, input_asset),
+        (OutputKind::Proceeds, output_asset),
+        (OutputKind::Refund, input_asset),
     ] {
         let blinding = output_blinding(terms.owner.nonce, seq, kind, Felt::ZERO);
         for (index, record) in records.iter().enumerate() {
@@ -242,7 +237,7 @@ pub fn recover_order_outputs(
             if note.output_leaf() == record.leaf {
                 recovered.push(RecoveredOutput {
                     seq,
-                    kind,
+                    kind: kind.as_u64(),
                     index,
                     note,
                 });
@@ -269,23 +264,25 @@ pub fn recover_order_residual(
     } else {
         quote_asset_id
     };
-    let decode = |value: Felt, kind: u64| {
-        let blinding = output_blinding(terms.owner.nonce, seq, kind, Felt::ZERO);
+    let residual_blinding =
+        output_blinding(terms.owner.nonce, seq, OutputKind::Residual, Felt::ZERO);
+    let [remaining_blinding, reserved_blinding, offset_blinding] =
+        output_aux_blindings(residual_blinding);
+    let decode = |value: Felt, blinding: Felt| {
         let decoded = value - blinding;
         (decoded <= Felt::from(u128::MAX)).then(|| u128::try_from(decoded).expect("bounded"))
     };
     for (index, record) in records.iter().enumerate() {
-        let Some(funding) = decode(record.enc, OUTPUT_KIND_RESIDUAL) else {
+        let Some(funding) = decode(record.enc, residual_blinding) else {
             continue;
         };
-        let Some(remaining) = decode(record.enc_remaining, OUTPUT_KIND_RESIDUAL + 1) else {
+        let Some(remaining) = decode(record.enc_remaining, remaining_blinding) else {
             continue;
         };
-        let Some(reserved) = decode(record.enc_reserved, OUTPUT_KIND_RESIDUAL + 2) else {
+        let Some(reserved) = decode(record.enc_reserved, reserved_blinding) else {
             continue;
         };
-        let Some(reserved_offset) = decode(record.enc_reserved_offset, OUTPUT_KIND_RESIDUAL + 3)
-        else {
+        let Some(reserved_offset) = decode(record.enc_reserved_offset, offset_blinding) else {
             continue;
         };
         let order = BookOrder {
@@ -337,23 +334,13 @@ mod tests {
     }
 
     #[test]
-    fn wallet_keys_match_the_deposit_encoding() {
+    fn wallet_keys_expose_only_their_public_authorities() {
         let seed = RecoverySeed([3; 32]);
         let keys = WalletKeys::from_seed(&seed).unwrap();
-        let raw = derive_user_keys(&seed);
-        let spend =
-            crate::spend_authority_from_raw_key_hex(&hex::encode(raw.spend_auth_key)).unwrap();
-        let withdraw =
-            crate::withdraw_authority_from_raw_key_hex(&hex::encode(raw.withdraw_auth_key))
-                .unwrap();
-        assert_eq!(
-            felt_from_hex_str(&spend).unwrap(),
-            public_key(&keys.spend_key)
-        );
-        assert_eq!(
-            felt_from_hex_str(&withdraw).unwrap(),
-            public_key(&keys.withdraw_key)
-        );
+        let owner = keys.owner(Felt::ONE);
+        assert_eq!(owner.owner_public_key, keys.owner_public_key);
+        assert_eq!(owner.spend_authority, public_key(&keys.spend_key));
+        assert_eq!(owner.withdraw_authority, public_key(&keys.withdraw_key));
         assert!(
             format!("{keys:?}")
                 .find(&format!("{:#x}", keys.spend_key))
@@ -417,7 +404,10 @@ mod tests {
         notes.add_deposit(&quote);
         let orders = [&sell, &buy].map(|request| {
             let membership = notes.membership(&request.funding[0]);
-            request.clone().into_new_order(vec![membership])
+            request
+                .clone()
+                .try_into_new_order(vec![membership])
+                .unwrap()
         });
         let result =
             build_transition(&input(1, vec![], orders.to_vec(), notes.root(), 100)).unwrap();

@@ -90,11 +90,7 @@ impl Fixture {
         let message = proof_message_hash(
             Felt::from(PROOF_PROGRAM),
             TRANSITION_MESSAGE_DOMAIN,
-            bound_statement_message(
-                TRANSITION_MESSAGE_DOMAIN,
-                public.chain_context,
-                public.commitment,
-            ),
+            public.commitment,
         );
         let calldata = transition_calldata(public, &attestations)?;
         self.lines.push(public.commitment);
@@ -108,11 +104,7 @@ impl Fixture {
         let message = proof_message_hash(
             Felt::from(PROOF_PROGRAM),
             WITHDRAWAL_MESSAGE_DOMAIN,
-            bound_statement_message(
-                WITHDRAWAL_MESSAGE_DOMAIN,
-                public.chain_context,
-                public.commitment,
-            ),
+            public.commitment,
         );
         self.lines.push(public.commitment);
         self.lines.push(message);
@@ -123,11 +115,7 @@ impl Fixture {
         let message = proof_message_hash(
             Felt::from(PROOF_PROGRAM),
             RESIDUAL_RECOVERY_MESSAGE_DOMAIN,
-            bound_statement_message(
-                RESIDUAL_RECOVERY_MESSAGE_DOMAIN,
-                public.chain_context,
-                public.commitment,
-            ),
+            public.commitment,
         );
         let calldata = residual_recovery_calldata(public);
         self.lines.push(public.commitment);
@@ -254,7 +242,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     fixture.withdrawal(&duplicate_exit);
     fixture.write(&dir, "exchange_cross")?;
     if let Some(program_dir) = &program_dir {
-        // the proof program's inputs: its exchange, the expected commitment and the witness.
+        // the proof program's expected commitment and witness.
         fs::create_dir_all(program_dir)?;
         let (withdrawal_public, withdrawal_witness) = build_withdrawal(&WithdrawalInput {
             chain_context: Felt::from(CHAIN),
@@ -282,11 +270,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
         ] {
             let mut program = Fixture {
-                lines: vec![
-                    Felt::from(CHAIN),
-                    commitment,
-                    Felt::from(witness.len() as u64),
-                ],
+                lines: vec![commitment, Felt::from(witness.len() as u64)],
             };
             program.lines.extend_from_slice(witness);
             program.write(program_dir, name)?;
@@ -388,7 +372,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(program_dir) = &program_dir {
         let mut program = Fixture {
             lines: vec![
-                Felt::from(CHAIN),
                 recovery.commitment,
                 Felt::from(recovery_witness.len() as u64),
             ],

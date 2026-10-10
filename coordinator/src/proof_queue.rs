@@ -24,10 +24,11 @@ use tokio::sync::Mutex;
 use zylith_core::extract_bearer_token;
 use zylith_core::hash::{felt_from_hex_str, felt_hex, tagged_sha256_hex};
 use zylith_proof_job::{
-    CompleteProofJob, EnqueueProofJob, ProofJobClaim, ProofJobDescriptor, ProofJobLeaseRequest,
-    ProofJobState, ProofJobStatus, ProofWorkerRegistrationGrant, RegisterProofWorker,
-    RegisterProofWorkerResponse, WorkerCapabilities, WorkerSessionConfig, constant_time_eq,
-    proof_artifact_hash, proof_result_hash,
+    CompleteProofJob, EnqueueProofJob, FailProofJob, ProofFailure, ProofFailureClass,
+    ProofJobClaim, ProofJobDescriptor, ProofJobLeaseRequest, ProofJobState, ProofJobStatus,
+    ProofWorkerRegistrationGrant, RegisterProofWorker, RegisterProofWorkerResponse,
+    WorkerCapabilities, WorkerSessionConfig, constant_time_eq, proof_artifact_hash,
+    proof_result_hash,
 };
 
 const CONTROL_HEADER: &str = "x-zylith-proof-control-token";
@@ -49,6 +50,8 @@ pub struct ProofQueue {
     max_request_bytes: u64,
     completed_retention_ms: u64,
     abandoned_retention_ms: u64,
+    max_attempts: u32,
+    retry_backoff_ms: u64,
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -246,6 +249,8 @@ impl ProofQueue {
             || config.max_request_bytes == 0
             || config.completed_retention_ms == 0
             || config.abandoned_retention_ms <= config.completed_retention_ms
+            || config.max_attempts == 0
+            || config.retry_backoff_ms == 0
         {
             return Err("proof queue timing or size limits are inconsistent".into());
         }
@@ -255,7 +260,9 @@ impl ProofQueue {
         {
             return Err("proof queue control and monitoring tokens must be distinct".into());
         }
-        open_database(&config.database_path)?;
+        let connection = open_database(&config.database_path)?;
+        retire_incompatible_jobs(&connection)?;
+        drop(connection);
         Ok(Self {
             database_path: Arc::new(config.database_path),
             artifacts: Arc::new(ArtifactStore::open(
@@ -271,6 +278,8 @@ impl ProofQueue {
             max_request_bytes: config.max_request_bytes,
             completed_retention_ms: config.completed_retention_ms,
             abandoned_retention_ms: config.abandoned_retention_ms,
+            max_attempts: config.max_attempts,
+            retry_backoff_ms: config.retry_backoff_ms,
             write_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -387,29 +396,8 @@ impl ProofQueue {
             if existing.descriptor == request.descriptor {
                 return Ok(existing);
             }
-            if request.descriptor.base_block_number > existing.descriptor.base_block_number {
-                let descriptor_json = serde_json::to_string(&request.descriptor)
-                    .map_err(|error| QueueError::Internal(error.to_string()))?;
-                connection
-                    .execute(
-                        "UPDATE proof_jobs SET descriptor_json = ?1, state = 'PENDING',
-                            worker_id = NULL, lease_id = NULL,
-                            lease_expires_at_unix_ms = NULL, result_json = NULL,
-                            result_hash = NULL, updated_at_unix_ms = ?2
-                         WHERE job_id = ?3",
-                        params![
-                            descriptor_json,
-                            request.descriptor.created_at_unix_ms as i64,
-                            request.descriptor.job_id,
-                        ],
-                    )
-                    .map_err(|error| QueueError::Internal(format!("proof job refresh: {error}")))?;
-                return load_status(&connection, &request.descriptor.job_id)?.ok_or_else(|| {
-                    QueueError::Internal("refreshed proof job cannot be read".into())
-                });
-            }
             return Err(QueueError::Conflict(
-                "proof job id is already bound to a newer proving attempt".into(),
+                "proof job id is already bound to different immutable inputs".into(),
             ));
         }
         let descriptor_json = serde_json::to_string(&request.descriptor)
@@ -461,21 +449,20 @@ impl ProofQueue {
         let now = now_ms();
         let complete_cutoff = now.saturating_sub(self.completed_retention_ms);
         let abandoned_cutoff = now.saturating_sub(self.abandoned_retention_ms);
-        let connection = self.connection()?;
-        connection
-            .execute(
-                "UPDATE proof_jobs SET state = 'PENDING', worker_id = NULL, lease_id = NULL,
-                    lease_expires_at_unix_ms = NULL, updated_at_unix_ms = ?1
-                 WHERE state IN ('CLAIMED', 'PROVING')
-                   AND lease_expires_at_unix_ms <= ?1",
-                [now as i64],
-            )
-            .map_err(|error| QueueError::Internal(format!("expired lease recovery: {error}")))?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| QueueError::Internal(format!("retention transaction: {error}")))?;
+        recover_expired_leases(&transaction, now, self.max_attempts, self.retry_backoff_ms)?;
+        promote_retryable_jobs(&transaction, now, self.max_attempts)?;
+        transaction
+            .commit()
+            .map_err(|error| QueueError::Internal(format!("retention commit: {error}")))?;
         let mut statement = connection
             .prepare(
                 "SELECT job_id FROM proof_jobs
-                 WHERE (state = 'COMPLETE' AND updated_at_unix_ms <= ?1)
-                    OR (state = 'PENDING' AND updated_at_unix_ms <= ?2)",
+                 WHERE (state IN ('COMPLETE', 'FAILED_PERMANENT') AND updated_at_unix_ms <= ?1)
+                    OR (state IN ('PENDING', 'FAILED_RETRYABLE') AND updated_at_unix_ms <= ?2)",
             )
             .map_err(|error| QueueError::Internal(format!("proof retention query: {error}")))?;
         let job_ids = statement
@@ -690,16 +677,8 @@ impl ProofQueue {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| QueueError::Internal(format!("claim transaction: {error}")))?;
-        transaction
-            .execute(
-                "UPDATE proof_jobs SET
-                    state = 'PENDING', worker_id = NULL, lease_id = NULL,
-                    lease_expires_at_unix_ms = NULL, updated_at_unix_ms = ?1
-                 WHERE state IN ('CLAIMED', 'PROVING')
-                   AND lease_expires_at_unix_ms <= ?1",
-                [now as i64],
-            )
-            .map_err(|error| QueueError::Internal(format!("expired lease recovery: {error}")))?;
+        recover_expired_leases(&transaction, now, self.max_attempts, self.retry_backoff_ms)?;
+        promote_retryable_jobs(&transaction, now, self.max_attempts)?;
         let candidates = {
             let mut statement = transaction
                 .prepare(
@@ -873,7 +852,9 @@ impl ProofQueue {
         transaction
             .execute(
                 "UPDATE proof_jobs SET state = 'COMPLETE', result_json = ?1,
-                    result_hash = ?2, lease_expires_at_unix_ms = NULL,
+                    result_hash = ?2, worker_id = NULL, lease_id = NULL,
+                    lease_expires_at_unix_ms = NULL, failure_json = NULL,
+                    retry_not_before_unix_ms = NULL,
                     updated_at_unix_ms = ?3 WHERE job_id = ?4",
                 params![result_json, result_hash, now as i64, job_id],
             )
@@ -884,29 +865,135 @@ impl ProofQueue {
         self.status_sync(job_id)
     }
 
+    fn fail_sync(
+        &self,
+        token: &str,
+        job_id: &str,
+        request: FailProofJob,
+    ) -> Result<ProofJobStatus, QueueError> {
+        request.failure.validate().map_err(QueueError::BadRequest)?;
+        let worker = self.authorize_worker(token)?;
+        let now = now_ms();
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| QueueError::Internal(format!("failure transaction: {error}")))?;
+        let row = transaction
+            .query_row(
+                "SELECT descriptor_json, state, worker_id, lease_id,
+                        lease_expires_at_unix_ms, attempts, failure_json
+                 FROM proof_jobs WHERE job_id = ?1",
+                [job_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, u32>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| QueueError::Internal(format!("failure read: {error}")))?
+            .ok_or(QueueError::NotFound)?;
+        let descriptor: ProofJobDescriptor = serde_json::from_str(&row.0)
+            .map_err(|error| QueueError::Internal(format!("job decode: {error}")))?;
+        if request.prover_build_id != descriptor.prover_build_id
+            || request.request_hash != descriptor.request_hash
+        {
+            return Err(QueueError::BadRequest(
+                "proof failure does not match the pinned job".into(),
+            ));
+        }
+        if matches!(row.1.as_str(), "FAILED_RETRYABLE" | "FAILED_PERMANENT") {
+            let persisted = row
+                .6
+                .as_deref()
+                .map(serde_json::from_str::<ProofFailure>)
+                .transpose()
+                .map_err(|error| QueueError::Internal(format!("proof failure decode: {error}")))?;
+            if persisted.as_ref() == Some(&request.failure)
+                && row.2.as_deref() == Some(&worker.worker_id)
+                && row.3.as_deref() == Some(&request.lease_id)
+            {
+                transaction
+                    .commit()
+                    .map_err(|error| QueueError::Internal(format!("failure commit: {error}")))?;
+                return self.status_sync(job_id);
+            }
+            return Err(QueueError::Conflict(
+                "proof job already has a different failure".into(),
+            ));
+        }
+        if row.2.as_deref() != Some(&worker.worker_id)
+            || row.3.as_deref() != Some(&request.lease_id)
+            || row.4.is_none_or(|expires| expires <= now as i64)
+            || !matches!(row.1.as_str(), "CLAIMED" | "PROVING")
+        {
+            return Err(QueueError::Conflict("proof lease is stale".into()));
+        }
+        let retryable = request.failure.class.is_retryable() && row.5 < self.max_attempts;
+        let state = if retryable {
+            "FAILED_RETRYABLE"
+        } else {
+            "FAILED_PERMANENT"
+        };
+        let retry_not_before =
+            retryable.then(|| now.saturating_add(retry_delay_ms(self.retry_backoff_ms, row.5)));
+        let failure_json = serde_json::to_string(&request.failure)
+            .map_err(|error| QueueError::Internal(error.to_string()))?;
+        transaction
+            .execute(
+                "UPDATE proof_jobs SET state = ?1,
+                    lease_expires_at_unix_ms = NULL, failure_json = ?2,
+                    retry_not_before_unix_ms = ?3, updated_at_unix_ms = ?4
+                 WHERE job_id = ?5",
+                params![
+                    state,
+                    failure_json,
+                    retry_not_before.map(|value| value as i64),
+                    now as i64,
+                    job_id,
+                ],
+            )
+            .map_err(|error| QueueError::Internal(format!("proof failure: {error}")))?;
+        transaction
+            .commit()
+            .map_err(|error| QueueError::Internal(format!("failure commit: {error}")))?;
+        self.status_sync(job_id)
+    }
+
     fn health_sync(&self) -> Result<serde_json::Value, QueueError> {
         let connection = self.connection()?;
         let now = now_ms();
-        let (pending, active, oldest_pending, expired_active) = connection
-            .query_row(
-                "SELECT
+        let (pending, active, failed_retryable, failed_permanent, oldest_pending, expired_active) =
+            connection
+                .query_row(
+                    "SELECT
                     SUM(CASE WHEN state = 'PENDING' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN state IN ('CLAIMED', 'PROVING') THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN state = 'FAILED_RETRYABLE' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN state = 'FAILED_PERMANENT' THEN 1 ELSE 0 END),
                     MIN(CASE WHEN state = 'PENDING' THEN updated_at_unix_ms END),
                     SUM(CASE WHEN state IN ('CLAIMED', 'PROVING')
                         AND lease_expires_at_unix_ms <= ?1 THEN 1 ELSE 0 END)
                  FROM proof_jobs",
-                [now as i64],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<u64>>(0)?,
-                        row.get::<_, Option<u64>>(1)?,
-                        row.get::<_, Option<u64>>(2)?,
-                        row.get::<_, Option<u64>>(3)?,
-                    ))
-                },
-            )
-            .map_err(|error| QueueError::Internal(format!("proof health: {error}")))?;
+                    [now as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<u64>>(0)?,
+                            row.get::<_, Option<u64>>(1)?,
+                            row.get::<_, Option<u64>>(2)?,
+                            row.get::<_, Option<u64>>(3)?,
+                            row.get::<_, Option<u64>>(4)?,
+                            row.get::<_, Option<u64>>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|error| QueueError::Internal(format!("proof health: {error}")))?;
         let workers = connection
             .query_row(
                 "SELECT COUNT(DISTINCT worker_id) FROM proof_worker_sessions
@@ -915,13 +1002,31 @@ impl ProofQueue {
                 |row| row.get::<_, u64>(0),
             )
             .map_err(|error| QueueError::Internal(format!("worker health: {error}")))?;
+        let jobs = {
+            let mut statement = connection
+                .prepare("SELECT job_id, state FROM proof_jobs ORDER BY job_id")
+                .map_err(|error| QueueError::Internal(format!("proof inventory: {error}")))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(serde_json::json!({
+                        "job_id": row.get::<_, String>(0)?,
+                        "state": row.get::<_, String>(1)?,
+                    }))
+                })
+                .map_err(|error| QueueError::Internal(format!("proof inventory: {error}")))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| QueueError::Internal(format!("proof inventory: {error}")))?
+        };
         Ok(serde_json::json!({
             "status": "ok",
             "pending_jobs": pending.unwrap_or(0),
             "active_jobs": active.unwrap_or(0),
+            "failed_retryable_jobs": failed_retryable.unwrap_or(0),
+            "failed_permanent_jobs": failed_permanent.unwrap_or(0),
             "registered_workers": workers,
             "oldest_pending_age_ms": oldest_pending.map_or(0, |created| now.saturating_sub(created)),
             "expired_active_jobs": expired_active.unwrap_or(0),
+            "jobs": jobs,
         }))
     }
 }
@@ -939,6 +1044,8 @@ pub struct ProofQueueConfig {
     pub max_request_bytes: u64,
     pub completed_retention_ms: u64,
     pub abandoned_retention_ms: u64,
+    pub max_attempts: u32,
+    pub retry_backoff_ms: u64,
 }
 
 pub fn router(queue: ProofQueue) -> Router {
@@ -978,6 +1085,7 @@ pub fn router(queue: ProofQueue) -> Router {
         .route("/internal/proof-jobs/{job_id}/start", post(start))
         .route("/internal/proof-jobs/{job_id}/artifact", get(artifact))
         .route("/internal/proof-jobs/{job_id}/complete", post(complete))
+        .route("/internal/proof-jobs/{job_id}/fail", post(fail))
         .route_layer(middleware::from_fn_with_state(
             queue.clone(),
             require_worker_middleware,
@@ -1168,6 +1276,19 @@ async fn complete(
     .map(Json)
 }
 
+async fn fail(
+    State(queue): State<ProofQueue>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Json(request): Json<FailProofJob>,
+) -> Result<Json<ProofJobStatus>, QueueError> {
+    let token = queue.worker_token(&headers)?.to_owned();
+    let _guard = queue.write_lock.clone().lock_owned().await;
+    blocking("failure", move || queue.fail_sync(&token, &job_id, request))
+        .await
+        .map(Json)
+}
+
 async fn health(State(queue): State<ProofQueue>) -> Result<Json<serde_json::Value>, QueueError> {
     blocking("health", move || {
         queue
@@ -1186,11 +1307,171 @@ async fn internal_health(
         .map(Json)
 }
 
+fn retry_delay_ms(base_ms: u64, attempts: u32) -> u64 {
+    let exponent = attempts.saturating_sub(1).min(6);
+    base_ms.saturating_mul(1_u64 << exponent)
+}
+
+fn recover_expired_leases(
+    connection: &Connection,
+    now: u64,
+    max_attempts: u32,
+    retry_backoff_ms: u64,
+) -> Result<(), QueueError> {
+    let expired = {
+        let mut statement = connection
+            .prepare(
+                "SELECT job_id, attempts FROM proof_jobs
+                 WHERE state IN ('CLAIMED', 'PROVING')
+                   AND lease_expires_at_unix_ms <= ?1",
+            )
+            .map_err(|error| QueueError::Internal(format!("expired lease query: {error}")))?;
+        statement
+            .query_map([now as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+            })
+            .map_err(|error| QueueError::Internal(format!("expired lease query: {error}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| QueueError::Internal(format!("expired lease row: {error}")))?
+    };
+    let failure = ProofFailure {
+        class: ProofFailureClass::WorkerLost,
+        code: "LEASE_EXPIRED".into(),
+        component: None,
+        profile_id: None,
+        required: None,
+        available: None,
+    };
+    let failure_json =
+        serde_json::to_string(&failure).map_err(|error| QueueError::Internal(error.to_string()))?;
+    for (job_id, attempts) in expired {
+        let retryable = attempts < max_attempts;
+        let state = if retryable {
+            "FAILED_RETRYABLE"
+        } else {
+            "FAILED_PERMANENT"
+        };
+        let retry_not_before =
+            retryable.then(|| now.saturating_add(retry_delay_ms(retry_backoff_ms, attempts)));
+        connection
+            .execute(
+                "UPDATE proof_jobs SET state = ?1,
+                    lease_expires_at_unix_ms = NULL, failure_json = ?2,
+                    retry_not_before_unix_ms = ?3, updated_at_unix_ms = ?4
+                 WHERE job_id = ?5 AND state IN ('CLAIMED', 'PROVING')",
+                params![
+                    state,
+                    failure_json,
+                    retry_not_before.map(|value| value as i64),
+                    now as i64,
+                    job_id,
+                ],
+            )
+            .map_err(|error| QueueError::Internal(format!("expired lease recovery: {error}")))?;
+    }
+    Ok(())
+}
+
+fn promote_retryable_jobs(
+    connection: &Connection,
+    now: u64,
+    max_attempts: u32,
+) -> Result<(), QueueError> {
+    connection
+        .execute(
+            "UPDATE proof_jobs SET state = 'FAILED_PERMANENT',
+                retry_not_before_unix_ms = NULL, updated_at_unix_ms = ?1
+             WHERE state = 'FAILED_RETRYABLE' AND attempts >= ?2",
+            params![now as i64, max_attempts],
+        )
+        .map_err(|error| QueueError::Internal(format!("retry exhaustion: {error}")))?;
+    connection
+        .execute(
+            "UPDATE proof_jobs SET state = 'PENDING', worker_id = NULL, lease_id = NULL,
+                lease_expires_at_unix_ms = NULL, failure_json = NULL,
+                retry_not_before_unix_ms = NULL, updated_at_unix_ms = ?1
+             WHERE state = 'FAILED_RETRYABLE' AND attempts < ?2
+               AND retry_not_before_unix_ms <= ?1",
+            params![now as i64, max_attempts],
+        )
+        .map_err(|error| QueueError::Internal(format!("retry promotion: {error}")))?;
+    Ok(())
+}
+
+const PROOF_JOBS_SCHEMA: &str = "CREATE TABLE proof_jobs (
+    job_id TEXT PRIMARY KEY,
+    descriptor_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN (
+        'PENDING', 'CLAIMED', 'PROVING', 'COMPLETE',
+        'FAILED_RETRYABLE', 'FAILED_PERMANENT'
+    )),
+    worker_id TEXT,
+    lease_id TEXT,
+    lease_expires_at_unix_ms INTEGER,
+    attempts INTEGER NOT NULL,
+    result_json TEXT,
+    result_hash TEXT,
+    failure_json TEXT,
+    retry_not_before_unix_ms INTEGER,
+    created_at_unix_ms INTEGER NOT NULL,
+    updated_at_unix_ms INTEGER NOT NULL
+)";
+
+fn migrate_proof_jobs_schema(connection: &mut Connection) -> Result<(), String> {
+    let schema = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'proof_jobs'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("proof database schema read: {error}"))?;
+    match schema {
+        None => connection
+            .execute_batch(&format!(
+                "{PROOF_JOBS_SCHEMA};
+                 CREATE INDEX idx_proof_jobs_state_created
+                    ON proof_jobs(state, created_at_unix_ms);"
+            ))
+            .map_err(|error| format!("proof database schema: {error}")),
+        Some(schema) if schema.contains("FAILED_RETRYABLE") => Ok(()),
+        Some(_) => {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| format!("proof database migration: {error}"))?;
+            transaction
+                .execute_batch(&format!(
+                    "DROP INDEX IF EXISTS idx_proof_jobs_state_created;
+                     ALTER TABLE proof_jobs RENAME TO proof_jobs_legacy;
+                     {PROOF_JOBS_SCHEMA};
+                     INSERT INTO proof_jobs (
+                        job_id, descriptor_json, state, worker_id, lease_id,
+                        lease_expires_at_unix_ms, attempts, result_json, result_hash,
+                        failure_json, retry_not_before_unix_ms,
+                        created_at_unix_ms, updated_at_unix_ms
+                     ) SELECT
+                        job_id, descriptor_json, state, worker_id, lease_id,
+                        lease_expires_at_unix_ms, attempts, result_json, result_hash,
+                        NULL, NULL, created_at_unix_ms, updated_at_unix_ms
+                     FROM proof_jobs_legacy;
+                     DROP TABLE proof_jobs_legacy;
+                     CREATE INDEX idx_proof_jobs_state_created
+                        ON proof_jobs(state, created_at_unix_ms);"
+                ))
+                .map_err(|error| format!("proof database migration: {error}"))?;
+            transaction
+                .commit()
+                .map_err(|error| format!("proof database migration commit: {error}"))
+        }
+    }
+}
+
 fn open_database(path: &FsPath) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("proof database directory: {error}"))?;
     }
-    let connection = Connection::open(path).map_err(|error| format!("proof database: {error}"))?;
+    let mut connection =
+        Connection::open(path).map_err(|error| format!("proof database: {error}"))?;
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(|error| error.to_string())?;
@@ -1200,24 +1481,10 @@ fn open_database(path: &FsPath) -> Result<Connection, String> {
     connection
         .busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())?;
+    migrate_proof_jobs_schema(&mut connection)?;
     connection
         .execute_batch(
-            "CREATE TABLE IF NOT EXISTS proof_jobs (
-                job_id TEXT PRIMARY KEY,
-                descriptor_json TEXT NOT NULL,
-                state TEXT NOT NULL CHECK(state IN ('PENDING', 'CLAIMED', 'PROVING', 'COMPLETE')),
-                worker_id TEXT,
-                lease_id TEXT,
-                lease_expires_at_unix_ms INTEGER,
-                attempts INTEGER NOT NULL,
-                result_json TEXT,
-                result_hash TEXT,
-                created_at_unix_ms INTEGER NOT NULL,
-                updated_at_unix_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_proof_jobs_state_created
-                ON proof_jobs(state, created_at_unix_ms);
-            CREATE TABLE IF NOT EXISTS proof_worker_sessions (
+            "CREATE TABLE IF NOT EXISTS proof_worker_sessions (
                 token_hash TEXT PRIMARY KEY,
                 worker_id TEXT NOT NULL,
                 capabilities_json TEXT NOT NULL,
@@ -1240,13 +1507,60 @@ fn open_database(path: &FsPath) -> Result<Connection, String> {
     Ok(connection)
 }
 
+fn retire_incompatible_jobs(connection: &Connection) -> Result<(), String> {
+    let jobs = {
+        let mut statement = connection
+            .prepare(
+                "SELECT job_id, descriptor_json FROM proof_jobs
+                 WHERE state IN ('PENDING', 'CLAIMED', 'PROVING', 'FAILED_RETRYABLE')",
+            )
+            .map_err(|error| format!("proof schema retirement query: {error}"))?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("proof schema retirement query: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("proof schema retirement row: {error}"))?
+    };
+    let failure = ProofFailure {
+        class: ProofFailureClass::PermanentProverRejection,
+        code: "INCOMPATIBLE_JOB_SCHEMA".into(),
+        component: None,
+        profile_id: None,
+        required: None,
+        available: None,
+    };
+    let failure_json = serde_json::to_string(&failure)
+        .map_err(|error| format!("proof failure encode: {error}"))?;
+    let now = now_ms();
+    for (job_id, encoded) in jobs {
+        let compatible = serde_json::from_str::<ProofJobDescriptor>(&encoded)
+            .is_ok_and(|descriptor| descriptor.validate().is_ok());
+        if compatible {
+            continue;
+        }
+        connection
+            .execute(
+                "UPDATE proof_jobs SET state = 'FAILED_PERMANENT', worker_id = NULL,
+                    lease_id = NULL, lease_expires_at_unix_ms = NULL,
+                    failure_json = ?1, retry_not_before_unix_ms = NULL,
+                    updated_at_unix_ms = ?2 WHERE job_id = ?3",
+                params![failure_json, now as i64, job_id],
+            )
+            .map_err(|error| format!("proof schema retirement: {error}"))?;
+    }
+    Ok(())
+}
+
 fn load_status(
     connection: &Connection,
     job_id: &str,
 ) -> Result<Option<ProofJobStatus>, QueueError> {
     let row = connection
         .query_row(
-            "SELECT descriptor_json, state, attempts, lease_expires_at_unix_ms, result_json
+            "SELECT descriptor_json, state, attempts, lease_expires_at_unix_ms, result_json,
+                    failure_json
              FROM proof_jobs WHERE job_id = ?1",
             [job_id],
             |row| {
@@ -1256,12 +1570,13 @@ fn load_status(
                     row.get::<_, u32>(2)?,
                     row.get::<_, Option<i64>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| QueueError::Internal(format!("proof job read: {error}")))?;
-    let Some((descriptor, state, attempts, expires, result)) = row else {
+    let Some((descriptor, state, attempts, expires, result, failure)) = row else {
         return Ok(None);
     };
     Ok(Some(ProofJobStatus {
@@ -1272,6 +1587,8 @@ fn load_status(
             "CLAIMED" => ProofJobState::Claimed,
             "PROVING" => ProofJobState::Proving,
             "COMPLETE" => ProofJobState::Complete,
+            "FAILED_RETRYABLE" => ProofJobState::FailedRetryable,
+            "FAILED_PERMANENT" => ProofJobState::FailedPermanent,
             _ => return Err(QueueError::Internal("invalid proof job state".into())),
         },
         attempts,
@@ -1280,6 +1597,12 @@ fn load_status(
             .map(|encoded| {
                 serde_json::from_str(&encoded)
                     .map_err(|error| QueueError::Internal(format!("proof result decode: {error}")))
+            })
+            .transpose()?,
+        failure: failure
+            .map(|encoded| {
+                serde_json::from_str(&encoded)
+                    .map_err(|error| QueueError::Internal(format!("proof failure decode: {error}")))
             })
             .transpose()?,
     }))
@@ -1344,6 +1667,16 @@ fn validate_result(
     {
         return Err(QueueError::BadRequest(
             "proof result does not match the job".into(),
+        ));
+    }
+    if request
+        .result
+        .resource_usage
+        .as_ref()
+        .is_some_and(|usage| usage.validate_measurement().is_err())
+    {
+        return Err(QueueError::BadRequest(
+            "proof resource usage is invalid".into(),
         ));
     }
     let normalize = |value: &str| normalize_protocol_felt(value).map_err(QueueError::BadRequest);
@@ -1505,6 +1838,8 @@ mod tests {
             max_request_bytes: 1 << 20,
             completed_retention_ms: 60_000,
             abandoned_retention_ms: 120_000,
+            max_attempts: 3,
+            retry_backoff_ms: 1,
         })
         .unwrap()
     }
@@ -1586,6 +1921,30 @@ mod tests {
                     "0x1".into(),
                     "0xa".into(),
                 ],
+                resource_usage: None,
+            },
+        }
+    }
+
+    fn failure(lease_id: String, request_hash: String, class: ProofFailureClass) -> FailProofJob {
+        FailProofJob {
+            lease_id,
+            prover_build_id: "build".into(),
+            request_hash,
+            failure: ProofFailure {
+                class,
+                code: match class {
+                    ProofFailureClass::CapacityExceeded => "TRACE_DOMAIN_EXCEEDED",
+                    ProofFailureClass::TransientNetwork => "UPSTREAM_TIMEOUT",
+                    _ => "PROVER_REJECTED",
+                }
+                .into(),
+                component: (class == ProofFailureClass::CapacityExceeded)
+                    .then(|| "POSEIDON".into()),
+                profile_id: (class == ProofFailureClass::CapacityExceeded)
+                    .then(|| "proof1-log20".into()),
+                required: (class == ProofFailureClass::CapacityExceeded).then_some(1_079_477),
+                available: (class == ProofFailureClass::CapacityExceeded).then_some(1_048_576),
             },
         }
     }
@@ -1647,12 +2006,23 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_base_replaces_a_stale_attempt_and_revokes_its_lease() {
+    fn a_changed_request_gets_a_new_identity_and_is_not_poisoned_by_terminal_history() {
         let queue = queue("proof-refresh", 60_000);
         let first = job();
         queue.enqueue_sync(first).unwrap();
         let session = register(&queue, worker());
         let stale = queue.claim_sync(&session.token).unwrap().unwrap();
+        queue
+            .fail_sync(
+                &session.token,
+                &stale.descriptor.job_id,
+                failure(
+                    stale.lease_id.clone(),
+                    stale.descriptor.request_hash.clone(),
+                    ProofFailureClass::InvalidWitness,
+                ),
+            )
+            .unwrap();
 
         let mut refreshed = job();
         refreshed.request = serde_json::json!({
@@ -1667,23 +2037,14 @@ mod tests {
         refreshed.descriptor.request_bytes = bytes.len() as u64;
         refreshed.descriptor.created_at_unix_ms += 1;
         refreshed.descriptor.job_id = refreshed.descriptor.expected_job_id().unwrap();
-        assert_eq!(
-            queue
-                .enqueue_sync(refreshed)
-                .unwrap()
-                .descriptor
-                .base_block_number,
-            11
-        );
-        let stale_result = proof(stale.lease_id, stale.descriptor.request_hash);
-        assert!(
-            queue
-                .complete_sync(&session.token, &stale.descriptor.job_id, stale_result)
-                .is_err()
-        );
+        assert_ne!(stale.descriptor.job_id, refreshed.descriptor.job_id);
+        let refreshed_id = refreshed.descriptor.job_id.clone();
+        queue.enqueue_sync(refreshed).unwrap();
+        let fresh_claim = queue.claim_sync(&session.token).unwrap().unwrap();
+        assert_eq!(fresh_claim.descriptor.job_id, refreshed_id);
         assert_eq!(
             queue.status_sync(&stale.descriptor.job_id).unwrap().state,
-            ProofJobState::Pending
+            ProofJobState::FailedPermanent
         );
     }
 
@@ -1699,6 +2060,8 @@ mod tests {
         let mut second_worker = worker();
         second_worker.worker_id = "worker-2".into();
         let second = register(&queue, second_worker);
+        assert!(queue.claim_sync(&second.token).unwrap().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let second_claim = queue.claim_sync(&second.token).unwrap().unwrap();
         assert_ne!(first_claim.lease_id, second_claim.lease_id);
         let late = proof(first_claim.lease_id, first_claim.descriptor.request_hash);
@@ -1706,6 +2069,240 @@ mod tests {
             queue.complete_sync(&first.token, &job_id, late),
             Err(QueueError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn deterministic_failure_is_terminal_redacted_and_restart_safe() {
+        let root = directory("permanent-failure");
+        let queue = open_queue(root.clone(), 60_000);
+        let job = job();
+        let job_id = job.descriptor.job_id.clone();
+        queue.enqueue_sync(job).unwrap();
+        let session = register(&queue, worker());
+        let claim = queue.claim_sync(&session.token).unwrap().unwrap();
+        let report = failure(
+            claim.lease_id,
+            claim.descriptor.request_hash,
+            ProofFailureClass::CapacityExceeded,
+        );
+        let failed = queue
+            .fail_sync(&session.token, &job_id, report.clone())
+            .unwrap();
+        assert_eq!(failed.state, ProofJobState::FailedPermanent);
+        assert_eq!(failed.failure, Some(report.failure));
+        assert!(failed.result.is_none());
+        assert!(queue.claim_sync(&session.token).unwrap().is_none());
+        drop(queue);
+
+        let reopened = open_queue(root, 60_000);
+        let recovered = reopened.status_sync(&job_id).unwrap();
+        assert_eq!(recovered.state, ProofJobState::FailedPermanent);
+        assert_eq!(recovered.failure.unwrap().code, "TRACE_DOMAIN_EXCEEDED");
+    }
+
+    #[test]
+    fn retryable_failures_back_off_and_stop_after_the_attempt_bound() {
+        let mut queue = queue("retry-bound", 60_000);
+        queue.max_attempts = 2;
+        queue.retry_backoff_ms = 60_000;
+        let job = job();
+        let job_id = job.descriptor.job_id.clone();
+        queue.enqueue_sync(job).unwrap();
+        let session = register(&queue, worker());
+
+        let first = queue.claim_sync(&session.token).unwrap().unwrap();
+        let first_failure = failure(
+            first.lease_id,
+            first.descriptor.request_hash,
+            ProofFailureClass::TransientNetwork,
+        );
+        assert_eq!(
+            queue
+                .fail_sync(&session.token, &job_id, first_failure)
+                .unwrap()
+                .state,
+            ProofJobState::FailedRetryable
+        );
+        assert!(queue.claim_sync(&session.token).unwrap().is_none());
+        queue
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE proof_jobs SET retry_not_before_unix_ms = 0 WHERE job_id = ?1",
+                [&job_id],
+            )
+            .unwrap();
+
+        let second = queue.claim_sync(&session.token).unwrap().unwrap();
+        let second_failure = failure(
+            second.lease_id,
+            second.descriptor.request_hash,
+            ProofFailureClass::TransientNetwork,
+        );
+        let terminal = queue
+            .fail_sync(&session.token, &job_id, second_failure)
+            .unwrap();
+        assert_eq!(terminal.state, ProofJobState::FailedPermanent);
+        assert_eq!(terminal.attempts, 2);
+        assert!(queue.claim_sync(&session.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_or_mismatched_failure_reports_cannot_mutate_a_job() {
+        let queue = queue("failure-binding", 60_000);
+        let job = job();
+        let job_id = job.descriptor.job_id.clone();
+        queue.enqueue_sync(job).unwrap();
+        let session = register(&queue, worker());
+        let claim = queue.claim_sync(&session.token).unwrap().unwrap();
+
+        let mut wrong_build = failure(
+            claim.lease_id.clone(),
+            claim.descriptor.request_hash.clone(),
+            ProofFailureClass::CapacityExceeded,
+        );
+        wrong_build.prover_build_id = "another-build".into();
+        assert!(matches!(
+            queue.fail_sync(&session.token, &job_id, wrong_build),
+            Err(QueueError::BadRequest(_))
+        ));
+        let mut wrong_request = failure(
+            claim.lease_id.clone(),
+            claim.descriptor.request_hash.clone(),
+            ProofFailureClass::CapacityExceeded,
+        );
+        wrong_request.request_hash = "f".repeat(64);
+        assert!(matches!(
+            queue.fail_sync(&session.token, &job_id, wrong_request),
+            Err(QueueError::BadRequest(_))
+        ));
+        let mut wrong_lease = failure(
+            claim.lease_id,
+            claim.descriptor.request_hash,
+            ProofFailureClass::CapacityExceeded,
+        );
+        wrong_lease.lease_id = "stale".into();
+        assert!(matches!(
+            queue.fail_sync(&session.token, &job_id, wrong_lease),
+            Err(QueueError::Conflict(_))
+        ));
+        assert_eq!(
+            queue.status_sync(&job_id).unwrap().state,
+            ProofJobState::Claimed
+        );
+    }
+
+    #[test]
+    fn terminal_failure_idempotency_remains_bound_to_its_worker_and_lease() {
+        let queue = queue("failure-idempotency-binding", 60_000);
+        let job = job();
+        let job_id = job.descriptor.job_id.clone();
+        queue.enqueue_sync(job).unwrap();
+        let first = register(&queue, worker());
+        let claim = queue.claim_sync(&first.token).unwrap().unwrap();
+        let report = failure(
+            claim.lease_id,
+            claim.descriptor.request_hash,
+            ProofFailureClass::CapacityExceeded,
+        );
+        queue
+            .fail_sync(&first.token, &job_id, report.clone())
+            .unwrap();
+
+        let mut other = worker();
+        other.worker_id = "worker-2".into();
+        let other = register(&queue, other);
+        assert!(matches!(
+            queue.fail_sync(&other.token, &job_id, report),
+            Err(QueueError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn opening_an_old_queue_migrates_records_without_losing_them() {
+        let root = directory("schema-migration");
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("queue.sqlite");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE proof_jobs (
+                    job_id TEXT PRIMARY KEY, descriptor_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('PENDING','CLAIMED','PROVING','COMPLETE')),
+                    worker_id TEXT, lease_id TEXT, lease_expires_at_unix_ms INTEGER,
+                    attempts INTEGER NOT NULL, result_json TEXT, result_hash TEXT,
+                    created_at_unix_ms INTEGER NOT NULL, updated_at_unix_ms INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        let old_job = job();
+        connection
+            .execute(
+                "INSERT INTO proof_jobs (
+                    job_id, descriptor_json, state, attempts,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, 'PENDING', 0, ?3, ?3)",
+                params![
+                    old_job.descriptor.job_id,
+                    serde_json::to_string(&old_job.descriptor).unwrap(),
+                    old_job.descriptor.created_at_unix_ms as i64,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let queue = open_queue(root, 60_000);
+        assert_eq!(
+            queue.status_sync(&old_job.descriptor.job_id).unwrap().state,
+            ProofJobState::Pending
+        );
+        let schema: String = queue
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'proof_jobs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(schema.contains("FAILED_PERMANENT"));
+    }
+
+    #[test]
+    fn opening_a_queue_retires_jobs_from_an_incompatible_logical_schema() {
+        let root = directory("job-schema-retirement");
+        let queue = open_queue(root.clone(), 60_000);
+        let mut old_job = job();
+        old_job.descriptor.schema_version = 1;
+        old_job.descriptor.job_id = old_job.descriptor.expected_job_id().unwrap();
+        let descriptor_json = serde_json::to_string(&old_job.descriptor).unwrap();
+        queue
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO proof_jobs (
+                    job_id, descriptor_json, state, attempts,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES (?1, ?2, 'PENDING', 0, ?3, ?3)",
+                params![
+                    old_job.descriptor.job_id,
+                    descriptor_json,
+                    old_job.descriptor.created_at_unix_ms as i64,
+                ],
+            )
+            .unwrap();
+        drop(queue);
+
+        let reopened = open_queue(root, 60_000);
+        let status = reopened.status_sync(&old_job.descriptor.job_id).unwrap();
+        assert_eq!(status.state, ProofJobState::FailedPermanent);
+        assert_eq!(status.failure.unwrap().code, "INCOMPATIBLE_JOB_SCHEMA");
+        assert!(
+            reopened
+                .claim_sync(&register(&reopened, worker()).token)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

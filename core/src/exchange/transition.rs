@@ -477,31 +477,19 @@ impl TransitionPublic {
     }
 }
 
-pub fn output_blinding(key: Felt, seq: u32, kind: u64, asset_id: Felt) -> Felt {
-    if kind == OUTPUT_KIND_FEE {
-        sponge(&[
+pub fn output_blinding(key: Felt, seq: u32, kind: OutputKind, asset_id: Felt) -> Felt {
+    match kind {
+        OutputKind::Fee => sponge(&[
             short_string(OUTPUT_BLINDING_DOMAIN),
             key,
             felt_u64(u64::from(seq)),
-            felt_u64(kind),
+            felt_u64(kind.as_u64()),
             asset_id,
-        ])
-    } else {
-        sponge(&[
-            short_string(OUTPUT_BLINDING_DOMAIN),
-            key,
-            felt_u64(u64::from(seq)),
-            felt_u64(kind),
-        ])
+        ]),
+        OutputKind::Proceeds => order_output_blindings(key, seq)[0],
+        OutputKind::Refund => order_output_blindings(key, seq)[1],
+        OutputKind::Residual => order_output_blindings(key, seq)[2],
     }
-}
-
-fn output_aux_blinding(blinding: Felt, lane: u64) -> Felt {
-    sponge(&[
-        short_string(OUTPUT_AUX_BLINDING_DOMAIN),
-        blinding,
-        felt_u64(lane),
-    ])
 }
 
 /// an order output as its owner can rebuild it from the order and the transition: its blinding
@@ -513,7 +501,7 @@ pub fn order_output_note(
     asset_id: Felt,
     amount: u128,
     seq: u32,
-    kind: u64,
+    kind: OutputKind,
 ) -> NoteFields {
     NoteFields {
         asset_id,
@@ -540,7 +528,7 @@ pub fn fee_output_note(
         owner_public_key: fee_recipient,
         spend_authority: fee_recipient,
         withdraw_authority: fee_recipient,
-        blinding: output_blinding(fee_key, seq, OUTPUT_KIND_FEE, asset_id),
+        blinding: output_blinding(fee_key, seq, OutputKind::Fee, asset_id),
         nonce: u64::from(seq),
         metadata_commitment: asset_id,
     }
@@ -1368,8 +1356,8 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                 }
             }
             for (kind, asset_id, amount) in [
-                (OUTPUT_KIND_PROCEEDS, output_asset, stream.proceeds),
-                (OUTPUT_KIND_REFUND, input_asset, stream.refund),
+                (OutputKind::Proceeds, output_asset, stream.proceeds),
+                (OutputKind::Refund, input_asset, stream.refund),
             ] {
                 if amount == 0 || stream.removal == Some(Removal::Recovered) {
                     continue;
@@ -1382,16 +1370,18 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                     input.seq,
                     kind,
                 );
+                let [enc_remaining, enc_reserved, enc_reserved_offset] =
+                    output_aux_blindings(note.blinding);
                 records.push(OutputRecord {
                     leaf: note.output_leaf(),
                     enc: felt_u128(amount) + note.blinding,
-                    enc_remaining: output_aux_blinding(note.blinding, 1),
-                    enc_reserved: output_aux_blinding(note.blinding, 2),
-                    enc_reserved_offset: output_aux_blinding(note.blinding, 3),
+                    enc_remaining,
+                    enc_reserved,
+                    enc_reserved_offset,
                 });
                 outputs.push(OutputNote {
                     order_id: stream.order.order_id,
-                    kind,
+                    kind: kind.as_u64(),
                     index: records.len() - 1,
                     note,
                 });
@@ -1407,30 +1397,14 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
                     );
                     stream.order.residual_commitment = note.commitment();
                     stream.order.residual_generation = input.seq;
+                    let [remaining_blinding, reserved_blinding, offset_blinding] =
+                        output_aux_blindings(note.blinding);
                     records.push(OutputRecord {
                         leaf: note.output_leaf(),
                         enc: felt_u128(note.funding) + note.blinding,
-                        enc_remaining: felt_u128(note.remaining)
-                            + output_blinding(
-                                stream.owner.nonce,
-                                input.seq,
-                                OUTPUT_KIND_RESIDUAL + 1,
-                                Felt::ZERO,
-                            ),
-                        enc_reserved: felt_u128(note.reserved)
-                            + output_blinding(
-                                stream.owner.nonce,
-                                input.seq,
-                                OUTPUT_KIND_RESIDUAL + 2,
-                                Felt::ZERO,
-                            ),
-                        enc_reserved_offset: felt_u128(note.reserved_offset)
-                            + output_blinding(
-                                stream.owner.nonce,
-                                input.seq,
-                                OUTPUT_KIND_RESIDUAL + 3,
-                                Felt::ZERO,
-                            ),
+                        enc_remaining: felt_u128(note.remaining) + remaining_blinding,
+                        enc_reserved: felt_u128(note.reserved) + reserved_blinding,
+                        enc_reserved_offset: felt_u128(note.reserved_offset) + offset_blinding,
                     });
                     residual_outputs.push(ResidualOutput {
                         order_id: stream.order.order_id,
@@ -1469,12 +1443,14 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
             *total,
             input.seq,
         );
+        let [enc_remaining, enc_reserved, enc_reserved_offset] =
+            output_aux_blindings(note.blinding);
         records.push(OutputRecord {
             leaf: note.output_leaf(),
             enc: felt_u128(*total) + note.blinding,
-            enc_remaining: output_aux_blinding(note.blinding, 1),
-            enc_reserved: output_aux_blinding(note.blinding, 2),
-            enc_reserved_offset: output_aux_blinding(note.blinding, 3),
+            enc_remaining,
+            enc_reserved,
+            enc_reserved_offset,
         });
         outputs.push(OutputNote {
             order_id: Felt::ZERO,
@@ -1485,17 +1461,19 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
     }
     let real_outputs = records.len();
     for index in real_outputs..padded_len(real_outputs, MIN_OUTPUT_BUCKET) {
+        let [leaf, enc, enc_remaining, enc_reserved, enc_reserved_offset] =
+            output_padding_record(input.padding_seed, index);
         records.push(OutputRecord {
-            leaf: padding_value(input.padding_seed, "output_leaf", index),
-            enc: padding_value(input.padding_seed, "output_enc", index),
-            enc_remaining: padding_value(input.padding_seed, "output_remaining", index),
-            enc_reserved: padding_value(input.padding_seed, "output_reserved", index),
-            enc_reserved_offset: padding_value(input.padding_seed, "output_offset", index),
+            leaf,
+            enc,
+            enc_remaining,
+            enc_reserved,
+            enc_reserved_offset,
         });
     }
     let real_nullifiers = nullifiers.len();
     for index in real_nullifiers..padded_len(real_nullifiers, MIN_NULLIFIER_BUCKET) {
-        nullifiers.push(padding_value(input.padding_seed, "nullifier", index));
+        nullifiers.push(nullifier_padding_value(input.padding_seed, index));
     }
     if new_book.len() > MAX_BOOK_ORDERS {
         return Err(invalid("the book exceeds its maximum size"));
@@ -1615,6 +1593,7 @@ fn serialize_witness(
         input.padding_seed,
         input.note_root,
         public.prior_book_root,
+        public.output_root,
     ];
     data.push(felt_u64(assets.ids.len() as u64));
     for (index, asset) in assets.ids.iter().enumerate() {
@@ -1817,7 +1796,9 @@ fn serialize_allocation(data: &mut Vec<Felt>, stream: &StreamOrder) {
     ]);
 }
 
-/// the shape that drives a transition statement's cairo steps.
+/// The shape that drives a transition statement's Cairo steps. This deliberately models only the
+/// statement and is an early trimming guard, not a full SNIP-36/STWO capacity guarantee; release
+/// admission must also use measured virtual-OS, account, builtin and component-domain evidence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepShape {
     pub markets: u64,
@@ -1868,7 +1849,8 @@ impl StepShape {
 
     /// an upper bound on the statement's cairo steps, fitted to the differential vectors (whose
     /// runner fails if a measured count ever exceeds it), so the operator can keep every
-    /// transition inside the snip-36 budget before proving it.
+    /// transition inside its statement-step guard before proving it. A full-proof capacity
+    /// profile remains mandatory because this estimate excludes SNOS and component domains.
     pub fn estimated_steps(&self) -> u64 {
         STEPS_FIXED
             + STEPS_PER_MARKET * self.markets

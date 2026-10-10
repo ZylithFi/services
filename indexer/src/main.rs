@@ -172,6 +172,10 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/internal/sync", post(sync_now))
+        .route(
+            "/api/internal/migration-inventory",
+            get(migration_inventory),
+        )
         .route("/api/deposits/range/{start}/{end}", get(deposits_range))
         .route("/api/deposits/recent", get(recent_deposits))
         .route(
@@ -1051,6 +1055,41 @@ async fn sync_now(State(state): State<AppState>, headers: HeaderMap) -> ApiResul
     Ok(Json(state.status().await))
 }
 
+async fn migration_inventory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Value> {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer_token)
+        .unwrap_or("");
+    if !constant_time_eq(token, &state.config.control_token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let index = state.index.read().await;
+    Ok(Json(json!({
+        "schema_version": 1,
+        "ready": index.last_sync_ms != 0,
+        "next_block": index.next_block,
+        "cursor_hash": format!("{:#x}", index.cursor_hash),
+        "last_successful_sync_unix_ms": index.last_sync_ms,
+        "deposits": {
+            "count": index.deposits.len(),
+            "activation_ids": index.deposits.keys().collect::<Vec<_>>(),
+        },
+        "transitions": {
+            "count": index.transitions.len(),
+            "sequences": index.transitions.keys().collect::<Vec<_>>(),
+            "latest_seq": index.transitions.keys().next_back().copied().unwrap_or(0),
+        },
+        "note_batches": {
+            "count": index.note_batch_roots.len(),
+            "roots": &index.note_batch_roots,
+        },
+    })))
+}
+
 async fn deposits_range(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -1406,6 +1445,43 @@ mod tests {
         let (status, body) = get(&app, "/health", "1.2.3.4:5", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ready"], true);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn migration_inventory_is_authenticated_exact_and_preimage_free() {
+        let path = temporary("migration-inventory");
+        let _ = std::fs::remove_file(&path);
+        let state = state(path.clone(), 100);
+        state.index.write().await.last_sync_ms = now_ms();
+        let app = router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/api/internal/migration-inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::get("/api/internal/migration-inventory")
+                    .header(AUTHORIZATION, "Bearer token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body = to_bytes(authorized.into_body(), 1 << 20).await.unwrap();
+        let inventory: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(inventory["schema_version"], 1);
+        assert_eq!(inventory["deposits"]["count"], 0);
+        assert!(inventory.get("private_key").is_none());
         let _ = std::fs::remove_file(&path);
     }
 

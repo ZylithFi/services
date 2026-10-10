@@ -5,6 +5,7 @@ mod api;
 mod chain;
 mod config;
 mod engine;
+mod execution_key_cli;
 mod market;
 mod snip36;
 mod state;
@@ -14,7 +15,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use starknet_rust_core::types::Felt;
+use starknet_rust_core::types::{BlockId, Felt};
+use starknet_rust_providers::Provider;
 use tokio::sync::Mutex;
 
 use crate::config::{Account, Config, felt};
@@ -44,29 +46,23 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Some("fingerprint") => {
-            // the manifest pin for an execution key file; only public keys enter it.
-            let path = args
-                .get(1)
-                .ok_or("usage: fingerprint <execution-keys.json>")?;
-            let raw = std::fs::read_to_string(path)
-                .map_err(|error| format!("execution keys {path}: {error}"))?;
-            let keys: Vec<zylith_core::PrivateExecutionKeyPrivateConfig> =
-                serde_json::from_str(&raw).map_err(|error| format!("execution keys: {error}"))?;
-            zylith_core::validate_private_execution_keys(&keys)
-                .map_err(|error| format!("execution keys: {error}"))?;
-            let registry = zylith_core::PrivateExecutionKeyRegistry {
-                keys: keys
-                    .iter()
-                    .map(|key| zylith_core::PrivateExecutionKeyPublicConfig {
-                        key_id: key.key_id.clone(),
-                        public_key: key.public_key.clone(),
-                    })
-                    .collect(),
-            };
+            // print exactly the selected key's one-key v2 registry pin.
+            if args.len() != 3 {
+                return Err("usage: fingerprint <execution-keys.json> <key-id>".into());
+            }
+            let path = &args[1];
+            let key_id = &args[2];
+            let keys = config::load_execution_keys(path, key_id)?;
+            let registry = config::active_execution_registry(&keys, key_id)?;
             println!(
                 "{}",
                 registry.fingerprint().map_err(|error| error.to_string())?
             );
+            Ok(())
+        }
+        Some("generate-execution-key") => {
+            let output = execution_key_cli::generate_execution_key_command(&args)?;
+            println!("{output}");
             Ok(())
         }
         Some("proof-public-key") => {
@@ -79,7 +75,7 @@ async fn main() -> Result<(), String> {
             Ok(())
         }
         Some(other) => Err(format!(
-            "unknown command {other}; use `serve`, `bench <witness.json>...`, `ids <name>...`, `fingerprint <keys.json>` or `proof-public-key`"
+            "unknown command {other}; use `serve`, `bench <witness.json>...`, `ids <name>...`, `fingerprint <keys.json> <key-id>`, `generate-execution-key <key-id> <new-private-config.json>` or `proof-public-key`"
         )),
     }
 }
@@ -423,7 +419,7 @@ async fn serve() -> Result<(), String> {
     let snip36 = Snip36::new(&config);
     check_exchange_configuration(&config, &snip36).await?;
     check_token_decimals(&config, &snip36).await?;
-    let state = match store.load()? {
+    let mut state = match store.load()? {
         Some(state) => state,
         None => {
             // the book's order preimages exist only in this state; starting empty against an
@@ -443,6 +439,15 @@ async fn serve() -> Result<(), String> {
             state
         }
     };
+    let transition_profile_id = config
+        .proof_capacity(zylith_proof_job::ProofStatementKind::Transition)
+        .profile_id
+        .clone();
+    if state.proof_capacity_profile_id.as_deref() != Some(transition_profile_id.as_str()) {
+        state.proof_capacity_profile_id = Some(transition_profile_id);
+        state.proof_capacity_admission_limit = None;
+        store.save(&state)?;
+    }
     let bind_addr: SocketAddr = config
         .bind_addr
         .parse()
@@ -483,7 +488,25 @@ async fn bench(paths: &[String]) -> Result<(), String> {
             "proof account key",
         )?,
     };
+    let proof_account_address = proof_account.address;
     let chain_id = config::chain_id(&required("ZYLITH_CHAIN_ID")?)?;
+    let release_commit = required("ZYLITH_RELEASE_COMMIT")?;
+    let prover_build_id = required("ZYLITH_PROVER_BUILD_ID")?;
+    let proof_version = required("ZYLITH_PROOF_VERSION")?;
+    let virtual_program_hash = format!(
+        "{:#x}",
+        felt(
+            &required("ZYLITH_VIRTUAL_PROGRAM_HASH")?,
+            "virtual program hash"
+        )?
+    );
+    let starknet_os_config_hash = format!(
+        "{:#x}",
+        felt(
+            &required("ZYLITH_STARKNET_OS_CONFIG_HASH")?,
+            "starknet os config hash"
+        )?
+    );
     let snip36 = Snip36::from_parts(Snip36Config {
         rpc_url: url::Url::parse(&required("ZYLITH_STARKNET_RPC_URL")?)
             .map_err(|error| error.to_string())?,
@@ -492,23 +515,58 @@ async fn bench(paths: &[String]) -> Result<(), String> {
         proof_account,
         proof_queue_url: required("ZYLITH_PROOF_QUEUE_URL")?,
         proof_queue_control_token: required("ZYLITH_PROOF_QUEUE_CONTROL_TOKEN")?,
-        prover_build_id: required("ZYLITH_PROVER_BUILD_ID")?,
+        prover_build_id: prover_build_id.clone(),
         protocol_version: "zylith-v1".into(),
-        config_version: required("ZYLITH_RELEASE_COMMIT")?,
-        proof_version: required("ZYLITH_PROOF_VERSION")?,
-        virtual_program_hash: required("ZYLITH_VIRTUAL_PROGRAM_HASH")?,
-        starknet_os_config_hash: required("ZYLITH_STARKNET_OS_CONFIG_HASH")?,
+        config_version: release_commit.clone(),
+        proof_version: proof_version.clone(),
+        virtual_program_hash: virtual_program_hash.clone(),
+        starknet_os_config_hash: starknet_os_config_hash.clone(),
         proof_validity_blocks: required("ZYLITH_PROOF_VALIDITY_BLOCKS")?
             .parse()
             .map_err(|_| "ZYLITH_PROOF_VALIDITY_BLOCKS is invalid".to_string())?,
         timeout_seconds: 900,
         blocks_back: 20,
     });
-    let proof_program = felt(
-        &required("ZYLITH_TRANSITION_PROOF_PROGRAM_ADDRESS")?,
-        "transition proof program",
-    )?;
+    let (
+        statement_kind,
+        proof_program_env,
+        proof_program_label,
+        program_entrypoint,
+        statement_version,
+    ) = match required("ZYLITH_BENCHMARK_STATEMENT_KIND")?.as_str() {
+        "TRANSITION" => (
+            zylith_proof_job::ProofStatementKind::Transition,
+            "ZYLITH_TRANSITION_PROOF_PROGRAM_ADDRESS",
+            "transition proof program",
+            "compile_transition_proof",
+            zylith_proof_job::TRANSITION_STATEMENT_VERSION,
+        ),
+        "WITHDRAWAL" => (
+            zylith_proof_job::ProofStatementKind::Withdrawal,
+            "ZYLITH_WITHDRAWAL_PROOF_PROGRAM_ADDRESS",
+            "withdrawal proof program",
+            "compile_withdrawal_proof",
+            zylith_proof_job::WITHDRAWAL_STATEMENT_VERSION,
+        ),
+        "RESIDUAL_RECOVERY" => (
+            zylith_proof_job::ProofStatementKind::ResidualRecovery,
+            "ZYLITH_RESIDUAL_RECOVERY_PROOF_PROGRAM_ADDRESS",
+            "residual recovery proof program",
+            "compile_residual_recovery_proof",
+            zylith_proof_job::RESIDUAL_RECOVERY_STATEMENT_VERSION,
+        ),
+        _ => {
+            return Err(
+                    "ZYLITH_BENCHMARK_STATEMENT_KIND must be TRANSITION, WITHDRAWAL, or RESIDUAL_RECOVERY"
+                        .into(),
+                );
+        }
+    };
+    let proof_program = felt(&required(proof_program_env)?, proof_program_label)?;
     let exchange = felt(&required("ZYLITH_EXCHANGE_ADDRESS")?, "exchange")?;
+    let require_resource_usage = env::var("ZYLITH_BENCHMARK_REQUIRE_RESOURCE_USAGE")
+        .ok()
+        .is_some_and(|value| value == "1");
     for path in paths {
         let raw = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
         let values: Vec<String> =
@@ -518,18 +576,15 @@ async fn bench(paths: &[String]) -> Result<(), String> {
             .skip(1)
             .map(|value| felt(value, "witness felt"))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut calldata = vec![
-            exchange,
-            starknet_rust_core::types::Felt::from(witness.len() as u64),
-        ];
+        let mut calldata = vec![starknet_rust_core::types::Felt::from(witness.len() as u64)];
         calldata.extend(witness.iter().copied());
         let started = Instant::now();
         let result = snip36
             .prove_checked(
-                vec![call(proof_program, "compile_transition_proof", calldata)],
+                vec![call(proof_program, program_entrypoint, calldata)],
                 None,
                 ProofJobContext {
-                    statement_kind: zylith_proof_job::ProofStatementKind::Benchmark,
+                    statement_kind: statement_kind.clone(),
                     transition_id: format!("benchmark:{}", canonical_witness_hash(&witness)),
                     epoch_id: None,
                     exchange_address: format!("{exchange:#x}"),
@@ -537,21 +592,57 @@ async fn bench(paths: &[String]) -> Result<(), String> {
                     expected_output_state_root: None,
                     statement_commitment: "0x0".into(),
                     witness_hash: canonical_witness_hash(&witness),
-                    program_entrypoint: "compile_transition_proof".into(),
+                    program_entrypoint: program_entrypoint.into(),
                 },
             )
             .await;
         match result {
             // the facts carry what the exchange pins: the proof version, the virtual program hash and
             // the os config hash.
-            Ok(proof) => println!(
-                "{path}: proven in {} ms ({} proof bytes); proof_version={:#x} virtual_program_hash={:#x} os_config_hash={:#x}",
-                started.elapsed().as_millis(),
-                proof.proof.len(),
-                proof.facts[0],
-                proof.facts[2],
-                proof.facts[6]
-            ),
+            Ok(proof) => {
+                if require_resource_usage && proof.resource_usage.is_none() {
+                    return Err(format!(
+                        "{path}: pinned prover adapter omitted structured full-SNOS resource usage"
+                    ));
+                }
+                let base_block_number: u64 = proof.facts[4]
+                    .try_into()
+                    .map_err(|_| "proof base block exceeds u64".to_string())?;
+                let proof_account_class_hash = snip36
+                    .provider
+                    .get_class_hash_at(BlockId::Number(base_block_number), proof_account_address)
+                    .await
+                    .map_err(|error| format!("benchmark proof-account class hash: {error}"))?;
+                let proof_program_class_hash = snip36
+                    .provider
+                    .get_class_hash_at(BlockId::Number(base_block_number), proof_program)
+                    .await
+                    .map_err(|error| format!("benchmark proof-program class hash: {error}"))?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": 3,
+                        "statement_kind": statement_kind,
+                        "witness_path": path,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                        "proof_bytes": proof.proof.len(),
+                        "base_block_number": base_block_number,
+                        "identity": {
+                            "release_commit": &release_commit,
+                            "prover_build_id": &prover_build_id,
+                            "proof_version": &proof_version,
+                            "program_variant": zylith_proof_job::VIRTUAL_PROGRAM_VARIANT,
+                            "virtual_program_hash": &virtual_program_hash,
+                            "starknet_os_output_version": zylith_proof_job::STARKNET_OS_OUTPUT_VERSION,
+                            "starknet_os_config_hash": &starknet_os_config_hash,
+                            "proof_account_class_hash": format!("{proof_account_class_hash:#x}"),
+                            "proof_program_class_hash": format!("{proof_program_class_hash:#x}"),
+                            "statement_version": statement_version,
+                        },
+                        "resource_usage": proof.resource_usage,
+                    })
+                );
+            }
             Err(error) => println!(
                 "{path}: failed after {} ms: {error}",
                 started.elapsed().as_millis()

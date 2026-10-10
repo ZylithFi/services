@@ -1,6 +1,6 @@
 //! the operator's http surface.
 //!
-//! private requests, status lookups included, arrive sealed to every execution key
+//! private requests, status lookups included, arrive sealed to the published active execution key
 //! (`zylith_core::exchange::seal_request`) at one endpoint. every request that opens is answered
 //! with http 200 and a padded body sealed under the request's response key, so neither the url,
 //! the status code nor the size says what was asked or what came back.
@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
+use zylith_core::PrivateExecutionKeyRegistry;
 use zylith_core::exchange::{
     CancelRequest, MAX_STATUS_EVENTS_PER_ORDER, MAX_STATUS_ITEMS, PrivateRequest, SealedRequest,
     StatusRequest, WithdrawalQuery, cancel_message, open_request, seal_response, verify_message,
@@ -43,6 +44,7 @@ fn reject(status: StatusCode, reason: &str) -> (StatusCode, Json<Value>) {
 }
 
 pub fn router(operator: Arc<Operator>) -> Router {
+    let execution_registry = operator.config.active_execution_registry();
     let origins = operator
         .config
         .allowed_origins
@@ -57,12 +59,12 @@ pub fn router(operator: Arc<Operator>) -> Router {
     };
     Router::new()
         .route("/health", get(health))
-        .route("/api/public/execution-keys", get(execution_keys))
         .route("/api/public/exchange", get(exchange_status))
         .route("/api/public/reference-prices", get(reference_prices))
         .route("/api/private/requests", post(private_request))
         .route("/api/internal/status", get(internal_status))
         .with_state(api)
+        .merge(execution_keys_router(execution_registry))
         .layer(DefaultBodyLimit::max(max_body))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
@@ -84,8 +86,14 @@ async fn health(State(api): State<Api>) -> Json<Value> {
     }))
 }
 
-async fn execution_keys(State(api): State<Api>) -> Json<Value> {
-    Json(serde_json::to_value(api.operator.config.registry()).expect("registry serializes"))
+fn execution_keys_router(registry: PrivateExecutionKeyRegistry) -> Router {
+    Router::new()
+        .route("/api/public/execution-keys", get(execution_keys))
+        .with_state(registry)
+}
+
+async fn execution_keys(State(registry): State<PrivateExecutionKeyRegistry>) -> Json<Value> {
+    Json(serde_json::to_value(registry).expect("registry serializes"))
 }
 
 async fn exchange_status(State(api): State<Api>) -> Json<Value> {
@@ -183,8 +191,15 @@ async fn private_request(
     {
         return Err(reject(StatusCode::TOO_MANY_REQUESTS, "rate limited"));
     }
-    let opened = open_request(&sealed, &api.operator.config.execution_keys)
-        .map_err(|_| reject(StatusCode::BAD_REQUEST, "the request does not open"))?;
+    let opened = open_request(
+        &sealed,
+        zylith_core::private_envelope::PrivateEnvelopeContext {
+            chain_id: crate::config::to_core(api.operator.config.chain_id),
+            deployment_id: api.operator.config.chain_context(),
+        },
+        &api.operator.config.execution_keys,
+    )
+    .map_err(|_| reject(StatusCode::BAD_REQUEST, "the request does not open"))?;
     // membership is determined when the authenticated request has opened, not when a contended
     // state lock later becomes available.
     let received_at_ms = now_ms();
@@ -636,6 +651,35 @@ async fn internal_status(State(api): State<Api>, headers: HeaderMap) -> Response
         return Err(reject(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     let state = api.operator.state.lock().await;
+    let resting_orders = state
+        .book
+        .iter()
+        .map(|entry| {
+            json!({
+                "order_id": key(&entry.order.order_id),
+                "residual_commitment": key(&entry.order.residual_commitment),
+                "residual_generation": entry.order.residual_generation,
+            })
+        })
+        .collect::<Vec<_>>();
+    let note_batches = state
+        .notes
+        .batches
+        .iter()
+        .map(|batch| json!({ "root": key(&batch.root), "leaf_count": batch.leaves.len(), "seq": batch.seq, "block": batch.block }))
+        .collect::<Vec<_>>();
+    let fee_outputs = state
+        .in_flight
+        .iter()
+        .flat_map(|transition| {
+            transition.result.outputs.iter().filter_map(|output| {
+                (output.kind == zylith_core::exchange::OUTPUT_KIND_FEE)
+                    .then(|| transition.result.public.output_records.get(output.index))
+                    .flatten()
+                    .map(|record| json!({ "seq": transition.seq, "leaf": key(&record.leaf) }))
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({
         "confirmed_seq": state.confirmed_seq,
         "book_orders": state.book.len(),
@@ -645,12 +689,34 @@ async fn internal_status(State(api): State<Api>, headers: HeaderMap) -> Response
         "in_flight": state.in_flight.iter().map(|entry| json!({ "seq": entry.seq, "stage": entry.stage })).collect::<Vec<_>>(),
         "note_batches": state.notes.batches.len(),
         "withdrawals": state.withdrawals.len(),
+        "migration_inventory": {
+            "schema_version": 1,
+            "state_version": state.version,
+            "resting_orders": resting_orders,
+            "pending_order_ids": state.pending_orders.keys().collect::<Vec<_>>(),
+            "note_batches": note_batches,
+            "note_leaves": state.notes.batches.iter().map(|batch| batch.leaves.len()).sum::<usize>(),
+            "residual_authorities": state.book.iter().filter(|entry| entry.order.residual_commitment != starknet_crypto::Felt::ZERO).count(),
+            "pending_withdrawal_nullifiers": state.withdrawals.keys().collect::<Vec<_>>(),
+            "pending_residual_recovery_nullifiers": state.pending_residual_recoveries.keys().collect::<Vec<_>>(),
+            "in_flight_sequences": state.in_flight.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            "fee_outputs": fee_outputs,
+        },
+        "proof_capacity": {
+            "transition_profile_id": api.operator.config.proof_capacity(zylith_proof_job::ProofStatementKind::Transition).profile_id,
+            "withdrawal_profile_id": api.operator.config.proof_capacity(zylith_proof_job::ProofStatementKind::Withdrawal).profile_id,
+            "residual_recovery_profile_id": api.operator.config.proof_capacity(zylith_proof_job::ProofStatementKind::ResidualRecovery).profile_id,
+            "learned_transition_admission_limit": state.proof_capacity_admission_limit,
+        },
     })))
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
     use starknet_rust_core::types::Felt;
+    use tower::ServiceExt;
     use zylith_core::exchange::fixtures::{BASE, Notes, User, deposit, input, new_order, user};
     use zylith_core::exchange::{
         NoteFields, OrderRequest, WithdrawRequest, build_transition, sign_message,
@@ -659,8 +725,11 @@ mod tests {
 
     use super::*;
     use crate::chain::NoteBatch;
-    use crate::config::from_core;
-    use crate::state::{InFlight, OperatorState, TransitionStage, WithdrawalJob, WithdrawalStage};
+    use crate::config::{active_execution_registry, from_core};
+    use crate::state::{
+        InFlight, OperatorState, TransitionPaddingSeed, TransitionStage, WithdrawalJob,
+        WithdrawalStage,
+    };
 
     fn request(notes: &Notes, owner: &User, note: &NoteFields, amount: u128) -> OrderRequest {
         let order = new_order(
@@ -677,6 +746,48 @@ mod tests {
             funding: vec![note.clone()],
             authorization: order.authorization,
         }
+    }
+
+    #[tokio::test]
+    async fn execution_keys_endpoint_publishes_only_the_explicit_active_key() {
+        let keys = vec![
+            zylith_core::PrivateExecutionKeyPrivateConfig {
+                key_id: "old".into(),
+                algorithm: zylith_core::private_envelope::HPKE_PROFILE_ID.into(),
+                private_key: "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb"
+                    .into(),
+                public_key: "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a"
+                    .into(),
+            },
+            zylith_core::PrivateExecutionKeyPrivateConfig {
+                key_id: "new".into(),
+                algorithm: zylith_core::private_envelope::HPKE_PROFILE_ID.into(),
+                private_key: hex::encode([1_u8; 32]),
+                public_key: "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209"
+                    .into(),
+            },
+        ];
+        let registry = active_execution_registry(&keys, "new").unwrap();
+        let response = execution_keys_router(registry)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/public/execution-keys")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let document: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(document["keys"][0]["key_id"], "new");
+        assert_eq!(
+            document["keys"][0]["algorithm"],
+            zylith_core::private_envelope::HPKE_PROFILE_ID
+        );
+        assert_eq!(document["keys"][0]["public_key"], keys[1].public_key);
+        assert!(document["keys"][0].get("private_key").is_none());
     }
 
     #[test]
@@ -751,6 +862,7 @@ mod tests {
         let mut transition = InFlight {
             seq: 1,
             close_time_ms: 10_001,
+            padding_seed: TransitionPaddingSeed::new(Felt::ONE).unwrap(),
             result,
             calldata: vec![],
             admitted: vec![],

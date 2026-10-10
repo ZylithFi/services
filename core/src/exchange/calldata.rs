@@ -289,14 +289,6 @@ pub fn sign_price_batch(
     Ok(())
 }
 
-/// `h(h(domain, contract), commitment)`: the statement message the proof program emits.
-pub fn bound_statement_message(domain: &str, chain_context: Felt, commitment: Felt) -> Felt {
-    poseidon_hash(
-        poseidon_hash(short_string(domain), chain_context),
-        commitment,
-    )
-}
-
 /// the l1 message hash the proof facts carry for a statement message from `proof_program`.
 pub fn proof_message_hash(proof_program: Felt, domain: &str, statement_message: Felt) -> Felt {
     poseidon_hash_many(&[

@@ -13,7 +13,7 @@ Object.assign(manifest, {
 });
 Object.assign(manifest.proof, {
   transition_proof_program_address: felt(7), withdrawal_proof_program_address: felt(17), residual_recovery_proof_program_address: felt(18), virtual_program_hash: felt(8), starknet_os_config_hash: felt(9),
-  proof_account_address: felt(10), settlement_account_address: felt(11), proof_validity_blocks: 450,
+  proof_account_address: felt(10), proof_account_class_hash: felt(20), transition_proof_program_class_hash: felt(21), withdrawal_proof_program_class_hash: felt(22), residual_recovery_proof_program_class_hash: felt(23), settlement_account_address: felt(11), proof_validity_blocks: 450,
   config_locked_after_deploy: true, prover_build_id: "stwo-production-v1",
 });
 manifest.funding.starknet_privacy.ingress_key_registry_fingerprint = "ab".repeat(32);
@@ -70,11 +70,13 @@ const env = {
   ZYLITH_PROOF_QUEUE_CONTROL_TOKEN: "q".repeat(32),
   ZYLITH_PROOF_QUEUE_MONITOR_TOKEN: "m".repeat(32),
   ZYLITH_PROVER_BUILD_ID: "stwo-production-v1",
+  ZYLITH_PROOF_CAPACITY_PROFILE_DIR: "/proof-capacity",
   ZYLITH_PAYMASTER_HEALTH_URL: "http://127.0.0.1:8787/health",
   ZYLITH_PRIVACY_DISCOVERY_HEALTH_URL: "https://api.example/discovery/health",
   ZYLITH_PRIVACY_PROVER_HEALTH_URL: "https://api.example/prover/health",
   ZYLITH_OPERATOR_ALLOWED_ORIGINS: "https://app.zylith.fi",
   ZYLITH_EXECUTION_KEYS_PATH: "/secrets/keys.json",
+  ZYLITH_ACTIVE_EXECUTION_KEY_ID: "active_1",
   ZYLITH_REFERENCE_PRICE_SIGNER_PRIVATE_KEY: felt(14),
   ZYLITH_REFERENCE_PRICE_SIGNER_PUBLIC_KEY: felt(14),
   ZYLITH_EXCHANGE_ADDRESS: felt(4),
@@ -89,6 +91,8 @@ const env = {
   ZYLITH_PROOF_WORKER_SESSION_TTL_MS: "1800000",
   ZYLITH_PROOF_WORKER_MAX_LIFETIME_MS: "14400000",
   ZYLITH_PROOF_JOB_LEASE_MS: "60000",
+  ZYLITH_PROOF_JOB_MAX_ATTEMPTS: "3",
+  ZYLITH_PROOF_JOB_RETRY_BACKOFF_MS: "5000",
   ZYLITH_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS: "900",
   ZYLITH_PROOF_JOB_COMPLETED_RETENTION_MS: "3600000",
   ZYLITH_PROOF_JOB_ABANDONED_RETENTION_MS: "604800000",
@@ -99,8 +103,41 @@ const env = {
   ZYLITH_ROUTE_SERVICE_HEALTH_URL: "",
 };
 
+const capacityProfile = (statementKind, statementVersion, programClassHash) => JSON.stringify({
+  schema_version: 4,
+  profile_id: "cd".repeat(32),
+  statement_kind: statementKind,
+  identity: {
+    release_commit: manifest.deployment.release_commit,
+    prover_build_id: manifest.proof.prover_build_id,
+    proof_version: manifest.proof.proof_version,
+    program_variant: "VIRTUAL_SNOS",
+    virtual_program_hash: manifest.proof.virtual_program_hash,
+    starknet_os_output_version: "VIRTUAL_SNOS0",
+    starknet_os_config_hash: manifest.proof.starknet_os_config_hash,
+    proof_account_class_hash: manifest.proof.proof_account_class_hash,
+    proof_program_class_hash: programClassHash,
+    statement_version: statementVersion,
+  },
+  vector_family: "release-gate-v1",
+  safety_margin_bps: 1000,
+  capacity: {},
+  limits: {},
+  vectors: [{}],
+});
+
+const capacityFiles = {
+  "/proof-capacity/transition.json": capacityProfile("TRANSITION", "zylith-transition-v2", manifest.proof.transition_proof_program_class_hash),
+  "/proof-capacity/withdrawal.json": capacityProfile("WITHDRAWAL", "zylith-withdrawal-v1", manifest.proof.withdrawal_proof_program_class_hash),
+  "/proof-capacity/residual_recovery.json": capacityProfile("RESIDUAL_RECOVERY", "zylith-residual-recovery-v2", manifest.proof.residual_recovery_proof_program_class_hash),
+};
+
 const run = (overrides = {}, manifestOverride = manifest) =>
-  check({ ...env, ...overrides }, () => JSON.stringify({ manifest: manifestOverride }), () => true);
+  check(
+    { ...env, ...overrides },
+    (path) => capacityFiles[path] ?? JSON.stringify({ manifest: manifestOverride }),
+    (path) => path in capacityFiles || path === env.ZYLITH_EXECUTION_KEYS_PATH,
+  );
 
 test("a complete production environment passes", () => {
   assert.deepEqual(run(), []);
@@ -147,6 +184,38 @@ test("an unfinished deployment fails", () => {
   assert.ok(failures.some((failure) => failure.includes("release_commit")));
 });
 
+test("the production release is PROOF2 only", () => {
+  const proof1 = structuredClone(manifest);
+  proof1.proof.proof_version = "PROOF1";
+  const failures = run({}, proof1);
+  assert.ok(failures.some((failure) => failure.includes("proof.proof_version must be PROOF2")));
+});
+
+test("proof class hashes and full-proof capacity evidence are mandatory and release-bound", () => {
+  const missingClass = structuredClone(manifest);
+  missingClass.proof.proof_account_class_hash = "0x0";
+  assert.ok(run({}, missingClass).some((failure) => failure.includes("proof_account_class_hash")));
+
+  assert.ok(run({ ZYLITH_PROOF_CAPACITY_PROFILE_DIR: "" }).some((failure) => failure.includes("ZYLITH_PROOF_CAPACITY_PROFILE_DIR is required")));
+
+  const changedClass = structuredClone(manifest);
+  changedClass.proof.transition_proof_program_class_hash = felt(99);
+  assert.ok(run({}, changedClass).some((failure) => failure.includes("profile identity differs")));
+
+  const staleProfile = JSON.parse(capacityFiles["/proof-capacity/transition.json"]);
+  staleProfile.schema_version = 3;
+  const staleFiles = {
+    ...capacityFiles,
+    "/proof-capacity/transition.json": JSON.stringify(staleProfile),
+  };
+  const staleFailures = check(
+    env,
+    (path) => staleFiles[path] ?? JSON.stringify({ manifest }),
+    (path) => path in staleFiles || path === env.ZYLITH_EXECUTION_KEYS_PATH,
+  );
+  assert.ok(staleFailures.some((failure) => failure.includes("invalid envelope")));
+});
+
 test("a pair without a minimum order size fails", () => {
   const changed = structuredClone(manifest);
   changed.market_registry.markets[0].min_order_amount = "0";
@@ -155,9 +224,29 @@ test("a pair without a minimum order size fails", () => {
 });
 
 test("an unpinned execution key registry fails", () => {
-  for (const pin of ["0".repeat(64), "xyz", undefined]) {
+  for (const pin of ["0".repeat(64), "xyz", "AB".repeat(32), null, undefined]) {
     const failures = run({}, { ...manifest, funding: { starknet_privacy: { ingress_key_registry_fingerprint: pin } } });
     assert.ok(failures.some((failure) => failure.includes("ingress_key_registry_fingerprint")), String(pin));
+  }
+});
+
+test("an explicit canonical active execution key id is required", () => {
+  for (const bad of ["", "Active", " next", "next ", "bad/id", "a".repeat(65)]) {
+    const failures = run({ ZYLITH_ACTIVE_EXECUTION_KEY_ID: bad });
+    assert.ok(failures.some((failure) => failure.includes("ZYLITH_ACTIVE_EXECUTION_KEY_ID")), JSON.stringify({ bad, failures }));
+  }
+});
+
+test("current and optional next registry pins are distinct canonical fingerprints", () => {
+  const current = "ab".repeat(32);
+  const next = "cd".repeat(32);
+  const rotated = structuredClone(manifest);
+  rotated.funding.starknet_privacy.ingress_key_registry_next_fingerprint = next;
+  assert.deepEqual(run({}, rotated), []);
+  for (const bad of [current, next.toUpperCase(), "0".repeat(64), "bad", "", null]) {
+    rotated.funding.starknet_privacy.ingress_key_registry_next_fingerprint = bad;
+    const failures = run({}, rotated);
+    assert.ok(failures.some((failure) => failure.includes("ingress_key_registry_next_fingerprint")), JSON.stringify({ bad, failures }));
   }
 });
 

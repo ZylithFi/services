@@ -29,3 +29,6 @@ url = "2"
 zeroize = "1"
 zylith-core = { path = "../core" }
 zylith-proof-job = { path = "../proof_job" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

@@ -81,6 +81,10 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
   origins("ZYLITH_OPERATOR_ALLOWED_ORIGINS");
   const executionKeys = required("ZYLITH_EXECUTION_KEYS_PATH");
   if (executionKeys && !fileExists(executionKeys)) fail(`ZYLITH_EXECUTION_KEYS_PATH does not exist: ${executionKeys}`);
+  const activeExecutionKeyId = required("ZYLITH_ACTIVE_EXECUTION_KEY_ID");
+  if (activeExecutionKeyId && (env.ZYLITH_ACTIVE_EXECUTION_KEY_ID !== activeExecutionKeyId || !/^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/.test(activeExecutionKeyId))) {
+    fail("ZYLITH_ACTIVE_EXECUTION_KEY_ID must be a canonical execution key id");
+  }
   const epochMs = integer("ZYLITH_EPOCH_MS", 1_000, 300_000, 6_000);
   integer("ZYLITH_PIPELINE_DEPTH", 1, 4, 2);
   const provingBlocksBack = integer("ZYLITH_PROVING_BLOCKS_BACK", 1, 1_000, 1);
@@ -112,6 +116,8 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
   const proofWorkerSessionMs = integer("ZYLITH_PROOF_WORKER_SESSION_TTL_MS", 60_000, 60 * 60_000, 30 * 60_000);
   const proofWorkerLifetimeMs = integer("ZYLITH_PROOF_WORKER_MAX_LIFETIME_MS", 5 * 60_000, 24 * 60 * 60_000, 4 * 60 * 60_000);
   const proofJobLeaseMs = integer("ZYLITH_PROOF_JOB_LEASE_MS", 1_000, 15 * 60_000, 60_000);
+  integer("ZYLITH_PROOF_JOB_MAX_ATTEMPTS", 1, 100, 3);
+  integer("ZYLITH_PROOF_JOB_RETRY_BACKOFF_MS", 100, 60 * 60_000, 5_000);
   const proofWorkerRequestTimeoutSeconds = integer("ZYLITH_PROOF_WORKER_REQUEST_TIMEOUT_SECONDS", 1, 60 * 60, 900);
   const completedRetentionMs = integer("ZYLITH_PROOF_JOB_COMPLETED_RETENTION_MS", 60_000, 24 * 60 * 60_000, 60 * 60_000);
   const abandonedRetentionMs = integer("ZYLITH_PROOF_JOB_ABANDONED_RETENTION_MS", 60_000, 30 * 24 * 60 * 60_000, 7 * 24 * 60 * 60_000);
@@ -133,13 +139,15 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     for (const contract of ["commitment_registry", "privacy_deposit_bridge", "exchange"]) {
       if (!isNonZeroFelt(manifest.contracts?.[contract])) fail(`manifest contracts.${contract} must be deployed`);
     }
-    for (const field of ["transition_proof_program_address", "withdrawal_proof_program_address", "residual_recovery_proof_program_address", "virtual_program_hash", "starknet_os_config_hash", "proof_account_address", "settlement_account_address"]) {
+    for (const field of ["transition_proof_program_address", "withdrawal_proof_program_address", "residual_recovery_proof_program_address", "virtual_program_hash", "starknet_os_config_hash", "proof_account_address", "proof_account_class_hash", "transition_proof_program_class_hash", "withdrawal_proof_program_class_hash", "residual_recovery_proof_program_class_hash", "settlement_account_address"]) {
       if (!isNonZeroFelt(manifest.proof?.[field])) fail(`manifest proof.${field} must be set`);
     }
     // wallets seal only to the execution keys the manifest pins; the operator checks its own
     // keys against the pin at startup.
-    const pins = [manifest.funding?.starknet_privacy?.ingress_key_registry_fingerprint, manifest.funding?.starknet_privacy?.ingress_key_registry_next_fingerprint].filter((pin) => pin !== undefined);
-    if (!pins.length || pins.some((pin) => !/^[0-9a-f]{64}$/.test(pin) || /^0+$/.test(pin))) fail("manifest funding.starknet_privacy.ingress_key_registry_fingerprint must pin the execution keys");
+    const currentPin = manifest.funding?.starknet_privacy?.ingress_key_registry_fingerprint;
+    const nextPin = manifest.funding?.starknet_privacy?.ingress_key_registry_next_fingerprint;
+    if (typeof currentPin !== "string" || !/^[0-9a-f]{64}$/.test(currentPin) || /^0+$/.test(currentPin)) fail("manifest funding.starknet_privacy.ingress_key_registry_fingerprint must pin the execution keys");
+    if (nextPin !== undefined && (typeof nextPin !== "string" || !/^[0-9a-f]{64}$/.test(nextPin) || /^0+$/.test(nextPin) || nextPin === currentPin)) fail("manifest funding.starknet_privacy.ingress_key_registry_next_fingerprint must be canonical and distinct");
     if (manifest.funding?.starknet_privacy?.proving_ohttp_policy !== "best_effort") fail("production funding proving_ohttp_policy must be best_effort");
     const privacyFunding = manifest.funding?.starknet_privacy;
     for (const field of ["privacy_pool", "privacy_pool_class_hash", "bridge_adapter", "paymaster_address", "proof_signer_class_hash"]) {
@@ -149,10 +157,56 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
       if (!/^https:\/\//i.test(privacyFunding?.[field] ?? "")) fail(`manifest funding.starknet_privacy.${field} must use https`);
     }
     if (manifest.proof?.config_locked_after_deploy !== true) fail("manifest proof.config_locked_after_deploy must be true");
+    if (manifest.proof?.proof_version !== "PROOF2") fail("manifest proof.proof_version must be PROOF2");
     if (!Number.isInteger(manifest.proof?.proof_validity_blocks) || manifest.proof.proof_validity_blocks <= 5) fail("manifest proof.proof_validity_blocks must leave submission headroom");
     if (provingBlocksBack + 5 >= manifest.proof?.proof_validity_blocks) fail("ZYLITH_PROVING_BLOCKS_BACK leaves no validity window for submission");
     if (!manifest.proof?.prover_build_id) fail("manifest proof.prover_build_id must be set");
     if (value("ZYLITH_PROVER_BUILD_ID") && value("ZYLITH_PROVER_BUILD_ID") !== manifest.proof?.prover_build_id) fail("ZYLITH_PROVER_BUILD_ID does not match the manifest's proof.prover_build_id");
+    const capacityDirectory = required("ZYLITH_PROOF_CAPACITY_PROFILE_DIR");
+    const capacityProfiles = [
+      ["transition.json", "TRANSITION", "zylith-transition-v2", "transition_proof_program_class_hash"],
+      ["withdrawal.json", "WITHDRAWAL", "zylith-withdrawal-v1", "withdrawal_proof_program_class_hash"],
+      ["residual_recovery.json", "RESIDUAL_RECOVERY", "zylith-residual-recovery-v2", "residual_recovery_proof_program_class_hash"],
+    ];
+    for (const [filename, statementKind, statementVersion, classField] of capacityProfiles) {
+      const path = `${capacityDirectory.replace(/\/+$/, "")}/${filename}`;
+      if (!capacityDirectory || !fileExists(path)) {
+        fail(`proof capacity profile is missing: ${path}`);
+        continue;
+      }
+      let profile;
+      try {
+        profile = JSON.parse(readFile(path));
+      } catch {
+        fail(`proof capacity profile is unreadable: ${path}`);
+        continue;
+      }
+      const identity = profile?.identity;
+      if (profile?.schema_version !== 4
+        || profile?.statement_kind !== statementKind
+        || !/^[0-9a-f]{64}$/.test(profile?.profile_id ?? "")
+        || /^0+$/.test(profile?.profile_id ?? "")
+        || !Number.isInteger(profile?.safety_margin_bps)
+        || profile.safety_margin_bps < 1
+        || profile.safety_margin_bps >= 10_000
+        || !Array.isArray(profile?.vectors)
+        || profile.vectors.length === 0) {
+        fail(`proof capacity profile has an invalid envelope: ${path}`);
+        continue;
+      }
+      if (identity?.release_commit !== manifest.deployment.release_commit
+        || identity?.prover_build_id !== manifest.proof.prover_build_id
+        || identity?.proof_version !== manifest.proof.proof_version
+        || identity?.program_variant !== "VIRTUAL_SNOS"
+        || !sameFelt(identity?.virtual_program_hash, manifest.proof.virtual_program_hash)
+        || identity?.starknet_os_output_version !== "VIRTUAL_SNOS0"
+        || !sameFelt(identity?.starknet_os_config_hash, manifest.proof.starknet_os_config_hash)
+        || !sameFelt(identity?.proof_account_class_hash, manifest.proof.proof_account_class_hash)
+        || !sameFelt(identity?.proof_program_class_hash, manifest.proof[classField])
+        || identity?.statement_version !== statementVersion) {
+        fail(`proof capacity profile identity differs from the deployment: ${path}`);
+      }
+    }
     if (manifest.deployment?.finalized !== true) fail("manifest deployment.finalized must be true");
     if (!/^[0-9a-f]{40}$/.test(manifest.deployment?.release_commit ?? "") || /^0+$/.test(manifest.deployment.release_commit)) {
       fail("manifest deployment.release_commit must name the released commit");

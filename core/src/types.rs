@@ -1,9 +1,9 @@
 use std::{collections::BTreeSet, fmt};
 
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use hpke::{Deserializable, Kem, Serializable, kem::X25519HkdfSha256};
 use serde::{Deserialize, Serialize};
-use starknet_crypto::get_public_key;
-use zeroize::Zeroize;
+use starknet_crypto::Felt;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     MarketRegistry, OhttpPolicy, ProtocolError,
@@ -11,6 +11,7 @@ use crate::{
         domain_felt, encode_starknet_felt, felt_from_hex_str, field_from_u64, field_from_u128,
         poseidon_chain_hex,
     },
+    wallet_crypto::parse_canonical_field_hex,
 };
 
 pub(crate) mod serde_u128_decimal {
@@ -174,10 +175,7 @@ impl fmt::Debug for Note {
 impl Note {
     pub fn commitment(&self) -> Result<NoteCommitment, ProtocolError> {
         let asset_id = felt_from_hex_str(&encode_starknet_felt("asset-id", &self.asset_id.0))?;
-        let owner_public_key = felt_from_hex_str(&encode_starknet_felt(
-            "owner-public-key",
-            &self.owner_public_key,
-        ))?;
+        let owner_public_key = felt_from_hex_str(&self.owner_public_key)?;
         let blinding = felt_from_hex_str(&self.blinding)?;
         let nonce = field_from_u64(self.nonce);
         let metadata_commitment = felt_from_hex_str(&self.metadata_commitment)?;
@@ -201,47 +199,6 @@ impl Note {
     }
 }
 
-pub fn spend_auth_key_felt_from_raw_key_hex(spend_auth_key_hex: &str) -> String {
-    encode_starknet_felt("spend-auth-key", spend_auth_key_hex)
-}
-
-pub fn spend_authority_from_spend_auth_key_felt(
-    spend_auth_key_felt: &str,
-) -> Result<String, ProtocolError> {
-    let spend_auth_key = felt_from_hex_str(spend_auth_key_felt)?;
-    if spend_auth_key == field_from_u64(0) {
-        return Err(ProtocolError::Crypto(
-            "spend authorization key cannot be zero".into(),
-        ));
-    }
-    Ok(format!("{:#x}", get_public_key(&spend_auth_key)))
-}
-
-pub fn spend_authority_from_raw_key_hex(spend_auth_key_hex: &str) -> Result<String, ProtocolError> {
-    spend_authority_from_spend_auth_key_felt(&spend_auth_key_felt_from_raw_key_hex(
-        spend_auth_key_hex,
-    ))
-}
-
-pub fn withdraw_auth_key_felt_from_raw_key_hex(withdraw_auth_key_hex: &str) -> String {
-    encode_starknet_felt("withdraw-auth-key", withdraw_auth_key_hex)
-}
-
-pub fn withdraw_authority_from_withdraw_auth_key_felt(
-    withdraw_auth_key_felt: &str,
-) -> Result<String, ProtocolError> {
-    let withdraw_auth_key = felt_from_hex_str(withdraw_auth_key_felt)?;
-    Ok(crate::hash::felt_hex(&get_public_key(&withdraw_auth_key)))
-}
-
-pub fn withdraw_authority_from_raw_key_hex(
-    withdraw_auth_key_hex: &str,
-) -> Result<String, ProtocolError> {
-    withdraw_authority_from_withdraw_auth_key_felt(&withdraw_auth_key_felt_from_raw_key_hex(
-        withdraw_auth_key_hex,
-    ))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DepositIntent {
@@ -253,6 +210,38 @@ pub struct DepositIntent {
     pub recipient_owner_public_key: String,
     pub recipient_spend_authority: String,
     pub recipient_withdraw_authority: String,
+}
+
+/// the mandatory deployment fields for wallet deposit derivation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepositDerivationContext {
+    pub chain_id: Felt,
+    pub bridge_address: Felt,
+}
+
+impl DepositDerivationContext {
+    pub fn from_hex(chain_id: &str, bridge_address: &str) -> Result<Self, ProtocolError> {
+        let context = Self {
+            chain_id: parse_canonical_field_hex(chain_id)?,
+            bridge_address: parse_canonical_field_hex(bridge_address)?,
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
+        if self.chain_id == Felt::ZERO {
+            return Err(ProtocolError::Crypto(
+                "deposit chain id must be nonzero".into(),
+            ));
+        }
+        if self.bridge_address == Felt::ZERO {
+            return Err(ProtocolError::Crypto(
+                "deposit bridge address must be nonzero".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,38 +261,19 @@ impl fmt::Debug for SpendAuthorization {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EncryptedBlob {
-    pub algorithm: String,
-    pub key_id: String,
-    pub ephemeral_public_key: String,
-    pub nonce: String,
-    pub ciphertext: String,
-}
-
-impl fmt::Debug for EncryptedBlob {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("EncryptedBlob")
-            .field("algorithm", &self.algorithm)
-            .field("key_id", &self.key_id)
-            .field("ephemeral_public_key", &self.ephemeral_public_key)
-            .field("nonce", &"<redacted>")
-            .field("ciphertext", &"<redacted>")
-            .finish()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivateExecutionKeyPublicConfig {
     pub key_id: String,
+    pub algorithm: String,
     pub public_key: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivateExecutionKeyPrivateConfig {
     pub key_id: String,
+    pub algorithm: String,
     pub private_key: String,
     pub public_key: String,
 }
@@ -313,6 +283,7 @@ impl fmt::Debug for PrivateExecutionKeyPrivateConfig {
         formatter
             .debug_struct("PrivateExecutionKeyPrivateConfig")
             .field("key_id", &self.key_id)
+            .field("algorithm", &self.algorithm)
             .field("private_key", &"<redacted>")
             .field("public_key", &self.public_key)
             .finish()
@@ -326,44 +297,131 @@ impl Drop for PrivateExecutionKeyPrivateConfig {
 }
 
 impl PrivateExecutionKeyPrivateConfig {
-    /// validates the secret/public point pair and returns the canonical uncompressed point.
-    pub fn canonical_public_key(&self) -> Result<Vec<u8>, ProtocolError> {
-        let private = hex::decode(self.private_key.trim_start_matches("0x"))?;
-        let secret = p256::SecretKey::from_slice(&private)
-            .map_err(|_| ProtocolError::Crypto("execution private key is invalid".into()))?;
-        let public = hex::decode(self.public_key.trim_start_matches("0x"))?;
-        let supplied = p256::PublicKey::from_sec1_bytes(&public)
-            .map_err(|_| ProtocolError::Crypto("execution public key is invalid".into()))?;
-        let canonical = supplied.to_encoded_point(false);
-        if public.as_slice() != canonical.as_bytes() {
+    /// constructs one fixed-profile config from raw x25519 private bytes.
+    pub fn from_private_key_bytes(
+        key_id: &str,
+        private_key: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, ProtocolError> {
+        validate_execution_key_id(key_id)?;
+        if private_key.iter().all(|byte| *byte == 0) {
             return Err(ProtocolError::Crypto(
-                "execution public key is not canonical uncompressed sec1".into(),
+                "execution private key is zero".into(),
             ));
         }
-        let derived = secret.public_key().to_encoded_point(false);
-        if derived.as_bytes() != canonical.as_bytes() {
+        let secret = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(private_key.as_slice())
+            .map_err(|_| ProtocolError::Crypto("execution private key is invalid".into()))?;
+        let public_key = hex::encode(X25519HkdfSha256::sk_to_pk(&secret).to_bytes());
+        let config = Self {
+            key_id: key_id.into(),
+            algorithm: crate::private_envelope::HPKE_PROFILE_ID.into(),
+            private_key: hex::encode(private_key.as_slice()),
+            public_key,
+        };
+        config.canonical_public_key()?;
+        Ok(config)
+    }
+
+    /// validates the secret/public key pair and returns the canonical x25519 public key.
+    pub fn canonical_public_key(&self) -> Result<Vec<u8>, ProtocolError> {
+        validate_execution_key_id(&self.key_id)?;
+        validate_execution_algorithm(&self.algorithm)?;
+        let private = parse_execution_private_key_hex(&self.private_key)?;
+        if private.iter().all(|byte| *byte == 0) {
+            return Err(ProtocolError::Crypto(
+                "execution private key is zero".into(),
+            ));
+        }
+        let secret = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(private.as_slice())
+            .map_err(|_| ProtocolError::Crypto("execution private key is invalid".into()))?;
+        let public = parse_execution_public_key(&self.public_key)?;
+        let derived = X25519HkdfSha256::sk_to_pk(&secret);
+        if derived.to_bytes().as_slice() != public {
             return Err(ProtocolError::Crypto(
                 "execution private and public keys do not match".into(),
             ));
         }
-        Ok(canonical.as_bytes().to_vec())
+        Ok(public.to_vec())
     }
+}
+
+fn validate_execution_algorithm(algorithm: &str) -> Result<(), ProtocolError> {
+    if algorithm != crate::private_envelope::HPKE_PROFILE_ID {
+        return Err(ProtocolError::Crypto(
+            "unsupported execution key algorithm".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_execution_key_id(key_id: &str) -> Result<(), ProtocolError> {
+    let bytes = key_id.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 64
+        || !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit()
+        || !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit()
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
+        })
+    {
+        return Err(ProtocolError::Crypto(
+            "execution key id must be 1..=64 canonical ascii characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_execution_key_hex(value: &str, kind: &str) -> Result<[u8; 32], ProtocolError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ProtocolError::Crypto(format!(
+            "execution {kind} key must be 64 lowercase hex characters"
+        )));
+    }
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(value, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn parse_execution_private_key_hex(value: &str) -> Result<Zeroizing<[u8; 32]>, ProtocolError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ProtocolError::Crypto(
+            "execution private key must be 64 lowercase hex characters".into(),
+        ));
+    }
+    let mut bytes = Zeroizing::new([0; 32]);
+    hex::decode_to_slice(value, bytes.as_mut())?;
+    Ok(bytes)
+}
+
+fn parse_execution_public_key(value: &str) -> Result<[u8; 32], ProtocolError> {
+    let public = parse_execution_key_hex(value, "public")?;
+    crate::private_envelope::validate_x25519_public_bytes(&public, "execution public key")?;
+    Ok(public)
 }
 
 pub fn validate_private_execution_keys(
     keys: &[PrivateExecutionKeyPrivateConfig],
+    active_key_id: &str,
 ) -> Result<(), ProtocolError> {
-    if keys.is_empty() {
+    if keys.is_empty() || keys.len() > 2 {
         return Err(ProtocolError::Crypto(
-            "at least one private execution key is required".into(),
+            "private execution keyring must hold one or two keys".into(),
         ));
     }
+    validate_execution_key_id(active_key_id)?;
     let mut ids = BTreeSet::new();
     let mut points = BTreeSet::new();
     for key in keys {
-        if key.key_id.trim().is_empty() || !ids.insert(key.key_id.clone()) {
+        if !ids.insert(key.key_id.clone()) {
             return Err(ProtocolError::Crypto(
-                "execution key ids must be nonempty and unique".into(),
+                "execution key ids must be unique".into(),
             ));
         }
         if !points.insert(key.canonical_public_key()?) {
@@ -372,33 +430,41 @@ pub fn validate_private_execution_keys(
             ));
         }
     }
+    if !ids.contains(active_key_id) {
+        return Err(ProtocolError::Crypto(
+            "active execution key id is absent".into(),
+        ));
+    }
     Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrivateExecutionKeyRegistry {
     pub keys: Vec<PrivateExecutionKeyPublicConfig>,
 }
 
 impl PrivateExecutionKeyRegistry {
-    /// the pin a deployment manifest carries for its execution keys: sha-256 over a domain tag,
-    /// the key count and every key sorted by id, each id and point length-prefixed. a wallet
-    /// seals only to a registry whose fingerprint the manifest pins.
+    /// the pin a deployment manifest carries for its one active execution key.
     pub fn fingerprint(&self) -> Result<String, ProtocolError> {
         use sha2::{Digest, Sha256};
-        let mut keys = self.keys.iter().collect::<Vec<_>>();
-        keys.sort_by(|left, right| left.key_id.cmp(&right.key_id));
-        if keys.is_empty() || keys.windows(2).any(|pair| pair[0].key_id == pair[1].key_id) {
+        if self.keys.len() != 1 {
             return Err(ProtocolError::Crypto(
-                "the execution key registry is empty or repeats a key id".into(),
+                "the execution key registry must hold exactly one active key".into(),
             ));
         }
         let mut hasher = Sha256::new();
-        hasher.update(b"zylith-execution-key-registry-v1");
-        hasher.update((keys.len() as u32).to_be_bytes());
-        for key in keys {
-            let point = hex::decode(key.public_key.trim_start_matches("0x"))?;
-            for part in [key.key_id.as_bytes(), point.as_slice()] {
+        hasher.update(b"zylith-execution-key-registry-v2");
+        hasher.update(1_u32.to_be_bytes());
+        for key in &self.keys {
+            validate_execution_key_id(&key.key_id)?;
+            validate_execution_algorithm(&key.algorithm)?;
+            let public = parse_execution_public_key(&key.public_key)?;
+            for part in [
+                key.algorithm.as_bytes(),
+                key.key_id.as_bytes(),
+                public.as_slice(),
+            ] {
                 hasher.update((part.len() as u32).to_be_bytes());
                 hasher.update(part);
             }
@@ -475,6 +541,8 @@ pub enum RecoveryArtifactKind {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptedRecoveryPayload {
+    #[serde(deserialize_with = "crate::wallet_crypto::deserialize_wallet_key_schedule_version")]
+    pub key_schedule_version: u16,
     pub algorithm: String,
     pub nonce: String,
     pub ciphertext: String,
@@ -494,6 +562,8 @@ impl fmt::Debug for EncryptedRecoveryPayload {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryArtifact {
+    #[serde(deserialize_with = "crate::wallet_crypto::deserialize_wallet_key_schedule_version")]
+    pub key_schedule_version: u16,
     pub artifact_id: String,
     pub account_id: String,
     pub kind: RecoveryArtifactKind,
@@ -537,7 +607,11 @@ pub struct StarknetPrivacyFundingRail {
     pub paymaster_url: String,
     pub ingress_key_registry_fingerprint: String,
     /// during a rotation, the fingerprint of the registry that replaces the current one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_execution_pin"
+    )]
     pub ingress_key_registry_next_fingerprint: Option<String>,
     pub sdk_package: String,
     pub sdk_version: String,
@@ -545,18 +619,38 @@ pub struct StarknetPrivacyFundingRail {
     pub proof_signer_class_hash: String,
 }
 
+fn deserialize_present_execution_pin<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
 impl StarknetPrivacyFundingRail {
-    /// the execution key registries a wallet may seal to: the current one and, while a rotation
-    /// is published, its successor.
-    pub fn pinned_registry_fingerprints(&self) -> Vec<&str> {
-        std::iter::once(self.ingress_key_registry_fingerprint.as_str())
-            .chain(self.ingress_key_registry_next_fingerprint.as_deref())
-            .filter(|fingerprint| {
-                fingerprint.len() == 64
-                    && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    && fingerprint.bytes().any(|byte| byte != b'0')
-            })
-            .collect()
+    /// the current and optional next one-key registry pins must be canonical and distinct.
+    pub fn pinned_registry_fingerprints(&self) -> Result<Vec<&str>, String> {
+        let current = self.ingress_key_registry_fingerprint.as_str();
+        let valid = |pin: &str| {
+            pin.len() == 64
+                && pin
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && pin.bytes().any(|byte| byte != b'0')
+        };
+        if !valid(current) {
+            return Err(
+                "ingress_key_registry_fingerprint must be a nonzero lowercase sha256 fingerprint"
+                    .into(),
+            );
+        }
+        let mut pins = vec![current];
+        if let Some(next) = self.ingress_key_registry_next_fingerprint.as_deref() {
+            if !valid(next) || next == current {
+                return Err("ingress_key_registry_next_fingerprint must be a distinct nonzero lowercase sha256 fingerprint".into());
+            }
+            pins.push(next);
+        }
+        Ok(pins)
     }
 }
 
@@ -589,6 +683,10 @@ pub struct DeploymentProofConfig {
     pub virtual_program_hash: String,
     pub starknet_os_config_hash: String,
     pub proof_account_address: String,
+    pub proof_account_class_hash: String,
+    pub transition_proof_program_class_hash: String,
+    pub withdrawal_proof_program_class_hash: String,
+    pub residual_recovery_proof_program_class_hash: String,
     pub settlement_account_address: String,
     pub proof_validity_blocks: u64,
     pub config_locked_after_deploy: bool,
@@ -662,6 +760,56 @@ impl DeploymentManifest {
         if self.funding.starknet_privacy.proving_ohttp_policy != OhttpPolicy::BestEffort {
             return Err("production funding must use best-effort ohttp".into());
         }
+        if self.proof.scheme != "snip36-stwo" || self.proof.prover_build_id.is_empty() {
+            return Err("deployment proof identity is incomplete".into());
+        }
+        if self.proof.proof_version != "PROOF2" {
+            return Err("production supports only the PROOF2 proof family".into());
+        }
+        for (label, value) in [
+            (
+                "transition proof program address",
+                &self.proof.transition_proof_program_address,
+            ),
+            (
+                "withdrawal proof program address",
+                &self.proof.withdrawal_proof_program_address,
+            ),
+            (
+                "residual recovery proof program address",
+                &self.proof.residual_recovery_proof_program_address,
+            ),
+            ("virtual program hash", &self.proof.virtual_program_hash),
+            (
+                "starknet os config hash",
+                &self.proof.starknet_os_config_hash,
+            ),
+            ("proof account address", &self.proof.proof_account_address),
+            (
+                "proof account class hash",
+                &self.proof.proof_account_class_hash,
+            ),
+            (
+                "transition proof program class hash",
+                &self.proof.transition_proof_program_class_hash,
+            ),
+            (
+                "withdrawal proof program class hash",
+                &self.proof.withdrawal_proof_program_class_hash,
+            ),
+            (
+                "residual recovery proof program class hash",
+                &self.proof.residual_recovery_proof_program_class_hash,
+            ),
+            (
+                "settlement account address",
+                &self.proof.settlement_account_address,
+            ),
+        ] {
+            if !felt_from_hex_str(value).is_ok_and(|felt| felt != Felt::ZERO) {
+                return Err(format!("deployment {label} must be a nonzero felt"));
+            }
+        }
         let runtime = &self.runtime;
         if !(1_000..=300_000).contains(&runtime.epoch_ms)
             || runtime.max_close_delay_ms == 0
@@ -692,17 +840,46 @@ impl DeploymentManifest {
         {
             return Err("deployment manifest has an invalid release commit".into());
         }
+        self.funding
+            .starknet_privacy
+            .pinned_registry_fingerprints()?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use hpke::{Deserializable, Kem, Serializable};
 
     use super::{
-        DeploymentManifest, PrivateExecutionKeyPrivateConfig, validate_private_execution_keys,
+        DeploymentManifest, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
+        validate_private_execution_keys,
     };
+
+    fn production_manifest() -> DeploymentManifest {
+        let mut manifest: DeploymentManifest =
+            serde_json::from_str(include_str!("../../client/public/deployment.example.json"))
+                .unwrap();
+        manifest.deployment.finalized = true;
+        manifest.deployment.release_commit = "1".repeat(40);
+        manifest.proof.config_locked_after_deploy = true;
+        manifest.proof.transition_proof_program_address = "0x1".into();
+        manifest.proof.withdrawal_proof_program_address = "0x2".into();
+        manifest.proof.residual_recovery_proof_program_address = "0x3".into();
+        manifest.proof.virtual_program_hash = "0x4".into();
+        manifest.proof.starknet_os_config_hash = "0x5".into();
+        manifest.proof.proof_account_address = "0x6".into();
+        manifest.proof.proof_account_class_hash = "0x7".into();
+        manifest.proof.transition_proof_program_class_hash = "0x8".into();
+        manifest.proof.withdrawal_proof_program_class_hash = "0x9".into();
+        manifest.proof.residual_recovery_proof_program_class_hash = "0xa".into();
+        manifest.proof.settlement_account_address = "0xb".into();
+        manifest
+            .funding
+            .starknet_privacy
+            .ingress_key_registry_fingerprint = "ab".repeat(32);
+        manifest
+    }
 
     /// the manifest example the client ships must parse as the services read it.
     #[test]
@@ -739,12 +916,7 @@ mod tests {
 
     #[test]
     fn production_runtime_limits_fail_closed() {
-        let mut manifest: DeploymentManifest =
-            serde_json::from_str(include_str!("../../client/public/deployment.example.json"))
-                .unwrap();
-        manifest.deployment.finalized = true;
-        manifest.deployment.release_commit = "1".repeat(40);
-        manifest.proof.config_locked_after_deploy = true;
+        let mut manifest = production_manifest();
         manifest.runtime.max_admissions_per_transition = manifest.runtime.max_book_orders + 1;
         assert!(
             manifest
@@ -754,14 +926,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_manifest_accepts_only_the_enabled_proof2_family() {
+        let mut manifest = production_manifest();
+        manifest.validate_production().unwrap();
+        for unsupported in ["PROOF1", "PROOF3", "0x50524f4f4632", ""] {
+            manifest.proof.proof_version = unsupported.into();
+            assert!(
+                manifest
+                    .validate_production()
+                    .unwrap_err()
+                    .contains("PROOF2"),
+                "unsupported version was not rejected: {unsupported}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_manifest_rejects_malformed_or_duplicate_execution_pins() {
+        let mut manifest = production_manifest();
+        let current = "ab".repeat(32);
+        manifest
+            .funding
+            .starknet_privacy
+            .ingress_key_registry_fingerprint = current.clone();
+        manifest
+            .funding
+            .starknet_privacy
+            .ingress_key_registry_next_fingerprint = Some("cd".repeat(32));
+        manifest.validate_production().unwrap();
+        for bad in [
+            current,
+            "CD".repeat(32),
+            "0".repeat(64),
+            "bad".into(),
+            String::new(),
+        ] {
+            manifest
+                .funding
+                .starknet_privacy
+                .ingress_key_registry_next_fingerprint = Some(bad);
+            assert!(manifest.validate_production().is_err());
+        }
+    }
+
+    #[test]
+    fn present_null_next_execution_pin_is_not_omission() {
+        let mut raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../client/public/deployment.example.json"))
+                .unwrap();
+        raw["funding"]["starknet_privacy"]["ingress_key_registry_next_fingerprint"] =
+            serde_json::Value::Null;
+        assert!(serde_json::from_value::<DeploymentManifest>(raw).is_err());
+    }
+
     fn execution_key(id: &str, scalar: u8) -> PrivateExecutionKeyPrivateConfig {
-        let mut bytes = [0_u8; 32];
-        bytes[31] = scalar;
-        let secret = p256::SecretKey::from_slice(&bytes).unwrap();
+        let bytes = [scalar; 32];
+        let secret =
+            <hpke::kem::X25519HkdfSha256 as hpke::Kem>::PrivateKey::from_bytes(&bytes).unwrap();
         PrivateExecutionKeyPrivateConfig {
             key_id: id.into(),
+            algorithm: crate::private_envelope::HPKE_PROFILE_ID.into(),
             private_key: hex::encode(bytes),
-            public_key: hex::encode(secret.public_key().to_encoded_point(false).as_bytes()),
+            public_key: hex::encode(hpke::kem::X25519HkdfSha256::sk_to_pk(&secret).to_bytes()),
         }
     }
 
@@ -769,12 +996,12 @@ mod tests {
     fn private_execution_keys_bind_each_secret_to_one_unique_public_point() {
         let first = execution_key("first", 1);
         let second = execution_key("second", 2);
-        validate_private_execution_keys(&[first.clone(), second.clone()]).unwrap();
+        validate_private_execution_keys(&[first.clone(), second.clone()], "first").unwrap();
 
         let mut mismatched = first.clone();
         mismatched.public_key = second.public_key.clone();
         assert!(
-            validate_private_execution_keys(&[mismatched])
+            validate_private_execution_keys(&[mismatched], "first")
                 .unwrap_err()
                 .to_string()
                 .contains("do not match")
@@ -782,10 +1009,213 @@ mod tests {
 
         let mut duplicate_id = second.clone();
         duplicate_id.key_id = first.key_id.clone();
-        assert!(validate_private_execution_keys(&[first.clone(), duplicate_id]).is_err());
+        assert!(validate_private_execution_keys(&[first.clone(), duplicate_id], "first").is_err());
 
         let mut duplicate_point = first.clone();
         duplicate_point.key_id = "other".into();
-        assert!(validate_private_execution_keys(&[first, duplicate_point]).is_err());
+        assert!(validate_private_execution_keys(&[first, duplicate_point], "first").is_err());
+    }
+
+    fn execution_key_v2(
+        key_id: &str,
+        private_key: &str,
+        public_key: &str,
+    ) -> PrivateExecutionKeyPrivateConfig {
+        PrivateExecutionKeyPrivateConfig {
+            key_id: key_id.into(),
+            algorithm: crate::private_envelope::HPKE_PROFILE_ID.into(),
+            private_key: private_key.into(),
+            public_key: public_key.into(),
+        }
+    }
+
+    #[test]
+    fn execution_key_v2_accepts_one_active_key_and_one_unique_next_key() {
+        let active = execution_key_v2(
+            "active",
+            "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+            "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
+        );
+        let next = execution_key_v2(
+            "next",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+        );
+
+        validate_private_execution_keys(&[active, next], "active").unwrap();
+    }
+
+    #[test]
+    fn execution_key_v2_rejects_bad_encoding_algorithm_and_key_mismatch() {
+        let valid = execution_key_v2(
+            "active",
+            "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+            "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
+        );
+        let mut invalid_cases = Vec::new();
+        let mut invalid = valid.clone();
+        invalid.public_key = format!("0x{}", valid.public_key);
+        invalid_cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.public_key = valid.public_key.to_uppercase();
+        invalid_cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.public_key = "00".repeat(32);
+        invalid_cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.public_key = "11".repeat(32);
+        invalid_cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.private_key = "00".repeat(32);
+        invalid_cases.push(invalid);
+        let mut invalid = valid.clone();
+        invalid.algorithm = "negotiated-algorithm".into();
+        invalid_cases.push(invalid);
+        for invalid in invalid_cases {
+            assert!(validate_private_execution_keys(&[invalid], "active").is_err());
+        }
+    }
+
+    #[test]
+    fn execution_key_v2_rejects_ambiguous_rotation_sets() {
+        let active = execution_key_v2(
+            "active",
+            "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+            "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
+        );
+        let next = execution_key_v2(
+            "next",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+        );
+        let third = execution_key_v2(
+            "third",
+            "0202020202020202020202020202020202020202020202020202020202020202",
+            "ce8d3ad1ccb633ec7b70c17814a5c76ed78f787082717001265f9cfa1add7725",
+        );
+
+        assert!(validate_private_execution_keys(&[], "active").is_err());
+        assert!(validate_private_execution_keys(std::slice::from_ref(&active), "missing").is_err());
+        assert!(
+            validate_private_execution_keys(&[active.clone(), next.clone(), third], "active")
+                .is_err()
+        );
+        assert!(
+            validate_private_execution_keys(&[active.clone(), active.clone()], "active").is_err()
+        );
+        let mut duplicate_public = next;
+        duplicate_public.public_key = active.public_key.clone();
+        assert!(validate_private_execution_keys(&[active, duplicate_public], "active").is_err());
+    }
+
+    #[test]
+    fn execution_key_v2_registry_fingerprint_is_exact_and_single_recipient() {
+        let public = PrivateExecutionKeyPublicConfig {
+            key_id: "active".into(),
+            algorithm: crate::private_envelope::HPKE_PROFILE_ID.into(),
+            public_key: "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a".into(),
+        };
+        let registry = crate::PrivateExecutionKeyRegistry {
+            keys: vec![public.clone()],
+        };
+
+        assert_eq!(
+            registry.fingerprint().unwrap(),
+            "d2c009f2ef19ce5f504d4948424f2686711ad06d7b8d83d401912ea7fc514b4d"
+        );
+        assert!(
+            crate::PrivateExecutionKeyRegistry {
+                keys: vec![public.clone(), public]
+            }
+            .fingerprint()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn execution_key_v2_rejects_noncanonical_ids_and_public_encodings() {
+        let valid = execution_key("active_1", 7);
+        for key_id in [
+            "", "UPPER", " bad", "bad ", "-bad", "bad-", "bad.dot", "a/../b",
+        ] {
+            let mut key = valid.clone();
+            key.key_id = key_id.into();
+            assert!(validate_private_execution_keys(&[key], key_id).is_err());
+        }
+        let mut long_id = valid.clone();
+        long_id.key_id = "a".repeat(65);
+        assert!(validate_private_execution_keys(&[long_id], "a").is_err());
+
+        for public_key in [
+            "ff".repeat(32),
+            format!("ed{}7f", "ff".repeat(30)),
+            format!("{}80", "00".repeat(31)),
+            format!("01{}", "00".repeat(31)),
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800".to_owned(),
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157".to_owned(),
+        ] {
+            let mut key = valid.clone();
+            key.public_key = public_key;
+            assert!(validate_private_execution_keys(&[key], "active_1").is_err());
+        }
+    }
+
+    #[test]
+    fn execution_key_v2_json_rejects_unknown_fields_and_missing_profile() {
+        let private = execution_key("active", 8);
+        let public = PrivateExecutionKeyPublicConfig {
+            key_id: private.key_id.clone(),
+            algorithm: private.algorithm.clone(),
+            public_key: private.public_key.clone(),
+        };
+        let mut private_json = serde_json::to_value(&private).unwrap();
+        private_json["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PrivateExecutionKeyPrivateConfig>(private_json).is_err());
+        let mut public_json = serde_json::to_value(&public).unwrap();
+        public_json["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<PrivateExecutionKeyPublicConfig>(public_json).is_err());
+        let mut public_json = serde_json::to_value(&public).unwrap();
+        public_json.as_object_mut().unwrap().remove("algorithm");
+        assert!(serde_json::from_value::<PrivateExecutionKeyPublicConfig>(public_json).is_err());
+    }
+
+    #[test]
+    fn execution_key_v2_registry_rejects_bad_profile_id_and_public_key() {
+        let private = execution_key("active", 9);
+        let public = PrivateExecutionKeyPublicConfig {
+            key_id: private.key_id.clone(),
+            algorithm: private.algorithm.clone(),
+            public_key: private.public_key.clone(),
+        };
+        let registry = |key| crate::PrivateExecutionKeyRegistry { keys: vec![key] };
+        assert!(
+            crate::PrivateExecutionKeyRegistry { keys: vec![] }
+                .fingerprint()
+                .is_err()
+        );
+        let mut invalid = public.clone();
+        invalid.algorithm = "other".into();
+        assert!(registry(invalid).fingerprint().is_err());
+        let mut invalid = public.clone();
+        invalid.public_key = "0x".to_owned() + &invalid.public_key;
+        assert!(registry(invalid).fingerprint().is_err());
+        let mut invalid = public;
+        invalid.public_key = "00".repeat(32);
+        assert!(registry(invalid).fingerprint().is_err());
+
+        for low_order_key in [
+            format!("01{}", "00".repeat(31)),
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800".to_owned(),
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157".to_owned(),
+        ] {
+            let private = execution_key("active", 9);
+            let mut invalid = registry(PrivateExecutionKeyPublicConfig {
+                key_id: private.key_id.clone(),
+                algorithm: private.algorithm.clone(),
+                public_key: private.public_key.clone(),
+            });
+            invalid.keys[0].public_key = low_order_key;
+            assert!(invalid.fingerprint().is_err());
+        }
     }
 }

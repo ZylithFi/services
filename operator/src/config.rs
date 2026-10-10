@@ -8,15 +8,22 @@ use std::path::PathBuf;
 
 use starknet_rust_core::types::Felt;
 use url::Url;
+use zeroize::Zeroizing;
 use zylith_core::hash::felt_from_hex_str;
 use zylith_core::{
     DeploymentManifest, PrivateExecutionKeyPrivateConfig, PrivateExecutionKeyPublicConfig,
     PrivateExecutionKeyRegistry, validate_private_execution_keys,
 };
+use zylith_proof_job::{
+    ProofCapacityProfile, ProofReleaseIdentity, ProofStatementKind,
+    RESIDUAL_RECOVERY_STATEMENT_VERSION, STARKNET_OS_OUTPUT_VERSION, TRANSITION_STATEMENT_VERSION,
+    VIRTUAL_PROGRAM_VARIANT, WITHDRAWAL_STATEMENT_VERSION,
+};
 
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3200";
 pub const DEFAULT_DATA_DIR: &str = "data/operator";
 const MAX_MANIFEST_BYTES: u64 = 1 << 20;
+const MAX_CAPACITY_PROFILE_BYTES: u64 = 1 << 20;
 
 #[derive(Clone)]
 pub struct Account {
@@ -69,8 +76,8 @@ pub struct Policy {
     pub max_book_orders: usize,
     pub max_pending_orders: usize,
     pub max_order_lifetime_ms: u64,
-    /// the most cairo steps a transition statement may take and still prove in one snip-36
-    /// transaction; every transition is estimated against it before proving.
+    /// conservative statement-only step guard used to trim early. This does not represent full
+    /// SNIP-36/STWO capacity; the release-bound proof capacity profile is authoritative.
     pub step_budget: u64,
     /// a cancellation, expiry or pending outcome forces a transition after waiting this long.
     pub force_after_ms: u64,
@@ -102,6 +109,9 @@ pub struct Config {
     pub proof_queue_url: String,
     pub proof_queue_control_token: String,
     pub prover_build_id: String,
+    /// Full-SNOS, release-bound capacity evidence. Statement-step estimates remain only an
+    /// early, conservative trimming guard and never authorize a proof by themselves.
+    pub proof_capacity_profiles: BTreeMap<ProofStatementKind, ProofCapacityProfile>,
     pub proof_job_timeout_seconds: u64,
     pub proving_blocks_back: u64,
     pub attestor_url: String,
@@ -127,6 +137,7 @@ pub struct Config {
     /// fee notes are valued at attested rates less this haircut, in basis points.
     pub fee_rate_haircut_bps: u128,
     pub execution_keys: Vec<PrivateExecutionKeyPrivateConfig>,
+    pub active_execution_key_id: String,
     pub fee_recipient: Felt,
     pub reference_price_signer: Felt,
     pub pairs: Vec<PairRuntime>,
@@ -137,6 +148,113 @@ pub struct Config {
     pub trusted_proxies: Vec<ipnet::IpNet>,
     pub max_body_bytes: usize,
     pub sync_from_block: u64,
+}
+
+fn canonical_felt(value: &str, label: &str) -> Result<String, String> {
+    Ok(format!("{:#x}", nonzero(value, label)?))
+}
+
+fn proof_program_class_hash<'a>(
+    manifest: &'a DeploymentManifest,
+    kind: &ProofStatementKind,
+) -> &'a str {
+    match kind {
+        ProofStatementKind::Transition => &manifest.proof.transition_proof_program_class_hash,
+        ProofStatementKind::Withdrawal => &manifest.proof.withdrawal_proof_program_class_hash,
+        ProofStatementKind::ResidualRecovery => {
+            &manifest.proof.residual_recovery_proof_program_class_hash
+        }
+        ProofStatementKind::Benchmark => "",
+    }
+}
+
+fn statement_version(kind: &ProofStatementKind) -> Result<&'static str, String> {
+    match kind {
+        ProofStatementKind::Transition => Ok(TRANSITION_STATEMENT_VERSION),
+        ProofStatementKind::Withdrawal => Ok(WITHDRAWAL_STATEMENT_VERSION),
+        ProofStatementKind::ResidualRecovery => Ok(RESIDUAL_RECOVERY_STATEMENT_VERSION),
+        ProofStatementKind::Benchmark => {
+            Err("benchmark statements cannot have a production capacity profile".into())
+        }
+    }
+}
+
+fn expected_capacity_identity(
+    manifest: &DeploymentManifest,
+    kind: &ProofStatementKind,
+) -> Result<ProofReleaseIdentity, String> {
+    Ok(ProofReleaseIdentity {
+        release_commit: manifest.deployment.release_commit.clone(),
+        prover_build_id: manifest.proof.prover_build_id.clone(),
+        proof_version: manifest.proof.proof_version.clone(),
+        program_variant: VIRTUAL_PROGRAM_VARIANT.into(),
+        virtual_program_hash: canonical_felt(
+            &manifest.proof.virtual_program_hash,
+            "manifest virtual program hash",
+        )?,
+        starknet_os_output_version: STARKNET_OS_OUTPUT_VERSION.into(),
+        starknet_os_config_hash: canonical_felt(
+            &manifest.proof.starknet_os_config_hash,
+            "manifest starknet os config hash",
+        )?,
+        proof_account_class_hash: canonical_felt(
+            &manifest.proof.proof_account_class_hash,
+            "manifest proof account class hash",
+        )?,
+        proof_program_class_hash: canonical_felt(
+            proof_program_class_hash(manifest, kind),
+            "manifest proof program class hash",
+        )?,
+        statement_version: statement_version(kind)?.into(),
+    })
+}
+
+fn parse_capacity_profile(
+    raw: &str,
+    expected_kind: ProofStatementKind,
+    expected_identity: &ProofReleaseIdentity,
+) -> Result<ProofCapacityProfile, String> {
+    let profile: ProofCapacityProfile = serde_json::from_str(raw)
+        .map_err(|error| format!("proof capacity profile schema: {error}"))?;
+    if profile.statement_kind != expected_kind {
+        return Err("proof capacity profile statement kind does not match its file".into());
+    }
+    profile.validate_identity(expected_identity)?;
+    Ok(profile)
+}
+
+fn load_capacity_profiles(
+    directory: &str,
+    manifest: &DeploymentManifest,
+) -> Result<BTreeMap<ProofStatementKind, ProofCapacityProfile>, String> {
+    let directory = PathBuf::from(directory);
+    let mut profiles = BTreeMap::new();
+    for (kind, filename) in [
+        (ProofStatementKind::Transition, "transition.json"),
+        (ProofStatementKind::Withdrawal, "withdrawal.json"),
+        (
+            ProofStatementKind::ResidualRecovery,
+            "residual_recovery.json",
+        ),
+    ] {
+        let path = directory.join(filename);
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("proof capacity profile {}: {error}", path.display()))?;
+        if !metadata.is_file() || metadata.len() > MAX_CAPACITY_PROFILE_BYTES {
+            return Err(format!(
+                "proof capacity profile {} must be a regular file no larger than {} bytes",
+                path.display(),
+                MAX_CAPACITY_PROFILE_BYTES
+            ));
+        }
+        let raw = fs::read_to_string(&path)
+            .map_err(|error| format!("proof capacity profile {}: {error}", path.display()))?;
+        let identity = expected_capacity_identity(manifest, &kind)?;
+        let profile = parse_capacity_profile(&raw, kind.clone(), &identity)
+            .map_err(|error| format!("proof capacity profile {}: {error}", path.display()))?;
+        profiles.insert(kind, profile);
+    }
+    Ok(profiles)
 }
 
 fn required(name: &str) -> Result<String, String> {
@@ -217,13 +335,72 @@ pub fn load_manifest(path: &str) -> Result<DeploymentManifest, String> {
     Ok(manifest)
 }
 
-fn load_execution_keys(path: &str) -> Result<Vec<PrivateExecutionKeyPrivateConfig>, String> {
-    let raw =
-        fs::read_to_string(path).map_err(|error| format!("execution keys {path}: {error}"))?;
+pub(crate) fn load_execution_keys(
+    path: &str,
+    active_key_id: &str,
+) -> Result<Vec<PrivateExecutionKeyPrivateConfig>, String> {
+    let raw = Zeroizing::new(
+        fs::read_to_string(path).map_err(|error| format!("execution keys {path}: {error}"))?,
+    );
     let keys: Vec<PrivateExecutionKeyPrivateConfig> =
         serde_json::from_str(&raw).map_err(|error| format!("execution keys: {error}"))?;
-    validate_private_execution_keys(&keys).map_err(|error| format!("execution keys: {error}"))?;
+    validate_private_execution_keys(&keys, active_key_id)
+        .map_err(|error| format!("execution keys: {error}"))?;
     Ok(keys)
+}
+
+pub(crate) fn active_execution_registry(
+    keys: &[PrivateExecutionKeyPrivateConfig],
+    active_key_id: &str,
+) -> Result<PrivateExecutionKeyRegistry, String> {
+    validate_private_execution_keys(keys, active_key_id)
+        .map_err(|error| format!("execution keys: {error}"))?;
+    let active = keys
+        .iter()
+        .find(|key| key.key_id == active_key_id)
+        .ok_or("active execution key id is absent")?;
+    Ok(PrivateExecutionKeyRegistry {
+        keys: vec![PrivateExecutionKeyPublicConfig {
+            key_id: active.key_id.clone(),
+            algorithm: active.algorithm.clone(),
+            public_key: active.public_key.clone(),
+        }],
+    })
+}
+
+fn validate_execution_rotation(
+    keys: &[PrivateExecutionKeyPrivateConfig],
+    active_key_id: &str,
+    pins: &[&str],
+) -> Result<(), String> {
+    active_execution_registry(keys, active_key_id)?;
+    if pins.is_empty()
+        || pins.len() > 2
+        || pins.len() != keys.len()
+        || pins.iter().any(|pin| {
+            pin.len() != 64
+                || !pin
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || pin.bytes().all(|byte| byte == b'0')
+        })
+        || pins.len() == 2 && pins[0] == pins[1]
+    {
+        return Err(
+            "manifest execution key fingerprints must be one or two distinct canonical pins".into(),
+        );
+    }
+    for key in keys {
+        let registry = active_execution_registry(keys, &key.key_id)?;
+        let fingerprint = registry.fingerprint().map_err(|error| error.to_string())?;
+        if !pins.contains(&fingerprint.as_str()) {
+            return Err(format!(
+                "execution key {} (fingerprint {fingerprint}) is not pinned by the manifest",
+                key.key_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn data_key() -> Result<[u8; 32], String> {
@@ -309,6 +486,8 @@ impl Config {
         {
             return Err("the prover build id does not match the deployment manifest".into());
         }
+        let proof_capacity_profiles =
+            load_capacity_profiles(&required("ZYLITH_PROOF_CAPACITY_PROFILE_DIR")?, &manifest)?;
 
         for retired in [
             "ZYLITH_MIN_SETTLEMENT_FEES",
@@ -457,6 +636,74 @@ impl Config {
                 "runtime.max_admissions_per_transition exceeds the worst-case step budget limit of {proof_admission_limit}"
             ));
         }
+        let transition_capacity = proof_capacity_profiles
+            .get(&ProofStatementKind::Transition)
+            .ok_or("transition proof capacity profile is missing")?;
+        let max_book_orders = runtime.max_book_orders;
+        let max_admissions = runtime.max_admissions_per_transition;
+        let padded_outputs = (2 * max_book_orders + zylith_core::exchange::MAX_ASSETS as u64)
+            .max(zylith_core::exchange::MIN_OUTPUT_BUCKET as u64)
+            .next_power_of_two();
+        let required_shape = zylith_proof_job::ProofShapeLimits {
+            markets: pairs.len() as u64,
+            resting_orders: max_book_orders,
+            admissions: max_admissions,
+            crossings: max_book_orders,
+            outcomes: max_book_orders,
+            nullifiers: (max_book_orders
+                + zylith_core::exchange::MAX_FUNDING_NOTES as u64 * max_admissions)
+                .max(zylith_core::exchange::MIN_NULLIFIER_BUCKET as u64),
+            retired_nullifiers: max_book_orders,
+            outputs: padded_outputs,
+            funding_notes: zylith_core::exchange::MAX_FUNDING_NOTES as u64 * max_admissions,
+            membership_path_elements: (zylith_core::exchange::MAX_FUNDING_NOTES
+                * (zylith_core::exchange::NOTE_ACCUMULATOR_DEPTH
+                    + zylith_core::exchange::MAX_OUTPUT_SUBTREE_DEPTH))
+                as u64
+                * max_admissions,
+        };
+        if !transition_capacity.limits.covers(&required_shape) {
+            return Err(format!(
+                "runtime limits exceed measured full-proof capacity profile {}",
+                transition_capacity.profile_id
+            ));
+        }
+        let membership_path_elements = (zylith_core::exchange::NOTE_ACCUMULATOR_DEPTH
+            + zylith_core::exchange::MAX_OUTPUT_SUBTREE_DEPTH)
+            as u64;
+        let withdrawal_shape = zylith_proof_job::ProofShapeLimits {
+            nullifiers: 1,
+            funding_notes: 1,
+            membership_path_elements,
+            ..Default::default()
+        };
+        let withdrawal_capacity = proof_capacity_profiles
+            .get(&ProofStatementKind::Withdrawal)
+            .ok_or("withdrawal proof capacity profile is missing")?;
+        if !withdrawal_capacity.limits.covers(&withdrawal_shape) {
+            return Err(format!(
+                "maximum withdrawal membership exceeds measured full-proof capacity profile {}",
+                withdrawal_capacity.profile_id
+            ));
+        }
+        let recovery_shape = zylith_proof_job::ProofShapeLimits {
+            resting_orders: 1,
+            outcomes: 1,
+            nullifiers: 1,
+            retired_nullifiers: 1,
+            funding_notes: 1,
+            membership_path_elements,
+            ..Default::default()
+        };
+        let recovery_capacity = proof_capacity_profiles
+            .get(&ProofStatementKind::ResidualRecovery)
+            .ok_or("residual recovery proof capacity profile is missing")?;
+        if !recovery_capacity.limits.covers(&recovery_shape) {
+            return Err(format!(
+                "maximum residual recovery membership exceeds measured full-proof capacity profile {}",
+                recovery_capacity.profile_id
+            ));
+        }
         let policy = Policy {
             epoch_ms,
             epoch_prepare_ms: parsed(
@@ -492,6 +739,7 @@ impl Config {
             return Err("the proof base leaves no validity window for submission".into());
         }
 
+        let active_execution_key_id = required("ZYLITH_ACTIVE_EXECUTION_KEY_ID")?;
         let config = Self {
             bind_addr: optional("ZYLITH_OPERATOR_BIND_ADDR")
                 .unwrap_or_else(|| DEFAULT_BIND_ADDR.into()),
@@ -522,6 +770,7 @@ impl Config {
             proof_queue_url,
             proof_queue_control_token: required("ZYLITH_PROOF_QUEUE_CONTROL_TOKEN")?,
             prover_build_id,
+            proof_capacity_profiles,
             proof_job_timeout_seconds: parsed("ZYLITH_PROOF_JOB_TIMEOUT_SECONDS", 120_u64)?,
             proving_blocks_back,
             attestor_url: required("ZYLITH_REFERENCE_PRICE_ATTESTOR_URL")?,
@@ -541,7 +790,11 @@ impl Config {
             fee_cover_percent: parsed("ZYLITH_FEE_COVER_PERCENT", 100_u64)?,
             min_transition_fee_strk: parsed("ZYLITH_MIN_TRANSITION_FEE_STRK", 0_u128)?,
             fee_rate_haircut_bps: parsed("ZYLITH_FEE_RATE_HAIRCUT_BPS", 100_u128)?,
-            execution_keys: load_execution_keys(&required("ZYLITH_EXECUTION_KEYS_PATH")?)?,
+            execution_keys: load_execution_keys(
+                &required("ZYLITH_EXECUTION_KEYS_PATH")?,
+                &active_execution_key_id,
+            )?,
+            active_execution_key_id,
             fee_recipient: nonzero(
                 &manifest.roles.protocol_fee_recipient,
                 "protocol fee recipient",
@@ -636,21 +889,12 @@ impl Config {
     /// wallets seal only to the registry the manifest pins, so serving any other would strand
     /// every order: the operator refuses to start with keys the manifest does not pin.
     fn check_pinned_execution_keys(&self) -> Result<(), String> {
-        let fingerprint = self
-            .registry()
-            .fingerprint()
-            .map_err(|error| format!("execution keys: {error}"))?;
         let pinned = self
             .manifest
             .funding
             .starknet_privacy
-            .pinned_registry_fingerprints();
-        if !pinned.contains(&fingerprint.as_str()) {
-            return Err(format!(
-                "the execution keys (fingerprint {fingerprint}) are not pinned by the manifest's ingress_key_registry_fingerprint"
-            ));
-        }
-        Ok(())
+            .pinned_registry_fingerprints()?;
+        validate_execution_rotation(&self.execution_keys, &self.active_execution_key_id, &pinned)
     }
 
     /// a pair that routes through ekubo needs every piece of the route: a quoter, the router, a
@@ -697,17 +941,15 @@ impl Config {
         self.pairs.iter().find(|pair| pair.pair_id == pair_id)
     }
 
-    pub fn registry(&self) -> PrivateExecutionKeyRegistry {
-        PrivateExecutionKeyRegistry {
-            keys: self
-                .execution_keys
-                .iter()
-                .map(|key| PrivateExecutionKeyPublicConfig {
-                    key_id: key.key_id.clone(),
-                    public_key: key.public_key.clone(),
-                })
-                .collect(),
-        }
+    pub fn active_execution_registry(&self) -> PrivateExecutionKeyRegistry {
+        active_execution_registry(&self.execution_keys, &self.active_execution_key_id)
+            .expect("execution key rotation was validated at startup")
+    }
+
+    pub fn proof_capacity(&self, kind: ProofStatementKind) -> &ProofCapacityProfile {
+        self.proof_capacity_profiles
+            .get(&kind)
+            .expect("all production statement capacity profiles were validated at startup")
     }
 
     /// the exchange as the core types see it.
@@ -728,6 +970,154 @@ pub fn from_core(value: starknet_crypto::Felt) -> Felt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zylith_proof_job::{
+        PROOF_CAPACITY_SCHEMA_VERSION, ProofCapacityVector, ProofResourceUsage, ProofShapeLimits,
+    };
+
+    fn key(id: &str, public_key: &str, private_key: &str) -> PrivateExecutionKeyPrivateConfig {
+        PrivateExecutionKeyPrivateConfig {
+            key_id: id.into(),
+            algorithm: zylith_core::private_envelope::HPKE_PROFILE_ID.into(),
+            private_key: private_key.into(),
+            public_key: public_key.into(),
+        }
+    }
+
+    fn rotation_keys() -> Vec<PrivateExecutionKeyPrivateConfig> {
+        vec![
+            key(
+                "old",
+                "4310ee97d88cc1f088a5576c77ab0cf5c3ac797f3d95139c6c84b5429c59662a",
+                "8057991eef8f1f1af18f4a9491d16a1ce333f695d4db8e38da75975c4478e0fb",
+            ),
+            key(
+                "new",
+                "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+                &hex::encode([1_u8; 32]),
+            ),
+        ]
+    }
+
+    fn resource(value: u64) -> ProofResourceUsage {
+        let domain_log_size = if value >= 1_000 { 11 } else { 10 };
+        let components = [
+            "bitwise",
+            "cpu",
+            "ec_op",
+            "ecdsa",
+            "pedersen",
+            "poseidon",
+            "range_check",
+        ];
+        let mut usage = ProofResourceUsage {
+            component_registry_id: String::new(),
+            raw_snos_steps: value,
+            adapted_rows: value,
+            memory_words: value,
+            memory_holes: value / 10,
+            builtin_instances: components
+                .into_iter()
+                .map(|component| (component.into(), value))
+                .collect(),
+            component_log_sizes: components
+                .into_iter()
+                .map(|component| (component.into(), domain_log_size))
+                .collect(),
+            max_domain_log_size: domain_log_size,
+            peak_rss_bytes: value,
+            wall_time_ms: value,
+        };
+        usage.component_registry_id = usage.expected_component_registry_id().unwrap();
+        usage
+    }
+
+    fn capacity_profile(identity: ProofReleaseIdentity) -> ProofCapacityProfile {
+        let limits = ProofShapeLimits {
+            markets: 3,
+            resting_orders: 2,
+            admissions: 2,
+            crossings: 2,
+            outcomes: 2,
+            nullifiers: 8,
+            retired_nullifiers: 2,
+            outputs: 16,
+            funding_notes: 8,
+            membership_path_elements: 384,
+        };
+        let mut profile = ProofCapacityProfile {
+            schema_version: PROOF_CAPACITY_SCHEMA_VERSION,
+            profile_id: String::new(),
+            statement_kind: ProofStatementKind::Transition,
+            identity,
+            vector_family: "transition-release-gate-v1".into(),
+            safety_margin_bps: 1_000,
+            capacity: resource(1_000),
+            limits: limits.clone(),
+            vectors: vec![ProofCapacityVector {
+                vector_id: "limit".into(),
+                evidence_sha256: "a".repeat(64),
+                shape: limits,
+                usage: resource(800),
+            }],
+        };
+        profile.profile_id = profile.expected_profile_id().unwrap();
+        profile
+    }
+
+    #[test]
+    fn rotation_registry_publishes_only_explicit_active_key() {
+        let keys = rotation_keys();
+        let old = active_execution_registry(&keys, "old").unwrap();
+        let new = active_execution_registry(&keys, "new").unwrap();
+        assert_eq!(old.keys.len(), 1);
+        assert_eq!(old.keys[0].key_id, "old");
+        assert_eq!(new.keys.len(), 1);
+        assert_eq!(new.keys[0].key_id, "new");
+        assert_ne!(old.fingerprint().unwrap(), new.fingerprint().unwrap());
+        assert!(active_execution_registry(&keys, "missing").is_err());
+        assert!(active_execution_registry(&keys, "").is_err());
+    }
+
+    #[test]
+    fn rotation_requires_pins_for_every_configured_private_key() {
+        let keys = rotation_keys();
+        let old = active_execution_registry(&keys, "old")
+            .unwrap()
+            .fingerprint()
+            .unwrap();
+        let new = active_execution_registry(&keys, "new")
+            .unwrap()
+            .fingerprint()
+            .unwrap();
+        validate_execution_rotation(&keys, "old", &[old.as_str(), new.as_str()]).unwrap();
+        validate_execution_rotation(&keys, "new", &[old.as_str(), new.as_str()]).unwrap();
+        assert!(
+            validate_execution_rotation(&keys[1..], "new", &[old.as_str(), new.as_str()]).is_err()
+        );
+        assert!(validate_execution_rotation(&keys, "old", &[old.as_str()]).is_err());
+        assert!(validate_execution_rotation(&keys, "new", &[old.as_str()]).is_err());
+        assert!(validate_execution_rotation(&keys, "old", &["cd".repeat(32).as_str()]).is_err());
+        assert!(validate_execution_rotation(&keys, "old", &[old.as_str(), old.as_str()]).is_err());
+        let mut duplicate = keys.clone();
+        duplicate[1].key_id = "old".into();
+        assert!(
+            validate_execution_rotation(&duplicate, "old", &[old.as_str(), new.as_str()]).is_err()
+        );
+        duplicate[1].key_id = "new".into();
+        duplicate[1].public_key = duplicate[0].public_key.clone();
+        assert!(
+            validate_execution_rotation(&duplicate, "old", &[old.as_str(), new.as_str()]).is_err()
+        );
+        assert!(validate_execution_rotation(&[], "old", &[old.as_str()]).is_err());
+        assert!(
+            validate_execution_rotation(
+                &[keys[0].clone(), keys[1].clone(), keys[0].clone()],
+                "old",
+                &[old.as_str(), new.as_str()]
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn chain_ids_parse_from_hex_or_short_string() {
@@ -736,5 +1126,75 @@ mod tests {
         assert_eq!(chain_id(" SN_SEPOLIA ").unwrap(), sepolia);
         assert!(chain_id("0x0").is_err());
         assert!(chain_id("").is_err());
+    }
+
+    #[test]
+    fn capacity_profiles_are_closed_and_release_bound() {
+        let identity = ProofReleaseIdentity {
+            release_commit: "release-1".into(),
+            prover_build_id: "stwo-production-v1".into(),
+            proof_version: "PROOF2".into(),
+            program_variant: VIRTUAL_PROGRAM_VARIANT.into(),
+            virtual_program_hash: "0x1".into(),
+            starknet_os_output_version: STARKNET_OS_OUTPUT_VERSION.into(),
+            starknet_os_config_hash: "0x2".into(),
+            proof_account_class_hash: "0x3".into(),
+            proof_program_class_hash: "0x4".into(),
+            statement_version: TRANSITION_STATEMENT_VERSION.into(),
+        };
+        let profile = capacity_profile(identity.clone());
+        let raw = serde_json::to_string(&profile).unwrap();
+        assert!(parse_capacity_profile(&raw, ProofStatementKind::Transition, &identity).is_ok());
+
+        let mut wrong_identity = identity.clone();
+        wrong_identity.proof_program_class_hash = "0x5".into();
+        assert!(
+            parse_capacity_profile(&raw, ProofStatementKind::Transition, &wrong_identity)
+                .unwrap_err()
+                .contains("release identity")
+        );
+        assert!(
+            parse_capacity_profile(&raw, ProofStatementKind::Withdrawal, &identity)
+                .unwrap_err()
+                .contains("statement kind")
+        );
+
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["unreviewed_limit"] = serde_json::json!(1);
+        assert!(
+            parse_capacity_profile(
+                &serde_json::to_string(&value).unwrap(),
+                ProofStatementKind::Transition,
+                &identity,
+            )
+            .unwrap_err()
+            .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn capacity_identity_pins_each_statement_class_hash() {
+        let mut manifest: DeploymentManifest =
+            serde_json::from_str(include_str!("../../client/public/deployment.example.json"))
+                .unwrap();
+        manifest.proof.virtual_program_hash = "0x01".into();
+        manifest.proof.starknet_os_config_hash = "0x02".into();
+        manifest.proof.proof_account_class_hash = "0x03".into();
+        manifest.proof.transition_proof_program_class_hash = "0x04".into();
+        manifest.proof.withdrawal_proof_program_class_hash = "0x05".into();
+        manifest.proof.residual_recovery_proof_program_class_hash = "0x06".into();
+
+        let transition =
+            expected_capacity_identity(&manifest, &ProofStatementKind::Transition).unwrap();
+        let withdrawal =
+            expected_capacity_identity(&manifest, &ProofStatementKind::Withdrawal).unwrap();
+        let recovery =
+            expected_capacity_identity(&manifest, &ProofStatementKind::ResidualRecovery).unwrap();
+        assert_eq!(transition.virtual_program_hash, "0x1");
+        assert_eq!(transition.proof_account_class_hash, "0x3");
+        assert_eq!(transition.proof_program_class_hash, "0x4");
+        assert_eq!(withdrawal.proof_program_class_hash, "0x5");
+        assert_eq!(recovery.proof_program_class_hash, "0x6");
+        assert_ne!(transition.statement_version, recovery.statement_version);
     }
 }

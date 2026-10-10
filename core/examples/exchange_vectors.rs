@@ -62,6 +62,18 @@ impl Vectors {
         let expectation = self.expectations.get_mut(name).expect("just written");
         expectation["max_steps"] = json!(shape.estimated_steps());
         expectation["shape"] = serde_json::to_value(shape)?;
+        expectation["proof_shape"] = json!({
+            "markets": shape.markets,
+            "resting_orders": shape.resting,
+            "admissions": shape.admissions,
+            "crossings": shape.crossing,
+            "outcomes": result.public.outcomes.len(),
+            "nullifiers": shape.nullifiers,
+            "retired_nullifiers": shape.retired_nullifiers,
+            "outputs": shape.outputs,
+            "funding_notes": shape.funding_notes,
+            "membership_path_elements": shape.membership_path_elements,
+        });
         Ok(())
     }
 
@@ -125,6 +137,13 @@ fn order_layout(layout: &WitnessLayout, existing: bool, index: usize) -> &OrderL
         .filter(|order| order.existing == existing)
         .nth(index)
         .expect("order layout")
+}
+
+fn market_witness_start(witness: &[Felt]) -> usize {
+    // type/header (including the claimed public output root), then the asset count and three
+    // certificate fields per asset, then the objective numeraire and market count.
+    let asset_count: usize = witness[10].try_into().expect("asset count");
+    13 + 3 * asset_count
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -227,8 +246,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         witness[order_layout(layout, false, 0).start + 1] -= Felt::ONE;
     })?;
     vectors.tamper("reject_order_value_dust", &cross, |witness, layout| {
-        let asset_count: usize = witness[9].try_into().expect("asset count");
-        let market_start = 12 + 3 * asset_count;
+        let market_start = market_witness_start(witness);
         witness[market_start + 8] = Felt::from(2_u64);
         witness[order_layout(layout, false, 0).start + 1] = Felt::ONE;
         witness[order_layout(layout, false, 0).start + 2] = Felt::ONE;
@@ -513,7 +531,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let multi = build_transition(&multi_input)?;
     vectors.accept("multi_market", &multi)?;
     vectors.tamper("reject_synthetic_midpoint", &multi, |witness, _| {
-        let market_start = 12 + 3 * 3;
+        let market_start = market_witness_start(witness);
         let synthetic_midpoint = market_start + 2 * 16 + 3;
         witness[synthetic_midpoint] += Felt::ONE;
     })?;
@@ -608,6 +626,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         &witness,
         Some(public.commitment),
     )?;
+    vectors.expectations.get_mut("withdraw_output").unwrap()["proof_shape"] = json!({
+        "markets": 0,
+        "resting_orders": 0,
+        "admissions": 0,
+        "crossings": 0,
+        "outcomes": 0,
+        "nullifiers": 1,
+        "retired_nullifiers": 0,
+        "outputs": 0,
+        "funding_notes": 1,
+        "membership_path_elements": withdrawal.membership.subtree_path.len()
+            + withdrawal.membership.accumulator_path.len(),
+    });
     let mut swapped_exit = witness.clone();
     swapped_exit[4] = public_key(&Felt::from(0xbad_u64));
     vectors.write_for(
@@ -676,6 +707,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         &recovery_witness,
         Some(recovery_public.commitment),
     )?;
+    vectors.expectations.get_mut("recover_residual").unwrap()["proof_shape"] = json!({
+        "markets": 0,
+        "resting_orders": 1,
+        "admissions": 0,
+        "crossings": 0,
+        "outcomes": 1,
+        "nullifiers": 1,
+        "retired_nullifiers": 1,
+        "outputs": 0,
+        "funding_notes": 1,
+        "membership_path_elements": recovery.membership.subtree_path.len()
+            + recovery.membership.accumulator_path.len(),
+    });
     let mut wrong_recovery_signature = recovery_witness.clone();
     let last = wrong_recovery_signature.len() - 1;
     wrong_recovery_signature[last] += Felt::ONE;

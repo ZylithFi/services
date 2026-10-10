@@ -1255,6 +1255,23 @@ mod tests {
         manifest["deployment"]["release_commit"] =
             serde_json::json!("1111111111111111111111111111111111111111");
         manifest["proof"]["config_locked_after_deploy"] = serde_json::json!(true);
+        for field in [
+            "transition_proof_program_address",
+            "withdrawal_proof_program_address",
+            "residual_recovery_proof_program_address",
+            "virtual_program_hash",
+            "starknet_os_config_hash",
+            "proof_account_address",
+            "proof_account_class_hash",
+            "transition_proof_program_class_hash",
+            "withdrawal_proof_program_class_hash",
+            "residual_recovery_proof_program_class_hash",
+            "settlement_account_address",
+        ] {
+            manifest["proof"][field] = serde_json::json!("0x1");
+        }
+        manifest["funding"]["starknet_privacy"]["ingress_key_registry_fingerprint"] =
+            serde_json::json!("abababababababababababababababababababababababababababababababab");
         manifest["roles"]["reference_price_signer"] = serde_json::json!("0x123");
         let valid = manifest.to_string();
         assert_eq!(

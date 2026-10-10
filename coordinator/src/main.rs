@@ -1,9 +1,9 @@
 //! the zylith wallet backup service: encrypted wallet-signature vaults and recovery snapshots.
 //!
 //! the service stores only ciphertext it cannot read. a vault is the single backup of a wallet's
-//! seed, so it is written once; a recovery account keeps only its latest snapshot and is bound
-//! to the auth tag of its first upload, stored only as a verifier. records live in sqlite, one row per record, in the
-//! `coordinator_records` table earlier releases already use.
+//! seed, so it is written once; a recovery account keeps only its latest snapshot and is keyed by
+//! a verifier derived from the wallet's secret auth tag. records live in sqlite, one row per
+//! record, in the `coordinator_records` table earlier releases already use.
 
 mod proof_queue;
 
@@ -18,6 +18,7 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::{Mutex, RwLock};
@@ -35,10 +36,12 @@ const VAULT_NAMESPACE: &str = "wallet_vault_bundles";
 const MAX_RECOVERY_PAYLOAD_CHARS: usize = 1_048_576;
 const MAX_VAULT_PAYLOAD_CHARS: usize = 65_536;
 const WALLET_VAULT_AUTH_HEADER: &str = "x-zylith-wallet-vault-auth";
-const WALLET_VAULT_ID_DOMAIN: &str = "zylith/wallet-signature-vault/id/v2:";
+const PROOF_MONITOR_HEADER: &str = "x-zylith-proof-monitor-token";
+const WALLET_VAULT_ID_DOMAIN: &str = "zylith/wallet-signature-vault/id/v3:";
 const RECOVERY_AUTH_DOMAIN: &str = "zylith/recovery-auth/verifier/v1:";
 const VAULT_FIELDS: &[&str] = &[
     "version",
+    "key_schedule_version",
     "kdf",
     "algorithm",
     "wallet_address",
@@ -50,10 +53,10 @@ const VAULT_FIELDS: &[&str] = &[
     "ciphertext",
 ];
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct RecoveryAccountRecord {
-    /// a hash of the account's auth tag salted with its account id, so a copy of the store cannot
-    /// present the tag.
+    /// a hash of the account's auth tag salted with its account id. this is also the opaque storage
+    /// key, so knowledge of the public account id alone cannot claim the wallet's namespace.
     #[serde(default)]
     recovery_auth_verifier: Option<String>,
     /// the plaintext tag earlier releases stored; it becomes a verifier when the store loads.
@@ -73,6 +76,7 @@ fn recovery_verifier(account_id: &str, tag: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct WalletVaultBundleRecord {
     wallet_auth_id: String,
+    #[serde(deserialize_with = "zylith_core::deserialize_unique_wallet_json")]
     vault: serde_json::Value,
     updated_at_unix_ms: u64,
 }
@@ -86,6 +90,7 @@ struct AppState {
     limiter: Arc<Mutex<HashMap<IpAddr, (u64, u64)>>>,
     rate_limit_per_minute: u64,
     trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+    internal_monitor_token: Arc<String>,
 }
 
 fn now_unix_ms() -> u64 {
@@ -137,8 +142,9 @@ fn load_records<T: DeserializeOwned>(
     for row in rows {
         let (key, value) = row.map_err(|error| error.to_string())?;
         records.insert(
-            key,
-            serde_json::from_str(&value).map_err(|error| format!("{namespace} record: {error}"))?,
+            key.clone(),
+            serde_json::from_str(&value)
+                .map_err(|error| format!("{namespace} record {key}: {error}"))?,
         );
     }
     Ok(records)
@@ -163,6 +169,36 @@ fn upsert_record<T: Serialize>(
         )
         .map(|_| ())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn replace_namespace_records<T: Serialize>(
+    path: &FsPath,
+    namespace: &str,
+    records: &BTreeMap<String, T>,
+) -> Result<(), String> {
+    let mut connection =
+        open_store(path).map_err(|error| format!("store {}: {error}", path.display()))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM coordinator_records WHERE namespace = ?1",
+            [namespace],
+        )
+        .map_err(|error| error.to_string())?;
+    for (key, value) in records {
+        let value = serde_json::to_string(value).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO coordinator_records
+                 (namespace, record_key, value_json, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![namespace, key, value, now_unix_ms() as i64],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 /// the client's address, resolved right-to-left through only configured proxy hops.
@@ -221,7 +257,7 @@ async fn list_recovery_artifacts(
     enforce_rate_limit(&state, peer, &headers).await?;
     let provided = recovery_verifier(&account_id, &recovery_auth(&headers)?);
     let accounts = state.accounts.read().await;
-    let account = accounts.get(&account_id).ok_or(StatusCode::UNAUTHORIZED)?;
+    let account = accounts.get(&provided).ok_or(StatusCode::UNAUTHORIZED)?;
     match &account.recovery_auth_verifier {
         Some(expected) if zylith_core::constant_time_eq(expected, &provided) => {}
         Some(_) => return Err(StatusCode::UNAUTHORIZED),
@@ -274,7 +310,7 @@ async fn upload_recovery_artifact(
         .accounts
         .read()
         .await
-        .get(&account_id)
+        .get(&provided)
         .cloned()
         .unwrap_or_default();
     match &account.recovery_auth_verifier {
@@ -282,7 +318,7 @@ async fn upload_recovery_artifact(
             return Err(StatusCode::UNAUTHORIZED);
         }
         Some(_) => {}
-        None => account.recovery_auth_verifier = Some(provided),
+        None => account.recovery_auth_verifier = Some(provided.clone()),
     }
     if let Some(existing) = account
         .artifacts
@@ -309,17 +345,20 @@ async fn upload_recovery_artifact(
     // single-snapshot retention: no history of upload times or sizes is kept.
     account.artifacts = vec![artifact.clone()];
     let path = state.store_path.as_ref().clone();
-    let (key, record) = (account_id.clone(), account.clone());
+    let (key, record) = (provided.clone(), account.clone());
     tokio::task::spawn_blocking(move || upsert_record(&path, RECOVERY_NAMESPACE, &key, &record))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
-    state.accounts.write().await.insert(account_id, account);
+    state.accounts.write().await.insert(provided, account);
     Ok(Json(artifact))
 }
 
 fn is_wallet_auth_id(value: &str) -> bool {
     value.strip_prefix("0x").is_some_and(|hex| {
-        hex.len() == 64 && hex.chars().all(|character| character.is_ascii_hexdigit())
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
 }
 
@@ -328,16 +367,18 @@ fn require_vault_auth(headers: &HeaderMap, wallet_auth_id: &str) -> Result<(), S
     let token = headers
         .get(WALLET_VAULT_AUTH_HEADER)
         .and_then(|value| value.to_str().ok())
-        .map(str::trim)
         .filter(|value| {
-            value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let expected = format!(
         "0x{}",
         tagged_sha256_hex(WALLET_VAULT_ID_DOMAIN, token.as_bytes())
     );
-    if !zylith_core::constant_time_eq(&expected, &wallet_auth_id.to_ascii_lowercase()) {
+    if !zylith_core::constant_time_eq(&expected, wallet_auth_id) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
@@ -345,12 +386,17 @@ fn require_vault_auth(headers: &HeaderMap, wallet_auth_id: &str) -> Result<(), S
 
 fn validate_vault(bundle: &WalletVaultBundleRecord) -> Result<(), StatusCode> {
     let vault = bundle.vault.as_object().ok_or(StatusCode::BAD_REQUEST)?;
-    if vault
-        .keys()
-        .any(|field| !VAULT_FIELDS.contains(&field.as_str()))
-        || vault.get("version").and_then(|value| value.as_u64()) != Some(2)
-        || vault.get("kdf").and_then(|value| value.as_str()) != Some("wallet-signature-sha256-v2")
-        || vault.get("algorithm").and_then(|value| value.as_str()) != Some("AES-GCM")
+    if vault.len() != VAULT_FIELDS.len()
+        || vault
+            .keys()
+            .any(|field| !VAULT_FIELDS.contains(&field.as_str()))
+        || vault.get("version").and_then(|value| value.as_u64()) != Some(3)
+        || vault
+            .get("key_schedule_version")
+            .and_then(|value| value.as_u64())
+            != Some(2)
+        || vault.get("kdf").and_then(|value| value.as_str()) != Some("HKDF-SHA-256")
+        || vault.get("algorithm").and_then(|value| value.as_str()) != Some("AES-256-GCM")
         || vault
             .get("message_version")
             .and_then(|value| value.as_u64())
@@ -358,19 +404,41 @@ fn validate_vault(bundle: &WalletVaultBundleRecord) -> Result<(), StatusCode> {
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    for field in [
-        "wallet_address",
-        "chain_id",
-        "deployment_id",
-        "origin",
-        "nonce",
-        "ciphertext",
-    ] {
-        if vault
+    let text = |field: &str| {
+        vault
             .get(field)
             .and_then(|value| value.as_str())
-            .is_none_or(|value| value.trim().is_empty())
+            .ok_or(StatusCode::BAD_REQUEST)
+    };
+    for field in ["wallet_address", "chain_id", "deployment_id"] {
+        let value = text(field)?;
+        if value.len() > 66
+            || !starknet_crypto::Felt::from_hex(value).is_ok_and(|felt| {
+                felt != starknet_crypto::Felt::ZERO && zylith_core::hash::felt_hex(&felt) == value
+            })
         {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    let origin = text("origin")?;
+    let url = url::Url::parse(origin).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let local = url.scheme() == "http"
+        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if origin.len() > 256
+        || origin != url.origin().ascii_serialization().to_ascii_lowercase()
+        || (url.scheme() != "https" && !local)
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    for (field, expected) in [("nonce", 12_usize), ("ciphertext", 80)] {
+        let value = text(field)?;
+        if value.len() != expected.div_ceil(3) * 4 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let decoded = STANDARD
+            .decode(value)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        if decoded.len() != expected || STANDARD.encode(decoded) != value {
             return Err(StatusCode::BAD_REQUEST);
         }
     }
@@ -454,6 +522,7 @@ fn app(state: AppState, allowed_origins: Vec<HeaderValue>, max_body_bytes: usize
             "/api/wallet-vaults/{wallet_auth_id}",
             get(get_wallet_vault).post(upload_wallet_vault),
         )
+        .route("/internal/migration-inventory", get(migration_inventory))
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         // encrypted vaults and recovery artifacts are per wallet: no cache may keep them.
@@ -469,28 +538,123 @@ fn app(state: AppState, allowed_origins: Vec<HeaderValue>, max_body_bytes: usize
         )
 }
 
+async fn migration_inventory(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let provided = headers
+        .get(PROOF_MONITOR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if state.internal_monitor_token.is_empty()
+        || !zylith_core::constant_time_eq(provided, &state.internal_monitor_token)
+    {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let accounts = state.accounts.read().await;
+    let vaults = state.vaults.read().await;
+    let recovery_artifacts = accounts
+        .iter()
+        .flat_map(|(_, account)| {
+            account.artifacts.iter().map(move |artifact| {
+                serde_json::json!({
+                    "account_id": artifact.account_id,
+                    "artifact_id": artifact.artifact_id,
+                    "key_schedule_version": artifact.key_schedule_version,
+                    "sequence": artifact.sequence,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let account_ids = recovery_artifacts
+        .iter()
+        .filter_map(|artifact| artifact["account_id"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(Json(serde_json::json!({
+        "schema_version": 1,
+        "recovery_accounts": {
+            "count": account_ids.len(),
+            "account_ids": account_ids,
+        },
+        "recovery_artifacts": {
+            "count": recovery_artifacts.len(),
+            "records": recovery_artifacts,
+        },
+        "wallet_vaults": {
+            "count": vaults.len(),
+            "wallet_auth_ids": vaults.keys().collect::<Vec<_>>(),
+            "versions": vaults.values().map(|record| record.vault["version"].as_u64().unwrap_or(0)).collect::<Vec<_>>(),
+        },
+    })))
+}
+
 fn build_state(
     store_path: PathBuf,
     rate_limit_per_minute: u64,
     trusted_proxies: Vec<ipnet::IpNet>,
 ) -> Result<AppState, String> {
-    let mut accounts: BTreeMap<String, RecoveryAccountRecord> =
+    let loaded_accounts: BTreeMap<String, RecoveryAccountRecord> =
         load_records(&store_path, RECOVERY_NAMESPACE)?;
-    for (account_id, account) in &mut accounts {
-        if let Some(tag) = account.recovery_auth_tag.take() {
-            account.recovery_auth_verifier = Some(recovery_verifier(account_id, &tag));
-            upsert_record(&store_path, RECOVERY_NAMESPACE, account_id, account)
-                .map_err(|status| format!("migrating recovery account {account_id}: {status}"))?;
+    let vaults: BTreeMap<String, WalletVaultBundleRecord> =
+        load_records(&store_path, VAULT_NAMESPACE)?;
+    for (key, record) in &vaults {
+        if !is_wallet_auth_id(key)
+            || record.wallet_auth_id != *key
+            || validate_vault(record).is_err()
+        {
+            return Err(format!(
+                "{VAULT_NAMESPACE} record {key}: wallet migration required"
+            ));
         }
+    }
+    let mut accounts = BTreeMap::new();
+    let mut recovery_records_changed = false;
+    for (stored_key, mut account) in loaded_accounts {
+        if let Some(tag) = account.recovery_auth_tag.take() {
+            let account_id = account
+                .artifacts
+                .first()
+                .map(|artifact| artifact.account_id.as_str())
+                .unwrap_or(stored_key.as_str());
+            if account
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.account_id != account_id)
+            {
+                return Err(format!(
+                    "{RECOVERY_NAMESPACE} record {stored_key}: mixed account ids"
+                ));
+            }
+            account.recovery_auth_verifier = Some(recovery_verifier(account_id, &tag));
+            recovery_records_changed = true;
+        }
+        let verifier = account.recovery_auth_verifier.clone().ok_or_else(|| {
+            format!("{RECOVERY_NAMESPACE} record {stored_key}: missing authentication verifier")
+        })?;
+        if stored_key != verifier {
+            recovery_records_changed = true;
+        }
+        if let Some(existing) = accounts.insert(verifier.clone(), account.clone())
+            && existing != account
+        {
+            return Err(format!(
+                "{RECOVERY_NAMESPACE} record {stored_key}: authentication verifier collision"
+            ));
+        }
+    }
+    if recovery_records_changed {
+        replace_namespace_records(&store_path, RECOVERY_NAMESPACE, &accounts)
+            .map_err(|error| format!("migrating recovery accounts: {error}"))?;
     }
     Ok(AppState {
         accounts: Arc::new(RwLock::new(accounts)),
-        vaults: Arc::new(RwLock::new(load_records(&store_path, VAULT_NAMESPACE)?)),
+        vaults: Arc::new(RwLock::new(vaults)),
         store_path: Arc::new(store_path),
         write_lock: Arc::new(Mutex::new(())),
         limiter: Arc::new(Mutex::new(HashMap::new())),
         rate_limit_per_minute,
         trusted_proxies: Arc::new(trusted_proxies),
+        internal_monitor_token: Arc::new(String::new()),
     })
 }
 
@@ -524,16 +688,19 @@ async fn main() -> Result<(), String> {
     let session_ttl_ms = number("ZYLITH_PROOF_WORKER_SESSION_TTL_MS", 30 * 60_000)?;
     let worker_max_lifetime_ms = number("ZYLITH_PROOF_WORKER_MAX_LIFETIME_MS", 4 * 60 * 60_000)?;
     let lease_duration_ms = number("ZYLITH_PROOF_JOB_LEASE_MS", 60_000)?;
+    let proof_job_max_attempts = u32::try_from(number("ZYLITH_PROOF_JOB_MAX_ATTEMPTS", 3)?)
+        .map_err(|_| "ZYLITH_PROOF_JOB_MAX_ATTEMPTS exceeds u32".to_string())?;
     let proof_cleanup_interval_ms = number("ZYLITH_PROOF_JOB_CLEANUP_INTERVAL_MS", 60_000)?;
     if proof_cleanup_interval_ms == 0 {
         return Err("ZYLITH_PROOF_JOB_CLEANUP_INTERVAL_MS must be positive".into());
     }
+    let proof_monitor_token = required("ZYLITH_PROOF_QUEUE_MONITOR_TOKEN")?;
     let proof_queue = proof_queue::ProofQueue::open(proof_queue::ProofQueueConfig {
         database_path: proof_database_path,
         artifact_directory: proof_artifact_directory,
         data_key: proof_key,
         control_token: required("ZYLITH_PROOF_QUEUE_CONTROL_TOKEN")?,
-        monitor_token: required("ZYLITH_PROOF_QUEUE_MONITOR_TOKEN")?,
+        monitor_token: proof_monitor_token.clone(),
         registration_grant_ttl_ms: grant_ttl_ms,
         session_ttl_ms,
         worker_max_lifetime_ms,
@@ -544,6 +711,8 @@ async fn main() -> Result<(), String> {
             "ZYLITH_PROOF_JOB_ABANDONED_RETENTION_MS",
             7 * 24 * 60 * 60_000,
         )?,
+        max_attempts: proof_job_max_attempts,
+        retry_backoff_ms: number("ZYLITH_PROOF_JOB_RETRY_BACKOFF_MS", 5_000)?,
     })?;
     let rate_limit = variable("ZYLITH_COORDINATOR_PUBLIC_RATE_LIMIT_PER_MINUTE")
         .map(|value| {
@@ -579,7 +748,8 @@ async fn main() -> Result<(), String> {
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.into())
         .parse()
         .map_err(|error| format!("bind address: {error}"))?;
-    let state = build_state(store_path, rate_limit, trusted_proxies)?;
+    let mut state = build_state(store_path, rate_limit, trusted_proxies)?;
+    state.internal_monitor_token = Arc::new(proof_monitor_token);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| format!("bind: {error}"))?;
@@ -625,24 +795,245 @@ mod tests {
         ))
     }
 
-    fn vault_request(wallet_auth_id: &str, ciphertext: &str) -> serde_json::Value {
+    fn vault_v2_request(wallet_auth_id: &str, ciphertext: &str) -> serde_json::Value {
         serde_json::json!({
             "wallet_auth_id": wallet_auth_id,
             "updated_at_unix_ms": 1,
             "vault": {
-                "version": 2, "kdf": "wallet-signature-sha256-v2", "algorithm": "AES-GCM",
+                "version": 2, "key_schedule_version": 2, "kdf": "wallet-signature-sha256-v2", "algorithm": "AES-GCM",
                 "wallet_address": "0x1", "chain_id": "SN_SEPOLIA", "deployment_id": "d", "origin": "o",
                 "message_version": 2, "nonce": "n", "ciphertext": ciphertext,
             },
         })
     }
 
+    fn vault_v3_request(wallet_auth_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "wallet_auth_id": wallet_auth_id,
+            "updated_at_unix_ms": 1,
+            "vault": {
+                "version": 3, "key_schedule_version": 2, "kdf": "HKDF-SHA-256", "algorithm": "AES-256-GCM",
+                "wallet_address": "0xabc", "chain_id": "0x534e5f5345504f4c4941", "deployment_id": "0x123", "origin": "https://app.zylith.fi",
+                "message_version": 2, "nonce": "AAECAwQFBgcICQoL",
+                "ciphertext": "LsHn4kqB/KDZThd5hEoSCRZFb8ffMajvhZgWtIL3/EZ1ayK8FEw7mWy0wFxaJucgA2NWiHAs5imy9YQAYfb+jD58XkG2twdfmeoA6Ve45Tg=",
+            },
+        })
+    }
+
+    fn vault_request(wallet_auth_id: &str, ciphertext: &str) -> serde_json::Value {
+        let mut record = vault_v3_request(wallet_auth_id);
+        let marker = ciphertext.bytes().fold(0_u8, u8::wrapping_add);
+        record["vault"]["ciphertext"] = serde_json::json!(STANDARD.encode([marker; 80]));
+        record
+    }
+
+    #[tokio::test]
+    async fn vault_v3_auth_matches_the_independent_client_vector() {
+        let state = build_state(temporary_store(), 100, vec![]).unwrap();
+        let token = "0f6af4e0101267ab33fcd61065bfe2c951d189e8741e1b73c5df0c3709e69f6e";
+        let id = "0x8b8ff2601b68bbf0f3566b5c28d1487eb864e0d70416b60f7bb683dda95d5639";
+        assert_eq!(
+            post_vault(&state, token, vault_v3_request(id)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_inventory_requires_the_monitor_credential_and_exposes_no_payloads() {
+        let mut state = build_state(temporary_store(), 100, vec![]).unwrap();
+        state.internal_monitor_token = Arc::new("monitor".into());
+        let app = app(state, vec![], 1 << 20);
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/internal/migration-inventory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::get("/internal/migration-inventory")
+                    .header(PROOF_MONITOR_HEADER, "monitor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let inventory: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(inventory["schema_version"], 1);
+        assert_eq!(inventory["recovery_artifacts"]["count"], 0);
+        assert!(
+            !String::from_utf8(body.to_vec())
+                .unwrap()
+                .contains("ciphertext")
+        );
+    }
+
+    fn malformed_v3_vaults(key: &str) -> Vec<serde_json::Value> {
+        let valid = vault_v3_request(key);
+        let mut invalid = Vec::new();
+        for field in VAULT_FIELDS {
+            let mut row = valid.clone();
+            row["vault"].as_object_mut().unwrap().remove(*field);
+            invalid.push(row);
+        }
+        for (field, value) in [
+            ("version", serde_json::json!(2)),
+            ("version", serde_json::json!(4)),
+            ("version", serde_json::json!(3.0)),
+            ("kdf", serde_json::json!("wallet-signature-sha256-v2")),
+            ("algorithm", serde_json::json!("AES-GCM")),
+            ("message_version", serde_json::json!(1)),
+            ("message_version", serde_json::json!(2.0)),
+            ("wallet_address", serde_json::json!("0x0")),
+            ("wallet_address", serde_json::json!("0x0abc")),
+            ("chain_id", serde_json::json!("SN_SEPOLIA")),
+            (
+                "deployment_id",
+                serde_json::json!(
+                    "0x800000000000011000000000000000000000000000000000000000000000001"
+                ),
+            ),
+            ("origin", serde_json::json!("https://APP.ZYLITH.FI")),
+            ("origin", serde_json::json!("https://app.zylith.fi/")),
+            ("origin", serde_json::json!("https://app.zylith.fi?x")),
+            ("origin", serde_json::json!("https://user@app.zylith.fi")),
+            ("origin", serde_json::json!("http://app.zylith.fi")),
+            ("origin", serde_json::json!("zylith://local")),
+            ("nonce", serde_json::json!("AA==")),
+            ("nonce", serde_json::json!(" AAECAwQFBgcICQoL")),
+            ("ciphertext", serde_json::json!("AA==")),
+            ("ciphertext", serde_json::json!("A".repeat(108))),
+            (
+                "ciphertext",
+                serde_json::json!(
+                    "LsHn4kqB/KDZThd5hEoSCRZFb8ffMajvhZgWtIL3/EZ1ayK8FEw7mWy0wFxaJucgA2NWiHAs5imy9YQAYfb+jD58XkG2twdfmeoA6Ve45Th="
+                ),
+            ),
+            ("extra", serde_json::json!(1)),
+        ] {
+            let mut row = valid.clone();
+            row["vault"][field] = value;
+            invalid.push(row);
+        }
+        invalid
+    }
+
+    #[tokio::test]
+    async fn vault_v3_malformed_requests_never_persist() {
+        let state = build_state(temporary_store(), 100, vec![]).unwrap();
+        let token = "0f6af4e0101267ab33fcd61065bfe2c951d189e8741e1b73c5df0c3709e69f6e";
+        let id = "0x8b8ff2601b68bbf0f3566b5c28d1487eb864e0d70416b60f7bb683dda95d5639";
+        for row in malformed_v3_vaults(id) {
+            assert_eq!(
+                post_vault(&state, token, row).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert!(state.vaults.read().await.is_empty());
+        assert!(
+            load_records::<serde_json::Value>(&state.store_path, VAULT_NAMESPACE)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn vault_v3_malformed_rows_stop_startup_before_other_rows_are_mutated() {
+        let key = "0x".to_owned() + &"a".repeat(64);
+        for row in malformed_v3_vaults(&key) {
+            let path = temporary_store();
+            let recovery =
+                serde_json::json!({ "recovery_auth_tag": "secret-tag", "artifacts": [] });
+            upsert_record(&path, RECOVERY_NAMESPACE, "account", &recovery).unwrap();
+            upsert_record(&path, VAULT_NAMESPACE, &key, &row).unwrap();
+            assert!(build_state(path.clone(), 100, vec![]).is_err());
+            assert_eq!(
+                load_records::<serde_json::Value>(&path, VAULT_NAMESPACE).unwrap()[&key],
+                row
+            );
+            assert_eq!(
+                load_records::<serde_json::Value>(&path, RECOVERY_NAMESPACE).unwrap()["account"],
+                recovery
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn vault_v3_local_origins_and_canonical_header_authentication() {
+        let token = "0f6af4e0101267ab33fcd61065bfe2c951d189e8741e1b73c5df0c3709e69f6e";
+        let id = "0x8b8ff2601b68bbf0f3566b5c28d1487eb864e0d70416b60f7bb683dda95d5639";
+        for origin in [
+            "http://localhost",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://[::1]:5173",
+        ] {
+            let mut record = vault_v3_request(id);
+            record["vault"]["origin"] = serde_json::json!(origin);
+            assert!(validate_vault(&serde_json::from_value(record).unwrap()).is_ok());
+        }
+        for invalid in [
+            token.to_uppercase(),
+            format!(" {token}"),
+            format!("{token} "),
+            "ab".repeat(32),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                WALLET_VAULT_AUTH_HEADER,
+                HeaderValue::from_str(&invalid).unwrap(),
+            );
+            assert_eq!(
+                require_vault_auth(&headers, id),
+                Err(StatusCode::UNAUTHORIZED)
+            );
+        }
+    }
+
+    #[test]
+    fn vault_v3_startup_refuses_v2_before_any_other_row_mutation() {
+        let key = "0x".to_owned() + &"a".repeat(64);
+        let path = temporary_store();
+        let original = vault_v2_request(&key, "c");
+        let recovery = serde_json::json!({ "recovery_auth_tag": "secret-tag", "artifacts": [] });
+        upsert_record(&path, RECOVERY_NAMESPACE, "account", &recovery).unwrap();
+        upsert_record(&path, VAULT_NAMESPACE, &key, &original).unwrap();
+        assert!(build_state(path.clone(), 100, vec![]).is_err());
+        assert_eq!(
+            load_records::<serde_json::Value>(&path, VAULT_NAMESPACE).unwrap()[&key],
+            original
+        );
+        assert_eq!(
+            load_records::<serde_json::Value>(&path, RECOVERY_NAMESPACE).unwrap()["account"],
+            recovery
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     async fn post_vault(state: &AppState, token: &str, body: serde_json::Value) -> StatusCode {
         let wallet_auth_id = body["wallet_auth_id"].as_str().unwrap().to_owned();
+        post_vault_raw(state, token, &wallet_auth_id, body.to_string()).await
+    }
+
+    async fn post_vault_raw(
+        state: &AppState,
+        token: &str,
+        wallet_auth_id: &str,
+        body: String,
+    ) -> StatusCode {
         let mut request = Request::post(format!("/api/wallet-vaults/{wallet_auth_id}"))
             .header("content-type", "application/json")
             .header(WALLET_VAULT_AUTH_HEADER, token)
-            .body(Body::from(body.to_string()))
+            .body(Body::from(body))
             .unwrap();
         request
             .extensions_mut()
@@ -657,6 +1048,62 @@ mod tests {
             "private, no-store"
         );
         response.status()
+    }
+
+    #[tokio::test]
+    async fn a_vault_refuses_duplicate_versions_before_persisting() {
+        let state = build_state(temporary_store(), 100, vec![]).unwrap();
+        let token = "ab".repeat(32);
+        let id = format!(
+            "0x{}",
+            tagged_sha256_hex(WALLET_VAULT_ID_DOMAIN, token.as_bytes())
+        );
+        let body = vault_request(&id, "c").to_string().replace(
+            "\"key_schedule_version\":2",
+            "\"key_schedule_version\":1,\"key_schedule_\\u0076ersion\":2",
+        );
+        assert_eq!(
+            post_vault_raw(&state, &token, &id, body).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(state.vaults.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_vault_refuses_missing_or_wrong_wallet_key_schedule_versions() {
+        let state = build_state(temporary_store(), 100, vec![]).unwrap();
+        let token = "ab".repeat(32);
+        let id = format!(
+            "0x{}",
+            tagged_sha256_hex(WALLET_VAULT_ID_DOMAIN, token.as_bytes())
+        );
+        for version in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!(3),
+            serde_json::json!("2"),
+            serde_json::json!(2.5),
+        ] {
+            let mut body = vault_request(&id, "c");
+            body["vault"]["key_schedule_version"] = version;
+            assert_eq!(
+                post_vault(&state, &token, body).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let mut missing = vault_request(&id, "c");
+        missing["vault"]
+            .as_object_mut()
+            .unwrap()
+            .remove("key_schedule_version");
+        assert_eq!(
+            post_vault(&state, &token, missing).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_vault(&state, &token, vault_request(&id, "c")).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -692,8 +1139,108 @@ mod tests {
         let reloaded = build_state(path.clone(), 100, vec![]).unwrap();
         assert_eq!(
             reloaded.vaults.read().await[&wallet_auth_id].vault["ciphertext"],
-            "c1"
+            vault_request(&wallet_auth_id, "c1")["vault"]["ciphertext"]
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_refuses_incompatible_stored_vaults_without_rewriting_them() {
+        let key = "0x".to_owned() + &"a".repeat(64);
+        let original = vault_request(&key, "ciphertext");
+        let mut invalid = Vec::new();
+        let mut missing = original.clone();
+        missing["vault"]
+            .as_object_mut()
+            .unwrap()
+            .remove("key_schedule_version");
+        invalid.push(missing);
+        for version in [
+            serde_json::json!(1),
+            serde_json::json!(3),
+            serde_json::json!("2"),
+            serde_json::json!(2.5),
+            serde_json::Value::Null,
+        ] {
+            let mut row = original.clone();
+            row["vault"]["key_schedule_version"] = version;
+            invalid.push(row);
+        }
+        let mut alias = original.clone();
+        alias["vault"]["keyScheduleVersion"] = serde_json::json!(1);
+        invalid.push(alias);
+        let mut mismatched_key = original.clone();
+        mismatched_key["wallet_auth_id"] = serde_json::json!("0xdead");
+        invalid.push(mismatched_key);
+
+        for row in invalid {
+            let path = temporary_store();
+            upsert_record(&path, VAULT_NAMESPACE, &key, &row).unwrap();
+            let error = build_state(path.clone(), 100, vec![])
+                .err()
+                .expect("startup must fail");
+            assert!(error.contains(VAULT_NAMESPACE), "{error}");
+            assert!(error.contains(&key), "{error}");
+            assert!(error.contains("migration"), "{error}");
+            let stored = load_records::<serde_json::Value>(&path, VAULT_NAMESPACE).unwrap();
+            assert_eq!(stored[&key], row);
+            let _ = std::fs::remove_file(path);
+        }
+
+        let path = temporary_store();
+        upsert_record(&path, VAULT_NAMESPACE, &key, &original).unwrap();
+        let state = build_state(path.clone(), 100, vec![]).expect("v3 vault must load");
+        assert_eq!(state.vaults.blocking_read()[&key].vault, original["vault"]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_refuses_escaped_duplicate_vault_keys_without_rewriting_the_row() {
+        let key = "0x".to_owned() + &"a".repeat(64);
+        let path = temporary_store();
+        let raw = vault_request(&key, "ciphertext").to_string().replace(
+            "\"key_schedule_version\":2",
+            "\"key_schedule_version\":1,\"key_schedule_\\u0076ersion\":2",
+        );
+        let connection = open_store(&path).unwrap();
+        connection.execute(
+            "INSERT INTO coordinator_records (namespace, record_key, value_json, updated_at_unix_ms) VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![VAULT_NAMESPACE, key, raw],
+        ).unwrap();
+        let error = build_state(path.clone(), 100, vec![])
+            .err()
+            .expect("startup must fail");
+        assert!(error.contains(VAULT_NAMESPACE), "{error}");
+        assert!(error.contains(&key), "{error}");
+        assert!(error.contains("migration"), "{error}");
+        let stored: String = connection.query_row(
+            "SELECT value_json FROM coordinator_records WHERE namespace = ?1 AND record_key = ?2",
+            rusqlite::params![VAULT_NAMESPACE, key],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(stored, raw);
+        drop(connection);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_rejects_a_legacy_vault_before_rewriting_other_rows() {
+        let key = "0x".to_owned() + &"a".repeat(64);
+        let path = temporary_store();
+        let recovery = serde_json::json!({ "recovery_auth_tag": "secret-tag", "artifacts": [] });
+        let mut vault = vault_request(&key, "ciphertext");
+        vault["vault"]
+            .as_object_mut()
+            .unwrap()
+            .remove("key_schedule_version");
+        upsert_record(&path, RECOVERY_NAMESPACE, "account", &recovery).unwrap();
+        upsert_record(&path, VAULT_NAMESPACE, &key, &vault).unwrap();
+
+        assert!(build_state(path.clone(), 100, vec![]).is_err());
+        let stored_recovery = load_records::<serde_json::Value>(&path, RECOVERY_NAMESPACE).unwrap();
+        let stored_vault = load_records::<serde_json::Value>(&path, VAULT_NAMESPACE).unwrap();
+        assert_eq!(stored_recovery["account"], recovery);
+        assert_eq!(stored_vault[&key], vault);
         let _ = std::fs::remove_file(path);
     }
 
@@ -722,12 +1269,13 @@ mod tests {
     ) -> StatusCode {
         let body = serde_json::json!({
             "artifact": {
+                "key_schedule_version": 2,
                 "artifact_id": artifact_id,
                 "account_id": account_id,
                 "kind": "Snapshot",
                 "sequence": sequence,
                 "created_at_unix_ms": sequence,
-                "payload": { "algorithm": "AES-GCM", "nonce": "n", "ciphertext": "c" },
+                "payload": { "key_schedule_version": 2, "algorithm": "AES-GCM", "nonce": "n", "ciphertext": "c" },
             },
             "previous_artifact_id": previous_artifact_id,
         });
@@ -770,6 +1318,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_arbitrary_first_tag_cannot_claim_another_wallets_recovery_namespace() {
+        let path = temporary_store();
+        let state = build_state(path.clone(), 100, vec![]).unwrap();
+        assert_eq!(
+            post_recovery(&state, "known-account", "attacker-tag", "0xbad", 1, None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_recovery(&state, "known-account", "wallet-tag", "0xgood", 1, None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_recovery(&state, "known-account", "wallet-tag").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_recovery(&state, "known-account", "unknown-tag").await,
+            StatusCode::UNAUTHORIZED
+        );
+        let accounts = state.accounts.read().await;
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.contains_key(&recovery_verifier("known-account", "wallet-tag")));
+        assert!(accounts.contains_key(&recovery_verifier("known-account", "attacker-tag")));
+        drop(accounts);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn the_store_keeps_only_a_verifier_of_the_recovery_tag() {
         let path = temporary_store();
         // a record written by an earlier release, with the tag in plaintext.
@@ -782,11 +1358,10 @@ mod tests {
         .unwrap();
         let state = build_state(path.clone(), 100, vec![]).unwrap();
         let stored = load_records::<serde_json::Value>(&path, RECOVERY_NAMESPACE).unwrap();
-        assert!(!stored["account"].to_string().contains("secret-tag"));
-        assert_eq!(
-            stored["account"]["recovery_auth_verifier"],
-            recovery_verifier("account", "secret-tag")
-        );
+        let verifier = recovery_verifier("account", "secret-tag");
+        assert!(!stored.contains_key("account"));
+        assert!(!stored[&verifier].to_string().contains("secret-tag"));
+        assert_eq!(stored[&verifier]["recovery_auth_verifier"], verifier);
         assert_eq!(
             list_recovery(&state, "account", "secret-tag").await,
             StatusCode::OK

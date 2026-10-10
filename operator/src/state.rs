@@ -4,6 +4,7 @@
 //! with aes-256-gcm under the data key and replaced atomically after every change.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use starknet_rust_core::types::Felt;
+use zeroize::Zeroizing;
 use zylith_core::exchange::{
     BookEntry, CancelRequest, OrderReport, OrderRequest, TransitionResult, WithdrawRequest,
 };
@@ -81,11 +83,36 @@ pub enum TransitionStage {
     Submitted { transaction_hash: Felt },
 }
 
+/// the private padding stream key assigned once to one logical transition.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TransitionPaddingSeed(Felt);
+
+impl TransitionPaddingSeed {
+    pub fn new(value: Felt) -> Result<Self, String> {
+        if value == Felt::ZERO {
+            return Err("a transition padding seed cannot be zero".into());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn expose(self) -> Felt {
+        self.0
+    }
+}
+
+impl fmt::Debug for TransitionPaddingSeed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TransitionPaddingSeed([redacted])")
+    }
+}
+
 /// a transition built on the book the chain will hold once its predecessors land.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InFlight {
     pub seq: u32,
     pub close_time_ms: u64,
+    pub padding_seed: TransitionPaddingSeed,
     pub result: TransitionResult,
     pub calldata: Vec<Felt>,
     pub admitted: Vec<Felt>,
@@ -213,6 +240,12 @@ pub struct OperatorState {
     /// since when a crossing has waited for its fees to cover a transition.
     #[serde(default)]
     pub uneconomic_since_ms: Option<u64>,
+    /// Release-bound adaptive ceiling learned only from a structured permanent capacity failure.
+    /// It monotonically decreases for one capacity profile and is reset when that profile changes.
+    #[serde(default)]
+    pub proof_capacity_profile_id: Option<String>,
+    #[serde(default)]
+    pub proof_capacity_admission_limit: Option<usize>,
 }
 
 impl OperatorState {
@@ -236,6 +269,8 @@ impl OperatorState {
             transition_leaves: BTreeMap::new(),
             transition_gas: 0,
             uneconomic_since_ms: None,
+            proof_capacity_profile_id: None,
+            proof_capacity_admission_limit: None,
         }
     }
 }
@@ -304,10 +339,11 @@ impl Store {
             return Err("state file is truncated".into());
         }
         let (nonce, ciphertext) = sealed.split_at(12);
-        let plaintext = self
-            .cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|_| "state file does not decrypt under the data key".to_string())?;
+        let plaintext = Zeroizing::new(
+            self.cipher
+                .decrypt(Nonce::from_slice(nonce), ciphertext)
+                .map_err(|_| "state file does not decrypt under the data key".to_string())?,
+        );
         let mut state: OperatorState =
             serde_json::from_slice(&plaintext).map_err(|error| format!("state decode: {error}"))?;
         if state.version != STATE_VERSION {
@@ -318,8 +354,9 @@ impl Store {
     }
 
     pub fn save(&self, state: &OperatorState) -> Result<(), String> {
-        let plaintext =
-            serde_json::to_vec(state).map_err(|error| format!("state encode: {error}"))?;
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(state).map_err(|error| format!("state encode: {error}"))?,
+        );
         let mut nonce = [0_u8; 12];
         OsRng.fill_bytes(&mut nonce);
         let ciphertext = self
@@ -463,9 +500,13 @@ mod tests {
                 proof: None,
             },
         };
+        let padding_seed =
+            TransitionPaddingSeed::new(Felt::from_bytes_be(&transition.witness[6].to_bytes_be()))
+                .unwrap();
         state.in_flight.push(InFlight {
             seq: 1,
             close_time_ms: 6_000,
+            padding_seed,
             result: transition,
             calldata: vec![Felt::from(94_u8)],
             admitted: Vec::new(),
@@ -499,6 +540,8 @@ mod tests {
             },
         );
         state.recovered_residuals.insert(key(&nullifier), 19);
+        state.proof_capacity_profile_id = Some("ab".repeat(32));
+        state.proof_capacity_admission_limit = Some(7);
         state.pending_residual_recoveries.insert(
             key(&Felt::from(77_u8)),
             PendingResidualRecovery {
@@ -515,12 +558,18 @@ mod tests {
 
         let restored = store.load().unwrap().unwrap();
         assert_eq!(restored.book, state.book);
+        assert_eq!(restored.in_flight[0].padding_seed, padding_seed);
         assert_eq!(
             serde_json::to_value(restored.in_flight[0].prepared_submission.as_ref().unwrap())
                 .unwrap(),
             serde_json::to_value(&prepared).unwrap()
         );
         assert_eq!(restored.recovered_residuals, state.recovered_residuals);
+        assert_eq!(
+            restored.proof_capacity_profile_id,
+            state.proof_capacity_profile_id
+        );
+        assert_eq!(restored.proof_capacity_admission_limit, Some(7));
         assert_eq!(restored.withdrawals.len(), 1);
         assert_eq!(
             serde_json::to_value(

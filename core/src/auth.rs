@@ -1,6 +1,8 @@
 use std::net::IpAddr;
 
-use crate::hash::tagged_sha256_hex;
+use zeroize::Zeroizing;
+
+use crate::{RecoverySeed, WalletKeyScheduleV2, hash::tagged_sha256_hex};
 
 pub const CONTROL_PLANE_TOKEN_ENV: &str = "ZYLITH_CONTROL_PLANE_TOKEN";
 pub const RECOVERY_AUTH_HEADER: &str = "x-zylith-recovery-auth";
@@ -28,11 +30,19 @@ pub fn constant_time_eq(left: &str, right: &str) -> bool {
     diff == 0
 }
 
-pub fn derive_recovery_auth_tag(account_id: &str, recovery_key_hex: &str) -> String {
+fn derive_recovery_auth_tag(account_id: &str, recovery_key_hex: &str) -> String {
     tagged_sha256_hex(
         "zylith/recovery-auth:",
         format!("{account_id}:{recovery_key_hex}").as_bytes(),
     )
+}
+
+/// derives the recovery authentication tag without exposing the recovery child key.
+pub fn derive_wallet_recovery_auth_tag(seed: &RecoverySeed) -> String {
+    let schedule = WalletKeyScheduleV2::from_seed(seed);
+    let recovery_key = schedule.recovery_encryption_key();
+    let recovery_key_hex = Zeroizing::new(hex::encode(recovery_key.as_bytes()));
+    derive_recovery_auth_tag(&schedule.account_id(), &recovery_key_hex)
 }
 
 /// returns the nearest untrusted address in a proxy-appended forwarding chain.
@@ -63,9 +73,10 @@ mod tests {
     use std::net::IpAddr;
 
     use super::{
-        constant_time_eq, derive_recovery_auth_tag, extract_bearer_token, format_bearer_token,
-        forwarded_client_ip,
+        constant_time_eq, derive_recovery_auth_tag, derive_wallet_recovery_auth_tag,
+        extract_bearer_token, format_bearer_token, forwarded_client_ip,
     };
+    use crate::RecoverySeed;
 
     #[test]
     fn bearer_roundtrip_extracts_original_token() {
@@ -99,6 +110,15 @@ mod tests {
                 "91e7fb7e163abc840faedd0c354d4e048ead61efab9bd14f7966c19f1ef44624"
             ),
             "8907823a9cfe812c9cca507d8f3d52b7b872b2f105c383c172baa3239c456395"
+        );
+    }
+
+    #[test]
+    fn wallet_recovery_auth_tag_matches_the_v2_seed_vector() {
+        let seed = RecoverySeed([1; 32]);
+        assert_eq!(
+            derive_wallet_recovery_auth_tag(&seed),
+            "b1acd9321469a0e0145ad11ce98b80faea63b2591755588f04c4c4f2c474fdcd"
         );
     }
 

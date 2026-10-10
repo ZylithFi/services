@@ -35,6 +35,37 @@ pub const OUTPUT_KIND_REFUND: u64 = 2;
 pub const OUTPUT_KIND_FEE: u64 = 3;
 pub const OUTPUT_KIND_RESIDUAL: u64 = 4;
 
+/// the closed output semantics carried by transition results. converting an unrecognized wire
+/// value fails before any blinding or witness can be constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum OutputKind {
+    Proceeds = OUTPUT_KIND_PROCEEDS,
+    Refund = OUTPUT_KIND_REFUND,
+    Fee = OUTPUT_KIND_FEE,
+    Residual = OUTPUT_KIND_RESIDUAL,
+}
+
+impl OutputKind {
+    pub const fn as_u64(self) -> u64 {
+        self as u64
+    }
+}
+
+impl TryFrom<u64> for OutputKind {
+    type Error = ProtocolError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            OUTPUT_KIND_PROCEEDS => Ok(Self::Proceeds),
+            OUTPUT_KIND_REFUND => Ok(Self::Refund),
+            OUTPUT_KIND_FEE => Ok(Self::Fee),
+            OUTPUT_KIND_RESIDUAL => Ok(Self::Residual),
+            _ => Err(invalid("unknown output kind")),
+        }
+    }
+}
+
 /// the existing note, nullifier and output-note domains (sha-derived; see `hash::domain_felt`).
 pub const NOTE_COMMITMENT_DOMAIN_HEX: &str =
     "0x43aeae569e031a74671a28c60a017d2a53bbb5ffa6f6a7711c076348fb186c";
@@ -63,9 +94,11 @@ pub const NULLIFIERS_DOMAIN: &str = "zylith_nullifiers_v1";
 pub const RETIRED_NULLIFIERS_DOMAIN: &str = "zylith_retired_v1";
 pub const OUTPUTS_DOMAIN: &str = "zylith_outputs_v1";
 pub const OUTPUT_BLINDING_DOMAIN: &str = "zylith_out_blind_v1";
-pub const OUTPUT_AUX_BLINDING_DOMAIN: &str = "zylith_out_aux_v1";
+pub const ORDER_OUTPUT_BLINDING_DOMAIN: &str = "zylith_order_blind_prg_v1";
+pub const OUTPUT_AUX_BLINDING_DOMAIN: &str = "zylith_out_aux_prg_v1";
+pub const OUTPUT_PADDING_DOMAIN: &str = "zylith_out_pad_v1";
+pub const NULLIFIER_PADDING_DOMAIN: &str = "zylith_null_pad_v1";
 pub const TRANSITION_DOMAIN: &str = "zylith_transition_v1";
-pub const PADDING_DOMAIN: &str = "zylith_pad_v1";
 pub const RESIDUAL_NOTE_DOMAIN: &str = "zylith_residual_v1";
 pub const WITHDRAW_AUTH_DOMAIN: &str = "zylith_withdraw_v2";
 pub const WITHDRAWAL_DOMAIN: &str = "zylith_withdrawal_v2";
@@ -86,6 +119,66 @@ pub(crate) fn domain_hex(hex: &str) -> Felt {
 /// `poseidon_hash_span` over the sequence: the sponge every commitment uses.
 pub fn sponge(values: &[Felt]) -> Felt {
     poseidon_hash_many(values)
+}
+
+/// one domain-separated pseudorandom field element keyed by `seed` and bound to `index`.
+fn poseidon_prg1(domain: &str, seed: Felt, index: usize) -> Felt {
+    let mut state = [short_string(domain), seed, felt_u64(index as u64)];
+    poseidon_permute_comp(&mut state);
+    state[0]
+}
+
+/// three domain-separated pseudorandom field elements from one secret key. the capacity lane is
+/// advanced before the second squeeze so this cannot collide with the one-permutation prefix.
+fn poseidon_prg3(domain: &str, key: Felt, index: Felt) -> [Felt; 3] {
+    let mut state = [short_string(domain), key, index];
+    poseidon_permute_comp(&mut state);
+    let first = state[0];
+    let second = state[1];
+    state[2] += Felt::ONE;
+    poseidon_permute_comp(&mut state);
+    [first, second, state[0]]
+}
+
+/// five domain-separated pseudorandom field elements keyed by `seed` and bound to `index`.
+/// squeezing two rate elements per permutation replaces five independent four-felt sponges while
+/// retaining a distinct field element for every public padding lane.
+fn poseidon_prg5(domain: &str, seed: Felt, index: usize) -> [Felt; 5] {
+    let mut state = [short_string(domain), seed, felt_u64(index as u64)];
+    poseidon_permute_comp(&mut state);
+    let first = state[0];
+    let second = state[1];
+    state[2] += Felt::ONE;
+    poseidon_permute_comp(&mut state);
+    let third = state[0];
+    let fourth = state[1];
+    state[2] += Felt::TWO;
+    poseidon_permute_comp(&mut state);
+    [first, second, third, fourth, state[0]]
+}
+
+/// proceeds, refund and residual blindings for one order and transition sequence.
+pub fn order_output_blindings(order_secret: Felt, seq: u32) -> [Felt; 3] {
+    poseidon_prg3(
+        ORDER_OUTPUT_BLINDING_DOMAIN,
+        order_secret,
+        felt_u64(u64::from(seq)),
+    )
+}
+
+/// masks for the remaining, reserved and reserved-offset fields of one output.
+pub fn output_aux_blindings(blinding: Felt) -> [Felt; 3] {
+    poseidon_prg3(OUTPUT_AUX_BLINDING_DOMAIN, blinding, Felt::ZERO)
+}
+
+/// the five public fields of one dummy output record.
+pub fn output_padding_record(padding_seed: Felt, index: usize) -> [Felt; 5] {
+    poseidon_prg5(OUTPUT_PADDING_DOMAIN, padding_seed, index)
+}
+
+/// one dummy nullifier at its final padded-list index.
+pub fn nullifier_padding_value(padding_seed: Felt, index: usize) -> Felt {
+    poseidon_prg1(NULLIFIER_PADDING_DOMAIN, padding_seed, index)
 }
 
 pub fn felt_u128(value: u128) -> Felt {
@@ -179,6 +272,7 @@ pub mod u128_decimal_serde {
 
 /// ecdsa over the stark curve, the scheme `check_ecdsa_signature` verifies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Signature {
     #[serde(with = "felt_hex_serde")]
     pub r: Felt,
@@ -210,6 +304,7 @@ pub fn public_key(private_key: &Felt) -> Felt {
 /// who receives an order's outputs and who may cancel it. `nonce` is the order's random secret:
 /// it makes the order id unique and keys the encryption of its output amounts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderOwner {
     #[serde(with = "felt_hex_serde")]
     pub owner_public_key: Felt,
@@ -255,6 +350,7 @@ impl OrderOwner {
 
 /// what the user signs: the immutable terms of a persistent order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrderTerms {
     #[serde(with = "felt_hex_serde")]
     pub pair_id: Felt,
@@ -505,7 +601,7 @@ impl ResidualNote {
             blinding: super::transition::output_blinding(
                 owner.nonce,
                 generation,
-                OUTPUT_KIND_RESIDUAL,
+                OutputKind::Residual,
                 Felt::ZERO,
             ),
         }
@@ -591,6 +687,7 @@ pub(crate) fn group_lt(left: &(Felt, bool), right: &(Felt, bool)) -> bool {
 
 /// a zylith note as its commitment sees it: the felts after asset and owner encoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NoteFields {
     #[serde(with = "felt_hex_serde")]
     pub asset_id: Felt,
@@ -649,10 +746,7 @@ impl NoteFields {
         Ok(Self {
             asset_id: felt_from_hex_str(&encode_starknet_felt("asset-id", &note.asset_id.0))?,
             amount: note.amount,
-            owner_public_key: felt_from_hex_str(&encode_starknet_felt(
-                "owner-public-key",
-                &note.owner_public_key,
-            ))?,
+            owner_public_key: felt_from_hex_str(&note.owner_public_key)?,
             spend_authority: felt_from_hex_str(&note.spend_authority)?,
             withdraw_authority: felt_from_hex_str(&note.withdraw_authority)?,
             blinding: felt_from_hex_str(&note.blinding)?,
@@ -870,15 +964,4 @@ impl NoteMembership {
 /// the next power of two at or above `count`, and at least `minimum`.
 pub fn padded_len(count: usize, minimum: usize) -> usize {
     count.max(minimum).next_power_of_two()
-}
-
-/// deterministic padding: unpredictable without the operator's seed, indistinguishable from
-/// real leaves and nullifiers.
-pub fn padding_value(seed: Felt, domain: &str, index: usize) -> Felt {
-    sponge(&[
-        short_string(PADDING_DOMAIN),
-        seed,
-        short_string(domain),
-        felt_u64(index as u64),
-    ])
 }

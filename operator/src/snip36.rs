@@ -33,8 +33,9 @@ use starknet_rust_signers::{LocalWallet, SigningKey};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use zylith_proof_job::{
-    EnqueueProofJob, PROOF_JOB_SCHEMA_VERSION, PROOF_VALIDITY_HEADROOM_BLOCKS, ProofJobDescriptor,
-    ProofJobState, ProofJobStatus, ProofStatementKind, proof_artifact_hash,
+    EnqueueProofJob, PROOF_JOB_SCHEMA_VERSION, PROOF_VALIDITY_HEADROOM_BLOCKS, ProofFailure,
+    ProofFailureClass, ProofJobDescriptor, ProofJobState, ProofJobStatus, ProofStatementKind,
+    STARKNET_OS_OUTPUT_VERSION, VIRTUAL_PROGRAM_VARIANT, proof_artifact_hash,
 };
 
 use crate::config::{Account, Config};
@@ -47,6 +48,12 @@ const SUBMIT_L1_DATA_GAS_FLOOR: u64 = 8_000;
 const SUBMIT_L2_GAS_FLOOR: u64 = 150_000_000;
 const MAX_PROVER_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const PROOF_JOB_POLL_MS: u64 = 200;
+/// how far behind the chain tip a queued job's base block may fall before nobody can prove it:
+/// public rpc nodes serve storage proofs for only about the last hundred blocks, so a job still
+/// waiting for a worker past this age is re-enqueued at a fresh base instead of being kept.
+pub const PROOF_JOB_FRESH_BLOCKS: u64 = 48;
+/// how often a waiting job's base block is compared with the chain tip.
+const PROOF_JOB_FRESHNESS_CHECK: Duration = Duration::from_secs(5);
 const RECEIPT_POLL_ATTEMPTS: usize = 60;
 const RECEIPT_POLL_INTERVAL_MS: u64 = 500;
 const SUBMIT_ATTEMPTS: usize = 8;
@@ -71,6 +78,8 @@ struct ProveRequest<'a> {
 pub struct Proof {
     pub proof: String,
     pub facts: Vec<Felt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_usage: Option<zylith_proof_job::ProofResourceUsage>,
 }
 
 /// one exact signed transaction, persisted before its first broadcast.
@@ -298,9 +307,9 @@ impl Snip36 {
             proof_program_address: format!("{:#x}", program_call.to),
             program_entrypoint: context.program_entrypoint,
             proof_version: self.proof_version.clone(),
-            program_variant: "VIRTUAL_SNOS".into(),
+            program_variant: VIRTUAL_PROGRAM_VARIANT.into(),
             virtual_program_hash: self.virtual_program_hash.clone(),
-            starknet_os_output_version: "VIRTUAL_SNOS0".into(),
+            starknet_os_output_version: STARKNET_OS_OUTPUT_VERSION.into(),
             starknet_os_config_hash: self.starknet_os_config_hash.clone(),
             base_block_number: 0,
             base_block_hash: "0x0".into(),
@@ -313,17 +322,7 @@ impl Snip36 {
             request_bytes: 1,
             created_at_unix_ms: now_ms(),
         };
-        descriptor.job_id = descriptor.expected_job_id()?;
         let (latest, _) = self.latest_block().await?;
-        if let Some(status) = self.queue_status(&descriptor.job_id).await?
-            && latest.saturating_add(PROOF_VALIDITY_HEADROOM_BLOCKS)
-                <= status
-                    .descriptor
-                    .base_block_number
-                    .saturating_add(self.proof_validity_blocks)
-        {
-            return self.await_job(descriptor, status, expected_message).await;
-        }
         let base = latest.saturating_sub(self.blocks_back);
         let base_hash = self.block_hash(base).await?;
         let mut account = self.account(&self.proof_account);
@@ -365,7 +364,17 @@ impl Snip36 {
         descriptor.base_block_hash = format!("{base_hash:#x}");
         descriptor.request_hash = proof_artifact_hash(&request_bytes);
         descriptor.request_bytes = request_bytes.len() as u64;
+        descriptor.job_id = descriptor.expected_job_id()?;
         descriptor.validate()?;
+        if latest.saturating_add(PROOF_VALIDITY_HEADROOM_BLOCKS)
+            > descriptor
+                .base_block_number
+                .saturating_add(self.proof_validity_blocks)
+        {
+            return Err(retryable(
+                "fresh proving request does not fit the configured proof-validity window",
+            ));
+        }
         let response = self
             .http
             .post(format!("{}/internal/proof-jobs", self.proof_queue_url))
@@ -410,6 +419,7 @@ impl Snip36 {
         expected_message: Option<Felt>,
     ) -> Result<Proof, String> {
         let wait = async {
+            let mut freshness_checked = std::time::Instant::now();
             loop {
                 verify_job_identity(&expected, &status.descriptor)?;
                 if status.state == ProofJobState::Complete {
@@ -418,6 +428,28 @@ impl Snip36 {
                     // artifact immediately instead of waiting for retention cleanup.
                     let _ = self.delete_job(&expected.job_id).await;
                     return Ok(proof);
+                }
+                if let Some(error) = failed_job_error(&status.state, status.failure.as_ref()) {
+                    return Err(error);
+                }
+                // a job nobody has claimed yet goes stale once its base block leaves the storage
+                // proof window; hand it back so the caller re-enqueues it at a fresh base.
+                if status.state == ProofJobState::Pending
+                    && freshness_checked.elapsed() >= PROOF_JOB_FRESHNESS_CHECK
+                {
+                    freshness_checked = std::time::Instant::now();
+                    let (latest, _) = self.latest_block().await.map_err(retryable)?;
+                    if latest
+                        > status
+                            .descriptor
+                            .base_block_number
+                            .saturating_add(PROOF_JOB_FRESH_BLOCKS)
+                    {
+                        return Err(retryable(format!(
+                            "job {} waited past the storage-proof window of its base block",
+                            expected.job_id
+                        )));
+                    }
                 }
                 sleep(Duration::from_millis(PROOF_JOB_POLL_MS)).await;
                 status = self
@@ -677,6 +709,22 @@ impl Snip36 {
         }
     }
 
+    /// true only when a journaled transaction has no receipt and the network does not know its
+    /// hash: it never entered the mempool, so a replacement cannot conflict with it.
+    pub async fn submission_never_landed(&self, prepared: &PreparedSubmission) -> bool {
+        if self.receipt(prepared.expected_hash).await.is_some() {
+            return false;
+        }
+        matches!(
+            self.provider
+                .get_transaction_status(prepared.expected_hash)
+                .await,
+            Err(starknet_rust_providers::ProviderError::StarknetError(
+                starknet_rust_core::types::StarknetError::TransactionHashNotFound
+            ))
+        )
+    }
+
     pub async fn receipt(&self, hash: Felt) -> Option<Outcome> {
         self.provider
             .get_transaction_receipt(hash)
@@ -812,6 +860,7 @@ fn proof_from_status(
     Ok(Proof {
         proof: result.proof.trim().to_owned(),
         facts,
+        resource_usage: result.resource_usage,
     })
 }
 
@@ -831,6 +880,41 @@ fn protocol_felt(value: &str, label: &str) -> Result<Felt, String> {
 
 pub fn is_retryable_proving_error(error: &str) -> bool {
     error.starts_with("retryable proof queue:")
+}
+
+pub fn is_capacity_proving_error(error: &str) -> bool {
+    error.starts_with("proof capacity exceeded:")
+}
+
+pub fn is_integrity_proving_error(error: &str) -> bool {
+    error.starts_with("proof integrity failure:")
+}
+
+pub fn is_terminal_proving_error(error: &str) -> bool {
+    error.starts_with("terminal proof queue:")
+}
+
+fn failed_job_error(state: &ProofJobState, failure: Option<&ProofFailure>) -> Option<String> {
+    if *state != ProofJobState::FailedPermanent {
+        return None;
+    }
+    let Some(failure) = failure.filter(|failure| failure.validate().is_ok()) else {
+        return Some("proof integrity failure: INVALID_FAILURE_STATUS".into());
+    };
+    let diagnostic = format!("{:?}/{}", failure.class, failure.code);
+    Some(match failure.class {
+        ProofFailureClass::CapacityExceeded => {
+            format!("proof capacity exceeded: {diagnostic}")
+        }
+        ProofFailureClass::InvalidArtifact | ProofFailureClass::InvalidWitness => {
+            format!("proof integrity failure: {diagnostic}")
+        }
+        ProofFailureClass::UnsupportedBuiltin
+        | ProofFailureClass::PermanentProverRejection
+        | ProofFailureClass::TransientNetwork
+        | ProofFailureClass::TransientProverUnavailable
+        | ProofFailureClass::WorkerLost => format!("terminal proof queue: {diagnostic}"),
+    })
 }
 
 pub fn canonical_witness_hash(witness: &[Felt]) -> String {
@@ -896,4 +980,54 @@ pub fn sanitize(value: &str) -> String {
     }
     flush(&mut run, &mut output);
     output.chars().take(512).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(class: ProofFailureClass) -> ProofFailure {
+        ProofFailure {
+            class,
+            code: "PINNED_CODE".into(),
+            component: None,
+            profile_id: None,
+            required: None,
+            available: None,
+        }
+    }
+
+    #[test]
+    fn failed_job_statuses_have_explicit_operator_dispositions() {
+        assert!(failed_job_error(&ProofJobState::FailedRetryable, None).is_none());
+        assert!(is_capacity_proving_error(
+            &failed_job_error(
+                &ProofJobState::FailedPermanent,
+                Some(&failure(ProofFailureClass::CapacityExceeded)),
+            )
+            .unwrap()
+        ));
+        for class in [
+            ProofFailureClass::InvalidArtifact,
+            ProofFailureClass::InvalidWitness,
+        ] {
+            assert!(is_integrity_proving_error(
+                &failed_job_error(&ProofJobState::FailedPermanent, Some(&failure(class))).unwrap()
+            ));
+        }
+        for class in [
+            ProofFailureClass::UnsupportedBuiltin,
+            ProofFailureClass::PermanentProverRejection,
+            ProofFailureClass::TransientNetwork,
+            ProofFailureClass::TransientProverUnavailable,
+            ProofFailureClass::WorkerLost,
+        ] {
+            assert!(is_terminal_proving_error(
+                &failed_job_error(&ProofJobState::FailedPermanent, Some(&failure(class))).unwrap()
+            ));
+        }
+        assert!(is_integrity_proving_error(
+            &failed_job_error(&ProofJobState::FailedPermanent, None).unwrap()
+        ));
+    }
 }

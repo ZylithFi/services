@@ -7,12 +7,15 @@ authors.workspace = true
 
 [dependencies]
 aes-gcm = "0.10"
+base64 = "0.22"
+generic-array = { version = "0.14", features = ["zeroize"] }
 hex = "0.4"
 hkdf = "0.12"
+hmac = "0.12"
+hpke = { version = "0.14.1", default-features = false, features = ["alloc", "chacha", "x25519"] }
 num-bigint = "0.4"
 num-integer = "0.1"
 num-traits = "0.2"
-p256 = { version = "0.13", features = ["ecdh"] }
 rand = "0.9"
 rand_core = "0.6"
 serde = { version = "1", features = ["derive"] }

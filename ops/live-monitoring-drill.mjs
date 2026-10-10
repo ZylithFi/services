@@ -2,6 +2,7 @@
 // probes every running service and checks the invariants an operator watches: each service
 // answers, the indexer keeps up with the chain, and the operator's pipeline is not backed up.
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 const timeoutMs = Number(process.env.ZYLITH_MONITORING_DRILL_TIMEOUT_MS || 8_000);
 const maxIndexerLagMs = Number(process.env.ZYLITH_MONITORING_MAX_INDEXER_LAG_MS || 60_000);
@@ -15,6 +16,7 @@ const failures = [];
 const observations = [];
 const manifestPath = process.env.ZYLITH_DEPLOYMENT_MANIFEST || "client/public/deployment.json";
 let expectedRegistry = null;
+let expectedExecutionPins = [];
 try {
   const document = JSON.parse(readFileSync(manifestPath, "utf8"));
   const manifest = document.manifest ?? document;
@@ -22,6 +24,14 @@ try {
     registry_version: manifest.market_registry.registry_version,
     registry_hash: manifest.market_registry.registry_hash,
   };
+  const current = manifest.funding?.starknet_privacy?.ingress_key_registry_fingerprint;
+  const next = manifest.funding?.starknet_privacy?.ingress_key_registry_next_fingerprint;
+  const validPin = (pin) => typeof pin === "string" && /^[0-9a-f]{64}$/.test(pin) && /[1-9a-f]/.test(pin);
+  if (!validPin(current) || next !== undefined && (!validPin(next) || next === current)) {
+    failures.push("deployment manifest execution key fingerprints are malformed");
+  } else {
+    expectedExecutionPins = next === undefined ? [current] : [current, next];
+  }
 } catch (error) {
   failures.push(`deployment manifest is unreadable: ${error instanceof Error ? error.message : "error"}`);
 }
@@ -77,7 +87,17 @@ if (controlToken) {
   failures.push("ZYLITH_CONTROL_PLANE_TOKEN is required for private operator monitoring");
 }
 const keys = await json("execution keys", `${services.operator}/api/public/execution-keys`);
-if (keys && !(keys.keys?.length > 0)) failures.push("the operator publishes no execution keys");
+if (keys) {
+  if (!Array.isArray(keys.keys) || keys.keys.length !== 1) {
+    failures.push("the operator must publish exactly one active execution key");
+  } else {
+    const active = keys.keys[0];
+    const expectedId = process.env.ZYLITH_ACTIVE_EXECUTION_KEY_ID || "";
+    if (!expectedId || active.key_id !== expectedId) failures.push("the published execution key id differs from ZYLITH_ACTIVE_EXECUTION_KEY_ID");
+    const fingerprint = executionKeyFingerprint(active);
+    if (!fingerprint || !expectedExecutionPins.includes(fingerprint)) failures.push("the published execution key is not pinned by the deployment manifest");
+  }
+}
 
 const indexer = await json("indexer health", `${services.indexer}/health`);
 if (indexer) {
@@ -126,6 +146,23 @@ function checkRegistryIdentity(label, value) {
   ) {
     failures.push(`${label} market registry identity differs from the deployment manifest`);
   }
+}
+
+function executionKeyFingerprint(key) {
+  const profile = "DHKEM(X25519,HKDF-SHA256)/HKDF-SHA256/ChaCha20Poly1305/base";
+  if (!key || !/^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/.test(key.key_id) || key.algorithm !== profile || !/^[0-9a-f]{64}$/.test(key.public_key) || /^0+$/.test(key.public_key)) return null;
+  const hash = createHash("sha256");
+  hash.update("zylith-execution-key-registry-v2");
+  const count = Buffer.alloc(4);
+  count.writeUInt32BE(1);
+  hash.update(count);
+  for (const part of [Buffer.from(key.algorithm), Buffer.from(key.key_id), Buffer.from(key.public_key, "hex")]) {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(part.length);
+    hash.update(length);
+    hash.update(part);
+  }
+  return hash.digest("hex");
 }
 
 async function json(label, url, headers = {}) {

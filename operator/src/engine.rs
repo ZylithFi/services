@@ -19,21 +19,22 @@ use tokio::time::sleep;
 use zylith_core::exchange::{
     Cancellation, OUTPUT_KIND_FEE, Outcome as ChainOutcome, ResidualNote,
     TRANSITION_MESSAGE_DOMAIN, TransitionInput, TransitionResult, WITHDRAWAL_MESSAGE_DOMAIN,
-    WithdrawalInput, bound_statement_message, build_transition, build_withdrawal,
-    proof_message_hash, transition_calldata, withdrawal_calldata,
+    WithdrawalInput, build_transition, build_withdrawal, proof_message_hash, transition_calldata,
+    withdrawal_calldata,
 };
-use zylith_proof_job::ProofStatementKind;
+use zylith_proof_job::{ProofShapeLimits, ProofStatementKind};
 
 use crate::chain::{CapacityView, Chain, ChainEvent, transition_batch};
 use crate::config::{Config, from_core, to_core};
 use crate::market::{LEG_MIN_PROFIT_INDEX, Market, Rate, Round};
 use crate::snip36::{
-    Outcome, ProofJobContext, Snip36, call, canonical_witness_hash, is_retryable_proving_error,
+    Outcome, ProofJobContext, Snip36, call, canonical_witness_hash, is_capacity_proving_error,
+    is_integrity_proving_error, is_retryable_proving_error, is_terminal_proving_error,
 };
 use crate::state::{
     CancellationTombstone, ClosedOrder, InFlight, OpenCapacity, OperatorState, OrderEvent,
-    PendingOrder, PendingResidualRecovery, Store, TransitionStage, WithdrawalJob, WithdrawalStage,
-    key,
+    PendingOrder, PendingResidualRecovery, Store, TransitionPaddingSeed, TransitionStage,
+    WithdrawalJob, WithdrawalStage, key,
 };
 
 const DRIVER_INTERVAL_MS: u64 = 250;
@@ -51,14 +52,43 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn private_padding_seed() -> starknet_crypto::Felt {
+fn private_padding_seed_with(mut fill: impl FnMut(&mut [u8])) -> TransitionPaddingSeed {
     loop {
         let mut bytes = [0_u8; 32];
-        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut bytes[1..]);
-        let seed = starknet_crypto::Felt::from_bytes_be(&bytes);
-        if seed != starknet_crypto::Felt::ZERO {
+        fill(&mut bytes[1..]);
+        let seed = Felt::from_bytes_be(&bytes);
+        if let Ok(seed) = TransitionPaddingSeed::new(seed) {
             return seed;
         }
+    }
+}
+
+fn private_padding_seed() -> TransitionPaddingSeed {
+    private_padding_seed_with(|bytes| {
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, bytes);
+    })
+}
+
+fn padding_seed_matches_witness(
+    seed: TransitionPaddingSeed,
+    witness: &[starknet_crypto::Felt],
+) -> bool {
+    witness.get(6).copied().map(from_core) == Some(seed.expose())
+}
+
+fn transition_proof_shape(result: &TransitionResult) -> ProofShapeLimits {
+    let shape = zylith_core::exchange::StepShape::of(result);
+    ProofShapeLimits {
+        markets: shape.markets,
+        resting_orders: shape.resting,
+        admissions: shape.admissions,
+        crossings: shape.crossing,
+        outcomes: result.public.outcomes.len() as u64,
+        nullifiers: shape.nullifiers,
+        retired_nullifiers: shape.retired_nullifiers,
+        outputs: shape.outputs,
+        funding_notes: shape.funding_notes,
+        membership_path_elements: shape.membership_path_elements,
     }
 }
 
@@ -114,7 +144,9 @@ pub fn persist(store: &Store, halted: &AtomicBool, state: &OperatorState) -> Res
 
 fn running(halted: &AtomicBool) -> Result<(), String> {
     if halted.load(Ordering::SeqCst) {
-        return Err("the operator halted after a failed state write".into());
+        return Err(
+            "the operator is fail-stopped after a persistence or proof-integrity failure".into(),
+        );
     }
     Ok(())
 }
@@ -614,18 +646,51 @@ async fn drive(operator: &Arc<Operator>) -> Result<(), String> {
     state = operator.state.lock().await;
 
     // a proven transition that can no longer land inside the contract's close delay would only
-    // revert: drop it, and the next close rebuilds with fresh midpoints.
-    if let Some(first) = state.in_flight.first()
-        && first.stage == TransitionStage::Proven
-        && first.prepared_submission.is_none()
-        && now_ms() + 5_000 > first.close_time_ms + operator.config.policy.max_close_delay_ms
-    {
-        eprintln!(
-            "transition {} proved too late to land; rebuilding",
-            first.seq
-        );
-        state.in_flight.clear();
-        changed = true;
+    // revert: drop it, and the next close rebuilds with fresh midpoints. a journaled submission
+    // is dropped too once the gateway never admitted it (for example a proof version the gateway
+    // does not accept): rebroadcasting it forever would stall every later epoch.
+    let expired = state
+        .in_flight
+        .first()
+        .filter(|first| {
+            first.stage == TransitionStage::Proven
+                && now_ms() + 5_000
+                    > first.close_time_ms + operator.config.policy.max_close_delay_ms
+        })
+        .map(|first| {
+            (
+                first.seq,
+                first.result.public.commitment,
+                first.prepared_submission.clone(),
+            )
+        });
+    if let Some((seq, commitment, prepared)) = expired {
+        let never_landed = match &prepared {
+            None => true,
+            Some(prepared) => {
+                drop(state);
+                let never_landed = operator.snip36.submission_never_landed(prepared).await;
+                state = operator.state.lock().await;
+                never_landed
+            }
+        };
+        let unchanged = state.in_flight.first().is_some_and(|first| {
+            first.seq == seq
+                && first.result.public.commitment == commitment
+                && first.stage == TransitionStage::Proven
+        });
+        if never_landed && unchanged {
+            eprintln!(
+                "transition {seq} {}; rebuilding",
+                if prepared.is_some() {
+                    "was never admitted before its close delay passed"
+                } else {
+                    "proved too late to land"
+                }
+            );
+            state.in_flight.clear();
+            changed = true;
+        }
     }
 
     // submit the oldest proven transition: its predecessors have all landed.
@@ -699,6 +764,9 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
         else {
             return Ok(());
         };
+        if !padding_seed_matches_witness(entry.padding_seed, &entry.result.witness) {
+            return Err("the persisted transition padding seed does not match its witness".into());
+        }
         let commitment = from_core(entry.result.public.commitment);
         let running_key = key(&commitment);
         let mut running = operator
@@ -718,11 +786,7 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
         let expected = from_core(proof_message_hash(
             to_core(operator.config.transition_proof_program),
             TRANSITION_MESSAGE_DOMAIN,
-            bound_statement_message(
-                TRANSITION_MESSAGE_DOMAIN,
-                operator.config.chain_context(),
-                entry.result.public.commitment,
-            ),
+            entry.result.public.commitment,
         ));
         let context = ProofJobContext {
             statement_kind: ProofStatementKind::Transition,
@@ -746,7 +810,7 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
 
     let operator = operator.clone();
     tokio::spawn(async move {
-        let mut calldata = vec![operator.config.exchange, Felt::from(witness.len() as u64)];
+        let mut calldata = vec![Felt::from(witness.len() as u64)];
         calldata.extend(witness);
         let proof = operator
             .snip36
@@ -779,6 +843,59 @@ async fn start_transition_proof(operator: &Arc<Operator>, seq: u32) -> Result<()
                     "transition {seq} proof job remains pending: {}",
                     crate::snip36::sanitize(&error)
                 );
+            }
+            (Err(error), Some(_)) if is_integrity_proving_error(&error) => {
+                eprintln!(
+                    "transition {seq} proof integrity failure, halting: {}",
+                    crate::snip36::sanitize(&error)
+                );
+                operator.halted.store(true, Ordering::SeqCst);
+            }
+            (Err(error), Some(_)) if is_capacity_proving_error(&error) => {
+                let admissions = state
+                    .in_flight
+                    .iter()
+                    .find(|entry| entry.seq == seq)
+                    .map(|entry| {
+                        zylith_core::exchange::StepShape::of(&entry.result).admissions as usize
+                    })
+                    .unwrap_or(0);
+                if admissions == 0 {
+                    eprintln!(
+                        "transition {seq} exceeded pinned proof capacity without admissions; the release profile is contradicted, halting: {}",
+                        crate::snip36::sanitize(&error)
+                    );
+                    operator.halted.store(true, Ordering::SeqCst);
+                } else {
+                    let profile_id = operator
+                        .config
+                        .proof_capacity(ProofStatementKind::Transition)
+                        .profile_id
+                        .clone();
+                    let previous =
+                        if state.proof_capacity_profile_id.as_deref() == Some(&profile_id) {
+                            state.proof_capacity_admission_limit
+                        } else {
+                            None
+                        };
+                    let next = previous
+                        .unwrap_or(operator.config.policy.max_admissions)
+                        .min(admissions.saturating_sub(1));
+                    state.proof_capacity_profile_id = Some(profile_id);
+                    state.proof_capacity_admission_limit = Some(next);
+                    eprintln!(
+                        "transition {seq} exceeded pinned proof capacity; reducing the durable admission ceiling to {next} and rebuilding: {}",
+                        crate::snip36::sanitize(&error)
+                    );
+                    state.in_flight.retain(|entry| entry.seq < seq);
+                }
+            }
+            (Err(error), Some(_)) if is_terminal_proving_error(&error) => {
+                eprintln!(
+                    "transition {seq} reached a terminal proof failure, halting: {}",
+                    crate::snip36::sanitize(&error)
+                );
+                operator.halted.store(true, Ordering::SeqCst);
             }
             (Err(error), Some(_)) => {
                 eprintln!(
@@ -1722,7 +1839,15 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
     }
     sleep(Duration::from_millis(close_ms - now)).await;
 
-    let (frontier, pending, cancels, open_capacities, note_root, memberships) = {
+    let (
+        frontier,
+        pending,
+        cancels,
+        open_capacities,
+        note_root,
+        memberships,
+        learned_admission_limit,
+    ) = {
         let state = operator.state.lock().await;
         if state.in_flight.len() >= policy.pipeline_depth {
             return Ok(());
@@ -1766,6 +1891,19 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             open_capacities,
             state.notes.root(),
             memberships,
+            if state.proof_capacity_profile_id.as_deref()
+                == Some(
+                    operator
+                        .config
+                        .proof_capacity(ProofStatementKind::Transition)
+                        .profile_id
+                        .as_str(),
+                )
+            {
+                state.proof_capacity_admission_limit
+            } else {
+                None
+            },
         )
     };
     if open_capacities.len() != capacity_views.len()
@@ -1893,6 +2031,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
     let mut used = frontier.spent_nullifiers.clone();
     let room = policy
         .max_admissions
+        .min(learned_admission_limit.unwrap_or(policy.max_admissions))
         .min(policy.max_book_orders.saturating_sub(frontier.book.len()));
     let candidates = pending
         .iter()
@@ -1952,7 +2091,13 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             used.insert(from_core(note.nullifier()).to_bytes_be());
         }
         admitted.push(from_core(order.request.order_id()));
-        new_orders.push(order.request.clone().into_new_order(notes));
+        new_orders.push(
+            order
+                .request
+                .clone()
+                .try_into_new_order(notes)
+                .map_err(|error| error.to_string())?,
+        );
     }
 
     let book_ids = frontier
@@ -1968,6 +2113,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             signature: cancel.signature,
         })
         .collect::<Vec<_>>();
+    let padding_seed = private_padding_seed();
     let input = TransitionInput {
         chain_context: operator.config.chain_context(),
         seq: frontier.seq,
@@ -1986,11 +2132,16 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
         cancellations,
         recovered_order_ids,
         outcomes,
-        padding_seed: private_padding_seed(),
+        padding_seed: to_core(padding_seed.expose()),
     };
-    // a transition must prove in one snip-36 transaction: past the step budget, the newest
-    // admissions wait for a later close.
+    // A transition must fit both the conservative statement-step guard and the release-bound,
+    // full-SNOS capacity profile. The latter covers virtual OS, account/program dispatch and
+    // every required builtin/component domain; statement steps alone never authorize proving.
+    // Newest admissions wait for a later close until both gates pass.
     let budget = operator.config.policy.step_budget;
+    let capacity = operator
+        .config
+        .proof_capacity(ProofStatementKind::Transition);
     let mut input = input;
     let (input, result) = loop {
         let attempt = input.clone();
@@ -1999,17 +2150,29 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             .map_err(|error| format!("transition build panicked: {error}"))?
             .map_err(|error| format!("transition build: {error}"))?;
         let steps = zylith_core::exchange::StepShape::of(&result).estimated_steps();
-        if steps <= budget {
+        let shape = transition_proof_shape(&result);
+        let measured = capacity.limits.covers(&shape);
+        if steps <= budget && measured {
             break (input, result);
         }
         if input.new_orders.is_empty() {
-            return Err(format!(
-                "transition {} needs about {steps} steps, beyond the {budget} step budget",
-                input.seq
-            ));
+            return if steps > budget {
+                Err(format!(
+                    "transition {} needs about {steps} statement steps, beyond the {budget} early guard",
+                    input.seq
+                ))
+            } else {
+                Err(format!(
+                    "transition {} shape {:?} is outside measured full-proof profile {}",
+                    input.seq, shape, capacity.profile_id
+                ))
+            };
         }
-        let drop =
-            ((steps - budget).div_ceil(ADMISSION_STEPS) as usize + 1).min(input.new_orders.len());
+        let drop = if steps > budget {
+            ((steps - budget).div_ceil(ADMISSION_STEPS) as usize + 1).min(input.new_orders.len())
+        } else {
+            1
+        };
         let keep = input.new_orders.len() - drop;
         input.new_orders.truncate(keep);
         admitted.truncate(keep);
@@ -2082,6 +2245,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
         state.in_flight.push(InFlight {
             seq,
             close_time_ms,
+            padding_seed,
             result,
             calldata,
             admitted,
@@ -2558,6 +2722,22 @@ fn start_proving(operator: &Arc<Operator>, state: &OperatorState, job: &Withdraw
                     );
                     (WithdrawalStage::Proving, false)
                 }
+                Err((reason, false)) if is_integrity_proving_error(&reason) => {
+                    eprintln!(
+                        "withdrawal proof integrity failure, halting: {}",
+                        crate::snip36::sanitize(&reason)
+                    );
+                    operator.halted.store(true, Ordering::SeqCst);
+                    (WithdrawalStage::Proving, false)
+                }
+                Err((reason, false)) if is_terminal_proving_error(&reason) => {
+                    eprintln!(
+                        "withdrawal reached a terminal proof failure, halting: {}",
+                        crate::snip36::sanitize(&reason)
+                    );
+                    operator.halted.store(true, Ordering::SeqCst);
+                    (WithdrawalStage::Proving, false)
+                }
                 Err((reason, false)) => (
                     WithdrawalStage::Failed {
                         reason: crate::snip36::sanitize(&reason),
@@ -2628,25 +2808,47 @@ async fn prove_and_request(
             .map_err(|error| (error, true))?;
         return settle_withdrawal_request(operator, request, nullifier, transaction_hash).await;
     }
+    let membership =
+        membership.ok_or_else(|| ("the note is not on chain yet".to_string(), false))?;
+    let withdrawal_shape = ProofShapeLimits {
+        markets: 0,
+        resting_orders: 0,
+        admissions: 0,
+        crossings: 0,
+        outcomes: 0,
+        nullifiers: 1,
+        retired_nullifiers: 0,
+        outputs: 0,
+        funding_notes: 1,
+        membership_path_elements: (membership.subtree_path.len()
+            + membership.accumulator_path.len()) as u64,
+    };
+    let withdrawal_capacity = operator
+        .config
+        .proof_capacity(ProofStatementKind::Withdrawal);
+    if !withdrawal_capacity.limits.covers(&withdrawal_shape) {
+        return Err((
+            format!(
+                "proof capacity exceeded: withdrawal shape {:?} is outside measured profile {}",
+                withdrawal_shape, withdrawal_capacity.profile_id
+            ),
+            false,
+        ));
+    }
     let (public, witness) = build_withdrawal(&WithdrawalInput {
         chain_context: operator.config.chain_context(),
         note_root: to_core(note_root),
         exit_commitment: request.exit_commitment,
         exit_authority: request.exit_authority,
         note: request.note.clone(),
-        membership: membership
-            .ok_or_else(|| ("the note is not on chain yet".to_string(), false))?,
+        membership,
         authorization: request.authorization,
     })
     .map_err(|error| (error.to_string(), false))?;
     let expected = from_core(proof_message_hash(
         to_core(operator.config.withdrawal_proof_program),
         WITHDRAWAL_MESSAGE_DOMAIN,
-        bound_statement_message(
-            WITHDRAWAL_MESSAGE_DOMAIN,
-            public.chain_context,
-            public.commitment,
-        ),
+        public.commitment,
     ));
     let witness = witness.into_iter().map(from_core).collect::<Vec<_>>();
     let context = ProofJobContext {
@@ -2660,7 +2862,7 @@ async fn prove_and_request(
         witness_hash: canonical_witness_hash(&witness),
         program_entrypoint: "compile_withdrawal_proof".into(),
     };
-    let mut calldata = vec![operator.config.exchange, Felt::from(witness.len() as u64)];
+    let mut calldata = vec![Felt::from(witness.len() as u64)];
     calldata.extend(witness);
     let proof = operator
         .snip36
@@ -2759,6 +2961,44 @@ mod tests {
 
     use super::*;
     use crate::state::PendingOrder;
+
+    #[test]
+    fn padding_seed_generation_rejects_zero_and_separates_new_transition_identities() {
+        let mut attempts = 0;
+        let first = private_padding_seed_with(|bytes| {
+            attempts += 1;
+            bytes.fill(0);
+            if attempts == 2 {
+                *bytes.last_mut().unwrap() = 7;
+            }
+        });
+        assert_eq!(attempts, 2);
+        assert_eq!(first.expose(), Felt::from(7_u8));
+        assert_eq!(format!("{first:?}"), "TransitionPaddingSeed([redacted])");
+
+        let second = private_padding_seed_with(|bytes| {
+            bytes.fill(0);
+            *bytes.last_mut().unwrap() = 8;
+        });
+        assert_ne!(first, second);
+        assert!(
+            TransitionPaddingSeed::new(Felt::ZERO)
+                .unwrap_err()
+                .contains("cannot be zero")
+        );
+    }
+
+    #[test]
+    fn persisted_padding_seed_must_match_the_immutable_transition_witness() {
+        let built = build_transition(&input(1, vec![], vec![], Felt::ZERO, 100)).unwrap();
+        let seed = TransitionPaddingSeed::new(from_core(built.witness[6])).unwrap();
+        assert!(padding_seed_matches_witness(seed, &built.witness));
+        assert!(!padding_seed_matches_witness(
+            TransitionPaddingSeed::new(seed.expose() + Felt::ONE).unwrap(),
+            &built.witness,
+        ));
+        assert!(!padding_seed_matches_witness(seed, &built.witness[..6]));
+    }
 
     #[test]
     fn scheduled_closes_and_reference_windows_are_exact() {
@@ -2872,6 +3112,7 @@ mod tests {
         let landed = InFlight {
             seq: 1,
             close_time_ms: 10_001,
+            padding_seed: TransitionPaddingSeed::new(Felt::ONE).unwrap(),
             result: result.clone(),
             calldata: vec![],
             admitted: vec![order_id],
