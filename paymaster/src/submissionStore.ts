@@ -13,6 +13,26 @@ export type SubmissionRecord = {
   submitted_at_unix_ms: number;
 };
 
+/**
+ * The relay durably recorded an intent before attempting the Starknet submission, but it
+ * cannot prove whether that attempt reached the network. Callers must reconcile this request;
+ * they must not create a fresh submission from this response.
+ */
+export class SubmissionOutcomeUnknownError extends Error {
+  constructor(cause?: unknown) {
+    super("submission outcome is pending reconciliation", { cause });
+    this.name = "SubmissionOutcomeUnknownError";
+  }
+}
+
+/** The relay proved that the submission callback failed before its broadcast boundary. */
+export class SubmissionNotStartedError extends Error {
+  constructor(cause: unknown) {
+    super(errorText(cause) || "submission was not started", { cause });
+    this.name = "SubmissionNotStartedError";
+  }
+}
+
 let tempFileCounter = 0;
 const MAX_SUBMISSION_LOG_BYTES = 64 * 1024 * 1024;
 const MAX_SUBMISSION_RECORDS = 100_000;
@@ -50,7 +70,7 @@ export class SubmissionStore {
     const existing = this.records.get(key);
     if (existing) {
       if (existing.transaction_hash === null) {
-        throw new Error("submission outcome is pending reconciliation");
+        throw new SubmissionOutcomeUnknownError();
       }
       return { transaction_hash: existing.transaction_hash };
     }
@@ -81,11 +101,36 @@ export class SubmissionStore {
       transaction_hash: null,
       submitted_at_unix_ms: Date.now()
     };
+    const recordsBeforePending = new Map(this.records);
     this.records.set(key, pending);
     this.pruneRecords(pending.submitted_at_unix_ms);
-    await this.persist();
+    try {
+      await this.persist();
+    } catch (error) {
+      this.records.clear();
+      for (const [existingKey, existingRecord] of recordsBeforePending) {
+        this.records.set(existingKey, existingRecord);
+      }
+      throw new SubmissionNotStartedError(error);
+    }
 
-    const result = await submit();
+    let result: ExecuteOutsideResponse;
+    try {
+      result = await submit();
+    } catch (error) {
+      if (error instanceof SubmissionNotStartedError) {
+        this.records.delete(key);
+        try {
+          await this.persist();
+        } catch (persistError) {
+          this.records.set(key, pending);
+          throw new SubmissionOutcomeUnknownError(persistError);
+        }
+        throw error;
+      }
+      if (error instanceof SubmissionOutcomeUnknownError) throw error;
+      throw new SubmissionOutcomeUnknownError(error);
+    }
 
     const submitted = { ...pending, transaction_hash: result.transaction_hash };
     this.records.set(key, submitted);
@@ -93,7 +138,7 @@ export class SubmissionStore {
       await this.persist();
     } catch (error) {
       this.records.set(key, pending);
-      throw error;
+      throw new SubmissionOutcomeUnknownError(error);
     }
     return result;
   }
@@ -217,6 +262,14 @@ export class SubmissionStore {
       }
     }
     this.lastPrunedAtUnixMs = nowUnixMs;
+  }
+}
+
+function errorText(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return "";
   }
 }
 

@@ -19,6 +19,10 @@ import type {
   RpcResponse
 } from "./types.js";
 import { parsePrivacyPoolActions } from "./privacyPoolActions.js";
+import {
+  SubmissionNotStartedError,
+  SubmissionOutcomeUnknownError,
+} from "./submissionStore.js";
 
 type AccountInstance = {
   getNonce(blockIdentifier?: string): Promise<string>;
@@ -100,21 +104,28 @@ export async function submitProofBearingOutsideExecution(
   config: ProofSubmissionConfig,
   deps: SubmitterDeps = {}
 ): Promise<ExecuteOutsideResponse> {
-  if (!request.proof || !request.proof_facts || request.proof_facts.length === 0) {
-    throw new Error("proof and proof_facts are required for paymaster execution");
+  try {
+    if (!request.proof || !request.proof_facts || request.proof_facts.length === 0) {
+      throw new Error("proof and proof_facts are required for paymaster execution");
+    }
+    const runtime = deps.runtime ?? defaultRuntime;
+    const calls = [
+      ...(request.authorization_call
+        ? [callPayloadToStarknetCall(request.authorization_call)]
+        : []),
+      ...(request.outside_transaction
+        ? (runtime.outsideExecution.buildExecuteFromOutsideCall(
+            request.outside_transaction as OutsideTransaction
+          ) as Call[])
+        : [callPayloadToStarknetCall(request.call)]),
+    ];
+    return await submitPaymasterCalls(calls, config, deps, request.proof, request.proof_facts);
+  } catch (error) {
+    if (error instanceof SubmissionNotStartedError || error instanceof SubmissionOutcomeUnknownError) {
+      throw error;
+    }
+    throw new SubmissionNotStartedError(error);
   }
-  const runtime = deps.runtime ?? defaultRuntime;
-  const calls = [
-    ...(request.authorization_call
-      ? [callPayloadToStarknetCall(request.authorization_call)]
-      : []),
-    ...(request.outside_transaction
-      ? (runtime.outsideExecution.buildExecuteFromOutsideCall(
-          request.outside_transaction as OutsideTransaction
-        ) as Call[])
-      : [callPayloadToStarknetCall(request.call)]),
-  ];
-  return submitPaymasterCalls(calls, config, deps, request.proof, request.proof_facts);
 }
 
 async function submitPaymasterCalls(
@@ -150,115 +161,118 @@ async function submitPaymasterCallsOnce(
   proof?: string,
   proofFacts?: string[]
 ): Promise<ExecuteOutsideResponse> {
-  const runtime = deps.runtime ?? defaultRuntime;
-  const fetchImpl = deps.fetchImpl ?? fetch;
-  const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
-  const account = new runtime.Account({
-    provider,
-    address: config.accountAddress,
-    signer: config.privateKey,
-    transactionVersion: runtime.ETransactionVersion3.V3
-  });
-  const nonce = await account.getNonce();
-  const cairoVersion = await account.getCairoVersion();
-  const proofDetails =
-    proof && proofFacts
-      ? {
-          proof,
-          proofFacts
-        }
-      : {};
-  const hasPoolCall = calls.some((call) => call.entrypoint === "apply_actions");
-  const hasClaimAuthorization = calls.some(
-    (call) => call.entrypoint === "authorize_strk20_exit_claim",
-  );
-  if (hasPoolCall && hasClaimAuthorization && !config.feeTokenAddress) {
-    throw new Error("privacy-pool fee token is not configured");
-  }
-  if (config.feeTokenAddress) {
-    const poolFee = await poolApplyActionsFee(fetchImpl, config.rpcUrl, calls);
-    assertAtomicPoolFeeReimbursement(
-      calls,
-      { accountAddress: config.accountAddress, feeTokenAddress: config.feeTokenAddress },
-      poolFee,
-    );
-  }
-  const feeResourceBounds = await estimateProofBearingInvokeResourceBounds({
-    account,
-    calls,
-    config,
-    runtime,
-    fetchImpl,
-    nonce,
-    cairoVersion,
-    ...(proof && proofFacts
-      ? {
-          proof,
-          proofFacts
-        }
-      : {})
-  });
-  assertSponsoredFeeWithinLimit(
-    feeResourceBounds,
-    config.maxSponsoredFeeFri ?? DEFAULT_MAX_SPONSORED_FEE_FRI
-  );
-  const details = {
-    resourceBounds: feeResourceBounds,
-    walletAddress: config.accountAddress,
-    cairoVersion,
-    chainId: config.chainId,
-    version: runtime.ETransactionVersion3.V3,
-    nonce,
-    tip: 0,
-    paymasterData: [],
-    accountDeploymentData: [],
-    nonceDataAvailabilityMode: runtime.EDataAvailabilityMode.L1,
-    feeDataAvailabilityMode: runtime.EDataAvailabilityMode.L1,
-    ...proofDetails
-  };
-  const invocation = await account.buildInvocation(calls, details);
-  const invokeTransaction = {
-    type: "INVOKE",
-    sender_address: toRpcFelt(invocation.contractAddress, "sender_address"),
-    calldata: runtime.CallData.toHex(invocation.calldata),
-    signature: signatureToHexArray(invocation.signature),
-    nonce: toRpcFelt(invocation.nonce ?? nonce, "nonce"),
-    resource_bounds: resourceBoundsToRpc(invocation.resourceBounds ?? feeResourceBounds),
-    tip: toRpcFelt(invocation.tip ?? 0, "tip"),
-    paymaster_data: (invocation.paymasterData ?? []).map((value) =>
-      toRpcFelt(value, "paymaster_data")
-    ),
-    account_deployment_data: (invocation.accountDeploymentData ?? []).map((value) =>
-      toRpcFelt(value, "account_deployment_data")
-    ),
-    nonce_data_availability_mode: invocation.nonceDataAvailabilityMode ?? runtime.EDataAvailabilityMode.L1,
-    fee_data_availability_mode: invocation.feeDataAvailabilityMode ?? runtime.EDataAvailabilityMode.L1,
-    version: runtime.ETransactionVersion3.V3
-  };
-  if (proof && proofFacts) {
-    Object.assign(invokeTransaction, {
-      proof,
-      proof_facts: proofFacts
-    });
-  }
-  const releaseSponsoredFee = deps.reserveSponsoredFee
-    ? await deps.reserveSponsoredFee(
-      maximumSponsoredFee(feeResourceBounds)
-    )
-    : null;
-  let transactionHash: string | undefined;
+  let releaseSponsoredFee: (() => Promise<void>) | null = null;
+  let broadcastStarted = false;
   try {
-    transactionHash = await submitInvokeToRpc(fetchImpl, config.rpcUrl, invokeTransaction);
+    const runtime = deps.runtime ?? defaultRuntime;
+    const fetchImpl = deps.fetchImpl ?? fetch;
+    const provider = new runtime.RpcProvider({ nodeUrl: config.rpcUrl });
+    const account = new runtime.Account({
+      provider,
+      address: config.accountAddress,
+      signer: config.privateKey,
+      transactionVersion: runtime.ETransactionVersion3.V3
+    });
+    const nonce = await account.getNonce();
+    const cairoVersion = await account.getCairoVersion();
+    const proofDetails = proof && proofFacts ? { proof, proofFacts } : {};
+    const hasPoolCall = calls.some((call) => call.entrypoint === "apply_actions");
+    const hasClaimAuthorization = calls.some(
+      (call) => call.entrypoint === "authorize_strk20_exit_claim",
+    );
+    if (hasPoolCall && hasClaimAuthorization && !config.feeTokenAddress) {
+      throw new Error("privacy-pool fee token is not configured");
+    }
+    if (config.feeTokenAddress) {
+      const poolFee = await poolApplyActionsFee(fetchImpl, config.rpcUrl, calls);
+      assertAtomicPoolFeeReimbursement(
+        calls,
+        { accountAddress: config.accountAddress, feeTokenAddress: config.feeTokenAddress },
+        poolFee,
+      );
+    }
+    const feeResourceBounds = await estimateProofBearingInvokeResourceBounds({
+      account,
+      calls,
+      config,
+      runtime,
+      fetchImpl,
+      nonce,
+      cairoVersion,
+      ...(proof && proofFacts ? { proof, proofFacts } : {})
+    });
+    assertSponsoredFeeWithinLimit(
+      feeResourceBounds,
+      config.maxSponsoredFeeFri ?? DEFAULT_MAX_SPONSORED_FEE_FRI
+    );
+    const details = {
+      resourceBounds: feeResourceBounds,
+      walletAddress: config.accountAddress,
+      cairoVersion,
+      chainId: config.chainId,
+      version: runtime.ETransactionVersion3.V3,
+      nonce,
+      tip: 0,
+      paymasterData: [],
+      accountDeploymentData: [],
+      nonceDataAvailabilityMode: runtime.EDataAvailabilityMode.L1,
+      feeDataAvailabilityMode: runtime.EDataAvailabilityMode.L1,
+      ...proofDetails
+    };
+    const invocation = await account.buildInvocation(calls, details);
+    const invokeTransaction = {
+      type: "INVOKE",
+      sender_address: toRpcFelt(invocation.contractAddress, "sender_address"),
+      calldata: runtime.CallData.toHex(invocation.calldata),
+      signature: signatureToHexArray(invocation.signature),
+      nonce: toRpcFelt(invocation.nonce ?? nonce, "nonce"),
+      resource_bounds: resourceBoundsToRpc(invocation.resourceBounds ?? feeResourceBounds),
+      tip: toRpcFelt(invocation.tip ?? 0, "tip"),
+      paymaster_data: (invocation.paymasterData ?? []).map((value) =>
+        toRpcFelt(value, "paymaster_data")
+      ),
+      account_deployment_data: (invocation.accountDeploymentData ?? []).map((value) =>
+        toRpcFelt(value, "account_deployment_data")
+      ),
+      nonce_data_availability_mode: invocation.nonceDataAvailabilityMode ?? runtime.EDataAvailabilityMode.L1,
+      fee_data_availability_mode: invocation.feeDataAvailabilityMode ?? runtime.EDataAvailabilityMode.L1,
+      version: runtime.ETransactionVersion3.V3
+    };
+    if (proof && proofFacts) {
+      Object.assign(invokeTransaction, { proof, proof_facts: proofFacts });
+    }
+    releaseSponsoredFee = deps.reserveSponsoredFee
+      ? await deps.reserveSponsoredFee(maximumSponsoredFee(feeResourceBounds))
+      : null;
+    broadcastStarted = true;
+    const transactionHash = await submitInvokeToRpc(fetchImpl, config.rpcUrl, invokeTransaction);
+    if (!transactionHash) {
+      throw new SubmissionOutcomeUnknownError(
+        new Error("Starknet submission response did not include transaction_hash"),
+      );
+    }
+    return { transaction_hash: transactionHash };
   } catch (error) {
-    await releaseSponsoredFee?.();
-    throw error;
-  }
-  if (!transactionHash) {
-    await releaseSponsoredFee?.();
-    throw new Error("Starknet submission response did not include transaction_hash");
-  }
+    const classified =
+      error instanceof SubmissionNotStartedError || error instanceof SubmissionOutcomeUnknownError
+        ? error
+        : broadcastStarted
+          ? new SubmissionOutcomeUnknownError(error)
+          : new SubmissionNotStartedError(error);
 
-  return { transaction_hash: transactionHash };
+    // A lost acknowledgement can conceal an accepted transaction. Keep its fee reservation
+    // charged until authoritative reconciliation exists; releasing it here could let the daily
+    // budget sponsor more fees than configured. Only a proved pre-broadcast/rejected attempt is
+    // safe to release.
+    if (classified instanceof SubmissionNotStartedError) {
+      try {
+        await releaseSponsoredFee?.();
+      } catch (releaseError) {
+        throw new SubmissionNotStartedError(releaseError);
+      }
+    }
+    throw classified;
+  }
 }
 
 function assertAtomicPoolFeeReimbursement(
@@ -313,10 +327,14 @@ async function submitInvokeToRpc(
     })
   });
   if ("error" in rpc && rpc.error) {
-    throw new Error(`Starknet RPC rejected invoke: ${rpcErrorSummary(rpc.error)}`);
+    throw new SubmissionNotStartedError(
+      new Error(`Starknet RPC rejected invoke: ${rpcErrorSummary(rpc.error)}`),
+    );
   }
   if (!("result" in rpc)) {
-    throw new Error("Starknet RPC response did not include result");
+    throw new SubmissionOutcomeUnknownError(
+      new Error("Starknet RPC response did not include result"),
+    );
   }
   return rpc.result.transaction_hash;
 }

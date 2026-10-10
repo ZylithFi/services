@@ -162,6 +162,64 @@ describe("submitProofBearingOutsideExecution", () => {
     expect(submissions).toBe(0);
   });
 
+  it("keeps the sponsored-fee reservation when the broadcast acknowledgement is lost", async () => {
+    const release = vi.fn(async () => undefined);
+    await expect(
+      submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey",
+        },
+        {
+          runtime: fakeRuntime,
+          reserveSponsoredFee: async () => release,
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(String(init?.body));
+            if (body.method === "starknet_estimateFee") {
+              return feeEstimateResponse();
+            }
+            throw new TypeError("connection lost after request write");
+          },
+        },
+      ),
+    ).rejects.toThrow("pending reconciliation");
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  it("releases the sponsored-fee reservation after an explicit RPC rejection", async () => {
+    const release = vi.fn(async () => undefined);
+    await expect(
+      submitProofBearingOutsideExecution(
+        request,
+        {
+          rpcUrl: "https://rpc.example",
+          chainId: "0x534e5f5345504f4c4941",
+          accountAddress: "0xabc",
+          privateKey: "0xkey",
+        },
+        {
+          runtime: fakeRuntime,
+          reserveSponsoredFee: async () => release,
+          fetchImpl: async (_url, init) => {
+            const body = JSON.parse(String(init?.body));
+            if (body.method === "starknet_estimateFee") {
+              return feeEstimateResponse();
+            }
+            return new Response(JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              error: { code: 55, message: "transaction rejected" },
+            }));
+          },
+        },
+      ),
+    ).rejects.toThrow("Starknet RPC rejected invoke");
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
   it("submits a proof-bearing invoke through the same RPC that admitted its proof", async () => {
     const seen: { body?: unknown; estimateBody?: unknown; submissionUrl?: string } = {};
     const result = await submitProofBearingOutsideExecution(
@@ -1137,6 +1195,21 @@ describe("submitProofBearingOutsideExecution", () => {
   });
 
 });
+
+function feeEstimateResponse(): Response {
+  return new Response(JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: [{
+      l1_gas_consumed: "0x2",
+      l1_gas_price: "0x4",
+      l2_gas_consumed: "0x6",
+      l2_gas_price: "0x8",
+      l1_data_gas_consumed: "0xa",
+      l1_data_gas_price: "0xc",
+    }],
+  }));
+}
 
 const request: ExecuteOutsideRequest = {
   chain_id: "0x534e5f5345504f4c4941",

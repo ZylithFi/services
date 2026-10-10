@@ -8,7 +8,11 @@ import { dirname } from "node:path";
 import type { PaymasterConfig } from "./config.js";
 import type { SubmitterDeps } from "./starknetSubmitter.js";
 import { submitProofBearingOutsideExecution } from "./starknetSubmitter.js";
-import { SubmissionStore } from "./submissionStore.js";
+import {
+  SubmissionNotStartedError,
+  SubmissionOutcomeUnknownError,
+  SubmissionStore,
+} from "./submissionStore.js";
 import { validateExecuteOutsideRequest } from "./validation.js";
 
 export type PaymasterServerDeps = SubmitterDeps & {
@@ -101,7 +105,12 @@ export function createPaymasterServer(config: PaymasterConfig, deps: PaymasterSe
         status,
         error: safeMessage,
       }));
-      sendJson(request, response, status, { error: safeMessage });
+      sendJson(request, response, status, {
+        error: safeMessage,
+        submission_outcome: error instanceof SubmissionOutcomeUnknownError
+          ? "unknown"
+          : "not_submitted",
+      });
     }
   });
 }
@@ -310,7 +319,10 @@ function validateCors(
   }
 
   if (!isOriginAllowed(config, origin)) {
-    sendJson(request, response, 403, { error: "origin is not allowlisted" }, false);
+    sendJson(request, response, 403, {
+      error: "origin is not allowlisted",
+      submission_outcome: "not_submitted",
+    }, false);
     return false;
   }
 
@@ -713,7 +725,7 @@ export class SubmissionQueues {
 
   enqueue<T>(queueKey: string, task: () => Promise<T>): Promise<T> {
     if (this.pendingCount >= this.maxPending) {
-      throw new Error("paymaster submission queue is full");
+      throw new SubmissionNotStartedError("paymaster submission queue is full");
     }
     this.pendingCount += 1;
     const tail = this.tails.get(queueKey) ?? Promise.resolve();

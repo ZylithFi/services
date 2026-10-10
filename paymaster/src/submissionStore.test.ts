@@ -1,10 +1,13 @@
-import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { SubmissionStore } from "./submissionStore.js";
+import {
+  SubmissionNotStartedError,
+  SubmissionStore,
+} from "./submissionStore.js";
 import type { ExecuteOutsideRequest } from "./types.js";
 
 const tempDirs: string[] = [];
@@ -193,6 +196,37 @@ describe("SubmissionStore", () => {
     expect(submits).toBe(0);
   });
 
+  it("does not retain a pending record when the initial journal write fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "zylith-paymaster-"));
+    tempDirs.push(root);
+    const parent = join(root, "journal");
+    const path = join(parent, "submissions.json");
+    await mkdir(parent);
+    const store = new SubmissionStore(path);
+    await expect(store.get(request)).resolves.toBeUndefined();
+    await rm(parent, { recursive: true });
+    await writeFile(parent, "blocks directory creation");
+    let submits = 0;
+
+    await expect(
+      store.runOnce(request, async () => {
+        submits += 1;
+        return { transaction_hash: "0xnever" };
+      })
+    ).rejects.toBeInstanceOf(SubmissionNotStartedError);
+    expect(submits).toBe(0);
+
+    await unlink(parent);
+    await mkdir(parent);
+    await expect(
+      store.runOnce(request, async () => {
+        submits += 1;
+        return { transaction_hash: "0xafter-repair" };
+      })
+    ).resolves.toEqual({ transaction_hash: "0xafter-repair" });
+    expect(submits).toBe(1);
+  });
+
   it("fails closed on an indeterminate persisted submission", async () => {
     const path = await tempPath();
     await writeFile(path, JSON.stringify([{ ...submissionRecord(null) }]));
@@ -214,7 +248,7 @@ describe("SubmissionStore", () => {
       store.runOnce(request, async () => {
         throw new Error("rpc disconnected after send");
       })
-    ).rejects.toThrow("rpc disconnected after send");
+    ).rejects.toThrow("pending reconciliation");
 
     const restarted = new SubmissionStore(path);
     let retries = 0;
@@ -225,6 +259,23 @@ describe("SubmissionStore", () => {
       })
     ).rejects.toThrow("pending reconciliation");
     expect(retries).toBe(0);
+  });
+
+  it("removes a proved pre-broadcast failure so a corrected request can retry", async () => {
+    const path = await tempPath();
+    const store = new SubmissionStore(path);
+    await expect(
+      store.runOnce(request, async () => {
+        throw new SubmissionNotStartedError(new Error("fee budget exhausted"));
+      })
+    ).rejects.toThrow("fee budget exhausted");
+
+    let submits = 0;
+    await expect(store.runOnce(request, async () => {
+      submits += 1;
+      return { transaction_hash: "0xafter-fix" };
+    })).resolves.toEqual({ transaction_hash: "0xafter-fix" });
+    expect(submits).toBe(1);
   });
 });
 

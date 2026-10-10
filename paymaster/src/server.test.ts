@@ -12,6 +12,10 @@ import {
   SubmissionQueues,
   createPaymasterServer
 } from "./server.js";
+import {
+  SubmissionNotStartedError,
+  SubmissionStore,
+} from "./submissionStore.js";
 import type { StarknetRuntime } from "./starknetSubmitter.js";
 import type { ExecuteOutsideRequest } from "./types.js";
 
@@ -77,6 +81,9 @@ describe("paymaster server", () => {
       })
     });
     expect(badRequest.status).toBe(403);
+    await expect(badRequest.json()).resolves.toMatchObject({
+      submission_outcome: "not_submitted",
+    });
 
     const metrics = await fetch(`${url}/metrics`, {
       headers: { authorization: "Bearer test-paymaster-token" }
@@ -125,6 +132,7 @@ describe("paymaster server", () => {
       expect(responseBody.error).toContain('"signature":[...]');
       expect(responseBody.error).toContain('"proof":"<redacted>"');
       expect(responseBody.error).toContain('"proof_facts":[...]');
+      expect(responseBody).toMatchObject({ submission_outcome: "not_submitted" });
       expect(logged).not.toContain(privateFelt);
       expect(logged).not.toContain("proof-bytes");
       expect(JSON.stringify(responseBody)).not.toContain(privateFelt);
@@ -150,6 +158,9 @@ describe("paymaster server", () => {
 
     expect(response.status).toBe(403);
     expect(response.headers.get("access-control-allow-origin")).toBeNull();
+    await expect(response.json()).resolves.toMatchObject({
+      submission_outcome: "not_submitted",
+    });
   });
 
   it("rejects non-JSON and oversized request bodies before validation", async () => {
@@ -292,8 +303,37 @@ describe("paymaster server", () => {
     expect(response.status).toBe(429);
     await expect(response.json()).resolves.toEqual({
       error: "daily sponsored fee budget exhausted",
+      submission_outcome: "not_submitted",
     });
     expect(broadcasts).toBe(0);
+  });
+
+  it("reports a lost broadcast acknowledgement as unknown and never broadcasts the duplicate", async () => {
+    let broadcasts = 0;
+    const server = createPaymasterServer(config(), {
+      fetchImpl: fakeRpcFetch(() => {
+        broadcasts += 1;
+        throw new TypeError("connection lost after request write");
+      }),
+      runtime: fakeRuntime(),
+    });
+    servers.push(server);
+    const url = await listen(server);
+
+    const first = await postRequest(url, request);
+    expect(first.status).toBe(503);
+    await expect(first.json()).resolves.toEqual({
+      error: "submission outcome is pending reconciliation",
+      submission_outcome: "unknown",
+    });
+
+    const duplicate = await postRequest(url, request);
+    expect(duplicate.status).toBe(503);
+    await expect(duplicate.json()).resolves.toEqual({
+      error: "submission outcome is pending reconciliation",
+      submission_outcome: "unknown",
+    });
+    expect(broadcasts).toBe(1);
   });
 
   it("ignores forwarded IP headers from untrusted direct clients", async () => {
@@ -456,12 +496,48 @@ describe("paymaster in-memory bounds", () => {
 
     expect(queues.pending).toBe(1);
     expect(() => queues.enqueue("paymaster", async () => undefined)).toThrow(
-      "paymaster submission queue is full"
+      SubmissionNotStartedError
     );
 
     release();
     await first;
     expect(queues.pending).toBe(0);
+  });
+
+  it("allows a safe retry after queue saturation rejects work before submission", async () => {
+    const queues = new SubmissionQueues(1);
+    const store = new SubmissionStore(null);
+    let release: () => void = () => {
+      throw new Error("queue task did not start");
+    };
+    let markStarted: () => void = () => {
+      throw new Error("queue task start barrier was not initialized");
+    };
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const occupyingTask = queues.enqueue(
+      "paymaster",
+      () => new Promise<void>((resolve) => {
+        release = resolve;
+        markStarted();
+      })
+    );
+    await started;
+
+    await expect(
+      store.runOnce(request, () =>
+        queues.enqueue("paymaster", async () => ({ transaction_hash: "0xnever" }))
+      )
+    ).rejects.toBeInstanceOf(SubmissionNotStartedError);
+
+    release();
+    await occupyingTask;
+    await expect(
+      store.runOnce(request, () =>
+        queues.enqueue("paymaster", async () => ({ transaction_hash: "0xafter-capacity" }))
+      )
+    ).resolves.toEqual({ transaction_hash: "0xafter-capacity" });
   });
 });
 
