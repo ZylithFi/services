@@ -132,6 +132,24 @@ const capacityFiles = {
   "/proof-capacity/residual_recovery.json": capacityProfile("RESIDUAL_RECOVERY", "zylith-residual-recovery-v2", manifest.proof.residual_recovery_proof_program_class_hash),
 };
 
+const capacityFilesFor = (value) => ({
+  "/proof-capacity/transition.json": capacityProfileFor(value, "TRANSITION", "zylith-transition-v2", value.proof.transition_proof_program_class_hash),
+  "/proof-capacity/withdrawal.json": capacityProfileFor(value, "WITHDRAWAL", "zylith-withdrawal-v1", value.proof.withdrawal_proof_program_class_hash),
+  "/proof-capacity/residual_recovery.json": capacityProfileFor(value, "RESIDUAL_RECOVERY", "zylith-residual-recovery-v2", value.proof.residual_recovery_proof_program_class_hash),
+});
+
+function capacityProfileFor(value, statementKind, statementVersion, programClassHash) {
+  const profile = JSON.parse(capacityProfile(statementKind, statementVersion, programClassHash));
+  profile.identity.release_commit = value.deployment.release_commit;
+  profile.identity.prover_build_id = value.proof.prover_build_id;
+  profile.identity.proof_version = value.proof.proof_version;
+  profile.identity.virtual_program_hash = value.proof.virtual_program_hash;
+  profile.identity.starknet_os_config_hash = value.proof.starknet_os_config_hash;
+  profile.identity.proof_account_class_hash = value.proof.proof_account_class_hash;
+  profile.identity.proof_program_class_hash = programClassHash;
+  return JSON.stringify(profile);
+}
+
 const run = (overrides = {}, manifestOverride = manifest) =>
   check(
     { ...env, ...overrides },
@@ -184,11 +202,21 @@ test("an unfinished deployment fails", () => {
   assert.ok(failures.some((failure) => failure.includes("release_commit")));
 });
 
-test("the production release is PROOF2 only", () => {
+test("production accepts only explicitly supported proof families", () => {
   const proof1 = structuredClone(manifest);
   proof1.proof.proof_version = "PROOF1";
-  const failures = run({}, proof1);
-  assert.ok(failures.some((failure) => failure.includes("proof.proof_version must be PROOF2")));
+  const proof1Files = capacityFilesFor(proof1);
+  assert.deepEqual(check(
+    env,
+    (path) => proof1Files[path] ?? JSON.stringify({ manifest: proof1 }),
+    (path) => path in proof1Files || path === env.ZYLITH_EXECUTION_KEYS_PATH,
+  ), []);
+
+  for (const version of ["PROOF3", "0x50524f4f4632", "", "proof1"]) {
+    const unsupported = structuredClone(manifest);
+    unsupported.proof.proof_version = version;
+    assert.ok(run({}, unsupported).some((failure) => failure.includes("proof.proof_version is unsupported")));
+  }
 });
 
 test("proof class hashes and full-proof capacity evidence are mandatory and release-bound", () => {

@@ -709,22 +709,6 @@ impl Snip36 {
         }
     }
 
-    /// true only when a journaled transaction has no receipt and the network does not know its
-    /// hash: it never entered the mempool, so a replacement cannot conflict with it.
-    pub async fn submission_never_landed(&self, prepared: &PreparedSubmission) -> bool {
-        if self.receipt(prepared.expected_hash).await.is_some() {
-            return false;
-        }
-        matches!(
-            self.provider
-                .get_transaction_status(prepared.expected_hash)
-                .await,
-            Err(starknet_rust_providers::ProviderError::StarknetError(
-                starknet_rust_core::types::StarknetError::TransactionHashNotFound
-            ))
-        )
-    }
-
     pub async fn receipt(&self, hash: Felt) -> Option<Outcome> {
         self.provider
             .get_transaction_receipt(hash)

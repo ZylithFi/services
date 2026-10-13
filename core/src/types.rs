@@ -763,8 +763,8 @@ impl DeploymentManifest {
         if self.proof.scheme != "snip36-stwo" || self.proof.prover_build_id.is_empty() {
             return Err("deployment proof identity is incomplete".into());
         }
-        if self.proof.proof_version != "PROOF2" {
-            return Err("production supports only the PROOF2 proof family".into());
+        if !matches!(self.proof.proof_version.as_str(), "PROOF1" | "PROOF2") {
+            return Err("deployment proof family is unsupported".into());
         }
         for (label, value) in [
             (
@@ -927,16 +927,19 @@ mod tests {
     }
 
     #[test]
-    fn production_manifest_accepts_only_the_enabled_proof2_family() {
+    fn production_manifest_accepts_only_supported_proof_families() {
         let mut manifest = production_manifest();
-        manifest.validate_production().unwrap();
-        for unsupported in ["PROOF1", "PROOF3", "0x50524f4f4632", ""] {
+        for supported in ["PROOF1", "PROOF2"] {
+            manifest.proof.proof_version = supported.into();
+            manifest.validate_production().unwrap();
+        }
+        for unsupported in ["PROOF3", "0x50524f4f4632", "", "proof1"] {
             manifest.proof.proof_version = unsupported.into();
             assert!(
                 manifest
                     .validate_production()
                     .unwrap_err()
-                    .contains("PROOF2"),
+                    .contains("unsupported"),
                 "unsupported version was not rejected: {unsupported}"
             );
         }

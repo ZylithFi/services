@@ -177,6 +177,41 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))?;
     vectors.accept("cross", &cross)?;
 
+    // The canonical floor can be zero for an extreme but valid direct reference ratio; the
+    // protocol clamps that asset's objective weight to one.
+    let mut minimum_weight_notes = Notes::default();
+    let minimum_weight_owner = user(20);
+    let minimum_weight_note = deposit(&minimum_weight_owner, BASE, 1, 20);
+    minimum_weight_notes.add_deposit(&minimum_weight_note);
+    let maximum_reference = u128::from(u64::MAX);
+    let mut minimum_weight_input = input(
+        1,
+        vec![],
+        vec![new_order(
+            &minimum_weight_notes,
+            &minimum_weight_owner,
+            true,
+            false,
+            1,
+            maximum_reference,
+            &[minimum_weight_note],
+        )],
+        minimum_weight_notes.root(),
+        maximum_reference,
+    );
+    minimum_weight_input.markets[0].scale = 1;
+    let minimum_weight = build_transition(&minimum_weight_input)?;
+    // The second sorted asset is the quote numeraire, whose unclamped weight is zero here.
+    assert_eq!(minimum_weight.witness[15], Felt::ONE);
+    vectors.accept("minimum_weight", &minimum_weight)?;
+    vectors.tamper(
+        "reject_minimum_weight_changed",
+        &minimum_weight,
+        |witness, _| {
+            witness[15] = Felt::TWO;
+        },
+    )?;
+
     // mainnet magnitudes: an 18-decimal base near 0.041 of a 6-decimal quote, a cross and an
     // external residual, which the certificate's weights must span.
     const STRK_SCALE: u128 = 1_000_000_000_000_000_000;
@@ -244,6 +279,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
     vectors.tamper("reject_amount_changed", &cross, |witness, layout| {
         witness[order_layout(layout, false, 0).start + 1] -= Felt::ONE;
+    })?;
+    vectors.tamper("reject_weight_changed", &cross, |witness, _| {
+        // Type/header, asset count, then the first asset id and weight.
+        witness[12] += Felt::ONE;
     })?;
     vectors.tamper("reject_order_value_dust", &cross, |witness, layout| {
         let market_start = market_witness_start(witness);

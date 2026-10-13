@@ -180,7 +180,6 @@ pub fn output_padding_record(padding_seed: Felt, index: usize) -> [Felt; 5] {
 pub fn nullifier_padding_value(padding_seed: Felt, index: usize) -> Felt {
     poseidon_prg1(NULLIFIER_PADDING_DOMAIN, padding_seed, index)
 }
-
 pub fn felt_u128(value: u128) -> Felt {
     Felt::from(value)
 }

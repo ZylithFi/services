@@ -234,8 +234,8 @@
     "max_close_delay_ms": 60000,
     "withdrawal_delay_seconds": 120,
     "external_window_seconds": 0,
-    "max_book_orders": 477,
-    "max_admissions_per_transition": 80,
+    "max_book_orders": 32,
+    "max_admissions_per_transition": 16,
     "max_internal_deferral_epochs": 2
   }
 }

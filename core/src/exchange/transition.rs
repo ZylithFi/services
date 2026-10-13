@@ -491,7 +491,6 @@ pub fn output_blinding(key: Felt, seq: u32, kind: OutputKind, asset_id: Felt) ->
         OutputKind::Residual => order_output_blindings(key, seq)[2],
     }
 }
-
 /// an order output as its owner can rebuild it from the order and the transition: its blinding
 /// derives from the order's secret nonce, its metadata names the order, and the published
 /// amount is padded by the blinding, which only the owner and the operator know.
@@ -1617,25 +1616,29 @@ fn serialize_witness(
             felt_u128(market.fee_bps),
             felt_u128(market.min_order_quote_amount),
             felt_u64(u64::from(market.reference_methodology)),
-            market.derivation_base_market_id,
-            market.derivation_quote_market_id,
-            felt_u128(market.derivation_base_bid),
-            felt_u128(market.derivation_base_ask),
-            felt_u128(market.derivation_quote_bid),
-            felt_u128(market.derivation_quote_ask),
-            felt_u64(market.max_leg_skew_ms),
         ]);
+        if market.reference_methodology == super::calldata::REFERENCE_METHOD_DIRECT_BBO {
+            data.extend_from_slice(&[
+                felt_u128(market.derivation_base_bid),
+                felt_u128(market.derivation_base_ask),
+            ]);
+        } else {
+            data.extend_from_slice(&[
+                market.derivation_base_market_id,
+                market.derivation_quote_market_id,
+                felt_u128(market.derivation_base_bid),
+                felt_u128(market.derivation_base_ask),
+                felt_u128(market.derivation_quote_bid),
+                felt_u128(market.derivation_quote_ask),
+                felt_u64(market.max_leg_skew_ms),
+            ]);
+        }
     }
     for index in 0..assets.ids.len() {
-        let (numerator, denominator) = weights.values[index];
-        data.extend_from_slice(&[
-            felt_u128(numerator),
-            felt_u128(denominator),
-            felt_u64(weights.roots[index] as u64),
-            felt_u64(u64::from(weights.depths[index])),
-            felt_u64(weights.parent_markets[index].unwrap_or(0) as u64),
-            felt_u64(weights.maxima[index] as u64),
-        ]);
+        if assets.ids[index] != input.objective_numeraire_asset_id {
+            let (numerator, denominator) = weights.values[index];
+            data.extend_from_slice(&[felt_u128(numerator), felt_u128(denominator)]);
+        }
     }
     data.push(felt_u64(input.outcomes.len() as u64));
     for outcome in &input.outcomes {

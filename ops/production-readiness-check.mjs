@@ -157,7 +157,7 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
       if (!/^https:\/\//i.test(privacyFunding?.[field] ?? "")) fail(`manifest funding.starknet_privacy.${field} must use https`);
     }
     if (manifest.proof?.config_locked_after_deploy !== true) fail("manifest proof.config_locked_after_deploy must be true");
-    if (manifest.proof?.proof_version !== "PROOF2") fail("manifest proof.proof_version must be PROOF2");
+    if (!["PROOF1", "PROOF2"].includes(manifest.proof?.proof_version)) fail("manifest proof.proof_version is unsupported");
     if (!Number.isInteger(manifest.proof?.proof_validity_blocks) || manifest.proof.proof_validity_blocks <= 5) fail("manifest proof.proof_validity_blocks must leave submission headroom");
     if (provingBlocksBack + 5 >= manifest.proof?.proof_validity_blocks) fail("ZYLITH_PROVING_BLOCKS_BACK leaves no validity window for submission");
     if (!manifest.proof?.prover_build_id) fail("manifest proof.prover_build_id must be set");

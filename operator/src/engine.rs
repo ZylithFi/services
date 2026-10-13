@@ -646,51 +646,20 @@ async fn drive(operator: &Arc<Operator>) -> Result<(), String> {
     state = operator.state.lock().await;
 
     // a proven transition that can no longer land inside the contract's close delay would only
-    // revert: drop it, and the next close rebuilds with fresh midpoints. a journaled submission
-    // is dropped too once the gateway never admitted it (for example a proof version the gateway
-    // does not accept): rebroadcasting it forever would stall every later epoch.
-    let expired = state
-        .in_flight
-        .first()
-        .filter(|first| {
-            first.stage == TransitionStage::Proven
-                && now_ms() + 5_000
-                    > first.close_time_ms + operator.config.policy.max_close_delay_ms
-        })
-        .map(|first| {
-            (
-                first.seq,
-                first.result.public.commitment,
-                first.prepared_submission.clone(),
-            )
-        });
-    if let Some((seq, commitment, prepared)) = expired {
-        let never_landed = match &prepared {
-            None => true,
-            Some(prepared) => {
-                drop(state);
-                let never_landed = operator.snip36.submission_never_landed(prepared).await;
-                state = operator.state.lock().await;
-                never_landed
-            }
-        };
-        let unchanged = state.in_flight.first().is_some_and(|first| {
-            first.seq == seq
-                && first.result.public.commitment == commitment
-                && first.stage == TransitionStage::Proven
-        });
-        if never_landed && unchanged {
-            eprintln!(
-                "transition {seq} {}; rebuilding",
-                if prepared.is_some() {
-                    "was never admitted before its close delay passed"
-                } else {
-                    "proved too late to land"
-                }
-            );
-            state.in_flight.clear();
-            changed = true;
-        }
+    // revert: drop it, and the next close rebuilds with fresh midpoints. once a signed submission
+    // has been journaled its outcome remains unknown until authoritative reconciliation; never
+    // replace it merely because one RPC endpoint has not observed its hash.
+    if let Some(first) = state.in_flight.first()
+        && first.stage == TransitionStage::Proven
+        && first.prepared_submission.is_none()
+        && now_ms() + 5_000 > first.close_time_ms + operator.config.policy.max_close_delay_ms
+    {
+        eprintln!(
+            "transition {} proved too late to land; rebuilding",
+            first.seq
+        );
+        state.in_flight.clear();
+        changed = true;
     }
 
     // submit the oldest proven transition: its predecessors have all landed.
