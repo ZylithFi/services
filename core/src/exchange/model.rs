@@ -908,6 +908,84 @@ impl NoteAccumulator {
             accumulator_directions,
         })
     }
+
+    /// snapshots one batch's accumulator path without copying or hashing its output leaves.
+    pub fn prepare_memberships(&self, batch_index: usize) -> Option<NoteMembershipBatch> {
+        if batch_index >= self.len() {
+            return None;
+        }
+        let mut index = batch_index;
+        let mut accumulator_path = Vec::with_capacity(NOTE_ACCUMULATOR_DEPTH);
+        let mut accumulator_directions = Vec::with_capacity(NOTE_ACCUMULATOR_DEPTH);
+        for level in &self.levels[..NOTE_ACCUMULATOR_DEPTH] {
+            accumulator_path.push(level.get(index ^ 1).copied().unwrap_or(Felt::ZERO));
+            accumulator_directions.push(index & 1 == 1);
+            index >>= 1;
+        }
+        Some(NoteMembershipBatch {
+            accumulator_path,
+            accumulator_directions,
+        })
+    }
+}
+
+/// an owned immutable path snapshot; its accumulator path belongs to the preparation root,
+/// even if the original accumulator is appended to or replaced before the paths are built.
+pub struct NoteMembershipBatch {
+    accumulator_path: Vec<Felt>,
+    accumulator_directions: Vec<bool>,
+}
+
+impl NoteMembershipBatch {
+    /// computes each subtree level once and returns memberships in requested-index order.
+    pub fn build(
+        self,
+        leaves: Vec<Felt>,
+        leaf_indices: Vec<usize>,
+    ) -> Option<Vec<(Felt, NoteMembership)>> {
+        if !leaves.len().is_power_of_two()
+            || leaves.len() > 1 << MAX_OUTPUT_SUBTREE_DEPTH
+            || leaf_indices.iter().any(|index| *index >= leaves.len())
+        {
+            return None;
+        }
+        let mut memberships = leaf_indices
+            .iter()
+            .map(|index| {
+                (
+                    leaves[*index],
+                    NoteMembership {
+                        subtree_path: Vec::new(),
+                        subtree_directions: Vec::new(),
+                        accumulator_path: self.accumulator_path.clone(),
+                        accumulator_directions: self.accumulator_directions.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if memberships.is_empty() {
+            return Some(memberships);
+        }
+        let mut level = leaves;
+        let mut indices = leaf_indices;
+        while level.len() > 1 {
+            for (position, index) in indices.iter_mut().enumerate() {
+                let membership = &mut memberships[position].1;
+                membership.subtree_path.push(level[*index ^ 1]);
+                membership.subtree_directions.push(*index & 1 == 1);
+                *index >>= 1;
+            }
+            // the last pair supplies the final siblings; hashing its root is not needed here.
+            if level.len() == 2 {
+                break;
+            }
+            level = level
+                .chunks_exact(2)
+                .map(|pair| output_note_node(pair[0], pair[1]))
+                .collect();
+        }
+        Some(memberships)
+    }
 }
 
 /// where a note sits: its leaf inside a deposit (single leaf) or an output subtree, and that

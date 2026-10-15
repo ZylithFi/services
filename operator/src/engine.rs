@@ -17,14 +17,14 @@ use starknet_rust_core::types::Felt;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use zylith_core::exchange::{
-    Cancellation, OUTPUT_KIND_FEE, Outcome as ChainOutcome, ResidualNote,
+    Cancellation, NewOrder, OUTPUT_KIND_FEE, Outcome as ChainOutcome, ResidualNote,
     TRANSITION_MESSAGE_DOMAIN, TransitionInput, TransitionResult, WITHDRAWAL_MESSAGE_DOMAIN,
     WithdrawalInput, build_transition, build_withdrawal, proof_message_hash, transition_calldata,
     withdrawal_calldata,
 };
 use zylith_proof_job::{ProofShapeLimits, ProofStatementKind};
 
-use crate::chain::{CapacityView, Chain, ChainEvent, transition_batch};
+use crate::chain::{CapacityView, Chain, ChainEvent, PreparedNoteMemberships, transition_batch};
 use crate::config::{Config, from_core, to_core};
 use crate::market::{LEG_MIN_PROFIT_INDEX, Market, Rate, Round};
 use crate::snip36::{
@@ -1772,6 +1772,46 @@ fn stale_pending(
         .collect()
 }
 
+fn funded_admissions(
+    candidates: impl IntoIterator<Item = PendingOrder>,
+    room: usize,
+    mut used: BTreeSet<[u8; 32]>,
+    chain_nullifiers: &BTreeMap<[u8; 32], u8>,
+    mut memberships: PreparedNoteMemberships,
+) -> Result<(Felt, Vec<NewOrder>), String> {
+    let mut new_orders = Vec::new();
+    for order in candidates {
+        if new_orders.len() >= room {
+            break;
+        }
+        if !order.request.funding.iter().all(|note| {
+            let nullifier = from_core(note.nullifier()).to_bytes_be();
+            !used.contains(&nullifier) && chain_nullifiers.get(&nullifier) == Some(&0)
+        }) {
+            continue;
+        }
+        let Some(notes) = order
+            .request
+            .funding
+            .iter()
+            .map(|note| memberships.membership(from_core(note.output_leaf())))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        for note in &order.request.funding {
+            used.insert(from_core(note.nullifier()).to_bytes_be());
+        }
+        new_orders.push(
+            order
+                .request
+                .try_into_new_order(notes)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok((memberships.root(), new_orders))
+}
+
 /// one epoch close: build, decide, and start proving.
 async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), String> {
     operator.running()?;
@@ -1808,15 +1848,11 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
     }
     sleep(Duration::from_millis(close_ms - now)).await;
 
-    let (
-        frontier,
-        pending,
-        cancels,
-        open_capacities,
-        note_root,
-        memberships,
-        learned_admission_limit,
-    ) = {
+    let market_pairs = pairs
+        .iter()
+        .map(|pair| pair.pair_id.to_bytes_be())
+        .collect::<BTreeSet<_>>();
+    let (frontier, pending, cancels, open_capacities, membership_snapshot, room) = {
         let state = operator.state.lock().await;
         if state.in_flight.len() >= policy.pipeline_depth {
             return Ok(());
@@ -1844,35 +1880,41 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
             .map(|(_, cancel)| cancel.clone())
             .collect::<Vec<_>>();
         let open_capacities = frontier.open_capacities(&state);
-        let mut memberships = BTreeMap::new();
-        for order in &pending {
-            for note in &order.request.funding {
-                let leaf = from_core(note.output_leaf());
-                if let Some(membership) = state.notes.membership(leaf) {
-                    memberships.insert(leaf.to_bytes_be(), membership);
-                }
-            }
-        }
+        let learned_admission_limit = if state.proof_capacity_profile_id.as_deref()
+            == Some(
+                operator
+                    .config
+                    .proof_capacity(ProofStatementKind::Transition)
+                    .profile_id
+                    .as_str(),
+            ) {
+            state.proof_capacity_admission_limit
+        } else {
+            None
+        };
+        let room = policy
+            .max_admissions
+            .min(learned_admission_limit.unwrap_or(policy.max_admissions))
+            .min(policy.max_book_orders.saturating_sub(frontier.book.len()));
+        let membership_snapshot = state.notes.prepare_memberships(
+            pending
+                .iter()
+                .filter(|order| {
+                    room != 0
+                        && market_pairs
+                            .contains(&from_core(order.request.terms.pair_id).to_bytes_be())
+                        && close_ms < order.request.terms.expiry_ms
+                })
+                .flat_map(|order| &order.request.funding)
+                .map(|note| from_core(note.output_leaf())),
+        );
         (
             frontier,
             pending,
             cancels,
             open_capacities,
-            state.notes.root(),
-            memberships,
-            if state.proof_capacity_profile_id.as_deref()
-                == Some(
-                    operator
-                        .config
-                        .proof_capacity(ProofStatementKind::Transition)
-                        .profile_id
-                        .as_str(),
-                )
-            {
-                state.proof_capacity_admission_limit
-            } else {
-                None
-            },
+            membership_snapshot,
+            room,
         )
     };
     if open_capacities.len() != capacity_views.len()
@@ -1919,10 +1961,6 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
         .zip(&pairs)
         .map(|(attestation, pair)| attestation.market(pair.fee_bps, pair.min_order_quote_amount))
         .collect::<Vec<_>>();
-    let market_pairs = pairs
-        .iter()
-        .map(|pair| pair.pair_id.to_bytes_be())
-        .collect::<BTreeSet<_>>();
 
     // outcomes whose external window has closed, read from the chain.
     let mut outcomes = Vec::new();
@@ -1995,13 +2033,7 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
 
     // new orders that can join: funded by known, unspent notes, one order per note. their
     // funding nullifiers are read together, and orders that can never join leave the pending set.
-    let mut new_orders = Vec::new();
-    let mut admitted = Vec::new();
-    let mut used = frontier.spent_nullifiers.clone();
-    let room = policy
-        .max_admissions
-        .min(learned_admission_limit.unwrap_or(policy.max_admissions))
-        .min(policy.max_book_orders.saturating_sub(frontier.book.len()));
+    let used = frontier.spent_nullifiers.clone();
     let candidates = pending
         .iter()
         .filter(|order| {
@@ -2036,38 +2068,28 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
         }
         operator.save(&state).await?;
     }
-    for order in candidates {
-        if new_orders.len() >= room {
-            break;
-        }
-        let mut notes = Vec::new();
-        let mut usable = true;
-        for note in &order.request.funding {
-            let nullifier = from_core(note.nullifier()).to_bytes_be();
-            let membership = memberships
-                .get(&from_core(note.output_leaf()).to_bytes_be())
-                .cloned();
-            let fresh = !used.contains(&nullifier) && chain_nullifiers.get(&nullifier) == Some(&0);
-            match (membership, fresh) {
-                (Some(membership), true) => notes.push(membership),
-                _ => usable = false,
-            }
-        }
-        if !usable {
-            continue;
-        }
-        for note in &order.request.funding {
-            used.insert(from_core(note.nullifier()).to_bytes_be());
-        }
-        admitted.push(from_core(order.request.order_id()));
-        new_orders.push(
-            order
-                .request
-                .clone()
-                .try_into_new_order(notes)
-                .map_err(|error| error.to_string())?,
-        );
-    }
+    let (note_root, new_orders) = if room == 0 {
+        (membership_snapshot.root(), Vec::new())
+    } else {
+        tokio::task::spawn_blocking(move || {
+            funded_admissions(
+                pending.into_iter().filter(|order| {
+                    market_pairs.contains(&from_core(order.request.terms.pair_id).to_bytes_be())
+                        && close_time_ms < order.request.terms.expiry_ms
+                }),
+                room,
+                used,
+                &chain_nullifiers,
+                membership_snapshot,
+            )
+        })
+        .await
+        .map_err(|error| format!("membership build panicked: {error}"))??
+    };
+    let mut admitted = new_orders
+        .iter()
+        .map(|order| from_core(order.terms.order_id()))
+        .collect::<Vec<_>>();
 
     let book_ids = frontier
         .book
@@ -2113,11 +2135,14 @@ async fn close_epoch(operator: &Arc<Operator>, close_ms: u64) -> Result<(), Stri
         .proof_capacity(ProofStatementKind::Transition);
     let mut input = input;
     let (input, result) = loop {
-        let attempt = input.clone();
-        let result = tokio::task::spawn_blocking(move || build_transition(&attempt))
-            .await
-            .map_err(|error| format!("transition build panicked: {error}"))?
-            .map_err(|error| format!("transition build: {error}"))?;
+        let (attempt, result) = tokio::task::spawn_blocking(move || {
+            let result = build_transition(&input);
+            (input, result)
+        })
+        .await
+        .map_err(|error| format!("transition build panicked: {error}"))?;
+        input = attempt;
+        let result = result.map_err(|error| format!("transition build: {error}"))?;
         let steps = zylith_core::exchange::StepShape::of(&result).estimated_steps();
         let shape = transition_proof_shape(&result);
         let measured = capacity.limits.covers(&shape);
@@ -3282,6 +3307,130 @@ mod tests {
         // the estimated floor is never lowered.
         raise_min_profit(&mut leg, 60);
         assert_eq!(leg.calldata[LEG_MIN_PROFIT_INDEX], Felt::from(70_u8));
+    }
+
+    #[test]
+    fn lazy_admissions_match_eager_selection_for_all_small_funding_states() {
+        let seller = user(4);
+        let funding = [deposit(&seller, BASE, 10, 4), deposit(&seller, BASE, 10, 5)];
+        let mut notes = Notes::default();
+        for note in &funding {
+            notes.add_deposit(note);
+        }
+        let candidates = [vec![0, 1], vec![0], vec![1]]
+            .into_iter()
+            .enumerate()
+            .map(|(i, indices)| {
+                let funding = indices
+                    .into_iter()
+                    .map(|index| funding[index].clone())
+                    .collect::<Vec<_>>();
+                let order = new_order(&notes, &seller, true, true, 8 + i as u128, 95, &funding);
+                PendingOrder {
+                    request: OrderRequest {
+                        terms: order.terms,
+                        funding,
+                        authorization: order.authorization,
+                    },
+                    received_at_ms: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        let nullifiers = funding
+            .each_ref()
+            .map(|note| note.nullifier().to_bytes_be());
+        let leaves = funding.each_ref().map(|note| from_core(note.output_leaf()));
+        for known in 0..4 {
+            let mut index = crate::chain::NoteIndex::default();
+            for (i, leaf) in leaves.iter().enumerate() {
+                if known & (1 << i) != 0 {
+                    index
+                        .append(crate::chain::NoteBatch {
+                            root: *leaf,
+                            leaves: vec![*leaf],
+                            seq: None,
+                            block: 0,
+                        })
+                        .unwrap();
+                }
+            }
+            let eager = leaves
+                .iter()
+                .filter_map(|leaf| {
+                    index
+                        .membership(*leaf)
+                        .map(|path| (leaf.to_bytes_be(), path))
+                })
+                .collect::<BTreeMap<_, _>>();
+            for states in 0..9 {
+                let mut chain = BTreeMap::new();
+                for (i, nullifier) in nullifiers.iter().enumerate() {
+                    match states / 3_usize.pow(i as u32) % 3 {
+                        0 => {}
+                        1 => {
+                            chain.insert(*nullifier, 0);
+                        }
+                        _ => {
+                            chain.insert(*nullifier, 1);
+                        }
+                    }
+                }
+                for in_flight in 0..4 {
+                    let used = nullifiers
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| in_flight & (1 << i) != 0)
+                        .map(|(_, key)| *key)
+                        .collect::<BTreeSet<_>>();
+                    for room in 0..4 {
+                        let mut expected = Vec::new();
+                        let mut used = used.clone();
+                        let initial_used = used.clone();
+                        for order in &candidates {
+                            if expected.len() >= room {
+                                break;
+                            }
+                            let mut paths = Vec::new();
+                            let mut usable = true;
+                            for note in &order.request.funding {
+                                let nullifier = note.nullifier().to_bytes_be();
+                                match (
+                                    eager.get(&note.output_leaf().to_bytes_be()),
+                                    !used.contains(&nullifier) && chain.get(&nullifier) == Some(&0),
+                                ) {
+                                    (Some(path), true) => paths.push(path.clone()),
+                                    _ => usable = false,
+                                }
+                            }
+                            if usable {
+                                used.extend(
+                                    order
+                                        .request
+                                        .funding
+                                        .iter()
+                                        .map(|note| note.nullifier().to_bytes_be()),
+                                );
+                                expected
+                                    .push(order.request.clone().try_into_new_order(paths).unwrap());
+                            }
+                        }
+                        let (root, actual) = funded_admissions(
+                            candidates.clone(),
+                            room,
+                            initial_used,
+                            &chain,
+                            index.prepare_memberships(leaves),
+                        )
+                        .unwrap();
+                        assert_eq!(root, index.root());
+                        assert_eq!(
+                            actual, expected,
+                            "known={known} states={states} in_flight={in_flight} room={room}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

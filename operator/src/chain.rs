@@ -1,7 +1,8 @@
 //! what the operator reads from the chain: the exchange's views and its events, folded into the
 //! note index every funding note and withdrawal proves membership against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use starknet_rust_core::types::{BlockId, EventFilter, Felt, InvokeTransaction, Transaction};
@@ -30,7 +31,8 @@ pub struct NoteBatch {
 /// every note leaf the chain holds, in accumulator order.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NoteIndex {
-    pub batches: Vec<NoteBatch>,
+    #[serde(with = "note_batches")]
+    pub batches: Vec<Arc<NoteBatch>>,
     pub next_block: u64,
     /// the hash of block `next_block - 1` when it was scanned; zero before the first scan.
     #[serde(default)]
@@ -39,6 +41,24 @@ pub struct NoteIndex {
     positions: BTreeMap<[u8; 32], (usize, usize)>,
     #[serde(skip)]
     tree: Option<zylith_core::exchange::NoteAccumulator>,
+}
+
+mod note_batches {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(
+        batches: &[Arc<NoteBatch>],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(batches.iter().map(Arc::as_ref))
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Arc<NoteBatch>>, D::Error> {
+        Vec::<NoteBatch>::deserialize(deserializer)
+            .map(|batches| batches.into_iter().map(Arc::new).collect())
+    }
 }
 
 impl NoteIndex {
@@ -85,7 +105,7 @@ impl NoteIndex {
                 .entry(leaf.to_bytes_be())
                 .or_insert((batch_index, leaf_index));
         }
-        self.batches.push(batch);
+        self.batches.push(Arc::new(batch));
         Ok(root)
     }
 
@@ -106,6 +126,92 @@ impl NoteIndex {
         self.tree
             .as_ref()?
             .membership(batch_index, &leaves, leaf_index)
+    }
+
+    /// shares each requested immutable batch and captures its path against this exact root. no
+    /// leaf conversion or output-subtree hashing occurs until the snapshot is built.
+    pub fn prepare_memberships(
+        &self,
+        leaves: impl IntoIterator<Item = Felt>,
+    ) -> PreparedNoteMemberships {
+        let mut requested: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for leaf in leaves {
+            if let Some((batch, index)) = self.positions.get(&leaf.to_bytes_be()) {
+                requested.entry(*batch).or_default().insert(*index);
+            }
+        }
+        let mut batches = BTreeMap::new();
+        let mut positions = BTreeMap::new();
+        if let Some(tree) = &self.tree {
+            for (batch, indices) in requested {
+                if let Some(snapshot) = tree.prepare_memberships(batch) {
+                    for index in &indices {
+                        positions.insert(self.batches[batch].leaves[*index].to_bytes_be(), batch);
+                    }
+                    batches.insert(
+                        batch,
+                        (
+                            Arc::clone(&self.batches[batch]),
+                            indices.into_iter().collect(),
+                            snapshot,
+                        ),
+                    );
+                }
+            }
+        }
+        PreparedNoteMemberships {
+            root: self.root(),
+            batches,
+            positions,
+            memberships: BTreeMap::new(),
+        }
+    }
+}
+
+pub struct PreparedNoteMemberships {
+    root: Felt,
+    batches: BTreeMap<
+        usize,
+        (
+            Arc<NoteBatch>,
+            Vec<usize>,
+            zylith_core::exchange::NoteMembershipBatch,
+        ),
+    >,
+    positions: BTreeMap<[u8; 32], usize>,
+    memberships: BTreeMap<[u8; 32], NoteMembership>,
+}
+
+impl PreparedNoteMemberships {
+    pub fn root(&self) -> Felt {
+        self.root
+    }
+
+    fn build_batch(&mut self, batch_index: usize) {
+        if let Some((batch, indices, snapshot)) = self.batches.remove(&batch_index) {
+            let leaves = batch.leaves.iter().copied().map(to_core).collect();
+            if let Some(paths) = snapshot.build(leaves, indices) {
+                for (leaf, membership) in paths {
+                    self.memberships.insert(leaf.to_bytes_be(), membership);
+                }
+            }
+        }
+    }
+
+    /// builds a batch only when a candidate needs it, then reuses its exact-root paths.
+    pub fn membership(&mut self, leaf: Felt) -> Option<NoteMembership> {
+        let key = leaf.to_bytes_be();
+        let batch_index = *self.positions.get(&key)?;
+        self.build_batch(batch_index);
+        self.memberships.get(&key).cloned()
+    }
+
+    #[cfg(test)]
+    pub fn build(mut self) -> (Felt, BTreeMap<[u8; 32], NoteMembership>) {
+        while let Some(batch_index) = self.batches.keys().next().copied() {
+            self.build_batch(batch_index);
+        }
+        (self.root, self.memberships)
     }
 }
 
@@ -524,6 +630,271 @@ mod tests {
                 root
             );
         }
+    }
+
+    #[test]
+    fn prepared_memberships_match_individual_paths_and_deduplicate_requests() {
+        let mut index = NoteIndex::default();
+        let mut leaves = Vec::new();
+        for (batch, depth) in [0_usize, 2, 5].into_iter().enumerate() {
+            let batch_leaves = (0..1_usize << depth)
+                .map(|leaf| Felt::from((100 * batch + leaf + 1) as u64))
+                .collect::<Vec<_>>();
+            let core_leaves = batch_leaves
+                .iter()
+                .copied()
+                .map(to_core)
+                .collect::<Vec<_>>();
+            index
+                .append(NoteBatch {
+                    root: from_core(output_tree_root(&core_leaves)),
+                    leaves: batch_leaves.clone(),
+                    seq: Some(batch as u32 + 1),
+                    block: batch as u64 + 1,
+                })
+                .unwrap();
+            leaves.extend(batch_leaves);
+        }
+        let expected = leaves
+            .iter()
+            .map(|leaf| (leaf.to_bytes_be(), index.membership(*leaf).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let mut requested = leaves.clone();
+        requested.extend(leaves.iter().rev().copied());
+        requested.push(Felt::from(999_u64));
+        let snapshot = index.prepare_memberships(requested);
+        assert_eq!(snapshot.batches.len(), 3);
+        for (position, (batch, _, _)) in snapshot.batches.values().enumerate() {
+            assert!(Arc::ptr_eq(batch, &index.batches[position]));
+        }
+        let (root, actual) = snapshot.build();
+        assert_eq!(root, index.root());
+        assert_eq!(actual, expected);
+        for leaf in &leaves {
+            assert_eq!(
+                from_core(actual[&leaf.to_bytes_be()].root(to_core(*leaf)).unwrap()),
+                root
+            );
+        }
+        assert!(index.prepare_memberships([]).build().1.is_empty());
+        assert!(
+            index
+                .prepare_memberships([Felt::from(999_u64)])
+                .build()
+                .1
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_memberships_keep_their_snapshot_after_rewind_without_holding_the_lock() {
+        let mut index = NoteIndex::default();
+        for (leaf, block) in [(7_u64, 5), (8, 9)] {
+            index
+                .append(NoteBatch {
+                    root: Felt::from(leaf),
+                    leaves: vec![Felt::from(leaf)],
+                    seq: None,
+                    block,
+                })
+                .unwrap();
+        }
+        let original_root = index.root();
+        let expected = index.membership(Felt::from(8_u64)).unwrap();
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(index));
+        let mut locked = shared.lock().await;
+        let snapshot = locked.prepare_memberships([Felt::from(8_u64)]);
+        locked.rewind(9).unwrap();
+        locked
+            .append(NoteBatch {
+                root: Felt::from(9_u64),
+                leaves: vec![Felt::from(9_u64)],
+                seq: None,
+                block: 9,
+            })
+            .unwrap();
+        let replacement_root = locked.root();
+        assert_ne!(replacement_root, original_root);
+        let (root, memberships) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || snapshot.build()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(root, original_root);
+        let removed = Felt::from(8_u64);
+        assert_eq!(memberships[&removed.to_bytes_be()], expected);
+        assert_eq!(from_core(expected.root(to_core(removed)).unwrap()), root);
+        assert!(locked.prepare_memberships([removed]).build().1.is_empty());
+        let replacement = Felt::from(9_u64);
+        let (new_root, new_memberships) = locked.prepare_memberships([replacement]).build();
+        assert_eq!(new_root, replacement_root);
+        assert_eq!(
+            from_core(
+                new_memberships[&replacement.to_bytes_be()]
+                    .root(to_core(replacement))
+                    .unwrap()
+            ),
+            new_root
+        );
+    }
+
+    #[test]
+    fn lazy_memberships_build_only_requested_batches_and_reuse_cached_paths() {
+        let mut index = NoteIndex::default();
+        for batch in 0..3_u64 {
+            let leaves = (0..4)
+                .map(|leaf| Felt::from(10 * batch + leaf + 1))
+                .collect::<Vec<_>>();
+            let root = output_tree_root(&leaves.iter().copied().map(to_core).collect::<Vec<_>>());
+            index
+                .append(NoteBatch {
+                    root: from_core(root),
+                    leaves,
+                    seq: Some(batch as u32),
+                    block: batch,
+                })
+                .unwrap();
+        }
+        let requested = [1_u64, 2, 11, 21].map(Felt::from);
+        let expected = requested.map(|leaf| index.membership(leaf).unwrap());
+        let mut snapshot = index.prepare_memberships(requested);
+        assert_eq!(snapshot.batches.len(), 3);
+        assert!(snapshot.memberships.is_empty());
+        assert!(snapshot.membership(Felt::from(999_u64)).is_none());
+        assert_eq!(snapshot.batches.len(), 3);
+        assert_eq!(snapshot.membership(requested[0]), Some(expected[0].clone()));
+        assert_eq!(snapshot.batches.len(), 2);
+        assert_eq!(snapshot.memberships.len(), 2);
+        assert_eq!(snapshot.membership(requested[1]), Some(expected[1].clone()));
+        assert_eq!(snapshot.membership(requested[0]), Some(expected[0].clone()));
+        assert_eq!(snapshot.batches.len(), 2);
+        let root = snapshot.root();
+        index.rewind(1).unwrap();
+        assert_ne!(index.root(), root);
+        assert_eq!(snapshot.membership(requested[3]), Some(expected[3].clone()));
+        assert_eq!(snapshot.batches.len(), 1);
+        assert_eq!(
+            from_core(expected[3].root(to_core(requested[3])).unwrap()),
+            root
+        );
+    }
+
+    #[test]
+    fn lazy_memberships_do_not_retry_or_relabel_a_malformed_batch() {
+        let mut index = NoteIndex::default();
+        index
+            .append(NoteBatch {
+                root: Felt::ONE,
+                leaves: vec![Felt::ONE, Felt::TWO, Felt::from(3_u64)],
+                seq: None,
+                block: 0,
+            })
+            .unwrap();
+        let mut snapshot = index.prepare_memberships([Felt::ONE]);
+        let root = snapshot.root();
+        assert!(snapshot.membership(Felt::ONE).is_none());
+        assert!(snapshot.batches.is_empty());
+        assert!(snapshot.membership(Felt::ONE).is_none());
+        assert!(snapshot.memberships.is_empty());
+        assert_eq!(snapshot.root(), root);
+    }
+
+    #[test]
+    fn prepared_memberships_survive_reindex_and_preserve_first_duplicate_position() {
+        #[derive(Serialize)]
+        struct LegacyNoteIndex {
+            batches: Vec<NoteBatch>,
+            next_block: u64,
+            cursor_hash: Felt,
+        }
+
+        let mut index = NoteIndex::default();
+        let leaf = Felt::from(7_u64);
+        for block in 1..=2 {
+            index
+                .append(NoteBatch {
+                    root: leaf,
+                    leaves: vec![leaf],
+                    seq: None,
+                    block,
+                })
+                .unwrap();
+        }
+        let expected = index.membership(leaf).unwrap();
+        let legacy = LegacyNoteIndex {
+            batches: index
+                .batches
+                .iter()
+                .map(|batch| batch.as_ref().clone())
+                .collect(),
+            next_block: index.next_block,
+            cursor_hash: index.cursor_hash,
+        };
+        let saved = serde_json::to_vec(&legacy).unwrap();
+        assert_eq!(serde_json::to_vec(&index).unwrap(), saved);
+        let mut restored: NoteIndex = serde_json::from_slice(&saved).unwrap();
+        assert!(restored.prepare_memberships([leaf]).build().1.is_empty());
+        restored.reindex().unwrap();
+        let (root, memberships) = restored.prepare_memberships([leaf, leaf]).build();
+        assert_eq!(root, index.root());
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[&leaf.to_bytes_be()], expected);
+        assert_eq!(from_core(expected.root(to_core(leaf)).unwrap()), root);
+    }
+
+    #[test]
+    fn prepared_funding_paths_leave_the_transition_witness_and_commitment_unchanged() {
+        let buyer = user(41);
+        let funding = (0..4)
+            .map(|i| deposit(&buyer, QUOTE, 300, 4100 + i))
+            .collect::<Vec<_>>();
+        let mut leaves = funding
+            .iter()
+            .map(NoteFields::output_leaf)
+            .collect::<Vec<_>>();
+        leaves.extend(
+            (leaves.len()..16).map(|i| zylith_core::exchange::short_string(&format!("pad-{i}"))),
+        );
+        let batch_root = output_tree_root(&leaves);
+        let mut notes = Notes::default();
+        notes.tree.append(batch_root);
+        for note in &funding {
+            notes.located.push((note.output_leaf(), 0, leaves.clone()));
+        }
+        let admission = new_order(&notes, &buyer, false, true, 5, 105, &funding);
+        let original_input = input(1, vec![], vec![admission], notes.root(), 100);
+        let original = build_transition(&original_input).unwrap();
+        let mut index = NoteIndex::default();
+        index
+            .append(NoteBatch {
+                root: from_core(batch_root),
+                leaves: leaves.into_iter().map(from_core).collect(),
+                seq: Some(1),
+                block: 1,
+            })
+            .unwrap();
+        let mut memberships =
+            index.prepare_memberships(funding.iter().map(|note| from_core(note.output_leaf())));
+        let root = memberships.root();
+        let mut shared_input = original_input.clone();
+        assert_eq!(root, from_core(shared_input.note_root));
+        for funding in &mut shared_input.new_orders[0].funding {
+            funding.membership = memberships
+                .membership(from_core(funding.note.output_leaf()))
+                .unwrap();
+        }
+        let shared = build_transition(&shared_input).unwrap();
+        assert_eq!(shared.witness, original.witness);
+        assert_eq!(
+            serde_json::to_value(shared.public).unwrap(),
+            serde_json::to_value(original.public).unwrap()
+        );
+        shared_input.new_orders[0].funding[0]
+            .membership
+            .accumulator_path[0] += zylith_core::exchange::short_string("tampered");
+        assert!(build_transition(&shared_input).is_err());
     }
 
     #[test]

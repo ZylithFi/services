@@ -127,15 +127,15 @@ const capacityProfile = (statementKind, statementVersion, programClassHash) => J
 });
 
 const capacityFiles = {
-  "/proof-capacity/transition.json": capacityProfile("TRANSITION", "zylith-transition-v2", manifest.proof.transition_proof_program_class_hash),
+  "/proof-capacity/transition.json": capacityProfile("TRANSITION", "zylith-transition-v1", manifest.proof.transition_proof_program_class_hash),
   "/proof-capacity/withdrawal.json": capacityProfile("WITHDRAWAL", "zylith-withdrawal-v1", manifest.proof.withdrawal_proof_program_class_hash),
-  "/proof-capacity/residual_recovery.json": capacityProfile("RESIDUAL_RECOVERY", "zylith-residual-recovery-v2", manifest.proof.residual_recovery_proof_program_class_hash),
+  "/proof-capacity/residual_recovery.json": capacityProfile("RESIDUAL_RECOVERY", "zylith-residual-recovery-v1", manifest.proof.residual_recovery_proof_program_class_hash),
 };
 
 const capacityFilesFor = (value) => ({
-  "/proof-capacity/transition.json": capacityProfileFor(value, "TRANSITION", "zylith-transition-v2", value.proof.transition_proof_program_class_hash),
+  "/proof-capacity/transition.json": capacityProfileFor(value, "TRANSITION", "zylith-transition-v1", value.proof.transition_proof_program_class_hash),
   "/proof-capacity/withdrawal.json": capacityProfileFor(value, "WITHDRAWAL", "zylith-withdrawal-v1", value.proof.withdrawal_proof_program_class_hash),
-  "/proof-capacity/residual_recovery.json": capacityProfileFor(value, "RESIDUAL_RECOVERY", "zylith-residual-recovery-v2", value.proof.residual_recovery_proof_program_class_hash),
+  "/proof-capacity/residual_recovery.json": capacityProfileFor(value, "RESIDUAL_RECOVERY", "zylith-residual-recovery-v1", value.proof.residual_recovery_proof_program_class_hash),
 });
 
 function capacityProfileFor(value, statementKind, statementVersion, programClassHash) {
@@ -242,6 +242,24 @@ test("proof class hashes and full-proof capacity evidence are mandatory and rele
     (path) => path in staleFiles || path === env.ZYLITH_EXECUTION_KEYS_PATH,
   );
   assert.ok(staleFailures.some((failure) => failure.includes("invalid envelope")));
+});
+
+test("experimental statement labels cannot authorize the first release", () => {
+  for (const [filename, statementVersion] of [
+    ["transition.json", "zylith-transition-v2"],
+    ["transition.json", "zylith-transition-v3"],
+    ["residual_recovery.json", "zylith-residual-recovery-v2"],
+  ]) {
+    const profilePath = `/proof-capacity/${filename}`;
+    const profile = JSON.parse(capacityFiles[profilePath]);
+    profile.identity.statement_version = statementVersion;
+    const files = { ...capacityFiles, [profilePath]: JSON.stringify(profile) };
+    assert.ok(check(
+      env,
+      (path) => files[path] ?? JSON.stringify({ manifest }),
+      (path) => path in files || path === env.ZYLITH_EXECUTION_KEYS_PATH,
+    ).some((failure) => failure.includes("profile identity differs")), statementVersion);
+  }
 });
 
 test("a pair without a minimum order size fails", () => {

@@ -130,10 +130,16 @@ impl Q {
     }
 
     fn add(&self, other: &Q) -> Q {
+        if self.d == other.d {
+            return Q::new(&self.n + &other.n, self.d.clone());
+        }
         Q::new(&self.n * &other.d + &other.n * &self.d, &self.d * &other.d)
     }
 
     fn sub(&self, other: &Q) -> Q {
+        if self.d == other.d {
+            return Q::new(&self.n - &other.n, self.d.clone());
+        }
         Q::new(&self.n * &other.d - &other.n * &self.d, &self.d * &other.d)
     }
 
@@ -1428,6 +1434,61 @@ pub fn solve_canonical_clearing(
 mod tests {
     use super::*;
     use starknet_crypto::Felt;
+
+    fn assert_rational_sums_match_reference(left: Q, right: Q) {
+        let expected = [
+            Q::new(&left.n * &right.d + &right.n * &left.d, &left.d * &right.d),
+            Q::new(&left.n * &right.d - &right.n * &left.d, &left.d * &right.d),
+        ];
+        for (actual, expected) in [left.add(&right), left.sub(&right)]
+            .into_iter()
+            .zip(expected)
+        {
+            assert_eq!(actual, expected);
+            assert!(actual.d.is_positive());
+            assert!(actual.n.gcd(&actual.d).is_one());
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(1_024))]
+
+        #[test]
+        fn rational_sums_match_multiply_then_reduce(
+            a in proptest::prelude::any::<i128>(),
+            b in 1..=u128::MAX,
+            c in proptest::prelude::any::<i128>(),
+            d in 1..=u128::MAX,
+            shared in proptest::prelude::any::<u128>(),
+        ) {
+            let factor = BigInt::from(shared) + BigInt::one();
+            let left = Q::new(BigInt::from(a), BigInt::from(b) * &factor);
+            let right = Q::new(BigInt::from(c) * factor, BigInt::from(d));
+            assert_rational_sums_match_reference(left, right);
+            assert_rational_sums_match_reference(
+                Q::new(BigInt::from(a), BigInt::from(b)),
+                Q::new(BigInt::from(c), BigInt::from(b)),
+            );
+        }
+    }
+
+    #[test]
+    fn rational_sums_preserve_zero_sign_and_common_denominator_boundaries() {
+        let values = [
+            Q::zero(),
+            Q::from_u128(1),
+            Q::int(BigInt::from(-1)),
+            Q::new(BigInt::from(i128::MIN), BigInt::from(u128::MAX)),
+            Q::new(BigInt::from(u128::MAX), BigInt::from(i128::MIN)),
+            Q::new(BigInt::from(5), BigInt::from(21)),
+            Q::new(BigInt::from(-8), BigInt::from(21)),
+        ];
+        for left in &values {
+            for right in &values {
+                assert_rational_sums_match_reference(left.clone(), right.clone());
+            }
+        }
+    }
 
     fn market(base: usize, quote: usize, midpoint: u128, scale: u128) -> ClearingMarket {
         ClearingMarket {

@@ -164,9 +164,9 @@ export function check(env, readFile = (path) => readFileSync(path, "utf8"), file
     if (value("ZYLITH_PROVER_BUILD_ID") && value("ZYLITH_PROVER_BUILD_ID") !== manifest.proof?.prover_build_id) fail("ZYLITH_PROVER_BUILD_ID does not match the manifest's proof.prover_build_id");
     const capacityDirectory = required("ZYLITH_PROOF_CAPACITY_PROFILE_DIR");
     const capacityProfiles = [
-      ["transition.json", "TRANSITION", "zylith-transition-v2", "transition_proof_program_class_hash"],
+      ["transition.json", "TRANSITION", "zylith-transition-v1", "transition_proof_program_class_hash"],
       ["withdrawal.json", "WITHDRAWAL", "zylith-withdrawal-v1", "withdrawal_proof_program_class_hash"],
-      ["residual_recovery.json", "RESIDUAL_RECOVERY", "zylith-residual-recovery-v2", "residual_recovery_proof_program_class_hash"],
+      ["residual_recovery.json", "RESIDUAL_RECOVERY", "zylith-residual-recovery-v1", "residual_recovery_proof_program_class_hash"],
     ];
     for (const [filename, statementKind, statementVersion, classField] of capacityProfiles) {
       const path = `${capacityDirectory.replace(/\/+$/, "")}/${filename}`;

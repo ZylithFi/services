@@ -28,7 +28,7 @@ use crate::exact_clearing::{
     solve_canonical_clearing, usdc_clearing_weights,
 };
 
-pub const STATEMENT_TYPE_TRANSITION: u64 = 14;
+pub const STATEMENT_TYPE_TRANSITION: u64 = 18;
 
 /// one attested midpoint and the pair's fee.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +342,10 @@ pub struct TransitionPublic {
 /// where each part of the witness starts, for tooling and tamper tests.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitnessLayout {
+    #[serde(default)]
+    pub funding_batches: usize,
+    #[serde(default)]
+    pub funding_siblings: usize,
     pub groups: Vec<usize>,
     pub orders: Vec<OrderLayout>,
 }
@@ -357,11 +361,15 @@ pub struct OrderLayout {
     pub removal: Option<usize>,
     /// the authorization signature of a new order.
     pub authorization: Option<usize>,
-    /// fill, quote, clearing capacity, external amount.
+    /// allocation start; new orders pack fill/quote and capacity/external into two felts.
     pub allocation: usize,
     /// admission work omitted by the old step estimate.
     pub funding_notes: u64,
     pub membership_path_elements: u64,
+    #[serde(default)]
+    pub funding_starts: Vec<usize>,
+    #[serde(default)]
+    pub batch_references: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1516,7 +1524,7 @@ pub fn build_transition(input: &TransitionInput) -> Result<TransitionResult, Pro
     };
     public.commitment = public.transition_commitment();
 
-    let (witness, layout) = serialize_witness(input, &assets, &weights, &prices, &groups, &public);
+    let (witness, layout) = serialize_witness(input, &assets, &weights, &prices, &groups, &public)?;
     Ok(TransitionResult {
         public,
         new_book,
@@ -1580,7 +1588,7 @@ fn serialize_witness(
     prices: &[u128],
     groups: &[Group],
     public: &TransitionPublic,
-) -> (Vec<Felt>, WitnessLayout) {
+) -> Result<(Vec<Felt>, WitnessLayout), ProtocolError> {
     let mut layout = WitnessLayout::default();
     let mut data = vec![
         felt_u64(STATEMENT_TYPE_TRANSITION),
@@ -1659,6 +1667,9 @@ fn serialize_witness(
             }
         }
     }
+    let batches = FundingBatches::new(groups)?;
+    layout.funding_batches = data.len();
+    batches.serialize(&mut data, &mut layout);
     data.push(felt_u64(groups.len() as u64));
     for group in groups {
         layout.groups.push(data.len());
@@ -1679,12 +1690,270 @@ fn serialize_witness(
             if stream.existing {
                 serialize_existing(&mut data, stream, &mut order_layout);
             } else {
-                serialize_new(&mut data, stream, &mut order_layout);
+                serialize_new(&mut data, stream, &mut order_layout, &batches);
             }
             layout.orders.push(order_layout);
         }
     }
-    (data, layout)
+    Ok((data, layout))
+}
+
+/// a canonical frontier proof over the union of all admitted funding batches. the ordinary
+/// membership checks above remain the oracle: compression never replaces builder validation.
+struct FundingBatches {
+    paths: BTreeMap<u32, (Felt, Vec<Felt>)>,
+}
+
+#[cfg(test)]
+mod funding_batch_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn old_persisted_layouts_remain_readable() {
+        let layout: WitnessLayout = serde_json::from_str(
+            r#"{"groups":[],"orders":[{"order_id":"0x1","existing":true,"start":0,"outcome":null,"removal":null,"authorization":null,"allocation":0,"funding_notes":0,"membership_path_elements":0}]}"#,
+        ).unwrap();
+        assert_eq!(layout.funding_batches, 0);
+        assert_eq!(layout.funding_siblings, 0);
+        assert!(layout.orders[0].funding_starts.is_empty());
+        assert!(layout.orders[0].batch_references.is_empty());
+    }
+
+    #[test]
+    fn frontier_encoder_covers_zero_and_maximum_u32_positions() {
+        let (first, last) = (Felt::from(123_u64), Felt::from(456_u64));
+        let (mut left, mut right) = (note_accumulator_leaf(first), note_accumulator_leaf(last));
+        for level in 0..31 {
+            left = note_accumulator_node(left, Felt::ZERO, level);
+            right = note_accumulator_node(Felt::ZERO, right, level);
+        }
+        let mut first_path = vec![Felt::ZERO; 32];
+        let mut last_path = first_path.clone();
+        first_path[31] = right;
+        last_path[31] = left;
+        let batches = FundingBatches {
+            paths: BTreeMap::from([(0, (first, first_path)), (u32::MAX, (last, last_path))]),
+        };
+        let mut data = Vec::new();
+        batches.serialize(&mut data, &mut WitnessLayout::default());
+        let mut expected = vec![
+            Felt::TWO,
+            Felt::from(u32::MAX) * two_pow(32),
+            first,
+            last,
+            Felt::from(62_u64),
+        ];
+        expected.extend([Felt::ZERO; 62]);
+        assert_eq!(data, expected);
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+        #[test]
+        fn packed_admission_terms_preserve_widths_and_explicit_authority(
+            amount in 0..=MAX_ORDER_AMOUNT, limit in 0..AMOUNT_BOUND,
+            count in 1_usize..=MAX_FUNDING_NOTES, external in any::<bool>(),
+            expiry in 0_u64..(1_u64 << 48), inherited in any::<bool>(), funding_key in any::<u128>(),
+        ) {
+            let owner = super::super::fixtures::user(71).owner;
+            let funding_spend = if inherited { owner.spend_authority } else { Felt::from(funding_key) };
+            let inherited = funding_spend == owner.spend_authority;
+            let terms = OrderTerms { pair_id: Felt::ONE, sell: false, external, amount, limit,
+                expiry_ms: expiry, owner };
+            let mut data = Vec::new();
+            serialize_admission_terms(&mut data, &terms, count, funding_spend);
+            let packed = data[0].to_bytes_be();
+            let actual_amount = u128::from_be_bytes(packed[16..].try_into().unwrap());
+            let actual_limit = u128::from_be_bytes(packed[..16].try_into().unwrap());
+            let expiry_flags = u64::try_from(data[1]).unwrap();
+            let flags = (expiry_flags >> 48) as u8;
+            prop_assert_eq!(actual_amount, amount);
+            prop_assert_eq!(actual_limit, limit);
+            prop_assert_eq!(flags & 1 != 0, external);
+            prop_assert_eq!((flags >> 1) & 7, count as u8);
+            prop_assert_eq!(flags >> 4, u8::from(inherited));
+            prop_assert_eq!(expiry_flags & ((1_u64 << 48) - 1), expiry);
+            prop_assert_eq!(&data[2..7], &terms.owner.fields());
+            prop_assert_eq!(&data[7..], if inherited { &[][..] } else { std::slice::from_ref(&funding_spend) });
+        }
+
+        #[test]
+        fn packed_notes_preserve_widths_and_optional_keys(
+            amount in any::<u128>(), nonce in any::<u64>(),
+            owner_key in any::<u128>(), withdraw_key in any::<u128>(),
+            explicit_owner in any::<bool>(), explicit_withdraw in any::<bool>(),
+        ) {
+            let owner = super::super::fixtures::user(71).owner;
+            let note = NoteFields {
+                asset_id: Felt::ONE, amount,
+                owner_public_key: if explicit_owner { Felt::from(owner_key) } else { owner.owner_public_key },
+                spend_authority: owner.spend_authority,
+                withdraw_authority: if explicit_withdraw { Felt::from(withdraw_key) } else { owner.withdraw_authority },
+                blinding: Felt::from(123_u64), nonce, metadata_commitment: Felt::from(456_u64),
+            };
+            let mut data = Vec::new();
+            serialize_funding_note(&mut data, &note, &owner);
+            let packed = data[0].to_bytes_be();
+            prop_assert_eq!(&packed[16..], &amount.to_be_bytes());
+            prop_assert_eq!(&packed[8..16], &nonce.to_be_bytes());
+            prop_assert!(packed[..7].iter().all(|byte| *byte == 0));
+            let mut expected = Vec::new();
+            let mut flags = 0;
+            if note.owner_public_key != owner.owner_public_key { flags += 1; expected.push(note.owner_public_key); }
+            if note.withdraw_authority != owner.withdraw_authority { flags += 2; expected.push(note.withdraw_authority); }
+            expected.extend([note.blinding, note.metadata_commitment]);
+            prop_assert_eq!(packed[7], flags);
+            prop_assert_eq!(&data[1..], &expected);
+        }
+
+        // independent tree-map reconstruction is the oracle; ordinary memberships supply paths.
+        #[test]
+        fn frontier_matches_independent_memberships(
+            seed in any::<u128>(),
+            selected in proptest::collection::btree_set(0_u32..64, 1..17),
+        ) {
+            let roots: Vec<_> = (0..64_u64).map(|i| Felt::from(seed) + Felt::from(i)).collect();
+            let mut tree = NoteAccumulator::default();
+            for root in &roots { tree.append(*root); }
+            let paths = selected.iter().map(|index| {
+                let membership = tree.membership(*index as usize, &[roots[*index as usize]], 0).unwrap();
+                prop_assert_eq!(membership.root(roots[*index as usize]).unwrap(), tree.root());
+                Ok((*index, (roots[*index as usize], membership.accumulator_path)))
+            }).collect::<Result<BTreeMap<_, _>, TestCaseError>>()?;
+            let proof = FundingBatches { paths };
+            let mut data = Vec::new();
+            let mut layout = WitnessLayout::default();
+            proof.serialize(&mut data, &mut layout);
+            prop_assert_eq!(data[0], Felt::from(selected.len() as u64));
+            let words = selected.len().div_ceil(4);
+            let mut nodes = BTreeMap::new();
+            for i in 0..selected.len() {
+                let word = BigUint::from_bytes_be(&data[1 + i / 4].to_bytes_be());
+                let index = ((word >> (32 * (i % 4))) & BigUint::from(u32::MAX)).to_u32().unwrap();
+                prop_assert_eq!(Some(&index), selected.iter().nth(i));
+                nodes.insert(index, note_accumulator_leaf(data[1 + words + i]));
+            }
+            let mut siblings = data[layout.funding_siblings..].iter();
+            for level in 0..NOTE_ACCUMULATOR_DEPTH {
+                let parents: BTreeSet<_> = nodes.keys().map(|index| index >> 1).collect();
+                let mut next = BTreeMap::new();
+                for parent in parents {
+                    let left = nodes.get(&(parent * 2)).copied().unwrap_or_else(|| *siblings.next().unwrap());
+                    let right = nodes.get(&(parent * 2 + 1)).copied().unwrap_or_else(|| *siblings.next().unwrap());
+                    next.insert(parent, note_accumulator_node(left, right, level));
+                }
+                nodes = next;
+            }
+            prop_assert_eq!(nodes, BTreeMap::from([(0, tree.root())]));
+            prop_assert!(siblings.next().is_none());
+        }
+    }
+}
+
+impl FundingBatches {
+    fn new(groups: &[Group]) -> Result<Self, ProtocolError> {
+        let mut paths = BTreeMap::new();
+        for funding in groups
+            .iter()
+            .flat_map(|group| &group.orders)
+            .filter_map(|stream| stream.new_order.as_ref())
+            .flat_map(|order| &order.funding)
+        {
+            let membership = &funding.membership;
+            if membership.subtree_path.len() != membership.subtree_directions.len()
+                || membership.subtree_path.len() > MAX_OUTPUT_SUBTREE_DEPTH
+                || membership.accumulator_path.len() != NOTE_ACCUMULATOR_DEPTH
+                || membership.accumulator_directions.len() != NOTE_ACCUMULATOR_DEPTH
+            {
+                return Err(invalid("funding membership cardinality is invalid"));
+            }
+            let mut root = funding.note.output_leaf();
+            for (sibling, right) in membership
+                .subtree_path
+                .iter()
+                .zip(&membership.subtree_directions)
+            {
+                root = if *right {
+                    output_note_node(*sibling, root)
+                } else {
+                    output_note_node(root, *sibling)
+                };
+            }
+            let index = membership
+                .accumulator_directions
+                .iter()
+                .enumerate()
+                .fold(0_u32, |index, (level, right)| {
+                    index | (u32::from(*right) << level)
+                });
+            let entry = (root, membership.accumulator_path.clone());
+            if let Some(previous) = paths.insert(index, entry.clone())
+                && previous != entry
+            {
+                return Err(invalid("funding paths disagree at one batch position"));
+            }
+        }
+        Ok(Self { paths })
+    }
+
+    fn reference(&self, funding: &FundingNote) -> usize {
+        let index = funding
+            .membership
+            .accumulator_directions
+            .iter()
+            .enumerate()
+            .fold(0_u32, |index, (level, right)| {
+                index | (u32::from(*right) << level)
+            });
+        self.paths
+            .keys()
+            .position(|key| *key == index)
+            .expect("validated funding batch")
+    }
+
+    fn serialize(&self, data: &mut Vec<Felt>, layout: &mut WitnessLayout) {
+        data.push(felt_u64(self.paths.len() as u64));
+        let positions: Vec<_> = self.paths.keys().copied().collect();
+        for chunk in positions.chunks(4) {
+            data.push(
+                chunk
+                    .iter()
+                    .enumerate()
+                    .fold(Felt::ZERO, |packed, (i, index)| {
+                        packed + felt_u64(u64::from(*index)) * two_pow(32 * i as u32)
+                    }),
+            );
+        }
+        for (root, _) in self.paths.values() {
+            data.push(*root);
+        }
+        let count_offset = data.len();
+        data.push(Felt::ZERO);
+        layout.funding_siblings = data.len();
+        let mut frontier: Vec<_> = self.paths.keys().copied().collect();
+        for level in 0..NOTE_ACCUMULATOR_DEPTH {
+            let siblings: BTreeMap<_, _> = self
+                .paths
+                .iter()
+                .map(|(index, (_, path))| ((*index >> level) ^ 1, path[level]))
+                .collect();
+            let mut parents = Vec::new();
+            let mut i = 0;
+            while i < frontier.len() {
+                let index = frontier[i];
+                if index & 1 == 0 && frontier.get(i + 1) == Some(&(index + 1)) {
+                    i += 1;
+                } else {
+                    data.push(siblings[&(index ^ 1)]);
+                }
+                parents.push(index >> 1);
+                i += 1;
+            }
+            frontier = parents;
+        }
+        data[count_offset] = felt_u64((data.len() - layout.funding_siblings) as u64);
+    }
 }
 
 fn serialize_existing(data: &mut Vec<Felt>, stream: &StreamOrder, layout: &mut OrderLayout) {
@@ -1736,58 +2005,97 @@ fn serialize_existing(data: &mut Vec<Felt>, stream: &StreamOrder, layout: &mut O
     }
 }
 
-fn serialize_new(data: &mut Vec<Felt>, stream: &StreamOrder, layout: &mut OrderLayout) {
+fn serialize_new(
+    data: &mut Vec<Felt>,
+    stream: &StreamOrder,
+    layout: &mut OrderLayout,
+    batches: &FundingBatches,
+) {
     let new_order = stream
         .new_order
         .as_ref()
         .expect("new orders carry their admission");
     let terms = &new_order.terms;
-    data.extend_from_slice(&[
-        felt_bool(terms.external),
-        felt_u128(terms.amount),
-        felt_u128(terms.limit),
-        felt_u64(terms.expiry_ms),
-    ]);
-    data.extend_from_slice(&terms.owner.fields());
-    data.push(felt_u64(new_order.funding.len() as u64));
+    serialize_admission_terms(
+        data,
+        terms,
+        new_order.funding.len(),
+        new_order.funding[0].note.spend_authority,
+    );
     layout.funding_notes = new_order.funding.len() as u64;
     for funding in &new_order.funding {
         let note = &funding.note;
-        data.extend_from_slice(&[
-            felt_u128(note.amount),
-            note.owner_public_key,
-            note.spend_authority,
-            note.withdraw_authority,
-            note.blinding,
-            felt_u64(note.nonce),
-            note.metadata_commitment,
-            felt_u64(funding.membership.subtree_path.len() as u64),
-        ]);
-        for (sibling, right) in funding
+        layout.funding_starts.push(data.len());
+        serialize_funding_note(data, note, &terms.owner);
+        layout.batch_references.push(data.len());
+        let position = funding
             .membership
-            .subtree_path
+            .subtree_directions
             .iter()
-            .zip(&funding.membership.subtree_directions)
-        {
+            .enumerate()
+            .fold(0_u64, |position, (level, right)| {
+                position | (u64::from(*right) << level)
+            });
+        data.push(felt_u64(
+            funding.membership.subtree_path.len() as u64
+                | (position << 5)
+                | ((batches.reference(funding) as u64) << 21),
+        ));
+        for sibling in &funding.membership.subtree_path {
             data.push(*sibling);
-            data.push(felt_bool(*right));
         }
         layout.membership_path_elements += funding.membership.subtree_path.len() as u64;
-        for (sibling, right) in funding
-            .membership
-            .accumulator_path
-            .iter()
-            .zip(&funding.membership.accumulator_directions)
-        {
-            data.push(*sibling);
-            data.push(felt_bool(*right));
-        }
+        // retain the uncompressed logical path count for conservative admission budgeting.
         layout.membership_path_elements += funding.membership.accumulator_path.len() as u64;
     }
     layout.authorization = Some(data.len());
     data.extend_from_slice(&[new_order.authorization.r, new_order.authorization.s]);
     layout.allocation = data.len();
-    serialize_allocation(data, stream);
+    data.push(felt_u128(stream.quote) + felt_u128(stream.fill) * two_pow(128));
+    data.push(
+        felt_u128(stream.clearing_capacity) + felt_u128(stream.external_amount) * two_pow(128),
+    );
+}
+
+fn serialize_admission_terms(
+    data: &mut Vec<Felt>,
+    terms: &OrderTerms,
+    note_count: usize,
+    funding_spend: Felt,
+) {
+    let inherited = funding_spend == terms.owner.spend_authority;
+    // Native 128-bit limbs avoid division when Cairo reconstructs the amount and limit.
+    // build_transition validates these widths and the signed funding set before serialization.
+    data.push(felt_u128(terms.amount) + felt_u128(terms.limit) * two_pow(128));
+    data.push(
+        felt_u64(terms.expiry_ms)
+            + felt_bool(terms.external) * two_pow(48)
+            + felt_u64(note_count as u64) * two_pow(49)
+            + felt_bool(inherited) * two_pow(52),
+    );
+    data.extend_from_slice(&terms.owner.fields());
+    if !inherited {
+        data.push(funding_spend);
+    }
+}
+
+fn serialize_funding_note(data: &mut Vec<Felt>, note: &NoteFields, owner: &OrderOwner) {
+    let explicit_owner = note.owner_public_key != owner.owner_public_key;
+    let explicit_withdraw = note.withdraw_authority != owner.withdraw_authority;
+    let flags = u64::from(explicit_owner) + 2 * u64::from(explicit_withdraw);
+    // amount occupies 128 bits, nonce 64 bits and the two optional-key flags two bits.
+    data.push(
+        felt_u128(note.amount)
+            + felt_u64(note.nonce) * two_pow(128)
+            + felt_u64(flags) * two_pow(192),
+    );
+    if explicit_owner {
+        data.push(note.owner_public_key);
+    }
+    if explicit_withdraw {
+        data.push(note.withdraw_authority);
+    }
+    data.extend_from_slice(&[note.blinding, note.metadata_commitment]);
 }
 
 fn serialize_allocation(data: &mut Vec<Felt>, stream: &StreamOrder) {

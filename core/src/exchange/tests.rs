@@ -14,6 +14,106 @@ fn envelope_context() -> crate::private_envelope::PrivateEnvelopeContext {
 use super::fixtures::*;
 use super::*;
 
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+    #[test]
+    fn shared_memberships_match_independent_paths(
+        seed in proptest::prelude::any::<u128>(),
+        depth in 0_usize..6,
+        prefix in 0_usize..5,
+        selected in proptest::collection::vec(0_usize..1024, 0..12),
+        appended in 0_usize..3,
+    ) {
+        let leaves = (0..1_usize << depth)
+            .map(|index| Felt::from(seed) + Felt::from(index as u64))
+            .collect::<Vec<_>>();
+        let indices = selected.into_iter().map(|index| index % leaves.len()).collect::<Vec<_>>();
+        let mut tree = NoteAccumulator::default();
+        for index in 0..prefix {
+            tree.append(Felt::from(index as u64));
+        }
+        let root = tree.append(output_tree_root(&leaves));
+        let expected = indices.iter().map(|index| {
+            (leaves[*index], tree.membership(prefix, &leaves, *index).unwrap())
+        }).collect::<Vec<_>>();
+        let snapshot = tree.prepare_memberships(prefix).unwrap();
+        for index in 0..appended {
+            tree.append(Felt::from(index as u64 + 100));
+        }
+        let actual = snapshot.build(leaves, indices).unwrap();
+        proptest::prop_assert_eq!(&actual, &expected);
+        for (leaf, membership) in actual {
+            proptest::prop_assert_eq!(membership.root(leaf).unwrap(), root);
+        }
+    }
+}
+
+#[test]
+fn shared_memberships_validate_shape_indices_and_empty_requests() {
+    let mut tree = NoteAccumulator::default();
+    assert!(tree.prepare_memberships(0).is_none());
+    tree.append(Felt::ZERO);
+    assert!(tree.prepare_memberships(1).is_none());
+    assert!(
+        tree.prepare_memberships(0)
+            .unwrap()
+            .build(vec![], vec![])
+            .is_none()
+    );
+    assert!(
+        tree.prepare_memberships(0)
+            .unwrap()
+            .build(vec![Felt::ZERO; 3], vec![0])
+            .is_none()
+    );
+    assert!(
+        tree.prepare_memberships(0)
+            .unwrap()
+            .build(vec![Felt::ZERO], vec![1])
+            .is_none()
+    );
+    assert!(
+        tree.prepare_memberships(0)
+            .unwrap()
+            .build(vec![Felt::ZERO], vec![])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        tree.prepare_memberships(0)
+            .unwrap()
+            .build(vec![Felt::ZERO; 1 << MAX_OUTPUT_SUBTREE_DEPTH], vec![])
+            .is_some()
+    );
+    assert!(
+        tree.prepare_memberships(0)
+            .unwrap()
+            .build(vec![Felt::ZERO; 2 << MAX_OUTPUT_SUBTREE_DEPTH], vec![0])
+            .is_none()
+    );
+}
+
+#[test]
+fn shared_memberships_preserve_zero_duplicate_and_field_maximum_leaves() {
+    let leaves = vec![Felt::ZERO, -Felt::ONE, Felt::ZERO, Felt::ONE];
+    let mut tree = NoteAccumulator::default();
+    let root = tree.append(output_tree_root(&leaves));
+    let indices = vec![3, 0, 2, 1, 0];
+    let paths = tree
+        .prepare_memberships(0)
+        .unwrap()
+        .build(leaves.clone(), indices.clone())
+        .unwrap();
+    assert_eq!(paths.len(), indices.len());
+    for (position, (leaf, membership)) in paths.iter().enumerate() {
+        let index = indices[position];
+        assert_eq!(*leaf, leaves[index]);
+        assert_eq!(*membership, tree.membership(0, &leaves, index).unwrap());
+        assert_eq!(membership.root(*leaf).unwrap(), root);
+    }
+}
+
 #[test]
 fn sealed_request_v3_uses_one_x25519_recipient() {
     let private = PrivateExecutionKeyPrivateConfig {
